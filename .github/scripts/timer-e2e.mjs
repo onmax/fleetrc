@@ -333,9 +333,12 @@ try {
   if (installed && cli) {
     step("clean up: remove the timer");
     const cleanup = run(process.execPath, [cli, "timer", "remove"]);
-    if (cleanup.code !== 0) {
+    const left = osKnows();
+    if (cleanup.code !== 0 || left.known) {
       process.exitCode = 1;
-      console.error(`[timer-e2e] cleanup failed:\n${cleanup.stdout}\n${cleanup.stderr}`);
+      console.error(
+        `[timer-e2e] cleanup failed (exit ${cleanup.code}):\n${cleanup.stdout}\n${cleanup.stderr}\nOS view:\n${left.output}`,
+      );
     }
   }
   rmSync(root, { recursive: true, force: true, maxRetries: 3 });

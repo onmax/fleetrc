@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import {
@@ -78,20 +79,35 @@ async function systemdConfigHome(): Promise<string | undefined> {
   return control ? dirname(dirname(control)) : undefined;
 }
 
-/** Runs `operation` with XDG_CONFIG_HOME pointing where the systemd user manager reads units. */
+/** Runs `operation` with one environment variable changed, and puts it back after. */
+async function withEnv<T>(key: string, value: string, operation: () => Promise<T>): Promise<T> {
+  const saved = process.env[key];
+  if (saved === value) return operation();
+  process.env[key] = value;
+  try {
+    return await operation();
+  } finally {
+    if (saved === undefined) delete process.env[key];
+    else process.env[key] = saved;
+  }
+}
+
+/**
+ * Runs a @vite-hub/schedule operation where it finds the timer the OS knows.
+ * - Linux: XDG_CONFIG_HOME points where the systemd user manager reads units.
+ * - macOS: HOME is a real path. launchd reports the real path of the plist it loaded, and
+ *   @vite-hub/schedule treats a job loaded from another path than `$HOME/Library/LaunchAgents`
+ *   as someone else's: with HOME under a symlink, such as /var/folders (/private/var/folders),
+ *   status says "not installed", remove leaves the job loaded, and a second install fails with
+ *   SCHEDULE_OS_NAME_TAKEN.
+ */
 async function inSchedulerEnv<T>(operation: () => Promise<T>): Promise<T> {
+  if (process.platform === "darwin") return withEnv("HOME", realpathSync(homedir()), operation);
   if (process.platform !== "linux") return operation();
   const managerHome = await systemdConfigHome();
   const ours = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
   if (!managerHome || managerHome === ours) return operation();
-  const saved = process.env.XDG_CONFIG_HOME;
-  process.env.XDG_CONFIG_HOME = managerHome;
-  try {
-    return await operation();
-  } finally {
-    if (saved === undefined) delete process.env.XDG_CONFIG_HOME;
-    else process.env.XDG_CONFIG_HOME = saved;
-  }
+  return withEnv("XDG_CONFIG_HOME", managerHome, operation);
 }
 
 /**
