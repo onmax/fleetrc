@@ -1,6 +1,9 @@
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { remoteScript } from "../src/fleet.ts";
+import { launchers } from "../src/selfinstall.ts";
 import { isWindows, machine, type Machine, pathWith, remote, skills } from "./fixture.ts";
 
 /**
@@ -104,4 +107,30 @@ describe("fleet", () => {
       hosts,
     );
   });
+
+  it.skipIf(isWindows)(
+    "R3-6. fleet upgrade on a host whose launcher's node is gone says so, not that skillfleet is missing",
+    () => {
+      const m = machine();
+      const state = join(m.root, "state");
+      const launcher = join(state, "skillfleet", "bin", "skillfleet");
+      mkdirSync(join(launcher, ".."), { recursive: true });
+      // Node.js was upgraded: the launcher still names the old node, and ssh's PATH has no node or npx.
+      writeFileSync(
+        launcher,
+        launchers(join(m.root, "node-v22.1.0", "bin", "node"), join(state, "skillfleet", "app", "cli.mjs"))
+          .sh,
+      );
+      chmodSync(launcher, 0o755);
+      const bin = join(m.root, "ssh-bin");
+      mkdirSync(bin);
+      const sed = spawnSync("sh", ["-c", "command -v sed"], { encoding: "utf8" }).stdout.trim();
+      symlinkSync(sed, join(bin, "sed"));
+      const run = spawnSync("/bin/sh", ["-c", remoteScript("upgrade", "1.2.3")], {
+        env: { HOME: m.home, XDG_STATE_HOME: state, PATH: bin },
+        encoding: "utf8",
+      });
+      expect(run.stdout.trim(), run.stderr).toBe("skillfleet-fleet: node-gone");
+    },
+  );
 });

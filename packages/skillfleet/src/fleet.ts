@@ -58,7 +58,7 @@ export function remoteScript(
       return `${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then "$f" sync --json${dryRun ? " --dry-run" : ""}; else ${MISSING}; fi`;
     case "upgrade":
       // npx next to the launcher's node, with that node first on PATH for npx's own `#!/usr/bin/env node`.
-      return `${LAUNCHER_NODE}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install && "$l" sync --json; else echo "${NOTE} no-node"; fi`;
+      return `${LAUNCHER_NODE}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install && "$l" sync --json; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
     default: {
       const exhaustive: never = action;
       return exhaustive;
@@ -200,17 +200,27 @@ async function runOnHost(
   const note = run.stdout.match(new RegExp(`^${NOTE} ([\\w-]+)$`, "m"))?.[1];
   if (note !== undefined && Object.hasOwn(HOST_NOTES, note))
     return { note: note as keyof typeof HOST_NOTES };
+  // sync --json prints the report last, and exits 1 when a source failed; status prints the file.
+  const report = parseReport(run.stdout);
+  if (report !== undefined) return { report };
   if (run.code !== 0)
     return {
       error:
         (run.stderr || run.stdout).trim().split("\n").slice(-3).join(" ") || `exit ${run.code}`,
     };
+  return { error: "the host answered with something that is not a skillfleet report" };
+}
+
+/** The skillfleet report a host printed, or undefined when its output holds none. */
+function parseReport(stdout: string): unknown {
+  const text = stdout.trim();
+  const start = text.indexOf("{");
+  if (start < 0) return undefined;
   try {
-    // sync --json prints the report last; status prints the file.
-    const text = run.stdout.trim();
-    return { report: JSON.parse(text.slice(text.indexOf("{"))) as unknown };
+    const raw: unknown = JSON.parse(text.slice(start));
+    return summarize(raw) ? raw : undefined;
   } catch {
-    return { error: "the host answered with something that is not a skillfleet report" };
+    return undefined;
   }
 }
 
