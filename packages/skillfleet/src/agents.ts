@@ -1,3 +1,4 @@
+import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { type AgentInfo, detectAgents, getSupportedAgents } from "skills";
@@ -8,6 +9,8 @@ export interface AgentTarget {
   dir: string;
   /** Agents that read it. */
   agents: string[];
+  /** Other agent folders that are links to this one, so they show the same skills. */
+  aliases?: string[];
 }
 
 /** The folder every universal agent reads, and Codex's own. */
@@ -40,15 +43,66 @@ export async function agentTargets(agents: Manifest["agents"]): Promise<AgentTar
     (agent) => agent.globalSkillsDir && resolve(agent.globalSkillsDir) === shared,
   );
   const byDir = new Map<string, AgentTarget>();
+  const folders = agentFolders();
   for (const agent of chosen) {
     if (!agent.globalSkillsDir) continue;
-    const dir = sharing && readsSharedDir(agent) ? shared : resolve(agent.globalSkillsDir);
+    const named = sharing && readsSharedDir(agent) ? shared : resolve(agent.globalSkillsDir);
+    // A folder that links to another agent folder is that folder: link into it once.
+    const dir = folders.get(named) ?? named;
     const target = byDir.get(dir) ?? { dir, agents: [] };
     target.agents.push(agent.id);
+    if (dir !== named && !target.aliases?.includes(named))
+      target.aliases = [...(target.aliases ?? []), named];
     byDir.set(dir, target);
   }
   return [...byDir.values()].sort((a, b) => (a.dir < b.dir ? -1 : 1));
 }
+
+const realKey = (path: string): string | undefined => {
+  try {
+    const real = realpathSync.native(path);
+    return process.platform === "win32" ? real.toLowerCase() : real;
+  } catch {
+    return undefined;
+  }
+};
+
+const isLink = (path: string) => {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Agent folders (every supported agent's, and Codex's old one) that are links to another agent
+ * folder, mapped to that folder as skillfleet names it. `~/.codex/skills -> ~/.agents/skills` or
+ * `~/.claude/skills -> ~/.agents/skills` make two agents read one folder; a link to a folder no
+ * agent owns (a dotfiles repository) is not in the map.
+ */
+export function agentFolders(): Map<string, string> {
+  const all = new Set([sharedSkillsDir(), resolve(codexLegacyDir())]);
+  for (const agent of getSupportedAgents())
+    if (agent.globalSkillsDir) all.add(resolve(agent.globalSkillsDir));
+  const realFolders = new Map<string, string>();
+  for (const dir of all) {
+    if (isLink(dir)) continue;
+    const key = realKey(dir);
+    if (key && !realFolders.has(key)) realFolders.set(key, dir);
+  }
+  const aliases = new Map<string, string>();
+  for (const dir of all) {
+    if (!isLink(dir)) continue;
+    const key = realKey(dir);
+    const folder = key ? realFolders.get(key) : undefined;
+    if (folder) aliases.set(dir, folder);
+  }
+  return aliases;
+}
+
+/** The agent folder `dir` links to, when it is a link to another agent folder. */
+export const aliasOf = (dir: string): string | undefined => agentFolders().get(resolve(dir));
 
 /**
  * Global skills folders of supported agents that are not targets now. skillfleet may have linked

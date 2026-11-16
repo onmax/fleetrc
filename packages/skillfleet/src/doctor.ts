@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join, sep } from "node:path";
-import { agentTargets, codexLegacyDir } from "./agents.ts";
+import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { exec, git } from "./exec.ts";
 import { lstat } from "./fs.ts";
 import { gitUrl } from "./gitcache.ts";
@@ -231,7 +231,9 @@ export async function doctor(manifest?: string): Promise<Check[]> {
   // Codex reads both of its folders, so one name in both shows twice.
   const codexDirs = [join(homedir(), ".agents", "skills"), codexLegacyDir()];
   const [modern, legacy] = codexDirs.map(skillNames);
-  const both = modern!.filter((name) => legacy!.includes(name));
+  // One folder linked to the other is one folder.
+  const sameFolder = codexDirs.some((dir) => aliasOf(dir));
+  const both = sameFolder ? [] : modern!.filter((name) => legacy!.includes(name));
   checks.push({
     name: "duplicate skills",
     ok: both.length === 0,

@@ -2,11 +2,12 @@ import {
   mkdirSync,
   readdirSync,
   readlinkSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import {
   AGENT_DIRS,
@@ -224,5 +225,50 @@ describe("init", () => {
       git: upstream.url,
       include: ["ag-dev", "ag-update"],
     });
+  });
+
+  describe("R2-1. agent folders linked to one another are one folder", () => {
+    // [the link, the folder it points to]. Codex reads ~/.agents/skills and ~/.codex/skills.
+    const layouts: [string, string][] = [
+      [".codex/skills", ".agents/skills"],
+      [".agents/skills", ".codex/skills"],
+      [".claude/skills", ".agents/skills"],
+      [".agents/skills", ".claude/skills"],
+    ];
+    for (const [link, folder] of layouts)
+      it.skipIf(isWindows)(`${link} -> ${folder}`, async () => {
+        const m = machine({ scheduler: "empty" });
+        const vendor = remote(m, "vendor", skills("skills/", "tool"));
+        mkdirSync(m.at(folder, "handmade"), { recursive: true });
+        writeFileSync(m.at(folder, "handmade/SKILL.md"), skillMd("handmade"));
+        rmSync(m.at(link), { recursive: true, force: true });
+        mkdirSync(dirname(m.at(link)), { recursive: true });
+        symlinkSync(m.at(folder), m.at(link));
+        const manifest = m.manifest({
+          agents: "all",
+          sources: [{ id: "vendor", git: vendor.url }],
+        });
+        const dry = await m.json<{ lost: string[]; migrations: object[] }>(
+          "init",
+          manifest,
+          "--dry-run",
+        );
+        expect(dry.lost).toEqual([]);
+        expect(dry.migrations).toEqual([]);
+        const init = await m.run("init", manifest, "--no-timer");
+        expect(init.stdout).not.toContain("LOST");
+        expect(init.code, init.stdout + init.stderr).toBe(0);
+        // The link stays, and both agents see the hand-made skill and the synced one, once.
+        expect(isLink(m.at(link))).toBe(true);
+        expect(names(m.at(folder))).toEqual(["handmade", "tool"]);
+        expect(names(m.at(link))).toEqual(["handmade", "tool"]);
+        expect(isLink(m.at(folder, "tool"))).toBe(true);
+        const doctor = await m.run("doctor");
+        expect(doctor.stdout).toMatch(/^ok {3}duplicate skills:/m);
+        expect(doctor.stdout).toMatch(/^ok {3}agents agree:/m);
+        const sync = await m.json("sync");
+        expect(sync.errors).toEqual([]);
+        expect(sync.targets.filter((target) => target.skipped)).toEqual([]);
+      });
   });
 });

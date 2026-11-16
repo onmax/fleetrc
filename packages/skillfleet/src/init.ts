@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync }
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
-import { agentTargets, codexLegacyDir } from "./agents.ts";
+import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { personalSkillsDir, personalSource } from "./edits.ts";
 import { isRecord, lstat, moveDir, readJsonFile } from "./fs.ts";
 import { linkTarget, MANIFEST_FILE, removeLink } from "./linker.ts";
@@ -221,6 +221,8 @@ export async function planInit(
       if (!stat) continue;
       const isLegacy = dir === legacy && !targets.includes(legacy);
       if (stat.isSymbolicLink()) {
+        // A link to another agent folder shows that folder's skills, which this plan already counts.
+        if (aliasOf(dir)) continue;
         const target = linkTarget(dir);
         migrations.push({ kind: "unfold", dir, target });
         for (const name of entries(dir)) if (!provided.has(name)) kept.delete(name);
