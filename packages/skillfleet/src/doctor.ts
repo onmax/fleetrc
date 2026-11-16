@@ -6,7 +6,7 @@ import { exec, git } from "./exec.ts";
 import { lstat } from "./fs.ts";
 import { gitUrl } from "./gitcache.ts";
 import { linkTarget } from "./linker.ts";
-import { loadManifest, type Source } from "./manifest.ts";
+import { loadManifest, readConfig, type Source } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 import { installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
 import { manifestSpec } from "./sync.ts";
@@ -24,6 +24,8 @@ export interface Check {
   name: string;
   ok: boolean;
   detail: string;
+  /** Not checked, by the user's choice (a timer they chose not to install). */
+  skipped?: boolean;
 }
 
 function remoteOf(source: Source): string | undefined {
@@ -103,6 +105,15 @@ async function lingerCheck(): Promise<Check | undefined> {
   };
 }
 
+/** The user chose no timer; a config.json that does not read is reported by the manifest check. */
+function timerDeclined(): boolean {
+  try {
+    return readConfig()?.timer === false;
+  } catch {
+    return false;
+  }
+}
+
 /** Whether the OS scheduler has the timer, and how its last run ended. */
 async function timerCheck(): Promise<Check> {
   const name = "timer";
@@ -114,6 +125,14 @@ async function timerCheck(): Promise<Check> {
     return { name, ok: false, detail: error.message.split("\n")[0]! };
   }
   if (!status.installed) {
+    if (timerDeclined())
+      return {
+        name,
+        ok: true,
+        skipped: true,
+        detail:
+          "not installed, as you chose (`init --no-timer` or `timer remove`); `skillfleet timer install` adds it",
+      };
     const foreign = await foreignTimerResource();
     return {
       name,
@@ -158,7 +177,8 @@ async function launchdCheck(): Promise<Check | undefined> {
   };
 }
 
-export async function doctor(): Promise<Check[]> {
+/** `manifest` is the manifest to check, instead of the configured one (`--manifest`). */
+export async function doctor(manifest?: string): Promise<Check[]> {
   const checks: Check[] = [];
   checks.push(await nodeCheck());
   const gitVersion = await git(["--version"], { allowFail: true });
@@ -168,11 +188,13 @@ export async function doctor(): Promise<Check[]> {
     detail: gitVersion.code === 0 ? gitVersion.stdout.trim() : "git is not on PATH",
   });
   checks.push(await timerCheck());
-  for (const check of [await lingerCheck(), await launchdCheck()]) if (check) checks.push(check);
+  // Linger and launchd's PATH only matter to a timer.
+  if (!timerDeclined())
+    for (const check of [await lingerCheck(), await launchdCheck()]) if (check) checks.push(check);
 
   let spec: string;
   try {
-    spec = manifestSpec();
+    spec = manifestSpec(manifest);
   } catch (error) {
     checks.push({ name: "manifest", ok: false, detail: (error as Error).message });
     return checks;
@@ -243,4 +265,9 @@ export async function doctor(): Promise<Check[]> {
 }
 
 export const formatChecks = (checks: readonly Check[]) =>
-  checks.map((check) => `${check.ok ? "ok  " : "FAIL"} ${check.name}: ${check.detail}`).join("\n");
+  checks
+    .map(
+      (check) =>
+        `${check.skipped ? "skip" : check.ok ? "ok  " : "FAIL"} ${check.name}: ${check.detail}`,
+    )
+    .join("\n");

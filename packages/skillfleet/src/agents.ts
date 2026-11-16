@@ -32,9 +32,7 @@ export async function agentTargets(agents: Manifest["agents"]): Promise<AgentTar
   if (agents === "all") {
     chosen = (await detectAgents({ cwd: homedir(), config: { telemetry: false } })).agents;
   } else {
-    const unknown = agents.filter((id) => !supported.some((agent) => agent.id === id));
-    if (unknown.length > 0)
-      throw new Error(`unknown agent${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}`);
+    // parseManifest has checked every id against this list.
     chosen = supported.filter((agent) => agents.includes(agent.id));
   }
   const shared = sharedSkillsDir();
@@ -68,3 +66,34 @@ export function formerTargets(targets: readonly AgentTarget[]): string[] {
 /** Codex's deprecated folder, which skillfleet empties during `init` instead of writing to. */
 export const codexLegacyDir = () =>
   join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "skills");
+
+export interface AgentRow {
+  id: string;
+  name: string;
+  /** Global skills folder, or undefined when the agent has none. */
+  dir?: string;
+  /** Its folder is in this home, so `"agents": "all"` includes it. */
+  detected: boolean;
+  /** The folder skillfleet links its skills into under the manifest's `agents`, when it does. */
+  linkedInto?: string;
+}
+
+/** Every agent id `skills` knows, for `skillfleet agents`. `agents` is the manifest's choice, when there is one. */
+export async function agentRows(agents?: Manifest["agents"]): Promise<AgentRow[]> {
+  const detected = new Set(
+    (await detectAgents({ cwd: homedir(), config: { telemetry: false } })).agents.map(
+      (agent) => agent.id,
+    ),
+  );
+  const targets = agents ? await agentTargets(agents) : [];
+  return getSupportedAgents().map((agent) => ({
+    id: agent.id,
+    name: agent.name,
+    ...(agent.globalSkillsDir ? { dir: resolve(agent.globalSkillsDir) } : {}),
+    detected: detected.has(agent.id),
+    ...(() => {
+      const target = targets.find((candidate) => candidate.agents.includes(agent.id));
+      return target ? { linkedInto: target.dir } : {};
+    })(),
+  }));
+}

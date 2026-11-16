@@ -1,5 +1,6 @@
 import { existsSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { getSupportedAgents } from "skills";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
 import { isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
@@ -245,14 +246,53 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
   }
 }
 
+/** Ids of the agents the `skills` package knows, which `agents` may name. */
+export const agentIds = () => getSupportedAgents().map((agent) => agent.id);
+
+/** The one of `known` closest to a mistyped `word`, or undefined when none is close. */
+export function closest(word: string, known: readonly string[]): string | undefined {
+  const distance = (a: string, b: string) => {
+    let row = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+      const next = [i];
+      for (let j = 1; j <= b.length; j++)
+        next[j] = Math.min(
+          row[j]! + 1,
+          next[j - 1]! + 1,
+          row[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+        );
+      row = next;
+    }
+    return row[b.length]!;
+  };
+  const best = known
+    .map((candidate) => ({ candidate, score: distance(word.toLowerCase(), candidate) }))
+    .sort((a, b) => a.score - b.score)[0];
+  return best && best.score <= Math.max(2, Math.floor(word.length / 3))
+    ? best.candidate
+    : undefined;
+}
+
 /** Validates a manifest file's JSON. `base` resolves relative paths. */
 export function parseManifest(file: string, raw: unknown, base = dirname(file)): Manifest {
   if (!isRecord(raw)) fail(file, "the manifest", "must be a JSON object");
   for (const key of Object.keys(raw))
     if (!ROOT_KEYS.has(key)) fail(file, key, "is not a manifest field");
   const agents = raw.agents ?? "all";
-  if (agents !== "all" && stringList(file, "agents", agents) === undefined)
-    fail(file, "agents", 'must be "all" or a list');
+  if (agents !== "all") {
+    const ids =
+      stringList(file, "agents", agents) ?? fail(file, "agents", 'must be "all" or a list');
+    const known = agentIds();
+    const unknown = ids.filter((id) => !known.includes(id));
+    if (unknown.length > 0) {
+      const near = closest(unknown[0]!, known);
+      fail(
+        file,
+        "agents",
+        `names ${unknown.map((id) => `"${id}"`).join(", ")}, which ${unknown.length === 1 ? "is not an agent id" : "are not agent ids"}${near ? ` (did you mean "${near}"?)` : ""}; \`skillfleet agents\` lists the ids`,
+      );
+    }
+  }
   if (!Array.isArray(raw.sources ?? [])) fail(file, "sources", "must be an array");
   const sources = ((raw.sources ?? []) as unknown[]).map((source, i) =>
     parseSource(file, `sources[${i}]`, source, base),
@@ -332,9 +372,14 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
   };
 }
 
+/** This machine's settings, in config.json. The manifest is shared; these are not. */
 export interface Config {
   /** A manifest path, or `<git repo>//<file>` such as `github:org/agents//skills.json`. */
   manifest: string;
+  /** Copy skill folders instead of linking them, on every sync (`--copy`, `--no-copy`). */
+  copy?: boolean;
+  /** False after `init --no-timer` or `timer remove`: `doctor` then skips the timer. */
+  timer?: boolean;
 }
 
 export function readConfig(): Config | undefined {
@@ -342,10 +387,30 @@ export function readConfig(): Config | undefined {
   if (raw === undefined) return undefined;
   if (!isRecord(raw) || typeof raw.manifest !== "string")
     throw new ManifestError(`${paths.config()}: needs a "manifest" string`);
-  return { manifest: raw.manifest };
+  for (const key of ["copy", "timer"] as const)
+    if (raw[key] !== undefined && typeof raw[key] !== "boolean")
+      throw new ManifestError(`${paths.config()}: "${key}" must be true or false`);
+  return {
+    manifest: raw.manifest,
+    ...(raw.copy === undefined ? {} : { copy: raw.copy as boolean }),
+    ...(raw.timer === undefined ? {} : { timer: raw.timer as boolean }),
+  };
 }
 
-export const writeConfig = (config: Config) => writeJson(paths.config(), config);
+/** Changes config.json, keeping the settings `change` does not name. */
+export function writeConfig(change: Partial<Config> & { manifest: string }) {
+  let config: Config | undefined;
+  try {
+    config = readConfig();
+  } catch {}
+  writeJson(paths.config(), { ...config, ...change });
+}
+
+/** Changes settings of an existing config.json; without one, there is nothing to remember them in. */
+export function updateConfig(change: Partial<Omit<Config, "manifest">>) {
+  const config = readConfig();
+  if (config) writeJson(paths.config(), { ...config, ...change });
+}
 
 export interface LoadedManifest {
   root: Manifest;
@@ -539,11 +604,18 @@ export async function loadManifest(
   return { root, sources, warnings, failed };
 }
 
-/** Reads, changes and writes back the root manifest's JSON, keeping fields skillfleet does not know. */
-export function editManifest(file: string, change: (raw: Record<string, unknown>) => void) {
-  const raw = readJsonFile(file);
+/**
+ * Reads, changes and writes back the root manifest's JSON, keeping fields skillfleet does not know.
+ * A dry run checks that the changed manifest is valid and writes nothing.
+ */
+export function editManifest(
+  file: string,
+  change: (raw: Record<string, unknown>) => void,
+  { dryRun = false } = {},
+) {
+  const raw = readJson(file);
   if (!isRecord(raw)) throw new ManifestError(`${file}: the manifest must be a JSON object`);
   change(raw);
   parseManifest(file, raw);
-  writeJson(file, raw);
+  if (!dryRun) writeJson(file, raw);
 }

@@ -45,13 +45,17 @@ const LAUNCHER_NODE = `l=${STATE}/bin/skillfleet; n=; g=; if [ -f "$l" ]; then n
 /** Prints why there is no skillfleet to run. */
 const MISSING = `if command -v node >/dev/null 2>&1; then echo "${NOTE} not-installed"; else echo "${NOTE} no-node"; fi`;
 
-/** The POSIX sh script each action runs on a host. */
-export function remoteScript(action: FleetAction, version: string): string {
+/** The POSIX sh script each action runs on a host. A dry run asks the host's sync for one too. */
+export function remoteScript(
+  action: FleetAction,
+  version: string,
+  { dryRun = false } = {},
+): string {
   switch (action) {
     case "status":
       return `r=${STATE}/last-run.json; if [ -f "$r" ]; then cat "$r"; else ${FIND}; if [ -n "$f" ]; then echo "${NOTE} never-synced"; else ${MISSING}; fi; fi`;
     case "sync":
-      return `${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then "$f" sync --json; else ${MISSING}; fi`;
+      return `${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then "$f" sync --json${dryRun ? " --dry-run" : ""}; else ${MISSING}; fi`;
     case "upgrade":
       // npx next to the launcher's node, with that node first on PATH for npx's own `#!/usr/bin/env node`.
       return `${LAUNCHER_NODE}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install && "$l" sync --json; else echo "${NOTE} no-node"; fi`;
@@ -169,7 +173,13 @@ function readCache(): Record<string, NonNullable<HostResult["lastRun"]>> {
   return cache;
 }
 
-async function runOnHost(host: string, action: FleetAction, version: string, timeoutMs: number) {
+async function runOnHost(
+  host: string,
+  action: FleetAction,
+  version: string,
+  timeoutMs: number,
+  dryRun: boolean,
+) {
   const problem = hostProblem(host);
   if (problem) return { error: problem };
   const { command, prefix } = sshCommand();
@@ -182,7 +192,7 @@ async function runOnHost(host: string, action: FleetAction, version: string, tim
     // hostProblem already refuses a leading "-"; this keeps ssh from reading any host as an option.
     "--",
     host,
-    `sh -c ${quote(remoteScript(action, version))}`,
+    `sh -c ${quote(remoteScript(action, version, { dryRun }))}`,
   ];
   // The report is parsed whole, so it is not cut to the default tail.
   const run = await exec(command, args, { timeoutMs, maxOutput: 64 * 1024 * 1024 });
@@ -204,17 +214,21 @@ async function runOnHost(host: string, action: FleetAction, version: string, tim
   }
 }
 
-/** Runs an action on every host in parallel; unreachable hosts fall back to their cached last run. */
+/**
+ * Runs an action on every host in parallel; unreachable hosts fall back to their cached last run.
+ * A dry run of `sync` runs `sync --dry-run` on each host, and its reports are not cached as runs.
+ */
 export async function fleet(
   hosts: readonly string[],
   action: FleetAction,
   version: string,
   timeoutMs = 30_000,
+  { dryRun = false } = {},
 ): Promise<HostResult[]> {
   const cache = readCache();
   const results = await Promise.all(
     hosts.map(async (host): Promise<HostResult> => {
-      const answer = await runOnHost(host, action, version, timeoutMs);
+      const answer = await runOnHost(host, action, version, timeoutMs, dryRun);
       // The host answered, but has no report to give.
       if ("note" in answer && answer.note) {
         const error = HOST_NOTES[answer.note];
@@ -228,7 +242,7 @@ export async function fleet(
       }
       const run = "report" in answer ? summarize(answer.report) : undefined;
       if (run) {
-        cache[host] = run;
+        if (!dryRun) cache[host] = run;
         return { host, reachable: true, lastRun: run, behind: [] };
       }
       return {
@@ -240,7 +254,7 @@ export async function fleet(
       };
     }),
   );
-  writeJson(paths.fleet(), cache);
+  if (!dryRun) writeJson(paths.fleet(), cache);
   markBehind(results);
   return results;
 }

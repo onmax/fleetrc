@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { UserError } from "./errors.ts";
 import { git, GitError, gitOut } from "./exec.ts";
 import { isRecord, readJsonOrNothing, sha256, writeJson } from "./fs.ts";
 import { nameKey } from "./names.ts";
@@ -97,7 +98,7 @@ export async function fetchClone(
   };
   let written = readMarker(cache.marker, cache.tree);
   if (offline) {
-    if (!written) throw new Error(`${url} has never been fetched and --offline is set`);
+    if (!written) throw new UserError(`${url} has never been fetched and --offline is set`);
     return { dir: cache.tree, ...written };
   }
   // A commit never changes: once written out, a ref that names one needs no fetch.

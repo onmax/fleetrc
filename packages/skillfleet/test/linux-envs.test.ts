@@ -152,6 +152,12 @@ describe("linux environments", () => {
     const m = machine({ scheduler: "empty" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    // A machine that expects a timer, as one where `timer install` ran once: doctor fails without
+    // it. After `init --no-timer` alone it skips the check (test/cli-contract.test.ts).
+    writeFileSync(
+      m.at(".config/skillfleet/config.json"),
+      JSON.stringify({ manifest, timer: true }),
+    );
     const checks = await m.json<{ name: string; ok: boolean }[]>("doctor");
     const timer = checks.find((check) => /timer/i.test(check.name));
     expect(timer, JSON.stringify(checks)).toMatchObject({ ok: false });

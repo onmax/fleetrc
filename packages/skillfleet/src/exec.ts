@@ -145,6 +145,7 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
 const GIT_ENV = { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", LC_ALL: "C" };
 
 export class GitError extends Error {
+  readonly args: readonly string[];
   readonly result: ExecResult;
   constructor(args: readonly string[], result: ExecResult) {
     super(
@@ -152,6 +153,7 @@ export class GitError extends Error {
         ? "git is not installed, or not on PATH; install git to fetch this source"
         : `git ${args.join(" ")} failed: ${(result.stderr || result.stdout).trim()}`,
     );
+    this.args = args;
     this.result = result;
   }
 }

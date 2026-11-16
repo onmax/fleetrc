@@ -14,6 +14,7 @@ import {
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { agentTargets, formerTargets } from "./agents.ts";
+import { UserError } from "./errors.ts";
 import { exec } from "./exec.ts";
 import {
   changedFiles,
@@ -170,7 +171,7 @@ function acquireLock(): { release: () => void; note?: string } {
     const lock = readLock(file);
     if (!lock) continue;
     const reason = staleBecause(lock.holder);
-    if (!reason) throw new Error(`another skillfleet sync is running (pid ${lock.holder.pid})`);
+    if (!reason) throw new UserError(`another skillfleet sync is running (pid ${lock.holder.pid})`);
     // Move it aside, then check it is still the lock judged stale: another sync may have broken
     // it and taken a fresh one in between, and that one goes back.
     const aside = `${file}.${process.pid}.stale`;
@@ -476,6 +477,12 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       }
 
     const targets = await agentTargets(loaded.root.agents);
+    if (targets.length === 0)
+      warnings.push(
+        loaded.root.agents === "all"
+          ? 'no agent is installed here, so no skills were linked: "agents": "all" means every agent whose folder is in your home, such as ~/.claude for Claude Code. Install one, or name agents in the manifest (`skillfleet agents` lists the ids)'
+          : "none of the manifest's agents has a global skills folder, so no skills were linked",
+      );
     const desired = [...winners.values()];
     // One folder that can't be written must not stop the others.
     const linkInto = (dir: string, links: DesiredLink[]): TargetReport => {

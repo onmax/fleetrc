@@ -3,13 +3,14 @@ import {
   constants,
   existsSync,
   mkdirSync,
+  readdirSync,
   readlinkSync,
   rmdirSync,
   rmSync,
   symlinkSync,
   unlinkSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   copyDir,
   type Hashes,
@@ -23,7 +24,7 @@ import {
   sameTree,
   writeJson,
 } from "./fs.ts";
-import { segmentProblem } from "./names.ts";
+import { nameKey, segmentProblem } from "./names.ts";
 import { tildify } from "./paths.ts";
 
 export const MANIFEST_FILE = ".skillfleet-manifest.json";
@@ -235,7 +236,7 @@ export function linkTargetDir(
       else {
         report.foreign.push(link.name);
         report.warnings.push(
-          `${tildify(path)} links to ${tildify(pointsTo)}, not ${tildify(link.target)}; skillfleet did not make it, so it stays`,
+          `${tildify(listedPath(dir, link.name))} links to ${tildify(pointsTo)}, not ${tildify(link.target)}; skillfleet did not make it, so it stays${sameFolderNote(dir, link.name)}`,
         );
       }
       return;
@@ -253,7 +254,7 @@ export function linkTargetDir(
     }
     report.foreign.push(link.name);
     report.warnings.push(
-      `${tildify(path)} is a ${current.isDirectory() ? "folder" : "file"} skillfleet did not make, so it stays`,
+      `${tildify(listedPath(dir, link.name))} is a ${current.isDirectory() ? "folder" : "file"} skillfleet did not make, so it stays${sameFolderNote(dir, link.name)}`,
     );
   }
 
@@ -290,6 +291,29 @@ export function linkTargetDir(
     failed(MANIFEST_FILE, error);
   }
   return report;
+}
+
+/**
+ * `dir/name` as the folder lists it. On a disk that ignores case or Unicode normalization (macOS,
+ * Windows), the skill `Mine` finds the folder `mine`, and a message should name the folder.
+ */
+export function listedPath(dir: string, name: string): string {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return join(dir, name);
+  }
+  if (entries.includes(name)) return join(dir, name);
+  return join(dir, entries.find((entry) => nameKey(entry) === nameKey(name)) ?? name);
+}
+
+/** Why a skill meets a folder with another name, when it does. */
+function sameFolderNote(dir: string, name: string): string {
+  const listed = basename(listedPath(dir, name));
+  return listed === name
+    ? ""
+    : `; this disk keeps "${listed}" and the skill "${name}" in one folder, so ${name} is not linked there`;
 }
 
 /** `EACCES: permission denied`, without the paths Node appends: the message names them already. */
