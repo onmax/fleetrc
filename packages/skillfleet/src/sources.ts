@@ -50,6 +50,8 @@ export interface SourceResult {
 
 export interface SourceContext {
   offline: boolean;
+  /** `--offline` was passed: a source never fetched is an error, not a note. */
+  offlineRequested?: boolean;
   dryRun: boolean;
   /** Apply review-mode updates for this source. */
   apply: boolean;
@@ -75,6 +77,20 @@ const result = (source: Source, status: SourceStatus): SourceResult => ({
 });
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/** The result of a source whose sync threw. */
+export const failedResult = (source: Source, error: string): SourceResult => ({
+  ...result(source, "error"),
+  error,
+});
+
+/** A source with nothing on this machine: an error when `--offline` was asked for, else a note. */
+function neverFetched(out: SourceResult, ctx: SourceContext, what: string) {
+  if (ctx.offlineRequested) {
+    out.status = "error";
+    out.error = `never fetched (${what}), and --offline is set; run sync without it`;
+  } else out.warnings.push(`${out.id}: never fetched (${what})`);
+}
 
 interface Found {
   name: string;
@@ -199,11 +215,15 @@ export async function syncClone(
   const out = result(source, "unchanged");
   const dir = source.path;
   if (!existsSync(join(dir, ".git"))) {
-    if (ctx.dryRun || ctx.offline) {
-      out.status = ctx.offline ? "offline" : "installed";
-      out.warnings.push(
-        `${source.id}: ${dir} is not cloned yet${ctx.dryRun ? "; sync clones it" : ""}`,
-      );
+    if (ctx.offline) {
+      out.status = "offline";
+      neverFetched(out, ctx, `${dir} is not cloned yet`);
+      if (existsSync(dir)) out.skills = await discoverInPlace(source, dir, out.warnings);
+      return out;
+    }
+    if (ctx.dryRun) {
+      out.status = "installed";
+      out.warnings.push(`${source.id}: ${dir} is not cloned yet; sync clones it`);
       if (existsSync(dir)) out.skills = await discoverInPlace(source, dir, out.warnings);
       return out;
     }
@@ -221,13 +241,22 @@ export async function syncClone(
       return out;
     }
   } else {
-    const before = await gitOut(["rev-parse", "HEAD"], dir);
-    out.from = before;
-    out.to = before;
-    if (!state.commit)
-      out.changed = (await gitOut(["ls-files", "-z"], dir)).split("\0").filter(Boolean);
-    if (ctx.offline) out.status = "offline";
-    else await updateClone(source, dir, before, ctx, out);
+    try {
+      const before = await gitOut(["rev-parse", "HEAD"], dir);
+      out.from = before;
+      out.to = before;
+      if (!state.commit)
+        out.changed = (await gitOut(["ls-files", "-z"], dir)).split("\0").filter(Boolean);
+      if (ctx.offline) out.status = "offline";
+      else await updateClone(source, dir, before, ctx, out);
+    } catch (error) {
+      // The clone is still on disk (git may be missing or broken): keep linking what it has.
+      out.status = "error";
+      out.error = message(error);
+      out.changed = [];
+      out.skills = await discoverInPlace(source, dir, out.warnings);
+      return out;
+    }
   }
   state.commit = out.to;
   state.fetchedAt = ctx.now;
@@ -280,6 +309,17 @@ async function updateClone(
   )
     .split(/\s+/)
     .map(Number);
+  if (ahead) {
+    const lost = await rewrittenAway(dir, tracking);
+    if (lost > 0) {
+      out.status = "held";
+      out.held = {
+        reason: `${tracking} was force-pushed and no longer has ${lost} commit${lost === 1 ? "" : "s"} checked out here; it stays at ${before.slice(0, 7)} until you reset or push it`,
+        files: [],
+      };
+      return;
+    }
+  }
   if (!behind) return;
   const incoming = (await gitOut(["diff", "--name-only", "-z", "HEAD", "@{u}"], dir))
     .split("\0")
@@ -327,6 +367,19 @@ async function updateClone(
         .filter(Boolean),
     ]),
   ];
+}
+
+/** Local commits that `tracking` once had and lost: upstream rewrote its history under them. */
+async function rewrittenAway(dir: string, tracking: string): Promise<number> {
+  const reflog = await git(["reflog", "show", "--format=%H", "-n", "50", tracking, "--"], {
+    cwd: dir,
+    allowFail: true,
+  });
+  const previous = reflog.stdout.split("\n").filter(Boolean);
+  if (reflog.code !== 0 || previous.length === 0) return 0;
+  const local = new Set((await gitOut(["rev-list", "HEAD", "--not", "@{u}"], dir)).split("\n"));
+  const dropped = (await gitOut(["rev-list", ...previous, "--not", "@{u}"], dir)).split("\n");
+  return dropped.filter((commit) => commit && local.has(commit)).length;
 }
 
 export async function syncLocal(
@@ -457,6 +510,7 @@ export async function syncVendored(
   if (ctx.offline) {
     out.status = "offline";
     out.skills = keptSkills(state, ctx.storeDir);
+    if (!state.fetchedAt && out.skills.length === 0) neverFetched(out, ctx, "nothing is cached");
     return out;
   }
   let opened: Awaited<ReturnType<typeof openVendored>>;
@@ -554,6 +608,26 @@ function applyVendored(
     const paths = storePaths(ctx.storeDir, skill.name);
     const incoming = hashDir(from);
     const record = state.skills[skill.name];
+    if (!record && existsSync(paths.live)) {
+      // A copy without an install record (state.json was lost): upstream becomes its base, and a
+      // copy that differs from it counts as edited, so it is never overwritten.
+      const files = changedFiles(incoming, hashDir(paths.live));
+      if (write) {
+        copyDir(from, paths.base);
+        state.skills[skill.name] = { hashes: incoming, path: skill.path };
+      }
+      out.skills.push({ name: skill.name, dir: paths.live, path: skill.path });
+      // New to the records (a killed sync may have copied it), so hooks hear about it again.
+      out.added.push(skill.name);
+      out.changed.push(...Object.keys(incoming).map((file) => `${skill.name}/${file}`));
+      if (files.length > 0) {
+        out.edited.push({ skill: skill.name, files });
+        out.warnings.push(
+          `${source.id}: ${skill.name} has no install record and differs from upstream, so it is kept as a local edit; see \`skillfleet diff ${skill.name}\``,
+        );
+      }
+      continue;
+    }
     if ((!record || !existsSync(paths.live)) && review && !firstRun) {
       hold(skill.name, from, "review", Object.keys(incoming));
       continue;
