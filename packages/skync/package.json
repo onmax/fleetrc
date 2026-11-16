@@ -1,6 +1,6 @@
 {
   "name": "skync",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "description": "The same skills on every agent and every machine, kept current by a timer.",
   "keywords": [
     "agent-skills",
