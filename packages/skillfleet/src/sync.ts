@@ -90,19 +90,20 @@ function commandLine(pid: number): string | undefined {
     if (process.platform === "linux")
       return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
     if (process.platform === "win32")
-      // Only runs when a lock names a live pid, so the second PowerShell takes is acceptable.
+      // Only runs when a lock names a live pid. [wmisearcher] loads no module: Get-CimInstance
+      // would, and with a fresh profile PowerShell first spends seconds indexing every module.
       return execFileSync(
         "powershell.exe",
         [
           "-NoProfile",
           "-NonInteractive",
           "-Command",
-          `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+          `([wmisearcher]'SELECT CommandLine FROM Win32_Process WHERE ProcessId=${pid}').Get() | ForEach-Object { $_.CommandLine }`,
         ],
         {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "ignore"],
-          timeout: 20_000,
+          timeout: 30_000,
           windowsHide: true,
         },
       );
