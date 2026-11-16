@@ -324,7 +324,9 @@ describe("fork with a manifest kept in a repository", () => {
     expect((await m.run("init", `${manifests.url}//skills.json`, "--no-timer")).code).toBe(0);
     const fork = await m.run("fork", "tool");
     expect(fork.code, fork.stdout + fork.stderr).toBe(0);
-    expect(fork.stdout).toContain(`then commit and push ~/code/manifests/skills.json`);
+    expect(fork.stdout).toContain(
+      `then commit and push ${join("~", "code", "manifests", "skills.json")}`,
+    );
     const edited = JSON.parse(read(join(work, "skills.json"))) as {
       forks: Record<string, { from: string }>;
       sources: { exclude?: string[] }[];
