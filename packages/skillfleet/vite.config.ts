@@ -39,7 +39,9 @@ function skillsAgentTable() {
       __SKILLS_OWN_GLOBAL_FOLDER__: JSON.stringify(own.sort()),
     };
   }
-  throw new Error("vite.config.ts: no agent table in the dist of skills; update skillsAgentTable()");
+  throw new Error(
+    "vite.config.ts: no agent table in the dist of skills; update skillsAgentTable()",
+  );
 }
 
 const define = skillsAgentTable();
