@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "skills";
@@ -471,6 +481,7 @@ async function openVendored(source: VendoredSource, state: SourceState, ctx: Sou
         handle: await discover(clone.dir, source.skills),
         version: clone.commit,
         glob: source.skills,
+        root: clone.dir,
       };
     }
     case "npm": {
@@ -481,6 +492,7 @@ async function openVendored(source: VendoredSource, state: SourceState, ctx: Sou
         handle: await discover(pkg.dir, source.skills),
         version: pkg.version,
         glob: source.skills,
+        root: pkg.dir,
       };
     }
     case "index":
@@ -488,6 +500,7 @@ async function openVendored(source: VendoredSource, state: SourceState, ctx: Sou
         handle: await resolveSource(source.index, { config: SKILLS_OPTIONS }),
         version: state.commit,
         glob: undefined,
+        root: undefined,
       };
     default: {
       const exhaustive: never = source;
@@ -613,6 +626,7 @@ export async function syncVendored(
       for (const target of installed.installed) staged.set(target.skill, target.path);
       for (const failure of installed.failed)
         out.warnings.push(`${source.id}: ${failure.skill}: ${failure.message}`);
+      if (opened.root) linkedSkillMds(source, opened.root, chosen, staged, out.warnings);
     }
     applyVendored(source, state, ctx, out, chosen, staged, firstRun);
     state.fetchedAt = ctx.now;
@@ -628,6 +642,41 @@ export async function syncVendored(
     rmSync(staging, { recursive: true, force: true });
   }
   return out;
+}
+
+/**
+ * Stores a SKILL.md that is a link as the file it points to, since Codex and Cursor skip a skill
+ * whose SKILL.md is a link. `skills` copies a link that stays in the skill's folder as its file and
+ * drops one that leaves it, leaving a skill without SKILL.md. A link to a file elsewhere in the
+ * source is copied here; a skill whose SKILL.md leaves the source is dropped, with a warning.
+ */
+function linkedSkillMds(
+  source: VendoredSource,
+  root: string,
+  chosen: readonly Found[],
+  staged: Map<string, string>,
+  warnings: string[],
+) {
+  const realRoot = realpathSync(root);
+  for (const skill of chosen) {
+    const dir = staged.get(skill.name);
+    if (!dir || skill.path === undefined) continue;
+    const file = join(root, skill.path, "SKILL.md");
+    if (!lstatSync(file, { throwIfNoEntry: false })?.isSymbolicLink()) continue;
+    let real: string | undefined;
+    try {
+      real = realpathSync(file);
+    } catch {}
+    if (real && inside(realRoot, real) && statSync(real).isFile()) {
+      rmSync(join(dir, "SKILL.md"), { force: true });
+      copyFileSync(real, join(dir, "SKILL.md"));
+    } else {
+      staged.delete(skill.name);
+      warnings.push(
+        `${source.id}: skipped the skill "${skill.name}": its SKILL.md links to ${real ? "a file outside the source" : "nothing"}`,
+      );
+    }
+  }
 }
 
 function applyVendored(

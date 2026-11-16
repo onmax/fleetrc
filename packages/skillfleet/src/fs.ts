@@ -10,7 +10,9 @@ import {
   renameSync,
   rmSync,
   type Stats,
+  statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
@@ -20,15 +22,22 @@ export type Hashes = Record<string, string>;
 export const lstat = (path: string): Stats | undefined =>
   lstatSync(path, { throwIfNoEntry: false });
 
-/** sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target text. */
-export function hashDir(dir: string): Hashes {
+/**
+ * sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target
+ * text; with `skillMdAsFile`, a top-level SKILL.md link hashes as the file it points to, as
+ * `materializeSkillMd` leaves it.
+ */
+export function hashDir(dir: string, { skillMdAsFile = false } = {}): Hashes {
   const hashes: Hashes = {};
   const walk = (current: string) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
       const key = relative(dir, path).split(sep).join("/");
       if (entry.isDirectory()) walk(path);
-      else if (entry.isSymbolicLink()) hashes[key] = sha256(`link:${readlinkSync(path)}`);
+      else if (entry.isSymbolicLink())
+        hashes[key] =
+          (skillMdAsFile && key === SKILL_MD && linkedFile(path)) ||
+          sha256(`link:${readlinkSync(path)}`);
       else if (entry.isFile()) hashes[key] = sha256(readFileSync(path));
     }
   };
@@ -38,6 +47,30 @@ export function hashDir(dir: string): Hashes {
 
 export const sha256 = (data: string | Uint8Array) =>
   createHash("sha256").update(data).digest("hex");
+
+const SKILL_MD = "SKILL.md";
+
+/** sha256 of the file a link points to, or undefined when it points to no file. */
+function linkedFile(path: string): string | undefined {
+  try {
+    return statSync(path).isFile() ? sha256(readFileSync(path)) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * In `copy`, a copy of the skill folder `original`, replaces a SKILL.md that is a link with the
+ * file it points to from `original`, where a relative link resolves. Codex and Cursor skip a
+ * skill whose SKILL.md is a link. A link to no file stays.
+ */
+export function materializeSkillMd(copy: string, original: string) {
+  const file = join(copy, SKILL_MD);
+  const from = join(original, SKILL_MD);
+  if (!lstat(file)?.isSymbolicLink() || !linkedFile(from)) return;
+  unlinkSync(file);
+  writeFileSync(file, readFileSync(from));
+}
 
 /** Files whose hash differs between two trees, including added and removed ones. */
 export function changedFiles(before: Hashes, after: Hashes): string[] {

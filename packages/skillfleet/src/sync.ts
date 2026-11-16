@@ -54,6 +54,9 @@ export function manifestSpec(override?: string): string {
   return config.manifest;
 }
 
+/** Agents that skip a skill whose SKILL.md is a symlink, found by running them. */
+const SKIP_LINKED_SKILL_MD: Record<string, string> = { codex: "Codex", cursor: "Cursor" };
+
 /** No sync takes this long; a lock older than this was left by one that hung or was killed. */
 const LOCK_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
@@ -429,6 +432,23 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       if (!dryRun && Object.keys(readTargetManifest(dir).links).length === 0)
         rmSync(join(dir, MANIFEST_FILE), { force: true });
     }
+
+    // Skills linked in place keep their SKILL.md as it is, and a link there is skipped by these.
+    const strict = Object.entries(SKIP_LINKED_SKILL_MD)
+      .filter(([id]) => targets.some((target) => target.agents.includes(id)))
+      .map(([, name]) => name);
+    if (strict.length > 0 && !options.copy)
+      for (const result of results) {
+        if (result.kind !== "local" && result.kind !== "clone") continue;
+        for (const skill of result.skills)
+          if (
+            winners.get(skill.name)?.source === result.id &&
+            lstat(join(skill.dir, "SKILL.md"))?.isSymbolicLink()
+          )
+            warnings.push(
+              `${result.id}: ${strict.join(" and ")} won't load ${skill.name}: its SKILL.md is a symlink (${tildify(join(skill.dir, "SKILL.md"))}); make it a regular file, or sync with --copy`,
+            );
+      }
 
     const sourceWon = (result: SourceResult, skill: string) =>
       winners.get(skill)?.source === result.id;

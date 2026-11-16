@@ -18,6 +18,7 @@ import {
   isRecord,
   JsonFileError,
   lstat,
+  materializeSkillMd,
   readJson,
   sameTree,
   writeJson,
@@ -137,6 +138,7 @@ export function makeLink(target: string, path: string, copy: boolean): LinkKind 
     }
   }
   copyDir(target, path);
+  materializeSkillMd(path, target);
   return "copy";
 }
 
@@ -244,7 +246,8 @@ export function linkTargetDir(
         report.warnings.push(`${tildify(path)} is a copy with local edits, so it is not refreshed`);
         return;
       }
-      if (!copy || !sameTree(now, hashDir(link.target)) || !samePath(record.target, link.target))
+      const fresh = hashDir(link.target, { skillMdAsFile: true });
+      if (!copy || !sameTree(now, fresh) || !samePath(record.target, link.target))
         write(link.name, link, true);
       return;
     }
