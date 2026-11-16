@@ -69,9 +69,27 @@ export function isErrno(error: unknown, ...codes: string[]): boolean {
   return error instanceof Error && "code" in error && codes.includes(String(error.code));
 }
 
+/** A JSON file that exists but does not parse: cut short by a crash or a full disk, or hand-edited. */
+export class JsonFileError extends Error {}
+
 export function readJson(path: string): unknown {
   if (!existsSync(path)) return undefined;
-  return JSON.parse(readFileSync(path, "utf8"));
+  const text = readFileSync(path, "utf8");
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    throw new JsonFileError(`${path} is not valid JSON: ${(error as Error).message}`);
+  }
+}
+
+/** `readJson` for records skillfleet rebuilds anyway (last run, fleet cache, sessions): a corrupt one reads as missing. */
+export function readJsonOrNothing(path: string): unknown {
+  try {
+    return readJson(path);
+  } catch (error) {
+    if (error instanceof JsonFileError) return undefined;
+    throw error;
+  }
 }
 
 /** Writes JSON through a temporary file, so a crash never leaves half a file. */

@@ -1,5 +1,5 @@
 import { exec } from "./exec.ts";
-import { isRecord, readJson, writeJson } from "./fs.ts";
+import { isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
 import type { Report } from "./report.ts";
 
@@ -89,7 +89,7 @@ function summarize(raw: unknown): HostResult["lastRun"] {
 }
 
 function readCache(): Record<string, NonNullable<HostResult["lastRun"]>> {
-  const raw = readJson(paths.fleet());
+  const raw = readJsonOrNothing(paths.fleet());
   const cache: Record<string, NonNullable<HostResult["lastRun"]>> = {};
   if (isRecord(raw))
     for (const [host, entry] of Object.entries(raw)) {
@@ -110,7 +110,8 @@ async function runOnHost(host: string, action: FleetAction, version: string, tim
     host,
     `sh -c ${quote(remoteScript(action, version))}`,
   ];
-  const run = await exec(command, args, { timeoutMs });
+  // The report is parsed whole, so it is not cut to the default tail.
+  const run = await exec(command, args, { timeoutMs, maxOutput: 64 * 1024 * 1024 });
   if (run.timedOut) return { error: `timed out after ${Math.round(timeoutMs / 1000)}s` };
   if (run.code !== 0)
     return {
@@ -206,7 +207,10 @@ export interface TailscalePeer {
 
 /** Machines on the tailnet, for `fleet add` to suggest. */
 export async function tailscalePeers(): Promise<TailscalePeer[]> {
-  const run = await exec("tailscale", ["status", "--json"], { timeoutMs: 10_000 });
+  const run = await exec("tailscale", ["status", "--json"], {
+    timeoutMs: 10_000,
+    maxOutput: 64 * 1024 * 1024,
+  });
   if (run.code !== 0) return [];
   const parsed: unknown = JSON.parse(run.stdout);
   if (!isRecord(parsed) || !isRecord(parsed.Peer)) return [];

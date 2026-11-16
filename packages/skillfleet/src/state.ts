@@ -1,6 +1,8 @@
-import { type Hashes, isRecord, readJson, writeJson } from "./fs.ts";
+import { mkdirSync, renameSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { type Hashes, isRecord, JsonFileError, readJson, writeJson } from "./fs.ts";
 import type { Source } from "./manifest.ts";
-import { paths } from "./paths.ts";
+import { paths, tildify } from "./paths.ts";
 
 /** A vendored skill as skillfleet last installed it: the merge base for local edits. */
 export interface InstalledCopy {
@@ -44,8 +46,30 @@ export interface State {
 
 export const emptyState = (): State => ({ version: 1, sources: {}, skills: {} });
 
-export function loadState(): State {
-  const raw = readJson(paths.state());
+/**
+ * Reads state.json. A file that does not parse reads as empty: vendored copies that differ from
+ * upstream then count as edited, so nothing local is overwritten. With `warnings` (a sync that
+ * will write a new state), the corrupt file is first moved to the backup folder.
+ */
+export function loadState(warnings?: string[]): State {
+  let raw: unknown;
+  try {
+    raw = readJson(paths.state());
+  } catch (error) {
+    if (!(error instanceof JsonFileError)) throw error;
+    if (warnings) {
+      const to = join(
+        paths.backup(),
+        `state-${new Date().toISOString().replace(/[:.]/g, "-")}.json`,
+      );
+      mkdirSync(dirname(to), { recursive: true });
+      renameSync(paths.state(), to);
+      warnings.push(
+        `${tildify(paths.state())} was corrupt, so skillfleet started a new one and kept the old one at ${tildify(to)}`,
+      );
+    }
+    return emptyState();
+  }
   if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.sources) || !isRecord(raw.skills))
     return emptyState();
   // Our own file, written by saveState: the shape was checked when it was written.

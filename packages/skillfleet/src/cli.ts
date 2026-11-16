@@ -6,7 +6,7 @@ import { parseArgs } from "node:util";
 import { doctor, formatChecks } from "./doctor.ts";
 import { adoptSkill, diffSkill, forkSkill, mergeSkill, UserError } from "./edits.ts";
 import { fleet, type FleetAction, formatFleet, tailscalePeers } from "./fleet.ts";
-import { isRecord, readJson } from "./fs.ts";
+import { isRecord, JsonFileError, readJsonOrNothing } from "./fs.ts";
 import { applyPlan, formatPlan, planInit } from "./init.ts";
 import {
   defaultSourceId,
@@ -223,7 +223,7 @@ async function timer(action: string | undefined) {
 }
 
 function lastRun(): Report | undefined {
-  const raw = readJson(paths.lastRun());
+  const raw = readJsonOrNothing(paths.lastRun());
   return isRecord(raw) && raw.version === 1 ? (raw as unknown as Report) : undefined;
 }
 
@@ -499,7 +499,11 @@ main().then(
     process.exitCode = code;
   },
   (error: unknown) => {
-    if (error instanceof UserError || error instanceof ManifestError)
+    if (
+      error instanceof UserError ||
+      error instanceof ManifestError ||
+      error instanceof JsonFileError
+    )
       console.error(`skillfleet: ${error.message}`);
     else console.error(error);
     process.exitCode = 1;
