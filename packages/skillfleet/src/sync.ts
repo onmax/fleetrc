@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -12,11 +13,18 @@ import {
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { agentTargets } from "./agents.ts";
+import { agentTargets, formerTargets } from "./agents.ts";
 import { exec } from "./exec.ts";
-import { changedFiles, hashDir, isErrno, isRecord, moveDir, writeJson } from "./fs.ts";
+import { changedFiles, hashDir, isErrno, isRecord, lstat, moveDir, writeJson } from "./fs.ts";
 import { matchesGlob } from "./glob.ts";
-import { type DesiredLink, errorText, linkTargetDir, type TargetReport } from "./linker.ts";
+import {
+  type DesiredLink,
+  errorText,
+  linkTargetDir,
+  MANIFEST_FILE,
+  readTargetManifest,
+  type TargetReport,
+} from "./linker.ts";
 import { type LoadedManifest, loadManifest, ManifestError, readConfig } from "./manifest.ts";
 import { nameKey, segmentProblem } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
@@ -389,21 +397,38 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const targets = await agentTargets(loaded.root.agents);
     const desired = [...winners.values()];
     // One folder that can't be written must not stop the others.
-    const targetReports = targets.map((target): TargetReport => {
+    const linkInto = (dir: string, links: DesiredLink[]): TargetReport => {
       try {
-        return linkTargetDir(target.dir, desired, { copy: options.copy, dryRun });
+        return linkTargetDir(dir, links, { copy: options.copy, dryRun });
       } catch (error) {
         return {
-          dir: target.dir,
+          dir,
           created: [],
           replaced: [],
           removed: [],
           foreign: [],
           warnings: [],
-          errors: [`${tildify(target.dir)}: ${errorText(error)}`],
+          errors: [`${tildify(dir)}: ${errorText(error)}`],
         };
       }
-    });
+    };
+    const targetReports = targets.map((target) => linkInto(target.dir, desired));
+    // Links skillfleet made in folders it no longer links into are removed. A folder that is a
+    // link, or another path to a current target, is left alone.
+    const real = (dir: string) => {
+      const path = existsSync(dir) ? realpathSync.native(dir) : dir;
+      return process.platform === "win32" ? path.toLowerCase() : path;
+    };
+    const current = new Set(targets.map((target) => real(target.dir)));
+    for (const dir of formerTargets(targets)) {
+      if (!lstat(dir)?.isDirectory() || current.has(real(dir))) continue;
+      if (!existsSync(join(dir, MANIFEST_FILE))) continue;
+      const former = linkInto(dir, []);
+      former.former = true;
+      targetReports.push(former);
+      if (!dryRun && Object.keys(readTargetManifest(dir).links).length === 0)
+        rmSync(join(dir, MANIFEST_FILE), { force: true });
+    }
 
     const sourceWon = (result: SourceResult, skill: string) =>
       winners.get(skill)?.source === result.id;

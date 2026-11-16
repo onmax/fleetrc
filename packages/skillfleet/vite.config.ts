@@ -4,12 +4,15 @@ import { dirname, join } from "node:path";
 import { defineConfig } from "vite-plus";
 
 /**
- * The environment variables `skills` reads to place agents' folders, such as CODEX_HOME and
- * GROK_HOME, taken from its agent table. The timer passes them on, so a scheduled sync links the
- * folders the installing shell would. Read at build time, so a new agent in `skills` needs no
- * change here; a `skills` whose table this can't find fails the build.
+ * Facts from the agent table of `skills` that its public API leaves out, read at build time so a
+ * new agent in `skills` needs no change here. A `skills` whose table this can't find fails the build.
+ * - `__SKILLS_AGENT_ENV__`: the environment variables that place agents' folders, such as
+ *   CODEX_HOME and GROK_HOME. The timer passes them on, so a scheduled sync links the folders the
+ *   installing shell would.
+ * - `__SKILLS_OWN_GLOBAL_FOLDER__`: universal agents that read only their own folder globally, not
+ *   ~/.agents/skills (`globalReadsCanonical: false`), such as Antigravity.
  */
-function agentEnv(): string[] {
+function skillsAgentTable() {
   const dist = dirname(createRequire(import.meta.url).resolve("skills"));
   const files = [dist, join(dist, "_chunks")].flatMap((dir) =>
     readdirSync(dir)
@@ -21,16 +24,25 @@ function agentEnv(): string[] {
     const table = code.indexOf("\nconst agents = {", start);
     const end = code.indexOf("\n};\n", table);
     if (start === -1 || table === -1 || end === -1) continue;
-    const names = [...code.slice(start, end).matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g)].map(
+    const env = [...code.slice(start, end).matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g)].map(
       (match) => match[1]!,
     );
-    if (!names.includes("CODEX_HOME")) break;
-    return [...new Set(names)].sort();
+    const entries = [
+      ...code.slice(table, end).matchAll(/\n\t\tname: "([^"]+)"([\s\S]*?)(?=\n\t\tname: "|$)/g),
+    ];
+    const own = entries
+      .filter((entry) => entry[2]!.includes("globalReadsCanonical: false"))
+      .map((entry) => entry[1]!);
+    if (!env.includes("CODEX_HOME") || !entries.some((entry) => entry[1] === "codex")) break;
+    return {
+      __SKILLS_AGENT_ENV__: JSON.stringify([...new Set(env)].sort()),
+      __SKILLS_OWN_GLOBAL_FOLDER__: JSON.stringify(own.sort()),
+    };
   }
-  throw new Error("vite.config.ts: no agent table in skills' dist; update agentEnv()");
+  throw new Error("vite.config.ts: no agent table in the dist of skills; update skillsAgentTable()");
 }
 
-const define = { __SKILLS_AGENT_ENV__: JSON.stringify(agentEnv()) };
+const define = skillsAgentTable();
 
 export default defineConfig({
   define,

@@ -43,7 +43,7 @@ const list = (names: readonly string[]) => names.join(", ");
 export function formatReport(report: Report): string {
   const lines: string[] = [];
   const verb = report.dryRun ? "would link" : "linked";
-  const folders = report.targets.filter((target) => !target.skipped).length;
+  const folders = report.targets.filter((target) => !target.skipped && !target.former).length;
   lines.push(
     `skillfleet: ${verb} ${report.skills.total} skills into ${folders} folder${folders === 1 ? "" : "s"}${report.offline ? " (offline)" : ""}`,
   );

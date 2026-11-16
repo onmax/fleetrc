@@ -15,6 +15,7 @@ import {
   serveIndexV2,
   skillMd,
   skills,
+  UNIVERSAL_DIRS,
 } from "./fixture.ts";
 
 /** A personal working clone, a vendored git repository and a well-known index. */
@@ -53,7 +54,8 @@ describe("sync", () => {
     }
     // Personal skills link into the working clone, so an edit through an agent folder edits the clone.
     expect(linkOf(m.at(".claude/skills/alpha"))).toBe(join(work, "skills", "alpha"));
-    expect(read(m.at(".gemini/skills/epsilon/notes.md"))).toBe("notes\n");
+    expect(read(m.at(".agents/skills/epsilon/notes.md"))).toBe("notes\n");
+    for (const dir of UNIVERSAL_DIRS) expect(names(m.at(dir)), dir).toEqual([]);
     expect(read(m.at(".agents/skills/gamma/SKILL.md"))).toBe(skillMd("gamma"));
     // Codex reads ~/.agents/skills; skillfleet never writes its deprecated folder.
     expect(existsSync(m.at(".codex/skills"))).toBe(false);

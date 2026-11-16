@@ -81,10 +81,14 @@ export const AGENT_HOMES = [
   ".copilot",
 ];
 
-/** The global skills folder of each detected agent, as `skills` 1.9 places them. */
-export const AGENT_DIRS = [
-  ".agents/skills",
-  ".claude/skills",
+/**
+ * The folders skillfleet links into for the agents in AGENT_HOMES. Codex reads ~/.agents/skills, so
+ * Gemini CLI, OpenCode, Copilot and Cursor, which read it too, get no links in their own folders.
+ */
+export const AGENT_DIRS = [".agents/skills", ".claude/skills"];
+
+/** Own folders of the agents in AGENT_HOMES that read ~/.agents/skills, which skillfleet leaves empty. */
+export const UNIVERSAL_DIRS = [
   ".config/opencode/skills",
   ".copilot/skills",
   ".cursor/skills",

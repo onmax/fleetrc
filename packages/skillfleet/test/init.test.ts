@@ -141,7 +141,7 @@ describe("init", () => {
       skillMd("conversation-video"),
     );
     expect(linkOf(m.at(".agents/skills/unslop"))).toBe(join(work, "skills/unslop"));
-    expect(read(m.at(".gemini/skills/nuxt/SKILL.md"))).toBe(skillMd("nuxt"));
+    expect(read(m.at(".agents/skills/nuxt/SKILL.md"))).toBe(skillMd("nuxt"));
     expect(JSON.parse(read(manifest)).forks).toEqual({
       council: { from: "t3dotgg/tstack", path: "skills/council", base: "unknown" },
     });

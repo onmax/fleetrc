@@ -56,6 +56,8 @@ export interface TargetReport {
   /** Hand-made folders and links skillfleet did not create, left as they are. */
   foreign: string[];
   skipped?: string;
+  /** A folder skillfleet linked into before and no longer does: only its old links are removed. */
+  former?: boolean;
   warnings: string[];
   /** Links that could not be made, changed or removed, and folders that could not be written. */
   errors: string[];

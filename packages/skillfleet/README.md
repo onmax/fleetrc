@@ -75,6 +75,8 @@ skillfleet fleet sync            # sync every machine in the manifest over SSH
 
 skillfleet links skills into Claude Code, Codex, Gemini CLI, OpenCode, Cursor, GitHub Copilot, and the rest of the agents in Vercel's [`skills`](https://github.com/vercel-labs/skills) package.
 
+When one of your agents reads `~/.agents/skills`, as Codex does, the agents that read it too (Gemini CLI, OpenCode, Cursor, GitHub Copilot and the other ones `skills` calls universal) get their skills from there only, as with `npx skills add -g`. Linking their own folders as well would show each skill twice, and Gemini CLI warns about every one.
+
 | System  | Timer                 | Skills are linked as |
 | ------- | --------------------- | -------------------- |
 | Linux   | a systemd user timer  | symlinks             |
