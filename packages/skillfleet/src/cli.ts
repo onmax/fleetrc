@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { userInfo } from "node:os";
+import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { doctor, formatChecks } from "./doctor.ts";
 import { adoptSkill, diffSkill, forkSkill, mergeSkill, UserError } from "./edits.ts";
 import { fleet, type FleetAction, formatFleet, tailscalePeers } from "./fleet.ts";
-import { isRecord, readJson, writeJson } from "./fs.ts";
+import { isRecord, readJson } from "./fs.ts";
 import { applyPlan, formatPlan, planInit } from "./init.ts";
 import {
   defaultSourceId,
@@ -14,7 +15,7 @@ import {
   ManifestError,
   readConfig,
 } from "./manifest.ts";
-import { paths, stateDir, tildify } from "./paths.ts";
+import { paths, tildify } from "./paths.ts";
 import { exec } from "./exec.ts";
 import { formatReport, type Report } from "./report.ts";
 import { installedCli, selfInstall } from "./selfinstall.ts";
@@ -22,12 +23,17 @@ import { promptHook, staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
 import { manifestSpec, sync } from "./sync.ts";
 import {
-  BLOCKED_REASON,
-  loadScheduler,
-  SchedulerUnavailable,
+  formatTimerStatus,
+  installTimer as installOsTimer,
+  machineTimeZone,
+  removeTimer,
   TIMER_NAME,
+  TimerError,
+  timerKind,
   type TimerSpec,
+  type TimerStatus,
   timerEnv,
+  timerStatus,
 } from "./timer.ts";
 import { version } from "./version.ts";
 
@@ -123,8 +129,6 @@ async function runSync(options: { only?: string; apply?: string } = {}) {
   return printReport(report);
 }
 
-const timerFile = () => join(stateDir(), "timer.json");
-
 /** Absolute path of git, so the timer's PATH has it even when the scheduler's own PATH does not. */
 async function gitPath(): Promise<string | undefined> {
   const run = await exec(process.platform === "win32" ? "where" : "which", ["git"], {
@@ -133,77 +137,85 @@ async function gitPath(): Promise<string | undefined> {
   return run.code === 0 ? run.stdout.split(/\r?\n/)[0]?.trim() || undefined : undefined;
 }
 
-async function installTimer(): Promise<{ code: number; lines: string[] }> {
+async function installTimer(): Promise<{
+  code: number;
+  lines: string[];
+  json: Record<string, unknown>;
+}> {
   const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
   const installed = dryRun ? undefined : selfInstall();
   const spec: TimerSpec = {
     name: TIMER_NAME,
     cron: loaded.root.timer.cron,
-    timeZone: loaded.root.timer.timeZone,
+    timeZone: loaded.root.timer.timeZone ?? machineTimeZone(),
     command: [installed?.node ?? process.execPath, installed?.cli ?? installedCli(), "sync"],
     env: timerEnv(await gitPath()),
     logDir: paths.logs(),
-    dryRun,
   };
   const lines = [
-    `timer ${TIMER_NAME}: \`${spec.command.join(" ")}\` on "${spec.cron}"${spec.timeZone ? ` (${spec.timeZone})` : ""}`,
+    `timer ${TIMER_NAME}: \`${spec.command.join(" ")}\` on "${spec.cron}" (${spec.timeZone})`,
   ];
+  if (dryRun) {
+    lines.push(`would install ${timerKind()}`);
+    return { code: 0, lines, json: { dryRun: true, ...spec } };
+  }
   try {
-    const scheduler = await loadScheduler();
-    const result = await scheduler.install(spec);
-    lines.push(`${dryRun ? "would write" : "installed"} for ${result.platform}:`);
-    for (const file of result.files)
+    const result = await installOsTimer(spec);
+    lines.push(
+      result.changed
+        ? `installed ${timerKind(result.platform)}`
+        : `${timerKind(result.platform)}: already installed, unchanged`,
+      ...result.files.map((file) => `  ${tildify(file)}`),
+    );
+    if (result.linger === false)
       lines.push(
-        `  ${tildify(file.path)}`,
-        ...(dryRun && file.content ? file.content.split("\n").map((line) => `    ${line}`) : []),
+        `systemd linger is off, so the timer runs only while you are logged in; run \`loginctl enable-linger ${userInfo().username}\``,
       );
-    if (!dryRun) writeJson(timerFile(), spec);
-    return { code: 0, lines };
+    return { code: 0, lines, json: { ...spec, ...result } };
   } catch (error) {
-    if (!(error instanceof SchedulerUnavailable)) throw error;
-    lines.push(`blocked: ${error.message}`);
-    if (installed)
-      lines.push(
-        `installed ${tildify(installed.launcher)}; run it from your own scheduler meanwhile`,
-      );
-    return { code: 3, lines };
+    if (!(error instanceof TimerError)) throw error;
+    lines.push(`the timer was not installed: ${error.message}`);
+    return { code: 1, lines, json: { ...spec, error: error.message } };
+  }
+}
+
+/** The OS's view of the timer, or why it could not be read. */
+async function readTimer(): Promise<TimerStatus | TimerError> {
+  try {
+    return await timerStatus();
+  } catch (error) {
+    if (error instanceof TimerError) return error;
+    throw error;
   }
 }
 
 async function timer(action: string | undefined) {
   switch (action) {
     case "install": {
-      const { code, lines } = await installTimer();
-      console.log(lines.join("\n"));
-      return code;
+      const result = await installTimer();
+      console.log(json ? JSON.stringify(result.json, null, 2) : result.lines.join("\n"));
+      return result.code;
     }
-    case "status":
-    case "remove": {
-      const saved = readJson(timerFile());
-      if (!isRecord(saved)) {
-        console.log("no timer installed");
-        return action === "status" ? 1 : 0;
+    case "status": {
+      const status = await readTimer();
+      if (status instanceof TimerError) {
+        console.error(`skillfleet: ${status.message}`);
+        return 1;
       }
-      let scheduler;
-      try {
-        scheduler = await loadScheduler();
-      } catch (error) {
-        console.log(`blocked: ${(error as Error).message}`);
-        return 3;
-      }
-      // Written by installTimer from a TimerSpec.
-      const spec = saved as unknown as TimerSpec;
-      if (action === "remove") {
-        await scheduler.uninstall(spec);
-        writeJson(timerFile(), null);
-        console.log(`removed ${spec.name}`);
-        return 0;
-      }
-      const status = await scheduler.status(spec);
       console.log(
-        `${spec.name}: ${status.installed ? "installed" : "not installed"} ${status.detail}`,
+        json ? JSON.stringify(status, null, 2) : `${TIMER_NAME}: ${formatTimerStatus(status)}`,
       );
       return status.installed ? 0 : 1;
+    }
+    case "remove": {
+      const removal = await removeTimer();
+      if (json) console.log(JSON.stringify(removal, null, 2));
+      else if (!removal.existed) console.log("no timer installed");
+      else {
+        console.log(`removed ${TIMER_NAME}`);
+        for (const file of removal.removed) console.log(`  ${tildify(file)}`);
+      }
+      return 0;
     }
     default:
       return usage("timer takes install, remove or status");
@@ -220,6 +232,7 @@ async function status() {
   const state = loadState();
   const stale = await staleSessions(state);
   const config = readConfig();
+  const timerState = await readTimer();
   if (json) {
     console.log(
       JSON.stringify(
@@ -228,6 +241,7 @@ async function status() {
           lastRun: report,
           lastChange: state.lastChange,
           staleSessions: stale,
+          timer: timerState instanceof TimerError ? { error: timerState.message } : timerState,
         },
         null,
         2,
@@ -241,9 +255,8 @@ async function status() {
     console.log(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`);
     console.log(formatReport(report));
   }
-  const timerSaved = existsSync(timerFile()) && isRecord(readJson(timerFile()));
   console.log(
-    `timer: ${timerSaved ? "installed" : `not installed (${BLOCKED_REASON.split(":")[0]})`}`,
+    `timer: ${timerState instanceof TimerError ? `unknown (${timerState.message.split("\n")[0]})` : formatTimerStatus(timerState)}`,
   );
   for (const proc of stale)
     console.log(
@@ -360,11 +373,10 @@ async function init() {
   }
   for (const line of applyPlan(plan)) console.log(`  ${line}`);
   const code = await runSync();
-  if (!values["no-timer"]) {
-    const timerResult = await installTimer();
-    console.log(timerResult.lines.join("\n"));
-  }
-  return code;
+  if (values["no-timer"]) return code;
+  const timerResult = await installTimer();
+  console.log(timerResult.lines.join("\n"));
+  return code || timerResult.code;
 }
 
 async function fleetCommand(action: string | undefined) {

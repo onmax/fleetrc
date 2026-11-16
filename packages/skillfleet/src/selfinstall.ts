@@ -1,6 +1,7 @@
 import { chmodSync, cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { hashDir, sameTree } from "./fs.ts";
 import { paths } from "./paths.ts";
 
 /** The launcher the timer and `fleet` run: an absolute node path and skillfleet's own copy. */
@@ -16,7 +17,8 @@ export function selfInstall(): { cli: string; launcher: string; node: string } {
   const dist = dirname(fileURLToPath(import.meta.url));
   const app = paths.app();
   const node = process.execPath;
-  if (dist !== app) {
+  // An unchanged copy stays as it is: the timer may be running it right now.
+  if (dist !== app && !sameTree(hashDir(dist), hashDir(app))) {
     const temp = `${app}.${process.pid}.tmp`;
     rmSync(temp, { recursive: true, force: true });
     cpSync(dist, temp, { recursive: true });

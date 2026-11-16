@@ -80,3 +80,55 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - run: pnpm test
+
+  # The real timer: install the packed package, let systemd, launchd or Task Scheduler run the sync
+  # on a one-minute cron, check `status`, reinstall to prove nothing changes, and remove it
+  # (.github/scripts/timer-e2e.mjs).
+  timer-e2e:
+    name: timer e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    # Bash runs on every GitHub runner; Windows defaults to PowerShell.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - run: corepack enable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Pack
+        run: pnpm --filter skillfleet pack --out "$RUNNER_TEMP/skillfleet.tgz"
+      # The runner user has no login session, so it has no systemd user manager. Linger starts one,
+      # as on a server.
+      - name: Start the systemd user manager
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          runtime_dir="/run/user/$(id -u)"
+          for _ in $(seq 1 30); do
+            if [ -S "$runtime_dir/bus" ]; then break; fi
+            sleep 1
+          done
+          if [ ! -S "$runtime_dir/bus" ]; then
+            echo "::error::The systemd user manager did not start: $runtime_dir/bus is missing."
+            exit 1
+          fi
+          {
+            echo "XDG_RUNTIME_DIR=$runtime_dir"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime_dir/bus"
+          } >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="$runtime_dir" systemctl --user is-system-running --wait || true
+      - name: Install skillfleet, let the OS timer sync twice, remove it
+        run: node .github/scripts/timer-e2e.mjs "$RUNNER_TEMP/skillfleet.tgz"
