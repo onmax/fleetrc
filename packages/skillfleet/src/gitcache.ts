@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { git, gitOut } from "./exec.ts";
+import { git, GitError, gitOut } from "./exec.ts";
 import { sha256 } from "./fs.ts";
 
 /** `owner/repo` and `github:owner/repo` become GitHub HTTPS URLs; anything else is a git URL already. */
@@ -29,11 +29,13 @@ export async function fetchClone(
   { offline = false }: { offline?: boolean } = {},
 ): Promise<CachedClone> {
   const dir = join(root, sha256(`${url}#${ref ?? ""}`).slice(0, 16));
-  const cloned = existsSync(join(dir, ".git"));
   if (offline) {
-    if (!cloned) throw new Error(`${url} has never been fetched and --offline is set`);
+    if (!existsSync(join(dir, ".git")))
+      throw new Error(`${url} has never been fetched and --offline is set`);
     return { dir, commit: await gitOut(["rev-parse", "HEAD"], dir) };
   }
+  // A cache a killed clone left half made has a .git folder but no commit: clone it again.
+  const cloned = existsSync(join(dir, ".git")) && (await usable(dir));
   if (!cloned) {
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(root, { recursive: true });
@@ -47,13 +49,39 @@ export async function fetchClone(
       throw error;
     }
   } else {
+    // A failed fetch is the network or the remote; the cache stays for --offline and later runs.
     await git(["fetch", "--quiet", "--depth", "1", "--no-tags", "origin", ref ?? "HEAD"], {
       cwd: dir,
     });
-    await git(["reset", "--quiet", "--hard", "FETCH_HEAD"], { cwd: dir });
-    await git(["clean", "-qfdx"], { cwd: dir });
+    try {
+      await git(["reset", "--quiet", "--hard", "FETCH_HEAD"], { cwd: dir });
+      await git(["clean", "-qfdx"], { cwd: dir });
+    } catch (error) {
+      // The fetch worked, so the cache itself is broken: start it over.
+      if (!(error instanceof GitError) || error.result.code === null) throw error;
+      rmSync(dir, { recursive: true, force: true });
+      return fetchClone(url, ref, root);
+    }
   }
   return { dir, commit: await gitOut(["rev-parse", "HEAD"], dir) };
+}
+
+/**
+ * The cache is a repository of its own (git does not climb from a broken one to a parent repository,
+ * such as a HOME kept in git), with a commit checked out and an origin. Throws when git can't run.
+ */
+async function usable(dir: string): Promise<boolean> {
+  const answer = async (args: string[]) => {
+    const run = await git(args, { cwd: dir, allowFail: true });
+    if (run.code === null && !run.timedOut) throw new GitError(args, run);
+    return run.code === 0 ? run.stdout.trim() : undefined;
+  };
+  const gitDir = await answer(["rev-parse", "--absolute-git-dir"]);
+  if (!gitDir || realpathSync(gitDir) !== realpathSync(join(dir, ".git"))) return false;
+  return (
+    (await answer(["rev-parse", "--verify", "--quiet", "HEAD"])) !== undefined &&
+    (await answer(["remote", "get-url", "origin"])) !== undefined
+  );
 }
 
 async function checkoutCommit(dir: string, commit: string) {
