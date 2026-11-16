@@ -417,7 +417,9 @@ describe("hostile npm registries and tarballs", () => {
     );
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["x"]);
-    expect(elsewhere.hits.map((hit) => hit.headers.authorization)).toEqual([undefined]);
+    // init plans with a dry run in a scratch cache, then syncs, so the tarball is fetched twice.
+    expect(elsewhere.hits.length).toBeGreaterThan(0);
+    expect(elsewhere.hits.filter((hit) => hit.headers.authorization)).toEqual([]);
   });
 
   it("A3. NPM_TOKEN is not sent to a registry an extended team manifest names", async () => {
