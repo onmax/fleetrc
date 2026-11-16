@@ -50,6 +50,22 @@ skillfleet fleet sync            # sync every machine in the manifest over SSH
 
 `skillfleet --help` lists the rest: `list`, `adopt`, `fork`, `diff`, `merge`, `update`, `timer install|remove|status`, `fleet status|upgrade|add` and `hook prompt`.
 
+### New skills in running sessions
+
+Claude Code loads a skill that a sync links mid-session on the next turn. Codex reads its skills when a session starts, so `skillfleet status` lists the Codex sessions to restart.
+
+`skillfleet hook prompt` also tells Claude Code's model when a skill arrived after its session started, once per skill. skillfleet doesn't edit your Claude Code settings, so add the hook yourself, in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`):
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "skillfleet hook prompt" }] }]
+  }
+}
+```
+
+If `skillfleet` isn't on the PATH that Claude Code runs hooks with, write the full path of the launcher `init` installed: `~/.local/state/skillfleet/bin/skillfleet`, or `%LOCALAPPDATA%\skillfleet\bin\skillfleet.cmd` on Windows.
+
 ## Manifest
 
 ```json
