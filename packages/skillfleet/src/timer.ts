@@ -114,15 +114,15 @@ export function timerEnv(git: string | undefined): Record<string, string> {
     PATH: [...new Set(dirs.filter((dir): dir is string => Boolean(dir)))].join(delimiter),
     DO_NOT_TRACK: "1",
   };
-  for (const key of [
+  // __SKILLS_AGENT_ENV__: what `skills` reads to place agents' folders (CODEX_HOME, GROK_HOME, …).
+  for (const key of new Set([
     "HOME",
     "USERPROFILE",
     "APPDATA",
     "LOCALAPPDATA",
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
     "SSH_AUTH_SOCK",
-  ]) {
+    ...__SKILLS_AGENT_ENV__,
+  ])) {
     const value = process.env[key];
     if (value) env[key] = value;
   }

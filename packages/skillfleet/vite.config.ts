@@ -1,6 +1,39 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { defineConfig } from "vite-plus";
 
+/**
+ * The environment variables `skills` reads to place agents' folders, such as CODEX_HOME and
+ * GROK_HOME, taken from its agent table. The timer passes them on, so a scheduled sync links the
+ * folders the installing shell would. Read at build time, so a new agent in `skills` needs no
+ * change here; a `skills` whose table this can't find fails the build.
+ */
+function agentEnv(): string[] {
+  const dist = dirname(createRequire(import.meta.url).resolve("skills"));
+  const files = [dist, join(dist, "_chunks")].flatMap((dir) =>
+    readdirSync(dir)
+      .filter((name) => name.endsWith(".mjs"))
+      .map((name) => readFileSync(join(dir, name), "utf8")),
+  );
+  for (const code of files) {
+    const start = code.indexOf("const home = homedir();");
+    const table = code.indexOf("\nconst agents = {", start);
+    const end = code.indexOf("\n};\n", table);
+    if (start === -1 || table === -1 || end === -1) continue;
+    const names = [...code.slice(start, end).matchAll(/process\.env\.([A-Z][A-Z0-9_]*)/g)].map(
+      (match) => match[1]!,
+    );
+    if (!names.includes("CODEX_HOME")) break;
+    return [...new Set(names)].sort();
+  }
+  throw new Error("vite.config.ts: no agent table in skills' dist; update agentEnv()");
+}
+
+const define = { __SKILLS_AGENT_ENV__: JSON.stringify(agentEnv()) };
+
 export default defineConfig({
+  define,
   // ESM only, for Node, and publint fails the build on a broken package.json.
   // Every dependency is bundled, so dist/cli.mjs runs on its own: the timer runs a copy of it from
   // the state folder, away from node_modules.
@@ -17,6 +50,7 @@ export default defineConfig({
         "cron-schedule",
       ],
     },
+    define,
     entry: { cli: "src/entry.ts" },
     format: ["esm"],
     platform: "node",

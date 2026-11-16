@@ -30,6 +30,8 @@ describe("agents", () => {
   // `skills` reads these to find an agent's folder. The timer runs without the shell's profile, so
   // without them it links ~/.grok/skills while Grok reads $GROK_HOME/skills.
   it.each([
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
     "GROK_HOME",
     "VIBE_HOME",
     "HERMES_HOME",
