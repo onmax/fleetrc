@@ -182,6 +182,7 @@ export async function planInit(
         ...loaded.sources.filter((source) => source.origin !== manifestFile),
       ],
       warnings: loaded.warnings,
+      failed: loaded.failed,
     };
     const report = await sync({ loaded: augmented, dryRun: true, offline });
     report.manifest = manifestFile;
