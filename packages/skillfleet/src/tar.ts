@@ -23,13 +23,30 @@ export function safeRelativePath(raw: string): string | undefined {
   return parts.join("/");
 }
 
-/** Regular files in a .tgz, keyed by path. Throws on links and on paths that leave the archive. */
+/** The most a .tgz may unpack to, and the most entries it may hold. */
+const UNPACKED_LIMIT = 100 * 1024 * 1024;
+const ENTRY_LIMIT = 50_000;
+
+function gunzipCapped(gz: Uint8Array): Buffer {
+  try {
+    return gunzipSync(gz, { maxOutputLength: UNPACKED_LIMIT });
+  } catch (error) {
+    if (error instanceof RangeError)
+      throw new Error("the archive unpacks to more than 100 MB, over skillfleet's size limit");
+    throw error;
+  }
+}
+
+/** Regular files in a .tgz, keyed by path. Throws on links, on paths that leave the archive, and past the size limits. */
 export function readTgz(gz: Uint8Array): Map<string, Uint8Array> {
-  const tar = gunzipSync(gz);
+  const tar = gunzipCapped(gz);
   const files = new Map<string, Uint8Array>();
   let offset = 0;
   let longName: string | undefined;
+  let entries = 0;
   while (offset + 512 <= tar.length) {
+    if (++entries > ENTRY_LIMIT)
+      throw new Error(`the archive has more than ${ENTRY_LIMIT} entries, over skillfleet's limit`);
     const header = tar.subarray(offset, offset + 512);
     if (header.every((byte) => byte === 0)) break;
     const size = Number.parseInt(text(header, 124, 12).trim() || "0", 8);
