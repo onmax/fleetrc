@@ -457,3 +457,78 @@ describe("docs and help", () => {
     expect(listedPath(dir, "other")).toBe(join(dir, "other"));
   });
 });
+
+describe("what users paste and how errors read (R2-13, R2-15, R2-16, R2-17)", () => {
+  it("R2-13. add takes a GitHub folder or SKILL.md link apart into git, ref and skills", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    const added = async (link: string) =>
+      (await m.json<{ added: object }>("add", link, "--dry-run")).added;
+    expect(await added("https://github.com/vercel-labs/agent-skills/tree/main/skills")).toEqual({
+      id: "agent-skills",
+      git: "https://github.com/vercel-labs/agent-skills",
+      ref: "main",
+      skills: "skills/**",
+    });
+    expect(
+      await added("https://github.com/o/r/blob/v2/skills/review/SKILL.md?plain=1#L3"),
+    ).toEqual({ id: "r", git: "https://github.com/o/r", ref: "v2", skills: "skills/review" });
+    expect(await added("https://gitlab.com/g/r/-/tree/main")).toEqual({
+      id: "r",
+      git: "https://gitlab.com/g/r",
+      ref: "main",
+    });
+    // A repository link stays as it was: git clones it.
+    expect(await added("https://github.com/o/r")).toEqual({ id: "r", git: "https://github.com/o/r" });
+  });
+
+  it("R2-13. the skills globs add writes find a folder of skills and a single skill", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", {
+      ...skills("skills/", "tool", "other"),
+      ...skills("elsewhere/", "outside"),
+      ...skills("single/", "solo"),
+    });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        { id: "folder", git: vendor.url, skills: "skills/**" },
+        // A tree link to one skill's folder, and a link to its SKILL.md.
+        { id: "tree", git: vendor.url, skills: "elsewhere/outside/**" },
+        { id: "blob", git: vendor.url, skills: "single/solo" },
+      ],
+    });
+    const init = await m.run("init", manifest, "--no-timer");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["other", "outside", "solo", "tool"]);
+  });
+
+  it("R2-15. a usage error under --json prints {ok: false, error} on stdout", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    for (const args of [["fleet", "status"], ["sync", "--bogus"], ["add"]]) {
+      const run = await m.run(...args, "--json");
+      expect(run.code, args.join(" ")).toBe(2);
+      const doc = JSON.parse(run.stdout) as { ok: boolean; error: string };
+      expect(doc.ok).toBe(false);
+      expect(run.stderr).toContain(doc.error);
+    }
+  });
+
+  it("R2-16. agents lists every agent without a manifest, and fails on a configured one that does not load", async () => {
+    const m = machine();
+    expect((await m.run("agents")).code).toBe(0);
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    const linked = await m.run("agents");
+    expect(linked.code).toBe(0);
+    expect(linked.stdout).toMatch(/^claude-code .*linked into/m);
+    writeFileSync(manifest, "{");
+    const broken = await m.run("agents");
+    expect(broken.code).toBe(1);
+    expect(broken.stderr).toContain("skills.json");
+  });
+});
+

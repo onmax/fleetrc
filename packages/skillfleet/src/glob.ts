@@ -3,6 +3,10 @@ export function globToRegExp(glob: string): RegExp {
   let source = "";
   for (let i = 0; i < glob.length; i++) {
     const char = glob[i]!;
+    if (char === "/" && glob.slice(i + 1) === "**") {
+      source += "(?:/.*)?";
+      break;
+    }
     if (char === "*" && glob[i + 1] === "*") {
       // `a/**/b` also matches `a/b`, and a trailing `/**` matches the folder itself.
       if (glob[i + 2] === "/") {

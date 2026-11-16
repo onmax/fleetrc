@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { agentRows } from "./agents.ts";
 import { doctor, formatChecks } from "./doctor.ts";
@@ -36,6 +36,7 @@ import {
   ManifestError,
   readConfig,
   updateConfig,
+  webPage,
 } from "./manifest.ts";
 import { findName } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
@@ -244,8 +245,20 @@ function commandHelp(name: string): string {
 /** Commands that only read, where a dry run would be the same as the real thing. */
 const READ_ONLY = new Set(["status", "list", "agents", "doctor", "diff"]);
 
-/** One line on stderr and exit code 2, for a command line skillfleet can't run. */
+/** --json on the command line, read before (or without) parsing it. */
+const jsonRequested = () => {
+  const args = process.argv.slice(2);
+  const end = args.indexOf("--");
+  return (end < 0 ? args : args.slice(0, end)).includes("--json");
+};
+
+/**
+ * One line on stderr and exit code 2, for a command line skillfleet can't run. Under --json,
+ * stdout gets the error as a document too.
+ */
 function usageError(message: string): never {
+  if (jsonRequested())
+    console.log(JSON.stringify({ ok: false, error: message }, null, 2));
   console.error(`skillfleet: ${message}`);
   process.exit(2);
 }
@@ -477,12 +490,10 @@ function list() {
 
 async function agents() {
   let chosen;
-  try {
-    chosen = (await loadManifest(manifestSpec(values.manifest), { offline: true })).root.agents;
-  } catch (error) {
-    // Without a manifest the list still shows the ids and what is installed.
-    if (!(error instanceof ManifestError) && !(error instanceof UserError)) throw error;
-  }
+  // Without a manifest the list still shows the ids and what is installed; a manifest named with
+  // --manifest or in config.json that does not load is an error.
+  const spec = values.manifest ?? readConfig()?.manifest;
+  if (spec) chosen = (await loadManifest(spec, { offline: true })).root.agents;
   const rows = await agentRows(chosen);
   if (json) {
     emit(rows);
@@ -508,6 +519,18 @@ async function agents() {
 /** What `add` writes for a source string. */
 function sourceFromSpec(spec: string): Record<string, unknown> {
   if (spec.startsWith("npm:")) return { npm: spec.slice(4) };
+  // A GitHub or GitLab page: git clones the repository, not the page of a folder or file in it.
+  const page = webPage(spec);
+  if (page?.kind) {
+    const folder =
+      page.kind === "blob" ? (page.path?.includes("/") ? dirname(page.path) : undefined) : page.path;
+    const skillFile = page.kind === "blob" && /(^|\/)SKILL\.md$/.test(page.path ?? "");
+    return {
+      git: page.repo,
+      ...(page.ref ? { ref: page.ref } : {}),
+      ...(folder ? { skills: skillFile ? folder : `${folder}/**` } : {}),
+    };
+  }
   // A bare repository or a URL that names one.
   if (
     /\.git[\\/]?$/.test(spec) ||

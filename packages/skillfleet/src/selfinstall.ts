@@ -244,8 +244,9 @@ export function commandOnPath(launcher = launcherPath()): string {
 }
 
 /**
- * How to put `bin` on PATH in the user's login shell ($SHELL), in the file that shell reads: zsh,
- * the macOS default, never reads ~/.profile, and bash reads it only without a ~/.bash_profile.
+ * How to put `bin` on PATH in the user's login shell ($SHELL), in the file and syntax that shell
+ * reads: zsh, the macOS default, never reads ~/.profile, and bash reads it only without a
+ * ~/.bash_profile; csh, tcsh, fish and nushell have their own.
  */
 export function pathAdvice(
   bin: string,
@@ -256,6 +257,12 @@ export function pathAdvice(
   const lead = `to run \`skillfleet\` from a new shell, add ${tildify(bin)} to PATH`;
   const name = basename(shell);
   if (name === "fish") return `${lead}: fish_add_path ${quoted}`;
+  // csh and tcsh keep PATH in the list $path; tcsh reads ~/.tcshrc before ~/.cshrc.
+  if (name === "tcsh" || name === "csh")
+    return `${lead}, for example in ${name === "tcsh" ? "~/.tcshrc" : "~/.cshrc"}: set path = ( ${quoted} $path )`;
+  // Nushell keeps PATH as a list, set in config.nu ($nu.config-path).
+  if (name === "nu")
+    return `${lead}, for example in config.nu (\`$nu.config-path\`): $env.PATH = ($env.PATH | split row (char esep) | prepend ${bin.includes("'") ? JSON.stringify(bin) : `'${bin}'`})`;
   const file =
     name === "zsh"
       ? platform === "darwin"

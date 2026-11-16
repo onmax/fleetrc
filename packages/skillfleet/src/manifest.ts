@@ -441,23 +441,45 @@ const isBareRepository = (dir: string) =>
   existsSync(join(dir, "objects")) &&
   existsSync(join(dir, "refs"));
 
+export interface WebPage {
+  /** The repository's https URL, which git clones. */
+  repo: string;
+  kind?: "blob" | "tree";
+  ref?: string;
+  /** The file (`blob`) or folder (`tree`) inside the repository, when the link names one. */
+  path?: string;
+}
+
 /**
- * A repository page on GitHub or GitLab, as a browser shows it. A `blob` link names a branch and a
- * file, a `tree` link a branch and a folder holding `skills.json`.
+ * A repository page on GitHub or GitLab, as a browser shows it: the repository, or a `blob` link
+ * to a file or a `tree` link to a folder on a branch. A line anchor (`#L3`) or a query
+ * (`?plain=1`) copied with the link is ignored.
  */
-function webPage(spec: string): RemoteManifest | undefined {
+export function webPage(spec: string): WebPage | undefined {
   const page =
     spec.match(
-      /^(https?:\/\/(?:www\.)?github\.com\/[^/?#]+\/[^/?#]+?)(?:\.git)?(?:\/(blob|tree)\/([^/?#]+)(?:\/([^?#]*?))?)?\/?$/,
+      /^(https?:\/\/(?:www\.)?github\.com\/[^/?#]+\/[^/?#]+?)(?:\.git)?(?:\/(blob|tree)\/([^/?#]+)(?:\/([^?#]*?))?)?\/?(?:[?#].*)?$/,
     ) ??
     spec.match(
-      /^(https?:\/\/gitlab\.com\/(?:[^/?#]+\/)+?[^/?#]+?)(?:\.git)?(?:\/-\/(blob|tree)\/([^/?#]+)(?:\/([^?#]*?))?)?\/?$/,
+      /^(https?:\/\/gitlab\.com\/(?:[^/?#]+\/)+?[^/?#]+?)(?:\.git)?(?:\/-\/(blob|tree)\/([^/?#]+)(?:\/([^?#]*?))?)?\/?(?:[?#].*)?$/,
     );
   if (!page) return undefined;
   const [, repo, kind, ref, path] = page;
+  return {
+    repo: repo!.replace(/^http:/, "https:").replace("://www.", "://"),
+    ...(kind ? { kind: kind as "blob" | "tree", ref } : {}),
+    ...(path ? { path } : {}),
+  };
+}
+
+/** A `blob` link names a manifest file, a `tree` link a folder holding `skills.json`. */
+function webManifest(spec: string): RemoteManifest | undefined {
+  const page = webPage(spec);
+  if (!page) return undefined;
+  const { repo, kind, ref, path } = page;
   const file =
     kind === "blob" && path ? path : path ? `${path}/${DEFAULT_MANIFEST}` : DEFAULT_MANIFEST;
-  return { repo: repo!.replace(/^http:/, "https:").replace("://www.", "://"), path: file, ref };
+  return { repo, path: file, ref };
 }
 
 export interface RemoteManifest {
@@ -482,7 +504,7 @@ export function remoteManifest(spec: string, base = process.cwd()): RemoteManife
     const repo = expandPath(split.repo, base);
     return isBareRepository(repo) ? { ...split, repo } : split;
   }
-  return webPage(spec) ?? (isRepository(spec) ? { repo: spec, path: DEFAULT_MANIFEST } : undefined);
+  return webManifest(spec) ?? (isRepository(spec) ? { repo: spec, path: DEFAULT_MANIFEST } : undefined);
 }
 
 /**

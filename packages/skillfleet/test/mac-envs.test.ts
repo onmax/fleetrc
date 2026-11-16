@@ -113,6 +113,14 @@ describe("mac environments", () => {
       /: fish_add_path '\/h\/.local\/state\/skillfleet\/bin'$/,
     );
     expect(pathAdvice(bin, "", "linux")).toContain("in ~/.profile:");
+    // R2-17: csh, tcsh and nushell neither read ~/.profile nor take `export`.
+    expect(pathAdvice(bin, "/bin/tcsh", "linux")).toMatch(
+      /in ~\/\.tcshrc: set path = \( '\/h\/.local\/state\/skillfleet\/bin' \$path \)$/,
+    );
+    expect(pathAdvice(bin, "/bin/csh", "darwin")).toContain("in ~/.cshrc: set path = (");
+    expect(pathAdvice(bin, "/usr/bin/nu", "linux")).toContain(
+      `config.nu (\`$nu.config-path\`): $env.PATH = ($env.PATH | split row (char esep) | prepend '${bin}')`,
+    );
   });
 
   it.skipIf(isWindows)(
