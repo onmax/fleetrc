@@ -26,6 +26,8 @@ export default defineConfig({
   },
   test: {
     include: ["test/**/*.test.ts"],
+    // Scheduler commands that tests run in-process go to a fake too (test/guard).
+    setupFiles: ["test/guard/scheduler-guard.mjs"],
     // End-to-end tests run the built CLI against real git and HTTP.
     testTimeout: 120_000,
     hookTimeout: 120_000,

@@ -4,6 +4,8 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  appendFileSync,
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -18,8 +20,9 @@ import {
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
-import { afterAll } from "vite-plus/test";
+import { afterAll, afterEach } from "vite-plus/test";
 
 const pkg = JSON.parse(readFileSync(resolve("package.json"), "utf8")) as {
   version: string;
@@ -31,6 +34,19 @@ export const isWindows = process.platform === "win32";
 
 const made: string[] = [];
 const servers: Server[] = [];
+/** Machines made by the running test, checked for scheduler calls when it ends. */
+const active: Machine[] = [];
+afterEach(() => {
+  const refused = active
+    .splice(0)
+    .filter((m) => m.scheduler !== "refuse")
+    .flatMap((m) => m.schedulerCalls().filter((call) => !call.answered));
+  if (refused.length > 0)
+    throw new Error(
+      `this test reached for the OS scheduler, which tests never touch:\n${refused.map((call) => `  ${call.command}`).join("\n")}\n` +
+        `Use --no-timer, machine({ scheduler: "empty" }) for a scheduler with no timer, or machine({ scheduler: "refuse" }) to test the failure.`,
+    );
+});
 afterAll(async () => {
   for (const server of servers) await new Promise((done) => server.close(done));
   for (const dir of made) rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
@@ -75,6 +91,43 @@ export const AGENT_DIRS = [
   ".gemini/skills",
 ];
 
+/**
+ * What the OS scheduler does for a test machine. Tests never reach the real one: every scheduler
+ * command goes to test/guard/fake-scheduler.mjs, which records it.
+ * - forbid: every call fails, and the test fails when it ends.
+ * - refuse: every call fails, for tests of how skillfleet reports that.
+ * - empty: reads answer as on a machine with no timer and linger off; changes fail the test.
+ */
+export type Scheduler = "forbid" | "refuse" | "empty";
+
+const guardDir = resolve("test", "guard");
+/** Commands that reach the scheduler; their shims go first on PATH, for shells too. */
+const SCHEDULER_COMMANDS = ["systemctl", "loginctl", "launchctl", "schtasks", "journalctl"];
+
+/** A folder of shims that run the fake scheduler, for commands a shell looks up on PATH. */
+function schedulerShims(root: string): string {
+  const dir = join(root, "scheduler-bin");
+  mkdirSync(dir, { recursive: true });
+  const fake = join(guardDir, "fake-scheduler.mjs");
+  for (const name of SCHEDULER_COMMANDS) {
+    if (isWindows) {
+      writeFileSync(join(dir, `${name}.cmd`), `@"${process.execPath}" "${fake}" ${name} %*\r\n`);
+      continue;
+    }
+    const file = join(dir, name);
+    writeFileSync(file, `#!/bin/sh\nexec "${process.execPath}" "${fake}" ${name} "$@"\n`);
+    chmodSync(file, 0o755);
+  }
+  return dir;
+}
+
+export interface SchedulerCall {
+  /** The command line, with a PowerShell script decoded. */
+  command: string;
+  /** The fake answered it as an empty scheduler would; otherwise it was refused. */
+  answered: boolean;
+}
+
 export interface RunResult {
   code: number | null;
   stdout: string;
@@ -97,6 +150,9 @@ export interface Machine {
   git(cwd: string, ...args: string[]): string;
   manifest(content: object): string;
   stateDir: string;
+  scheduler: Scheduler;
+  /** Every scheduler command this machine's runs made, in order. */
+  schedulerCalls(): SchedulerCall[];
 }
 
 export interface Report {
@@ -145,9 +201,15 @@ function spawnAsync(
 }
 
 /** A fresh temporary machine. `agents: false` leaves out the agent folders. */
-export function machine({ agents = true }: { agents?: boolean } = {}): Machine {
+export function machine({
+  agents = true,
+  scheduler = "forbid",
+}: { agents?: boolean; scheduler?: Scheduler } = {}): Machine {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "skillfleet-e2e-")));
   made.push(root);
+  const schedulerLog = join(root, "scheduler-calls.jsonl");
+  appendFileSync(schedulerLog, "");
+  const path = [schedulerShims(root), process.env.PATH ?? process.env.Path ?? ""].join(delimiter);
   const home = join(root, "home");
   mkdirSync(home, { recursive: true });
   if (agents) for (const dir of AGENT_HOMES) mkdirSync(join(home, dir), { recursive: true });
@@ -164,8 +226,8 @@ export function machine({ agents = true }: { agents?: boolean } = {}): Machine {
     ].join("\n") + "\n",
   );
   const env: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    Path: process.env.Path,
+    PATH: path,
+    Path: process.env.Path === undefined ? undefined : path,
     SystemRoot: process.env.SystemRoot,
     COMSPEC: process.env.COMSPEC,
     PATHEXT: process.env.PATHEXT,
@@ -187,6 +249,11 @@ export function machine({ agents = true }: { agents?: boolean } = {}): Machine {
     GIT_CEILING_DIRECTORIES: root,
     DO_NOT_TRACK: "1",
     NO_COLOR: "1",
+    // Every Node process the test starts, skillfleet and what it runs, loads the scheduler guard.
+    NODE_OPTIONS: `--import=${pathToFileURL(join(guardDir, "scheduler-guard.mjs")).href}`,
+    SKILLFLEET_TEST_ROOT: root,
+    SKILLFLEET_TEST_SCHEDULER: scheduler,
+    SKILLFLEET_TEST_SCHEDULER_LOG: schedulerLog,
   };
   for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
   const self: Machine = {
@@ -194,6 +261,12 @@ export function machine({ agents = true }: { agents?: boolean } = {}): Machine {
     home,
     env,
     stateDir: join(home, ".local", "state", "skillfleet"),
+    scheduler,
+    schedulerCalls: () =>
+      read(schedulerLog)
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as SchedulerCall),
     at: (...parts) => join(home, ...parts),
     run: (...args) => self.runWith({}, ...args),
     runWith: (options, ...args) =>
@@ -226,6 +299,7 @@ export function machine({ agents = true }: { agents?: boolean } = {}): Machine {
       return file;
     },
   };
+  active.push(self);
   return self;
 }
 

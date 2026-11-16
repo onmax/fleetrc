@@ -142,7 +142,7 @@ describe("cli and environments", () => {
 
   // ps lists every user's processes; only this user's agents read this user's skills.
   it.skipIf(isWindows)("L11. status lists only this user's agent sessions", async () => {
-    const m = machine();
+    const m = machine({ scheduler: "empty" });
     const vendor = remote(m, "vendor", skills("skills/", "first"));
     const manifest = m.manifest({
       agents: ["claude-code"],

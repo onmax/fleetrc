@@ -258,7 +258,7 @@ describe("hostile manifests", () => {
 
 describe("hostile git sources", () => {
   it("G1. doctor does not run a git URL from a team manifest as an --upload-pack command", async () => {
-    const m = machine();
+    const m = machine({ scheduler: "empty" });
     const marker = join(m.root, "pwned-doctor");
     const team = join(m.root, "team", "skills.json");
     mkdirSync(join(m.root, "team"), { recursive: true });
@@ -907,7 +907,7 @@ describe("crashes, corrupt state and recovery", () => {
   });
 
   it("C8. status, fleet status and the prompt hook survive their own state files being corrupt", async () => {
-    const m = machine();
+    const m = machine({ scheduler: "empty" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [], fleet: ["nowhere"] });
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
     for (const file of ["last-run.json", "fleet.json", "sessions.json"])

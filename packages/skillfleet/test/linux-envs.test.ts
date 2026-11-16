@@ -149,7 +149,7 @@ describe("linux environments", () => {
 
   // L6: README says doctor checks the timer; it has no timer check and exits 0 with no timer.
   it("L6. doctor checks the timer", async () => {
-    const m = machine();
+    const m = machine({ scheduler: "empty" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
     const checks = await m.json<{ name: string; ok: boolean }[]>("doctor");
@@ -162,7 +162,7 @@ describe("linux environments", () => {
   it.runIf(process.platform === "linux")(
     "L7. doctor reads 'not logged in or lingering' as linger off",
     async () => {
-      const m = machine();
+      const m = machine({ scheduler: "empty" });
       const bin = join(m.root, "fakebin");
       mkdirSync(bin);
       const loginctl = join(bin, "loginctl");

@@ -90,7 +90,7 @@ describe("skillfleet", () => {
   });
 
   it("status lists agent sessions started before the last skill change", async () => {
-    const m = machine();
+    const m = machine({ scheduler: "empty" });
     const vendor = remote(m, "vendor", skills("skills/", "first"));
     const manifest = m.manifest({
       agents: ["claude-code"],

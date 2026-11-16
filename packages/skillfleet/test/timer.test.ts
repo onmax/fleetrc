@@ -59,7 +59,7 @@ describe("timer", () => {
   });
 
   it("15b. the installed copy runs on its own from the state folder, with an absolute node path", async () => {
-    const m = machine();
+    const m = machine({ scheduler: "empty" });
     const install = await m.run("self-install");
     expect(install.code, install.stderr).toBe(0);
     const launcher = join(m.stateDir, "bin", "skillfleet");
