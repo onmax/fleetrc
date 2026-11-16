@@ -84,17 +84,33 @@ function readLock(file: string): { text: string; holder: LockHolder } | undefine
   return { text, holder: { pid: 0, at: mtime } };
 }
 
-/** The command line of a running process, where the OS lets us read it cheaply. */
+/** The command line of a running process, or undefined when the OS does not tell. */
 function commandLine(pid: number): string | undefined {
   try {
     if (process.platform === "linux")
       return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
-    if (process.platform !== "win32")
-      return execFileSync("ps", ["-o", "command=", "-p", String(pid)], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 5000,
-      });
+    if (process.platform === "win32")
+      // Only runs when a lock names a live pid, so the second PowerShell takes is acceptable.
+      return execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+        ],
+        {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 20_000,
+          windowsHide: true,
+        },
+      );
+    return execFileSync("ps", ["-o", "command=", "-p", String(pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    });
   } catch {}
   return undefined;
 }
@@ -109,9 +125,12 @@ function staleBecause(holder: LockHolder): string | undefined {
     if (!isErrno(error, "EPERM")) return `its sync (pid ${pid}) is gone`;
   }
   if (Date.now() - holder.at > LOCK_MAX_AGE_MS) return `it is more than two hours old`;
-  const command = commandLine(pid);
+  // An empty answer means the OS would not say, not that the command line is empty.
+  const command = commandLine(pid)?.trim() || undefined;
   const script = holder.script ?? process.argv[1];
-  if (command !== undefined && script && !command.includes(script))
+  // Windows paths compare without case.
+  const fold = (text: string) => (process.platform === "win32" ? text.toLowerCase() : text);
+  if (command !== undefined && script && !fold(command).includes(fold(script)))
     return `pid ${pid} is now another program`;
   return undefined;
 }
