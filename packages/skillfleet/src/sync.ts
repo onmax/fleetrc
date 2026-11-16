@@ -497,7 +497,13 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     // Links skillfleet made in folders it no longer links into are removed. A folder that is a
     // link, or another path to a current target, is left alone.
     const real = (dir: string) => {
-      const path = existsSync(dir) ? realpathSync.native(dir) : dir;
+      let path = dir;
+      try {
+        if (existsSync(dir)) path = realpathSync.native(dir);
+      } catch {
+        // Windows opens the folder to resolve it, which an ACL that denies writing refuses; the
+        // folder is still reported by the link step.
+      }
       return process.platform === "win32" ? path.toLowerCase() : path;
     };
     const current = new Set(targets.map((target) => real(target.dir)));
