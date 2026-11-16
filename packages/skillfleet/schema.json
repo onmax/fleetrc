@@ -101,9 +101,12 @@
         "cron": {
           "type": "string",
           "default": "*/30 * * * *",
-          "description": "Five-field cron expression."
+          "description": "When the timer runs the sync: a five-field cron expression, such as \"*/30 * * * *\". \"* * * * *\" runs it every minute."
         },
-        "timeZone": { "type": "string" }
+        "timeZone": {
+          "type": "string",
+          "description": "IANA time zone of the cron, such as \"Europe/Madrid\". Defaults to the machine's. launchd and Task Scheduler run timers in the machine's time zone, so on macOS and Windows another zone works only when it gives the same times."
+        }
       }
     }
   },

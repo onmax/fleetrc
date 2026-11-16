@@ -2,11 +2,21 @@ import { defineConfig } from "vite-plus";
 
 export default defineConfig({
   // ESM only, for Node, and publint fails the build on a broken package.json.
-  // `skills` is bundled, so dist/cli.mjs runs on its own: the timer runs a copy of it from the
-  // state folder, away from node_modules.
+  // Every dependency is bundled, so dist/cli.mjs runs on its own: the timer runs a copy of it from
+  // the state folder, away from node_modules.
   pack: {
-    noExternal: ["skills"],
-    deps: { onlyBundle: ["skills", "yaml", "nostics", "tar"] },
+    noExternal: ["skills", "@vite-hub/schedule"],
+    deps: {
+      onlyBundle: [
+        "skills",
+        "yaml",
+        "nostics",
+        "tar",
+        "@vite-hub/schedule",
+        "@vite-hub/runtime",
+        "cron-schedule",
+      ],
+    },
     entry: { cli: "src/cli.ts" },
     format: ["esm"],
     platform: "node",

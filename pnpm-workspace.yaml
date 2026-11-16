@@ -3,3 +3,9 @@ packages:
 # skills 1.9.0 came out on 2026-11-16, inside pnpm's minimum release age. Drop this once it is a day old.
 minimumReleaseAgeExclude:
   - skills@1.9.0
+  - nostics@1.4.0
+# The @vite-hub/schedule preview depends on the @vite-hub/runtime preview by pkg.pr.new URL, an "exotic"
+# subdependency. Drop this once @vite-hub/schedule/os is published to npm.
+blockExoticSubdeps: false
+allowBuilds:
+  esbuild: false

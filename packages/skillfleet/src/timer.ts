@@ -1,136 +1,153 @@
-import { delimiter, dirname } from "node:path";
+import { homedir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
+import {
+  installOsSchedule,
+  osScheduleStatus,
+  type OsScheduleStatus,
+  uninstallOsSchedule,
+} from "@vite-hub/schedule/os";
+import { exec } from "./exec.ts";
 
 export const TIMER_NAME = "skillfleet-sync";
 
 export interface TimerSpec {
   name: string;
   cron: string;
-  timeZone?: string;
+  timeZone: string;
   /** Absolute node path, then the installed CLI and its arguments. */
-  command: string[];
+  command: [string, ...string[]];
   env: Record<string, string>;
   logDir: string;
-  /** Print the units instead of installing them. */
-  dryRun: boolean;
 }
 
 export interface InstalledTimer {
   platform: string;
-  files: { path: string; content?: string }[];
+  /** Unit files, plist or task wrapper, and the log file. */
+  files: string[];
+  /** `false` when the same timer was already installed and nothing changed. */
+  changed: boolean;
+  /** Linux: whether systemd lingering is on, so the timer runs while the user is logged out. */
+  linger?: boolean;
 }
 
-export interface TimerStatus {
-  installed: boolean;
-  detail: string;
+export type TimerStatus = OsScheduleStatus;
+
+/** A scheduler failure, with the fix @vite-hub/schedule suggests. */
+export class TimerError extends Error {
+  constructor(error: { code: string; message: string; fix?: string }) {
+    super(`${error.code}: ${error.message}${error.fix ? `\n  fix: ${error.fix}` : ""}`);
+  }
 }
 
-/** What skillfleet needs from an OS scheduler (systemd user timers, launchd agents, Task Scheduler). */
-export interface Scheduler {
-  install(spec: TimerSpec): Promise<InstalledTimer>;
-  /** Status and removal get the spec the timer was installed with, as kept in the state folder. */
-  status(spec: TimerSpec): Promise<TimerStatus>;
-  uninstall(spec: TimerSpec): Promise<void>;
-}
+/** The machine's time zone, which the timer uses when the manifest names none. */
+export const machineTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-export class SchedulerUnavailable extends Error {}
-
-export const BLOCKED_REASON =
-  "the OS timer comes from @vite-hub/schedule/os (installOsSchedule), which is not published yet: " +
-  "it is being built on the feat/schedule-os branch of vite-hub/vitehub. Until then run `skillfleet sync` " +
-  "from cron, a systemd timer or Task Scheduler yourself.";
-
-interface OsScheduleModule {
-  installOsSchedule: (
-    name: string,
-    schedule: unknown,
-    options: {
-      command: string[];
-      scope: "user";
-      catchUp: boolean;
-      env: Record<string, string>;
-      logDir: string;
-      dryRun?: boolean;
-    },
-  ) => Promise<{
-    platform: string;
-    files: ({ path: string; content?: string } | string)[];
-    status(): Promise<unknown>;
-    uninstall(): Promise<void>;
-  }>;
-}
-
-interface ScheduleModule {
-  defineSchedule: (definition: {
-    cron: string;
-    timeZone?: string;
-    handler: () => unknown;
-  }) => unknown;
-}
-
-const hasFunction = (value: unknown, key: string) =>
-  typeof value === "object" &&
-  value !== null &&
-  key in value &&
-  typeof (value as Record<string, unknown>)[key] === "function";
+/** What each OS installs, for `timer install --dry-run`. */
+export const timerKind = (platform: string = process.platform) =>
+  platform === "linux"
+    ? "a systemd user timer"
+    : platform === "darwin"
+      ? "a launchd agent"
+      : platform === "win32"
+        ? "a Task Scheduler task"
+        : `nothing: ${platform} has no supported scheduler`;
 
 /**
- * Loads the scheduler. `@vite-hub/schedule/os` is imported at runtime by name so this build works
- * without it; once it is published it becomes a bundled dependency and this adapter stays the same.
+ * The folder the systemd user manager reads user units from, as the manager sees it.
+ * @vite-hub/schedule writes units to `$XDG_CONFIG_HOME/systemd/user` (else `~/.config/...`) of
+ * the installing process. When that shell's HOME or XDG_CONFIG_HOME differs from the manager's,
+ * as with an XDG_CONFIG_HOME set only in a shell profile, or a throwaway HOME, the unit lands
+ * where the manager never looks and `systemctl --user enable` fails. The manager's first unit path
+ * is `<config home>/systemd/user.control`.
  */
-export async function loadScheduler(): Promise<Scheduler> {
-  const osSpecifier = "@vite-hub/schedule/os";
-  const coreSpecifier = "@vite-hub/schedule";
-  let os: unknown;
-  let core: unknown;
+async function systemdConfigHome(): Promise<string | undefined> {
+  const uid = process.getuid?.();
+  const env =
+    process.env.XDG_RUNTIME_DIR || uid === undefined
+      ? process.env
+      : { ...process.env, XDG_RUNTIME_DIR: `/run/user/${uid}` };
+  const run = await exec("systemctl", ["--user", "show", "-p", "UnitPath", "--value"], {
+    env,
+    timeoutMs: 10_000,
+  });
+  if (run.code !== 0) return undefined;
+  const control = run.stdout
+    .trim()
+    .split(/\s+/)
+    .find((path) => path.endsWith("/systemd/user.control") && !path.startsWith("/run/"));
+  return control ? dirname(dirname(control)) : undefined;
+}
+
+/** Runs `operation` with XDG_CONFIG_HOME pointing where the systemd user manager reads units. */
+async function inSchedulerEnv<T>(operation: () => Promise<T>): Promise<T> {
+  if (process.platform !== "linux") return operation();
+  const managerHome = await systemdConfigHome();
+  const ours = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+  if (!managerHome || managerHome === ours) return operation();
+  const saved = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = managerHome;
   try {
-    os = await import(osSpecifier);
-    core = await import(coreSpecifier);
-  } catch {
-    throw new SchedulerUnavailable(BLOCKED_REASON);
+    return await operation();
+  } finally {
+    if (saved === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = saved;
   }
-  if (!hasFunction(os, "installOsSchedule") || !hasFunction(core, "defineSchedule"))
-    throw new SchedulerUnavailable(
-      `${osSpecifier} does not export installOsSchedule/defineSchedule`,
-    );
-  const { installOsSchedule } = os as OsScheduleModule;
-  const { defineSchedule } = core as ScheduleModule;
-  const install = (spec: TimerSpec) =>
+}
+
+/**
+ * Installs or updates the timer: a systemd user timer, a launchd agent, or a Task Scheduler task.
+ * Installing the same spec again changes nothing.
+ */
+export async function installTimer(spec: TimerSpec): Promise<InstalledTimer> {
+  const [error, unit] = await inSchedulerEnv(() =>
     installOsSchedule(
       spec.name,
-      defineSchedule({ cron: spec.cron, timeZone: spec.timeZone, handler: () => {} }),
-      {
-        command: spec.command,
-        scope: "user",
-        catchUp: true,
-        env: spec.env,
-        logDir: spec.logDir,
-        dryRun: spec.dryRun,
-      },
-    );
+      { cron: spec.cron, timeZone: spec.timeZone },
+      { command: spec.command, scope: "user", catchUp: true, env: spec.env, logDir: spec.logDir },
+    ),
+  );
+  if (error) throw new TimerError(error);
   return {
-    async install(spec) {
-      const installed = await install(spec);
-      return {
-        platform: installed.platform,
-        files: installed.files.map((file) => (typeof file === "string" ? { path: file } : file)),
-      };
-    },
-    async status(spec) {
-      const installed = await install({ ...spec, dryRun: true });
-      const status = await installed.status();
-      return {
-        installed: Boolean(status),
-        detail: typeof status === "string" ? status : JSON.stringify(status),
-      };
-    },
-    async uninstall(spec) {
-      const installed = await install({ ...spec, dryRun: true });
-      await installed.uninstall();
-    },
+    platform: unit.platform,
+    files: unit.files,
+    changed: unit.changed,
+    ...(unit.linger === undefined ? {} : { linger: unit.linger }),
   };
 }
 
-/** PATH for scheduled runs: node's folder and git's, ahead of the system defaults. */
+export async function timerStatus(name = TIMER_NAME): Promise<TimerStatus> {
+  const [error, status] = await inSchedulerEnv(() => osScheduleStatus(name, { scope: "user" }));
+  if (error) throw new TimerError(error);
+  return status;
+}
+
+/** Stops and removes the timer and its files. Returns the files it deleted. */
+export async function removeTimer(
+  name = TIMER_NAME,
+): Promise<{ existed: boolean; removed: string[] }> {
+  const [error, removal] = await inSchedulerEnv(() => uninstallOsSchedule(name, { scope: "user" }));
+  if (error) throw new TimerError(error);
+  return { existed: removal.existed, removed: removal.removed };
+}
+
+/** One line about the timer for `status` and `timer status`. */
+export function formatTimerStatus(status: TimerStatus): string {
+  if (!status.installed) return "not installed; run `skillfleet timer install`";
+  const parts = [`installed (${timerKind(status.platform)})`];
+  if (status.running) parts.push("running now");
+  if (status.lastRunAt) parts.push(`last run ${status.lastRunAt.toISOString()}`);
+  if (status.lastExitCode !== undefined) parts.push(`last exit code ${status.lastExitCode}`);
+  if (status.nextRunAt) parts.push(`next run ${status.nextRunAt.toISOString()}`);
+  if (status.linger === false) parts.push("linger off: it stops when you log out");
+  if (status.logFile) parts.push(`log ${status.logFile}`);
+  return parts.join(", ");
+}
+
+/**
+ * Environment of scheduled runs: PATH with node's folder and git's ahead of the system defaults,
+ * and every variable skillfleet reads to find its config, state and the agents' folders, so the
+ * timer works on the same folders as the shell that installed it.
+ */
 export function timerEnv(git: string | undefined): Record<string, string> {
   const dirs = [
     dirname(process.execPath),
@@ -144,6 +161,8 @@ export function timerEnv(git: string | undefined): Record<string, string> {
   for (const key of [
     "HOME",
     "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
     "XDG_CONFIG_HOME",
     "XDG_STATE_HOME",
     "CLAUDE_CONFIG_DIR",
