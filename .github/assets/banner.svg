@@ -25,7 +25,14 @@
 <rect x="974" y="270" width="52" height="52" rx="12" fill="#59e1a2"/>
 <rect x="1050" y="270" width="52" height="52" rx="12" fill="#59e1a2"/>
 <rect x="1126" y="270" width="52" height="52" rx="12" fill="#59e1a2"/>
-<text x="76" y="146" fill="#f5f2e9" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="88" font-weight="700" letter-spacing="-3">skillfleet</text>
+<g transform="translate(80 78) scale(.7)">
+<rect x="36" y="0" width="26" height="26" rx="7" fill="#59e1a2"/>
+<rect x="18" y="36" width="26" height="26" rx="7" fill="#f5f2e9"/>
+<rect x="54" y="36" width="26" height="26" rx="7" fill="#f5f2e9"/>
+<rect x="0" y="72" width="26" height="26" rx="7" fill="#f5f2e9"/>
+<rect x="72" y="72" width="26" height="26" rx="7" fill="#f5f2e9"/>
+</g>
+<text x="172" y="146" fill="#f5f2e9" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="88" font-weight="700" letter-spacing="-3">skillfleet</text>
 <text x="80" y="200" fill="#a5b4bb" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="28">The same skills on every agent and every machine.</text>
 <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="22">
 <text x="80" y="286" fill="#75838a">$ <tspan fill="#f5f2e9">npx skillfleet init</tspan> <tspan fill="#59e1a2">onmax/skills</tspan></text>

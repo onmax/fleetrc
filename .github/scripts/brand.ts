@@ -1,6 +1,6 @@
-// Draws the brand from one mark, a fleet: a 3 by 3 grid of tiles, the source in the middle and the same skills in
-// every tile around it. It makes the logo, the favicons, the icons a phone and a shared link show, and the README
-// banner, in .github/assets.
+// Draws the brand from one mark, a fleet in formation: the source in front, in green, and the same skill on every
+// machine behind it. It makes the logo, the favicons, the icons a phone and a shared link show, and the README banner,
+// in .github/assets.
 // Usage: node --no-warnings .github/scripts/brand.ts (needs sharp)
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -14,15 +14,23 @@ const MUTED = "#a5b4bb"; // oklch(0.76 0.02 230), 8.8:1
 const FAINT = "#75838a"; // oklch(0.6 0.02 230), 4.8:1
 const SYNC = "#59e1a2"; // oklch(0.82 0.15 160), 11.4:1, a skill that is current
 
-// The mark, in a 128 box: the source in the middle, in green, and eight copies around it.
-const mark = [0, 1, 2]
-  .flatMap((row) =>
-    [0, 1, 2].map(
-      (col) =>
-        `<rect x="${15 + col * 36}" y="${15 + row * 36}" width="26" height="26" rx="7" fill="${row === 1 && col === 1 ? SYNC : PAPER}"/>`,
-    ),
-  )
-  .join("\n");
+// The mark, in a 128 box: five tiles in a V, like ships or birds in formation. The lead tile is the source, in green, and
+// the four behind it are the copies it keeps current. Five tiles, not nine, so it still reads as a shape at 16 pixels.
+const formation: [x: number, y: number][] = [
+  [51, 15],
+  [33, 51],
+  [69, 51],
+  [15, 87],
+  [87, 87],
+];
+const tiles = (dx = 0, dy = 0) =>
+  formation
+    .map(
+      ([x, y], i) =>
+        `<rect x="${x + dx}" y="${y + dy}" width="26" height="26" rx="7" fill="${i === 0 ? SYNC : PAPER}"/>`,
+    )
+    .join("\n");
+const mark = tiles();
 
 const svg = (size: number, body: string) =>
   `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 128 128" role="img" aria-labelledby="t">
@@ -64,7 +72,7 @@ const banner = `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400
 <rect width="1280" height="400" fill="${INK}"/>
 <rect x="780" y="0" width="500" height="400" fill="${TILE}" opacity=".35"/>
 ${grid}
-<text x="76" y="146" fill="${PAPER}" font-family="${font}" font-size="88" font-weight="700" letter-spacing="-3">skillfleet</text>
+<g transform="translate(80 78) scale(.7)">\n${tiles(-15, -15)}\n</g>\n<text x="172" y="146" fill="${PAPER}" font-family="${font}" font-size="88" font-weight="700" letter-spacing="-3">skillfleet</text>
 <text x="80" y="200" fill="${MUTED}" font-family="${font}" font-size="28">The same skills on every agent and every machine.</text>
 <g font-family="${mono}" font-size="22">
 <text x="80" y="286" fill="${FAINT}">$ <tspan fill="${PAPER}">npx skillfleet init</tspan> <tspan fill="${SYNC}">onmax/skills</tspan></text>
