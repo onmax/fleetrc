@@ -69,9 +69,13 @@ export function isErrno(error: unknown, ...codes: string[]): boolean {
   return error instanceof Error && "code" in error && codes.includes(String(error.code));
 }
 
+/** Parses a JSON file, skipping the UTF-8 byte order mark some Windows editors write. */
+export const readJsonFile = (path: string): unknown =>
+  JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
+
 export function readJson(path: string): unknown {
   if (!existsSync(path)) return undefined;
-  return JSON.parse(readFileSync(path, "utf8"));
+  return readJsonFile(path);
 }
 
 /** Writes JSON through a temporary file, so a crash never leaves half a file. */

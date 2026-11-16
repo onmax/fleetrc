@@ -5,6 +5,8 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Why the command could not start, such as `ENOENT` when it is not installed. */
+  spawnError?: string;
 }
 
 export interface ExecOptions {
@@ -38,7 +40,8 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
       : undefined;
     child.on("error", (error) => {
       clearTimeout(timer);
-      resolve({ code: null, stdout, stderr: stderr || error.message, timedOut });
+      const spawnError = (error as NodeJS.ErrnoException).code;
+      resolve({ code: null, stdout, stderr: stderr || error.message, timedOut, spawnError });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
@@ -54,7 +57,11 @@ const GIT_ENV = { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", LC
 export class GitError extends Error {
   readonly result: ExecResult;
   constructor(args: readonly string[], result: ExecResult) {
-    super(`git ${args.join(" ")} failed: ${(result.stderr || result.stdout).trim()}`);
+    super(
+      result.spawnError === "ENOENT"
+        ? "git is not installed, or not on PATH; install git to fetch this source"
+        : `git ${args.join(" ")} failed: ${(result.stderr || result.stdout).trim()}`,
+    );
     this.result = result;
   }
 }

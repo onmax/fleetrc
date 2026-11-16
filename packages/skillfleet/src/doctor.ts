@@ -1,15 +1,16 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join, sep } from "node:path";
 import { agentTargets, codexLegacyDir } from "./agents.ts";
 import { exec, git } from "./exec.ts";
 import { lstat } from "./fs.ts";
 import { gitUrl } from "./gitcache.ts";
 import { linkTarget } from "./linker.ts";
 import { loadManifest, type Source } from "./manifest.ts";
-import { tildify } from "./paths.ts";
-import { installedCli, launcherPath } from "./selfinstall.ts";
+import { paths, tildify } from "./paths.ts";
+import { installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
 import { manifestSpec } from "./sync.ts";
+import { formatTimerStatus, TimerError, type TimerStatus, timerStatus } from "./timer.ts";
 
 export interface Check {
   name: string;
@@ -42,7 +43,7 @@ async function nodeCheck(): Promise<Check> {
       detail: `${process.execPath} (no installed copy yet; \`skillfleet timer install\` makes one)`,
     };
   const text = readFileSync(launcher, "utf8");
-  const node = text.match(/"([^"]+)"/)?.[1];
+  const node = launcherNode(text);
   const ok = Boolean(node && existsSync(node)) && existsSync(installedCli());
   return {
     name: "node",
@@ -58,15 +59,53 @@ async function lingerCheck(): Promise<Check | undefined> {
   const run = await exec("loginctl", ["show-user", userInfo().username, "--property=Linger"], {
     timeoutMs: 5000,
   });
-  if (run.code !== 0)
-    return { name: "systemd linger", ok: true, detail: "loginctl is not available; skipped" };
-  const ok = run.stdout.trim() === "Linger=yes";
+  if (run.spawnError === "ENOENT")
+    return { name: "systemd linger", ok: true, detail: "loginctl is not installed; skipped" };
+  // Without lingering and with no login session (cron, `sudo -u`, `docker exec`), loginctl knows
+  // no such user: "User ID 1000 is not logged in or lingering".
+  const unknownUser = /not logged in or lingering/.test(run.stderr);
+  if (run.code !== 0 && !unknownUser)
+    return {
+      name: "systemd linger",
+      ok: true,
+      detail: `loginctl could not tell (${run.stderr.trim().split("\n")[0] || `exit ${run.code}`}); skipped`,
+    };
+  const ok = !unknownUser && run.stdout.trim() === "Linger=yes";
   return {
     name: "systemd linger",
     ok,
     detail: ok
       ? "on: the timer runs while you are logged out"
       : `off: the timer stops when you log out; run \`loginctl enable-linger ${userInfo().username}\``,
+  };
+}
+
+/** Whether the OS scheduler has the timer, and how its last run ended. */
+async function timerCheck(): Promise<Check> {
+  const name = "timer";
+  let status: TimerStatus;
+  try {
+    status = await timerStatus();
+  } catch (error) {
+    if (!(error instanceof TimerError)) throw error;
+    return { name, ok: false, detail: error.message.split("\n")[0]! };
+  }
+  if (!status.installed) return { name, ok: false, detail: formatTimerStatus(status) };
+  // One timer name per user: after a change of HOME or XDG_STATE_HOME, it may run another copy.
+  const logs = paths.logs();
+  if (status.logFile && !status.logFile.startsWith(logs + sep))
+    return {
+      name,
+      ok: false,
+      detail: `installed, but it syncs another skillfleet state folder (its log is ${tildify(status.logFile)}); run \`skillfleet timer install\` to point it at ${tildify(dirname(logs))}`,
+    };
+  const failed = status.lastExitCode !== undefined && status.lastExitCode !== 0;
+  return {
+    name,
+    ok: !failed,
+    detail: failed
+      ? `the last run exited with ${status.lastExitCode}${status.logFile ? `; see ${status.logFile}` : ""}`
+      : formatTimerStatus(status),
   };
 }
 
@@ -95,6 +134,7 @@ export async function doctor(): Promise<Check[]> {
     ok: gitVersion.code === 0,
     detail: gitVersion.code === 0 ? gitVersion.stdout.trim() : "git is not on PATH",
   });
+  checks.push(await timerCheck());
   for (const check of [await lingerCheck(), await launchdCheck()]) if (check) checks.push(check);
 
   let spec: string;

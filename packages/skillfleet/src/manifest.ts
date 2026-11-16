@@ -1,7 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
-import { isRecord, readJson, writeJson } from "./fs.ts";
+import { isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { expandPath, paths } from "./paths.ts";
 
 export type UpdateMode = "auto" | "review";
@@ -321,24 +321,65 @@ export interface LoadedManifest {
   warnings: string[];
 }
 
+/** The manifest file a repository holds when a spec names only the repository, as in `init owner/repo`. */
+export const DEFAULT_MANIFEST = "skills.json";
+
+/** `owner/repo`, `github:owner/repo`, `gitlab:group/repo`, or a git URL ending in `.git`. */
+const isRepository = (spec: string) =>
+  /^(github|gitlab):[^/]/.test(spec) ||
+  (/^[\w-][\w.-]*\/[\w.-]+$/.test(spec) && !spec.endsWith(".json")) ||
+  /^(https?|ssh|git|file):\/\/.+\.git\/?$/.test(spec) ||
+  /^[\w.-]+@[\w.-]+:.+\.git$/.test(spec);
+
+/**
+ * The repository and file of a manifest kept in git, or undefined for a file on this machine.
+ * `<repo>//<file>` names both; a repository alone means its `skills.json`. A path that exists
+ * on this machine, resolved against `base`, is always local.
+ */
+export function remoteManifest(
+  spec: string,
+  base = process.cwd(),
+): { repo: string; path: string } | undefined {
+  if (existsSync(expandPath(spec, base))) return undefined;
+  return (
+    splitRepoPath(spec) ?? (isRepository(spec) ? { repo: spec, path: DEFAULT_MANIFEST } : undefined)
+  );
+}
+
+/** The spec as config.json keeps it: `<repo>//<file>`, or an absolute path, so it reads the same from any folder. */
+export function canonicalManifestSpec(spec: string): string {
+  const remote = remoteManifest(spec);
+  return remote ? `${remote.repo}//${remote.path}` : expandPath(spec);
+}
+
 /** Where a manifest spec lives on disk, fetching it when it is in a remote repository. */
 export async function locateManifest(
   spec: string,
-  { offline = false, cacheRoot = join(paths.cache(), "manifests") } = {},
+  { offline = false, cacheRoot = join(paths.cache(), "manifests"), base = process.cwd() } = {},
 ) {
-  const remote = splitRepoPath(spec);
-  if (remote && !existsSync(spec)) {
-    const clone = await fetchClone(gitUrl(remote.repo), undefined, cacheRoot, { offline });
-    return join(clone.dir, remote.path);
+  const remote = remoteManifest(spec, base);
+  if (!remote) {
+    // A folder, such as a clone of the manifest's repository, means its skills.json.
+    const path = expandPath(spec, base);
+    return statSync(path, { throwIfNoEntry: false })?.isDirectory()
+      ? join(path, DEFAULT_MANIFEST)
+      : path;
   }
-  return expandPath(spec);
+  const url = gitUrl(remote.repo);
+  const clone = await fetchClone(url, undefined, cacheRoot, { offline });
+  const file = join(clone.dir, remote.path);
+  if (!existsSync(file))
+    throw new ManifestError(
+      `${url} has no ${remote.path}; name the manifest file as ${remote.repo}//<file>`,
+    );
+  return file;
 }
 
 function readManifestFile(file: string): Manifest {
   if (!existsSync(file)) throw new ManifestError(`${file}: no such manifest`);
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(file, "utf8"));
+    raw = readJsonFile(file);
   } catch (error) {
     throw new ManifestError(`${file}: ${(error as Error).message}`);
   }
@@ -364,11 +405,7 @@ export async function loadManifest(
     for (const parent of manifest.extends) {
       let file: string;
       try {
-        const remote = splitRepoPath(parent);
-        file =
-          remote && !existsSync(parent)
-            ? await locateManifest(parent, options)
-            : expandPath(parent, dirname(manifest.file));
+        file = await locateManifest(parent, { ...options, base: dirname(manifest.file) });
       } catch (error) {
         warnings.push(`extends ${parent}: ${(error as Error).message}`);
         continue;
@@ -411,7 +448,7 @@ export async function loadManifest(
 
 /** Reads, changes and writes back the root manifest's JSON, keeping fields skillfleet does not know. */
 export function editManifest(file: string, change: (raw: Record<string, unknown>) => void) {
-  const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
+  const raw = readJsonFile(file);
   if (!isRecord(raw)) throw new ManifestError(`${file}: the manifest must be a JSON object`);
   change(raw);
   parseManifest(file, raw);
