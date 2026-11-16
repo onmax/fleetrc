@@ -194,6 +194,8 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
     case "index":
       for (const key of ["ref", "path", "registry", "adopt"])
         onlyFor(key, key === "registry" ? "npm" : "git");
+      // An index lists skills by name; there are no folders to glob.
+      onlyFor("skills", "git, npm and local");
       try {
         new URL(spec);
       } catch {
@@ -373,7 +375,13 @@ export async function loadManifest(
       }
       if (seen.has(file)) continue;
       seen.add(file);
-      const team = readManifestFile(file);
+      let team: Manifest;
+      try {
+        team = readManifestFile(file);
+      } catch (error) {
+        warnings.push(`extends ${parent}: ${(error as Error).message}`);
+        continue;
+      }
       const ignored = [
         team.hooks.length > 0 && "hooks",
         team.fleet.length > 0 && "fleet",

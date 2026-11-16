@@ -69,6 +69,31 @@ describe("sync", () => {
     ]);
   });
 
+  it("1b. links a skill in a working clone whose frontmatter is not valid YAML, with a warning", async () => {
+    const m = machine();
+    // Claude Code loads this SKILL.md; YAML parsers reject the unquoted ": " in the description.
+    const loose =
+      "---\nname: dev\ndescription: Use on Slimbook: starting it, or sharing it.\n---\nbody\n";
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "strict"),
+      "skills/dev/SKILL.md": loose,
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+    const dry = await m.run("init", manifest, "--dry-run");
+    expect(dry.stdout).toContain("none lost");
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["dev", "strict"]);
+    expect(linkOf(m.at(".claude/skills/dev"))).toBe(join(work, "skills/dev"));
+    const report = await m.json("sync");
+    expect(report.warnings).toContain(
+      "personal: skills/dev/SKILL.md frontmatter is not valid YAML; linked anyway, but tools that parse it strictly skip dev",
+    );
+  });
+
   it("2. fast-forwards a dirty working clone when upstream touches other files, keeping local edits byte for byte", async () => {
     const { m, personal, work, manifest } = await threeSources();
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
@@ -216,7 +241,11 @@ describe("sync", () => {
         hub: "http://127.0.0.1:9/hub",
       }),
     );
-    const manifest = m.manifest({ extends: [teamManifest], agents: ["claude-code"], sources: [] });
+    const manifest = m.manifest({
+      extends: [teamManifest, join(m.root, "missing.json")],
+      agents: ["claude-code"],
+      sources: [],
+    });
     const init = await m.run("init", manifest, "--no-timer");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["team-skill"]);
@@ -225,6 +254,10 @@ describe("sync", () => {
     expect(report.warnings.some((warning) => warning.includes("ignored hooks, fleet, hub"))).toBe(
       true,
     );
+    // A team manifest that cannot be read is a warning, not a failed sync.
+    expect(
+      report.warnings.some((warning) => warning.includes("missing.json: no such manifest")),
+    ).toBe(true);
     expect(existsSync(marker)).toBe(false);
     const fleet = await m.run("fleet", "status");
     expect(fleet.code).toBe(2);

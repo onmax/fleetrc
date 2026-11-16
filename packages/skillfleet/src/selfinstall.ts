@@ -1,4 +1,4 @@
-import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { paths } from "./paths.ts";
@@ -35,5 +35,3 @@ export function selfInstall(): { cli: string; launcher: string; node: string } {
     writeFileSync(join(paths.bin(), "skillfleet.cmd"), `@"${node}" "${cli}" %*\r\n`);
   return { cli, launcher: launcherPath(), node };
 }
-
-export const isSelfInstalled = () => existsSync(installedCli());

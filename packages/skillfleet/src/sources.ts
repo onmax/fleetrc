@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { installSkills, resolveSource, type SkillSource } from "skills";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "skills";
 import { git, gitOut } from "./exec.ts";
-import { changedFiles, copyDir, hashDir, sameTree } from "./fs.ts";
+import { changedFiles, copyDir, hashDir, isRecord, sameTree } from "./fs.ts";
 import { fetchClone, gitUrl } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
 import type { CloneSource, InPlaceSource, Source, VendoredSource } from "./manifest.ts";
@@ -99,10 +99,30 @@ export function select(source: Source, found: readonly Found[], warnings: string
 }
 
 /** Discovers skills in a folder through the `skills` package, limited to the `skills` glob's base folder. */
-async function discover(root: string, glob: string | undefined): Promise<SkillSource> {
+async function discover(
+  root: string,
+  glob: string | undefined,
+  skipped: string[] = [],
+): Promise<SkillSource> {
   const base = glob ? globBase(glob) : "";
-  const handle = await resolveSource(base ? join(root, base) : root, { config: SKILLS_OPTIONS });
-  return handle;
+  return resolveSource(base ? join(root, base) : root, {
+    config: SKILLS_OPTIONS,
+    onWarning: (warning) => {
+      const data: unknown = warning.data;
+      if (
+        isDiagnostic(warning, "SKILLS_SKILL_SKIPPED") &&
+        isRecord(data) &&
+        typeof data.path === "string"
+      )
+        skipped.push(data.path);
+    },
+  });
+}
+
+/** The `name:` of a SKILL.md whose frontmatter is not valid YAML, read line by line. */
+function lenientName(file: string): string | undefined {
+  const frontmatter = readFileSync(file, "utf8").match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1];
+  return frontmatter?.match(/^name:\s*["']?([^"'\r\n]+?)["']?\s*$/m)?.[1];
 }
 
 const withBase = (glob: string | undefined, path: string | undefined) => {
@@ -117,25 +137,41 @@ async function discoverInPlace(
   root: string,
   warnings: string[],
 ): Promise<SkillEntry[]> {
-  let handle: SkillSource;
+  const skipped: string[] = [];
+  let handle: SkillSource | undefined;
   try {
-    handle = await discover(root, source.skills);
+    handle = await discover(root, source.skills, skipped);
   } catch (error) {
-    warnings.push(`${source.id}: ${message(error)}`);
-    return [];
+    if (!isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") || skipped.length === 0) {
+      warnings.push(`${source.id}: ${message(error)}`);
+      return [];
+    }
   }
   try {
-    const found = handle.skills.map((skill) => ({
+    const found: Found[] = (handle?.skills ?? []).map((skill) => ({
       name: skill.name,
       path: withBase(source.skills, skill.path),
     }));
+    // Agents read a SKILL.md that `skills` rejects (Claude Code parses frontmatter leniently),
+    // so a folder in place is linked anyway rather than dropped.
+    for (const file of skipped) {
+      const dir = dirname(file);
+      const path = relative(root, dir).split(sep).join("/");
+      if (path.startsWith("..") || isAbsolute(path)) continue;
+      const name = lenientName(file) ?? basename(dir);
+      if (found.some((skill) => skill.name === name)) continue;
+      found.push({ name, path: path || "." });
+      warnings.push(
+        `${source.id}: ${path}/SKILL.md frontmatter is not valid YAML; linked anyway, but tools that parse it strictly skip ${name}`,
+      );
+    }
     return select(source, found, warnings).map((skill) => ({
       name: skill.name,
       path: skill.path,
       dir: skill.path && skill.path !== "." ? join(root, skill.path) : root,
     }));
   } finally {
-    await handle.dispose();
+    await handle?.dispose();
   }
 }
 

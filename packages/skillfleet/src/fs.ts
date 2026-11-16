@@ -38,14 +38,6 @@ export function hashDir(dir: string): Hashes {
 export const sha256 = (data: string | Uint8Array) =>
   createHash("sha256").update(data).digest("hex");
 
-/** One hash for a whole tree, from its per-file hashes. */
-export const treeHash = (hashes: Hashes) =>
-  sha256(
-    Object.entries(hashes)
-      .map(([file, hash]) => `${file}\0${hash}`)
-      .join("\n"),
-  );
-
 /** Files whose hash differs between two trees, including added and removed ones. */
 export function changedFiles(before: Hashes, after: Hashes): string[] {
   const files = new Set([...Object.keys(before), ...Object.keys(after)]);

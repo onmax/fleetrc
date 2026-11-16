@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://unpkg.com/skillfleet/schema.json",
+  "title": "skillfleet manifest",
+  "description": "Where skills come from and which agents get them. Sources are listed in precedence order: the first source with a skill name wins.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "extends": {
+      "description": "Team manifests, as paths or <repo>//<file> such as github:org/agents//skills.json. They add sources only; their hooks, fleet, hub and report are ignored.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "agents": {
+      "description": "\"all\" for every agent detected on the machine, or agent ids from the skills package (claude-code, codex, gemini-cli, opencode, cursor, github-copilot, ...).",
+      "oneOf": [
+        { "const": "all" },
+        { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      ],
+      "default": "all"
+    },
+    "sources": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/source" }
+    },
+    "forks": {
+      "description": "Skills copied from upstream into the personal repository, by skill name. `skillfleet diff` and `merge` compare against `from` at `base`.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["from", "path", "base"],
+        "properties": {
+          "from": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Repository the skill came from."
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Skill folder inside that repository."
+          },
+          "base": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Upstream commit the fork was last merged with."
+          }
+        }
+      }
+    },
+    "hooks": {
+      "description": "Commands run after a sync that changed matching files. Only the root manifest can declare them.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["run"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "run": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Shell command. Gets the report JSON on stdin and SKILLFLEET_CHANGED in the environment."
+          },
+          "on": {
+            "description": "<source id>:<glob> patterns, such as personal:pstack/**. Default: any change.",
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "fleet": {
+      "description": "SSH hosts for `skillfleet fleet`.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "hub": {
+      "type": "string",
+      "minLength": 1,
+      "description": "URL each sync POSTs its report to."
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run"],
+      "properties": {
+        "run": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Shell command that gets the report JSON on stdin after each sync."
+        }
+      }
+    },
+    "timer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cron": {
+          "type": "string",
+          "default": "*/30 * * * *",
+          "description": "Five-field cron expression."
+        },
+        "timeZone": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "common": {
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "description": "Defaults to the repository, host or package name."
+        },
+        "skills": {
+          "type": "string",
+          "description": "Glob of skill folders inside the source, e.g. skills/*."
+        },
+        "include": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Only these skill names."
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Never these skill names."
+        },
+        "update": {
+          "enum": ["auto", "review"],
+          "default": "auto",
+          "description": "review: fetch and show a diff, apply only on `skillfleet update <source>`."
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "A git repository. With `path`, a working clone you edit, updated by fast-forward and linked in place; without, a copy skillfleet keeps.",
+          "required": ["git"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/common/properties/id" },
+            "skills": { "$ref": "#/$defs/common/properties/skills" },
+            "include": { "$ref": "#/$defs/common/properties/include" },
+            "exclude": { "$ref": "#/$defs/common/properties/exclude" },
+            "update": { "$ref": "#/$defs/common/properties/update" },
+            "git": {
+              "type": "string",
+              "minLength": 1,
+              "description": "owner/repo, github:owner/repo, or any git URL."
+            },
+            "ref": { "type": "string", "minLength": 1 },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Working clone on this machine, e.g. ~/onmax/skills."
+            },
+            "adopt": {
+              "type": "boolean",
+              "description": "init, adopt and fork move hand-made skills into this source."
+            }
+          }
+        },
+        {
+          "description": "A site serving /.well-known/agent-skills/index.json (v0.2.0, with digests) or /.well-known/skills/index.json (v0.1).",
+          "required": ["index"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/common/properties/id" },
+            "include": { "$ref": "#/$defs/common/properties/include" },
+            "exclude": { "$ref": "#/$defs/common/properties/exclude" },
+            "update": { "$ref": "#/$defs/common/properties/update" },
+            "index": { "type": "string", "format": "uri" }
+          }
+        },
+        {
+          "description": "An npm package; `name`, `name@version` or `name@tag`.",
+          "required": ["npm"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/common/properties/id" },
+            "skills": { "$ref": "#/$defs/common/properties/skills" },
+            "include": { "$ref": "#/$defs/common/properties/include" },
+            "exclude": { "$ref": "#/$defs/common/properties/exclude" },
+            "update": { "$ref": "#/$defs/common/properties/update" },
+            "npm": { "type": "string", "minLength": 1 },
+            "registry": { "type": "string", "format": "uri" }
+          }
+        },
+        {
+          "description": "A folder on this machine, linked in place.",
+          "required": ["local"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "$ref": "#/$defs/common/properties/id" },
+            "skills": { "$ref": "#/$defs/common/properties/skills" },
+            "include": { "$ref": "#/$defs/common/properties/include" },
+            "exclude": { "$ref": "#/$defs/common/properties/exclude" },
+            "update": { "$ref": "#/$defs/common/properties/update" },
+            "local": { "type": "string", "minLength": 1 },
+            "adopt": { "type": "boolean" }
+          }
+        }
+      ]
+    }
+  }
+}

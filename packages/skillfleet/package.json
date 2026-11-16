@@ -25,9 +25,14 @@
     "skillfleet": "./dist/cli.mjs"
   },
   "files": [
-    "dist"
+    "dist",
+    "schema.json"
   ],
   "type": "module",
+  "exports": {
+    "./schema.json": "./schema.json",
+    "./package.json": "./package.json"
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true
