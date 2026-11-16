@@ -6,14 +6,17 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "$schema": { "type": "string" },
+    "$schema": {
+      "type": "string",
+      "description": "This schema, for editors: https://unpkg.com/skillfleet/schema.json"
+    },
     "extends": {
       "description": "Team manifests, as paths or <repo>//<file> such as github:org/agents//skills.json. They add sources only; their hooks, fleet, hub and report are ignored.",
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
     "agents": {
-      "description": "\"all\" for every agent detected on the machine, or agent ids from the skills package (claude-code, codex, gemini-cli, opencode, cursor, github-copilot, ...).",
+      "description": "\"all\" for every agent installed on the machine (one whose folder is in your home, such as ~/.claude for Claude Code), or agent ids from the skills package (claude-code, codex, gemini-cli, opencode, cursor, github-copilot, ...). `skillfleet agents` lists the ids.",
       "oneOf": [
         { "const": "all" },
         { "type": "array", "items": { "type": "string", "minLength": 1 } }
@@ -58,11 +61,15 @@
         "additionalProperties": false,
         "required": ["run"],
         "properties": {
-          "name": { "type": "string", "minLength": 1 },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Names the hook in the report and in SKILLFLEET_HOOK. Defaults to run."
+          },
           "run": {
             "type": "string",
             "minLength": 1,
-            "description": "Shell command. Gets the report JSON on stdin and SKILLFLEET_CHANGED in the environment."
+            "description": "Shell command. Gets the sync report as JSON on stdin, SKILLFLEET_HOOK, and SKILLFLEET_CHANGED: the matched <source>:<file> lines."
           },
           "on": {
             "description": "<source id>:<glob> patterns, such as personal:pstack/**. Default: any change.",
@@ -117,7 +124,11 @@
         "id": {
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
-          "description": "Defaults to the repository, host or package name."
+          "maxLength": 255,
+          "not": {
+            "pattern": "^([Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][0-9]|[Ll][Pp][Tt][0-9])(\\..*)?$"
+          },
+          "description": "Names the source's folder in the state folder. Defaults to the repository, host or package name. Not a Windows device name such as con or aux, and unique without regard to case."
         },
         "skills": {
           "type": "string",
@@ -166,9 +177,10 @@
             },
             "adopt": {
               "type": "boolean",
-              "description": "init, adopt and fork move hand-made skills into this source."
+              "description": "init, adopt and fork move hand-made skills into this source. Needs path."
             }
-          }
+          },
+          "dependentRequired": { "adopt": ["path"] }
         },
         {
           "description": "A site serving /.well-known/agent-skills/index.json (v0.2.0, with digests) or /.well-known/skills/index.json (v0.1).",

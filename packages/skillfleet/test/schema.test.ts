@@ -5,7 +5,18 @@ import { parseManifest } from "../src/manifest.ts";
 
 interface Schema {
   properties: Record<string, unknown>;
-  $defs: { source: { oneOf: { required: string[]; properties: Record<string, unknown> }[] } };
+  $defs: {
+    common: {
+      properties: { id: { pattern: string; maxLength: number; not: { pattern: string } } };
+    };
+    source: {
+      oneOf: {
+        required: string[];
+        properties: Record<string, unknown>;
+        dependentRequired?: Record<string, string[]>;
+      }[];
+    };
+  };
 }
 const schema = JSON.parse(readFileSync("schema.json", "utf8")) as Schema;
 
@@ -63,5 +74,49 @@ describe("schema.json", () => {
         ).toThrow();
       }
     }
+  });
+
+  it("takes a source id exactly when the parser does", () => {
+    const rule = schema.$defs.common.properties.id;
+    const schemaTakes = (id: string) =>
+      new RegExp(rule.pattern).test(id) &&
+      id.length <= rule.maxLength &&
+      !new RegExp(rule.not.pattern).test(id);
+    const parserTakes = (id: string) => {
+      try {
+        parseManifest("m.json", { sources: [{ id, local: "/tmp/x" }] });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (const id of [
+      "x",
+      "My_source.2",
+      "con",
+      "CON",
+      "aux.md",
+      "nul.",
+      "lpt1",
+      "com9.x",
+      "console",
+      "-x",
+      ".x",
+      "a b",
+      "a".repeat(255),
+      "a".repeat(256),
+    ])
+      expect(schemaTakes(id), id).toBe(parserTakes(id));
+  });
+
+  it("asks for path wherever the parser does: adopt on a git source", () => {
+    const git = schema.$defs.source.oneOf.find((variant) => variant.required[0] === "git")!;
+    expect(git.dependentRequired).toEqual({ adopt: ["path"] });
+    expect(() => parseManifest("m.json", { sources: [{ git: "a/b", adopt: true }] })).toThrow(
+      "adopt only applies to git sources with a path",
+    );
+    expect(() =>
+      parseManifest("m.json", { sources: [{ git: "a/b", path: "/tmp/x", adopt: true }] }),
+    ).not.toThrow();
   });
 });
