@@ -21,20 +21,56 @@ export interface HostResult {
 
 const STATE = '"${XDG_STATE_HOME:-$HOME/.local/state}/skillfleet"';
 
+/** What a host prints, instead of a report, when it cannot give one. */
+const NOTE = "skillfleet-fleet:";
+const HOST_NOTES = {
+  "never-synced": undefined,
+  "not-installed": "skillfleet is not installed there; run `npx skillfleet init <manifest>` on it",
+  "no-node":
+    "skillfleet is not installed there, and node is not on the PATH ssh commands get; install Node.js 22.12 or newer, then run `npx skillfleet init <manifest>` on it",
+} as const;
+
+/** Finds skillfleet on the host: the installed launcher, else a `skillfleet` on PATH. */
+const FIND = `f=${STATE}/bin/skillfleet; [ -x "$f" ] || f=$(command -v skillfleet) || f=`;
+/** Prints why there is no skillfleet to run. */
+const MISSING = `if command -v node >/dev/null 2>&1; then echo "${NOTE} not-installed"; else echo "${NOTE} no-node"; fi`;
+
 /** The POSIX sh script each action runs on a host. */
 export function remoteScript(action: FleetAction, version: string): string {
   switch (action) {
     case "status":
-      return `cat ${STATE}/last-run.json`;
+      return `r=${STATE}/last-run.json; if [ -f "$r" ]; then cat "$r"; else ${FIND}; if [ -n "$f" ]; then echo "${NOTE} never-synced"; else ${MISSING}; fi; fi`;
     case "sync":
-      return `f=${STATE}/bin/skillfleet; if [ -x "$f" ]; then "$f" sync --json; else npx -y skillfleet sync --json; fi`;
+      return `${FIND}; if [ -n "$f" ]; then "$f" sync --json; else ${MISSING}; fi`;
     case "upgrade":
-      return `npx -y skillfleet@${version} self-install && ${STATE}/bin/skillfleet sync --json`;
+      return `if command -v npx >/dev/null 2>&1; then npx -y skillfleet@${version} self-install && ${STATE}/bin/skillfleet sync --json; else echo "${NOTE} no-node"; fi`;
     default: {
       const exhaustive: never = action;
       return exhaustive;
     }
   }
+}
+
+/**
+ * Why hosts cannot install this version with npx, or undefined when they can or the registry
+ * cannot be asked. 0.0.0 is the version in the repository, which development and preview builds
+ * carry; any other version is looked up on the registry npm uses.
+ */
+export async function unpublished(version: string): Promise<string | undefined> {
+  const fix = "run the upgrade from a release, such as `npx skillfleet@latest fleet upgrade`";
+  if (version === "0.0.0")
+    return `this skillfleet is a development or preview build (0.0.0), which hosts cannot install from npm; ${fix}`;
+  const registry = (process.env.npm_config_registry || "https://registry.npmjs.org").replace(
+    /\/+$/,
+    "",
+  );
+  try {
+    const response = await fetch(`${registry}/skillfleet/${encodeURIComponent(version)}`, {
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (response.status === 404) return `skillfleet ${version} is not on ${registry}; ${fix}`;
+  } catch {}
+  return undefined;
 }
 
 const quote = (script: string) => `'${script.replace(/'/g, `'\\''`)}'`;
@@ -112,6 +148,9 @@ async function runOnHost(host: string, action: FleetAction, version: string, tim
   ];
   const run = await exec(command, args, { timeoutMs });
   if (run.timedOut) return { error: `timed out after ${Math.round(timeoutMs / 1000)}s` };
+  const note = run.stdout.match(new RegExp(`^${NOTE} ([\\w-]+)$`, "m"))?.[1];
+  if (note !== undefined && Object.hasOwn(HOST_NOTES, note))
+    return { note: note as keyof typeof HOST_NOTES };
   if (run.code !== 0)
     return {
       error:
@@ -137,6 +176,17 @@ export async function fleet(
   const results = await Promise.all(
     hosts.map(async (host): Promise<HostResult> => {
       const answer = await runOnHost(host, action, version, timeoutMs);
+      // The host answered, but has no report to give.
+      if ("note" in answer && answer.note) {
+        const error = HOST_NOTES[answer.note];
+        return {
+          host,
+          reachable: true,
+          lastRun: cache[host],
+          ...(error ? { error } : {}),
+          behind: [],
+        };
+      }
       const run = "report" in answer ? summarize(answer.report) : undefined;
       if (run) {
         cache[host] = run;
@@ -192,7 +242,11 @@ export function formatFleet(results: readonly HostResult[]): string {
       const last = run
         ? `last run ${age(run.finishedAt)} ago, ${run.skills} skills${run.ok ? "" : ", with errors"}`
         : "no run recorded";
-      const state = result.reachable ? last : `unreachable (${result.error}); ${last}`;
+      const state = !result.reachable
+        ? `unreachable (${result.error}); ${last}`
+        : result.error
+          ? `${result.error}; ${last}`
+          : last;
       return `${result.host}: ${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
     })
     .join("\n");
