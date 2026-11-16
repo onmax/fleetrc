@@ -45,6 +45,7 @@
   "devDependencies": {
     "@types/node": "^26.6.6",
     "publint": "^0.3.25",
+    "skills": "^1.9.0",
     "tsrs": "0.20.1-ts7.1.0-beta",
     "typescript": "^7.0.2",
     "vite-plus": "^1.4.0"
