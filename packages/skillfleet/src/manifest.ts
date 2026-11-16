@@ -349,6 +349,8 @@ export interface LoadedManifest {
   /** Root sources first, then each extended manifest's, in order. */
   sources: Source[];
   warnings: string[];
+  /** Extended manifests that could not be fetched or read: the sources they declare are unknown. */
+  failed?: string[];
 }
 
 /** Where a manifest spec lives on disk, fetching it when it is in a remote repository. */
@@ -387,6 +389,7 @@ export async function loadManifest(
   const rootFile = await locateManifest(spec, options);
   const root = readManifestFile(rootFile);
   const warnings: string[] = [];
+  const failed: string[] = [];
   const sources = [...root.sources];
   const seen = new Set([rootFile]);
   const ids = new Set(sources.map((source) => nameKey(source.id)));
@@ -408,6 +411,7 @@ export async function loadManifest(
             : expandPath(parent, dirname(manifest.file));
       } catch (error) {
         warnings.push(`extends ${parent}: ${(error as Error).message}`);
+        failed.push(parent);
         continue;
       }
       if (seen.has(file)) continue;
@@ -417,6 +421,7 @@ export async function loadManifest(
         team = readManifestFile(file);
       } catch (error) {
         warnings.push(`extends ${parent}: ${(error as Error).message}`);
+        failed.push(parent);
         continue;
       }
       const ignored = [
@@ -451,7 +456,7 @@ export async function loadManifest(
     }
   };
   await visit(root);
-  return { root, sources, warnings };
+  return { root, sources, warnings, failed };
 }
 
 /** Reads, changes and writes back the root manifest's JSON, keeping fields skillfleet does not know. */

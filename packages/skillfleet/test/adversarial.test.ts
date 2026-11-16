@@ -960,6 +960,27 @@ describe("two syncs and a killed sync", () => {
   }, 60_000);
 });
 
+describe("syncs started at the same moment", () => {
+  it("S1. of several syncs started together, exactly one takes the lock", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const log = join(m.root, "hook.log");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+      // Holds the lock long enough that every other sync starts while it runs.
+      hooks: [{ name: "slow", run: `echo ran >> "${log}"; sleep 8`, on: ["vendor:**"] }],
+    });
+    mkdirSync(join(m.home, ".config", "skillfleet"), { recursive: true });
+    writeFileSync(m.at(".config/skillfleet/config.json"), JSON.stringify({ manifest }));
+    const runs = await Promise.all(Array.from({ length: 6 }, () => m.run("sync")));
+    expect(runs.filter((run) => run.code === 0)).toHaveLength(1);
+    for (const run of runs.filter((run) => run.code !== 0))
+      expect(run.stderr).toContain("another skillfleet sync is running");
+    expect(read(log).trim().split("\n")).toEqual(["ran"]);
+  }, 60_000);
+});
+
 describe("prune never deletes what it did not make", () => {
   it("R1. removing a source from the manifest keeps its skills' local edits", async () => {
     const { m, manifest, edited } = await editedVendored();

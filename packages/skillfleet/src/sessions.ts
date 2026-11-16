@@ -1,6 +1,6 @@
 import { join, basename } from "node:path";
 import { exec } from "./exec.ts";
-import { isRecord, readJson, writeJson } from "./fs.ts";
+import { isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
 import type { State } from "./state.ts";
 
@@ -36,9 +36,7 @@ export async function agentProcesses(): Promise<AgentProcess[]> {
     const out = await exec(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command", script],
-      {
-        timeoutMs: 60_000,
-      },
+      { timeoutMs: 60_000, maxOutput: 64 * 1024 * 1024 },
     );
     if (out.code !== 0 || !out.stdout.trim()) return [];
     const parsed: unknown = JSON.parse(out.stdout);
@@ -55,6 +53,7 @@ export async function agentProcesses(): Promise<AgentProcess[]> {
   const out = await exec("ps", ["-A", "-ww", "-o", "pid=,lstart=,args="], {
     env: { ...process.env, LC_ALL: "C" },
     timeoutMs: 20_000,
+    maxOutput: 64 * 1024 * 1024,
   });
   if (out.code !== 0) return [];
   return out.stdout.split("\n").flatMap((line) => {
@@ -101,7 +100,7 @@ export function promptHook(input: string, state: State, now = new Date()): strin
     const parsed: unknown = JSON.parse(input);
     if (isRecord(parsed) && typeof parsed.session_id === "string") sessionId = parsed.session_id;
   } catch {}
-  const raw = readJson(paths.sessions());
+  const raw = readJsonOrNothing(paths.sessions());
   const sessions: Record<string, SessionRecord> = {};
   if (isRecord(raw))
     for (const [id, record] of Object.entries(raw))
