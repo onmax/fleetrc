@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vite-plus/test";
 import {
@@ -23,7 +24,6 @@ import {
   machine,
   type Machine,
   names,
-  pathWith,
   read,
   remote,
   sha256,
@@ -53,6 +53,33 @@ function tree(dir: string): string[] {
   };
   if (existsSync(dir)) walk(dir, "");
   return out.sort();
+}
+
+/** A link to a folder that, like skillfleet's own on Windows, needs no symlink privilege there. */
+const linkDir = (target: string, path: string) =>
+  symlinkSync(target, path, isWindows ? "junction" : "dir");
+
+/**
+ * A hook command that appends "ran" and its pid to `log`, then waits `seconds`. It is a Node script,
+ * so the same hook runs under sh and under cmd.exe.
+ */
+function slowHook(m: Machine, log: string, seconds: number): string {
+  const script = join(m.root, "slow-hook.mjs");
+  writeFileSync(
+    script,
+    `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(log)}, "ran " + process.pid + "\\n");\nsetTimeout(() => {}, ${seconds * 1000});\n`,
+  );
+  return `"${process.execPath}" "${script}"`;
+}
+
+/** The runs a slowHook recorded, and a way to stop the ones a killed sync left behind. */
+const hookRuns = (log: string) => read(log).trim().split("\n");
+function stopHooks(log: string) {
+  if (!existsSync(log)) return;
+  for (const line of hookRuns(log))
+    try {
+      process.kill(Number(line.split(" ")[1]));
+    } catch {}
 }
 
 describe("hostile skill names", () => {
@@ -637,7 +664,11 @@ describe("hostile skill indexes", () => {
       type: "application/gzip",
     });
     await installEach(m, [
-      { name: "local", archive: local, entry: { url: `file://${join(m.root, "local.tar.gz")}` } },
+      {
+        name: "local",
+        archive: local,
+        entry: { url: pathToFileURL(join(m.root, "local.tar.gz")).href },
+      },
       { name: "cdn", archive: cdn, entry: { url: `${other.url}/cdn.tar.gz` } },
     ]);
     expect(names(m.at(".claude/skills"))).toEqual(["good"]);
@@ -724,17 +755,14 @@ describe("names that differ only on some file systems", () => {
 });
 
 describe("fleet over ssh", () => {
-  /** An ssh that records its argv, one JSON line per call, and answers like a host with no skillfleet. */
+  /** An ssh that records its argv, one JSON line per call, and answers like a host it can't reach. */
   function recordingSsh(m: Machine) {
-    const dir = join(m.root, "bin");
-    mkdirSync(dir, { recursive: true });
     const log = join(m.root, "ssh-argv.jsonl");
-    const ssh = join(dir, "ssh");
+    const ssh = join(m.root, "ssh.mjs");
     writeFileSync(
       ssh,
-      `#!/bin/sh\n"${process.execPath}" -e 'require("fs").appendFileSync(process.argv[1], JSON.stringify(process.argv.slice(2)) + "\\n")' "${log}" "$@"\nexit 255\n`,
+      `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + "\\n");\nprocess.exit(255);\n`,
     );
-    chmodSync(ssh, 0o755);
     const calls = () =>
       existsSync(log)
         ? readFileSync(log, "utf8")
@@ -742,7 +770,7 @@ describe("fleet over ssh", () => {
             .split("\n")
             .map((line) => JSON.parse(line) as string[])
         : [];
-    return { env: { PATH: pathWith(dir, m.env) }, calls };
+    return { env: { SKILLFLEET_SSH: ssh }, calls };
   }
 
   it("F1. a fleet host that looks like an ssh option reaches ssh only after --, or is refused", async () => {
@@ -753,13 +781,17 @@ describe("fleet over ssh", () => {
     const host = `-oProxyCommand=touch ${join(m.root, "pwned")}`;
     // parseArgs takes it as an option on the command line, so it can only come from the manifest.
     const added = await m.run("fleet", "add", "--", host);
-    const listed = read(manifest).includes("ProxyCommand");
-    expect(added.code !== 0 || listed).toBe(true);
-    if (!listed) return;
+    expect(added.code !== 0 || read(manifest).includes("ProxyCommand")).toBe(true);
+    // A hand-edited manifest can still name it.
+    writeFileSync(
+      manifest,
+      JSON.stringify({ agents: ["claude-code"], sources: [], fleet: [host] }),
+    );
     await m.runWith({ env: ssh.env }, "fleet", "status", "--timeout", "3");
-    const calls = ssh.calls().filter((argv) => argv.includes(host));
-    expect(calls.length).toBeGreaterThan(0);
-    for (const argv of calls) expect(argv.slice(0, argv.indexOf(host))).toContain("--");
+    // Refused before ssh runs, or passed after --.
+    for (const argv of ssh.calls().filter((args) => args.includes(host)))
+      expect(argv.slice(0, argv.indexOf(host))).toContain("--");
+    expect(existsSync(join(m.root, "pwned"))).toBe(false);
   });
 
   it("F2. fleet add refuses hosts with spaces or shell characters", async () => {
@@ -778,7 +810,12 @@ describe("hooks and commands", () => {
   it("H1. a command that times out returns on time even when it left a child holding its output", async () => {
     const { exec } = await import("../src/exec.ts");
     const started = Date.now();
-    const run = await exec("sleep 6 & sleep 6; wait", [], { shell: true, timeoutMs: 500 });
+    // A shell command whose child starts a grandchild that inherits its output, then both wait 6s.
+    const child = `require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 6000)'], { stdio: 'inherit' }); setTimeout(() => {}, 6000)`;
+    const run = await exec(`"${process.execPath}" -e "${child}"`, [], {
+      shell: true,
+      timeoutMs: 500,
+    });
     expect(run.timedOut).toBe(true);
     expect(Date.now() - started).toBeLessThan(3000);
   });
@@ -786,7 +823,8 @@ describe("hooks and commands", () => {
   it("H2. a hook that prints without end is not buffered whole in memory", async () => {
     const { exec } = await import("../src/exec.ts");
     // 64 MB is enough to show exec keeps everything; the real risk is a hook printing gigabytes.
-    const run = await exec("head -c 67108864 /dev/zero | tr '\\0' x", [], {
+    const print = `const block = Buffer.alloc(1 << 20, 120); for (let i = 0; i < 64; i++) process.stdout.write(block)`;
+    const run = await exec(`"${process.execPath}" -e "${print}"`, [], {
       shell: true,
       timeoutMs: 60_000,
     });
@@ -873,15 +911,21 @@ describe("crashes, corrupt state and recovery", () => {
     });
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
     vendor.commit({ "skills/second/SKILL.md": skillMd("second") });
-    chmodSync(m.at(".claude/skills"), 0o555);
+    const folder = m.at(".claude/skills");
+    // Windows ignores a folder's read-only mode; an ACL that denies writing makes it read-only.
+    const icacls = (...args: string[]) =>
+      execFileSync("icacls", [folder, ...args], { stdio: "pipe" });
+    if (isWindows) icacls("/deny", "*S-1-1-0:(W,D,DC)");
+    else chmodSync(folder, 0o555);
     try {
       const run = await m.run("sync", "--json");
       expect(run.stderr).not.toMatch(/\n\s+at /);
       const report = JSON.parse(run.stdout) as { errors: string[]; warnings: string[] };
-      expect([...report.errors, ...report.warnings].join("\n")).toContain(".claude/skills");
+      expect([...report.errors, ...report.warnings].join("\n")).toMatch(/\.claude[\\/]skills/);
       expect(names(m.at(".cursor/skills"))).toEqual(["second", "tool"]);
     } finally {
-      chmodSync(m.at(".claude/skills"), 0o755);
+      if (isWindows) icacls("/remove:d", "*S-1-1-0");
+      else chmodSync(folder, 0o755);
     }
   });
 
@@ -897,7 +941,7 @@ describe("crashes, corrupt state and recovery", () => {
     rmSync(m.at(".cursor/skills"), { recursive: true, force: true });
     writeFileSync(m.at(".cursor/skills"), "not a folder\n");
     rmSync(m.at(".claude/skills/tool"));
-    symlinkSync(join(m.root, "gone"), m.at(".claude/skills/tool"));
+    linkDir(join(m.root, "gone"), m.at(".claude/skills/tool"));
     writeFileSync(m.at(".claude/skills/.skillfleet-manifest.json"), '{"version":1,"links":{}}');
     const report = await m.json("sync");
     expect(read(m.at(".cursor/skills"))).toBe("not a folder\n");
@@ -935,7 +979,7 @@ describe("two syncs and a killed sync", () => {
     const manifest = m.manifest({
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
-      hooks: [{ name: "slow", run: `echo ran >> "${log}"; sleep 20`, on: ["vendor:**"] }],
+      hooks: [{ name: "slow", run: slowHook(m, log, 20), on: ["vendor:**"] }],
     });
     mkdirSync(join(m.home, ".config", "skillfleet"), { recursive: true });
     writeFileSync(m.at(".config/skillfleet/config.json"), JSON.stringify({ manifest }));
@@ -947,17 +991,22 @@ describe("two syncs and a killed sync", () => {
     const exited = new Promise((done) => first.on("exit", done));
     for (let i = 0; i < 300 && !existsSync(log); i++) await new Promise((r) => setTimeout(r, 100));
     expect(existsSync(log)).toBe(true);
-    const second = await m.run("sync");
-    expect(second.code).toBe(1);
-    expect(second.stderr).toContain("another skillfleet sync is running");
-    first.kill("SIGKILL");
-    await exited;
+    try {
+      const second = await m.run("sync");
+      expect(second.code).toBe(1);
+      expect(second.stderr).toContain("another skillfleet sync is running");
+      first.kill("SIGKILL");
+      await exited;
 
-    const rerun = await m.run("sync");
-    expect(rerun.code, rerun.stdout + rerun.stderr).toBe(0);
-    expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
-    // The killed run never recorded its changes, so the hook runs again for them.
-    expect(read(log).trim().split("\n")).toEqual(["ran", "ran"]);
+      const rerun = await m.run("sync");
+      expect(rerun.code, rerun.stdout + rerun.stderr).toBe(0);
+      expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+      // The killed run never recorded its changes, so the hook runs again for them.
+      expect(hookRuns(log)).toHaveLength(2);
+    } finally {
+      // The killed sync's hook outlives it; on Windows it would keep the test folder in use.
+      stopHooks(log);
+    }
   }, 60_000);
 });
 
@@ -970,7 +1019,7 @@ describe("syncs started at the same moment", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
       // Holds the lock long enough that every other sync starts while it runs.
-      hooks: [{ name: "slow", run: `echo ran >> "${log}"; sleep 8`, on: ["vendor:**"] }],
+      hooks: [{ name: "slow", run: slowHook(m, log, 8), on: ["vendor:**"] }],
     });
     mkdirSync(join(m.home, ".config", "skillfleet"), { recursive: true });
     writeFileSync(m.at(".config/skillfleet/config.json"), JSON.stringify({ manifest }));
@@ -978,7 +1027,7 @@ describe("syncs started at the same moment", () => {
     expect(runs.filter((run) => run.code === 0)).toHaveLength(1);
     for (const run of runs.filter((run) => run.code !== 0))
       expect(run.stderr).toContain("another skillfleet sync is running");
-    expect(read(log).trim().split("\n")).toEqual(["ran"]);
+    expect(hookRuns(log)).toHaveLength(1);
   }, 60_000);
 });
 
@@ -1025,7 +1074,7 @@ describe("prune never deletes what it did not make", () => {
     mkdirSync(m.at(".claude/skills/handmade"), { recursive: true });
     writeFileSync(m.at(".claude/skills/handmade/SKILL.md"), "hand made\n");
     mkdirSync(join(m.root, "elsewhere"), { recursive: true });
-    symlinkSync(join(m.root, "elsewhere"), m.at(".claude/skills/linked"));
+    linkDir(join(m.root, "elsewhere"), m.at(".claude/skills/linked"));
     rmSync(m.stateDir, { recursive: true, force: true });
     rmSync(m.at(".claude/skills/.skillfleet-manifest.json"));
     writeFileSync(manifest, JSON.stringify({ agents: ["claude-code"], sources: [] }));
@@ -1140,7 +1189,11 @@ describe("unusual environments", () => {
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(existsSync(m.at("rel-state"))).toBe(false);
     expect(existsSync(m.at("rel-config"))).toBe(false);
-    expect(existsSync(m.at(".config/skillfleet/config.json"))).toBe(true);
+    // Without XDG_CONFIG_HOME, Windows keeps the config in %APPDATA%.
+    const config = isWindows
+      ? "AppData/Roaming/skillfleet/config.json"
+      : ".config/skillfleet/config.json";
+    expect(existsSync(m.at(config))).toBe(true);
   });
 
   it("V2. a HOME with spaces, accents, $ and a quote works, including the installed launcher", async () => {
@@ -1184,8 +1237,13 @@ describe("unusual environments", () => {
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
     const bin = join(m.root, "nogit");
     mkdirSync(bin, { recursive: true });
-    for (const tool of ["sh", "env"]) symlinkSync(`/bin/${tool}`, join(bin, tool));
-    const run = await m.runWith({ env: { PATH: bin } }, "sync", "--json");
+    // POSIX keeps sh and env, which commands may need; Windows needs nothing on PATH.
+    if (!isWindows) for (const tool of ["sh", "env"]) symlinkSync(`/bin/${tool}`, join(bin, tool));
+    const run = await m.runWith(
+      { env: { PATH: bin, ...(isWindows ? { Path: bin } : {}) } },
+      "sync",
+      "--json",
+    );
     expect(run.stderr).not.toMatch(/\n\s+at /);
     const report = JSON.parse(run.stdout) as { errors: string[] };
     expect(report.errors.join("\n")).toMatch(/git/);
