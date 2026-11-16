@@ -37,6 +37,29 @@ export function remoteScript(action: FleetAction, version: string): string {
   }
 }
 
+const USER = "[A-Za-z0-9._-]+";
+/** A hostname, an ssh_config alias, an IPv4 address, or an IPv6 address with an optional zone. */
+const NAME = "(?:[A-Za-z0-9_][A-Za-z0-9._-]*|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*(?:%[A-Za-z0-9._-]+)?)";
+const BRACKETED = "\\[[0-9A-Fa-f:.]+(?:%[A-Za-z0-9._-]+)?\\]";
+const PLAIN_HOST = new RegExp(`^(?:${USER}@)?${NAME}$`);
+const SSH_URL = new RegExp(
+  `^ssh://(?:${USER}@)?(?:[A-Za-z0-9_][A-Za-z0-9._-]*|${BRACKETED})(?::[0-9]{1,5})?$`,
+);
+
+/**
+ * Why `host` cannot be handed to ssh, or undefined when it can: `host`, `user@host`, an IP address,
+ * an ssh_config alias, or `ssh://user@host:port`. Nothing that ssh would read as an option or a
+ * shell would split.
+ */
+export function hostProblem(host: string): string | undefined {
+  const invalid = `"${host}" is not a host name, user@host, an IP address or ssh://user@host:port`;
+  if (host.startsWith("ssh://")) return SSH_URL.test(host) ? undefined : invalid;
+  if (host.startsWith("-")) return `"${host}" starts with "-", so ssh would read it as an option`;
+  if (/^(?:[^@]+@)?[A-Za-z0-9_][A-Za-z0-9._-]*:[0-9]+$/.test(host))
+    return `"${host}" has a port; write it as ssh://${host}`;
+  return PLAIN_HOST.test(host) ? undefined : invalid;
+}
+
 const quote = (script: string) => `'${script.replace(/'/g, `'\\''`)}'`;
 
 /** ssh, or `SKILLFLEET_SSH` (a program, or a .js/.mjs file run with node). */
@@ -100,6 +123,8 @@ function readCache(): Record<string, NonNullable<HostResult["lastRun"]>> {
 }
 
 async function runOnHost(host: string, action: FleetAction, version: string, timeoutMs: number) {
+  const problem = hostProblem(host);
+  if (problem) return { error: problem };
   const { command, prefix } = sshCommand();
   const args = [
     ...prefix,

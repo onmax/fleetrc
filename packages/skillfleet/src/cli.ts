@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { doctor, formatChecks } from "./doctor.ts";
 import { adoptSkill, diffSkill, forkSkill, mergeSkill, UserError } from "./edits.ts";
-import { fleet, type FleetAction, formatFleet, tailscalePeers } from "./fleet.ts";
+import { fleet, type FleetAction, formatFleet, hostProblem, tailscalePeers } from "./fleet.ts";
 import { isRecord, readJson } from "./fs.ts";
 import { applyPlan, formatPlan, planInit } from "./init.ts";
 import {
@@ -400,6 +400,8 @@ async function fleetCommand(action: string | undefined) {
       }
       return 0;
     }
+    const problems = hosts.flatMap((host) => hostProblem(host) ?? []);
+    if (problems.length > 0) throw new UserError(problems.join("\n"));
     editManifest(loaded.root.file, (raw) => {
       raw.fleet = [...new Set([...(Array.isArray(raw.fleet) ? raw.fleet : []), ...hosts])];
     });

@@ -91,4 +91,16 @@ describe("fleet", () => {
       "maxi@100.105.98.81",
     ]);
   });
+
+  it("fleet add takes the host forms ssh reads, including ssh:// with a port", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    const hosts = ["box.tail1234.ts.net", "my_alias", "ssh://me@box:2222", "fe80::1%eth0"];
+    const added = await m.run("fleet", "add", ...hosts);
+    expect(added.code, added.stderr).toBe(0);
+    expect((JSON.parse(readFileSync(manifest, "utf8")) as { fleet: string[] }).fleet).toEqual(
+      hosts,
+    );
+  });
 });
