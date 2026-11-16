@@ -15,7 +15,16 @@ import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { agentTargets, formerTargets } from "./agents.ts";
 import { exec } from "./exec.ts";
-import { changedFiles, hashDir, isErrno, isRecord, lstat, moveDir, writeJson } from "./fs.ts";
+import {
+  changedFiles,
+  hashDir,
+  isErrno,
+  isRecord,
+  lstat,
+  moveDir,
+  readJsonOrNothing,
+  writeJson,
+} from "./fs.ts";
 import { matchesGlob } from "./glob.ts";
 import {
   type DesiredLink,
@@ -29,7 +38,7 @@ import { type LoadedManifest, loadManifest, ManifestError, readConfig } from "./
 import { nameKey, segmentProblem } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import type { HookRun, Report } from "./report.ts";
-import { failedResult, type SourceResult, storePaths, syncSource } from "./sources.ts";
+import { failedResult, type SourceResult, sourceFiles, storePaths, syncSource } from "./sources.ts";
 import { loadState, saveState, sourceState, type State } from "./state.ts";
 import { version } from "./version.ts";
 
@@ -210,6 +219,77 @@ function create(file: string, text: string): boolean {
 /** Hooks run while the sync holds its lock, so a stuck one is stopped after this long. */
 const HOOK_TIMEOUT_MS = 5 * 60_000;
 
+const splitPattern = (pattern: string) => {
+  const at = pattern.indexOf(":");
+  return at < 0
+    ? { id: "*", glob: pattern }
+    : { id: pattern.slice(0, at), glob: pattern.slice(at + 1) };
+};
+
+/**
+ * One warning for each hook pattern that matches no file of the sources it names, so a hook that
+ * can never run is not silent. Changed paths start at the root of the source's repository.
+ */
+async function unmatchedHooks(loaded: LoadedManifest, results: SourceResult[]): Promise<string[]> {
+  const warnings: string[] = [];
+  const files = new Map<string, Promise<string[]>>();
+  const filesOf = (result: SourceResult) => {
+    const source = loaded.sources.find((candidate) => candidate.id === result.id)!;
+    if (!files.has(result.id)) files.set(result.id, sourceFiles(source, result));
+    return files.get(result.id)!;
+  };
+  for (const hook of loaded.root.hooks)
+    for (const pattern of hook.on) {
+      const { id, glob } = splitPattern(pattern);
+      const named = results.filter(
+        (result) => (id === "*" || result.id === id) && !result.error && result.skills.length > 0,
+      );
+      if (id !== "*" && !results.some((result) => result.id === id)) {
+        if (!loaded.failed?.length)
+          warnings.push(`hook ${hook.name}: "${pattern}" names no source "${id}"`);
+        continue;
+      }
+      let example: string | undefined;
+      let matched = named.length === 0;
+      for (const result of named) {
+        const list = await filesOf(result);
+        if (list.some((file) => matchesGlob(file, glob))) matched = true;
+        example ??= list.find((file) => /(^|\/)SKILL\.md$/.test(file)) ?? list[0];
+        if (matched) break;
+      }
+      if (!matched && example)
+        warnings.push(
+          `hook ${hook.name}: "${pattern}" matches no file in ${id === "*" ? "any source" : id}, so it never runs; paths start at the root of the source, as in ${example}`,
+        );
+    }
+  return warnings;
+}
+
+/**
+ * `sync <source>` and `update <source>` read the other sources from disk only. What only a fetch
+ * finds out, such as a working clone held back or waiting for review, is carried over from the
+ * last run for them, so `status` keeps showing it.
+ */
+function carryOver(report: Report, only: string) {
+  const raw = readJsonOrNothing(paths.lastRun());
+  if (!isRecord(raw) || raw.version !== 1 || !Array.isArray(raw.sources)) return;
+  const last = raw as unknown as Report;
+  for (const [i, entry] of report.sources.entries()) {
+    if (entry.id === only || entry.status !== "offline") continue;
+    const before = last.sources.find((source) => source.id === entry.id);
+    if (!before || before.kind !== entry.kind) continue;
+    if (before.status !== "held" && before.status !== "review") continue;
+    report.sources[i] = { ...entry, status: before.status, held: before.held };
+    report.held.push(...(last.held ?? []).filter((held) => held.source === entry.id));
+    for (const pending of last.pending ?? [])
+      if (
+        pending.source === entry.id &&
+        !report.pending.some((now) => now.source === entry.id && now.skill === pending.skill)
+      )
+        report.pending.push(pending);
+  }
+}
+
 /** Runs each hook whose `on` patterns match a changed `<source>:<file>`; the report JSON goes to stdin. */
 async function runHooks(
   loaded: LoadedManifest,
@@ -224,9 +304,7 @@ async function runHooks(
     const matched = changed
       .filter(({ source, file }) =>
         hook.on.some((pattern) => {
-          const at = pattern.indexOf(":");
-          const id = at < 0 ? "*" : pattern.slice(0, at);
-          const glob = at < 0 ? pattern : pattern.slice(at + 1);
+          const { id, glob } = splitPattern(pattern);
           return (id === "*" || id === source) && matchesGlob(file, glob);
         }),
       )
@@ -486,12 +564,18 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       ),
       targets: targetReports,
       hooks: [],
-      warnings: [...warnings, ...loaded.warnings, ...results.flatMap((result) => result.warnings)],
+      warnings: [
+        ...warnings,
+        ...loaded.warnings,
+        ...results.flatMap((result) => result.warnings),
+        ...(await unmatchedHooks(loaded, results)),
+      ],
       errors: [
         ...results.flatMap((result) => (result.error ? [`${result.id}: ${result.error}`] : [])),
         ...targetReports.flatMap((target) => target.errors),
       ],
     };
+    if (options.only) carryOver(report, options.only);
     if (!dryRun) {
       report.hooks = await runHooks(loaded, results, report);
       for (const hook of report.hooks)

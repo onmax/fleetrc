@@ -45,6 +45,18 @@ export function hashDir(dir: string, { skillMdAsFile = false } = {}): Hashes {
   return Object.fromEntries(Object.entries(hashes).sort(([a], [b]) => (a < b ? -1 : 1)));
 }
 
+/** Every file and link under `dir`, as `/`-separated relative paths. */
+export function listFiles(dir: string): string[] {
+  const files: string[] = [];
+  const walk = (current: string, prefix: string) => {
+    for (const entry of readdirSync(current, { withFileTypes: true }))
+      if (entry.isDirectory()) walk(join(current, entry.name), `${prefix}${entry.name}/`);
+      else files.push(`${prefix}${entry.name}`);
+  };
+  if (existsSync(dir)) walk(dir, "");
+  return files;
+}
+
 export const sha256 = (data: string | Uint8Array) =>
   createHash("sha256").update(data).digest("hex");
 

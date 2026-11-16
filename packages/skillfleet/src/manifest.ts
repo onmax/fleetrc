@@ -363,24 +363,64 @@ const isRepository = (spec: string) =>
   /^(https?|ssh|git|file):\/\/.+\.git\/?$/.test(spec) ||
   /^[\w.-]+@[\w.-]+:.+\.git$/.test(spec);
 
+/** A bare repository, such as a team's `team.git` on a shared drive: a folder of git's own files. */
+const isBareRepository = (dir: string) =>
+  statSync(dir, { throwIfNoEntry: false })?.isDirectory() === true &&
+  statSync(join(dir, "HEAD"), { throwIfNoEntry: false })?.isFile() === true &&
+  existsSync(join(dir, "objects")) &&
+  existsSync(join(dir, "refs"));
+
 /**
- * The repository and file of a manifest kept in git, or undefined for a file on this machine.
- * `<repo>//<file>` names both; a repository alone means its `skills.json`. A path that exists
- * on this machine, resolved against `base`, is always local.
+ * A repository page on GitHub or GitLab, as a browser shows it. A `blob` link names a branch and a
+ * file, a `tree` link a branch and a folder holding `skills.json`.
  */
-export function remoteManifest(
-  spec: string,
-  base = process.cwd(),
-): { repo: string; path: string } | undefined {
-  if (existsSync(expandPath(spec, base))) return undefined;
-  return (
-    splitRepoPath(spec) ?? (isRepository(spec) ? { repo: spec, path: DEFAULT_MANIFEST } : undefined)
-  );
+function webPage(spec: string): RemoteManifest | undefined {
+  const page =
+    spec.match(
+      /^(https?:\/\/(?:www\.)?github\.com\/[^/?#]+\/[^/?#]+?)(?:\.git)?(?:\/(blob|tree)\/([^/?#]+)(?:\/([^?#]*?))?)?\/?$/,
+    ) ??
+    spec.match(
+      /^(https?:\/\/gitlab\.com\/(?:[^/?#]+\/)+?[^/?#]+?)(?:\.git)?(?:\/-\/(blob|tree)\/([^/?#]+)(?:\/([^?#]*?))?)?\/?$/,
+    );
+  if (!page) return undefined;
+  const [, repo, kind, ref, path] = page;
+  const file =
+    kind === "blob" && path ? path : path ? `${path}/${DEFAULT_MANIFEST}` : DEFAULT_MANIFEST;
+  return { repo: repo!.replace(/^http:/, "https:").replace("://www.", "://"), path: file, ref };
 }
 
-/** The spec as config.json keeps it: `<repo>//<file>`, or an absolute path, so it reads the same from any folder. */
+export interface RemoteManifest {
+  repo: string;
+  path: string;
+  /** Branch or tag, from a GitHub or GitLab link; the default branch when absent. */
+  ref?: string;
+}
+
+/**
+ * The repository and file of a manifest kept in git, or undefined for a file on this machine.
+ * `<repo>//<file>` names both; a repository alone means its `skills.json`, and so does a GitHub or
+ * GitLab page link. A path that exists on this machine, resolved against `base`, is local, unless
+ * it is a bare repository.
+ */
+export function remoteManifest(spec: string, base = process.cwd()): RemoteManifest | undefined {
+  const local = expandPath(spec, base);
+  if (existsSync(local))
+    return isBareRepository(local) ? { repo: local, path: DEFAULT_MANIFEST } : undefined;
+  const split = splitRepoPath(spec);
+  if (split) {
+    const repo = expandPath(split.repo, base);
+    return isBareRepository(repo) ? { ...split, repo } : split;
+  }
+  return webPage(spec) ?? (isRepository(spec) ? { repo: spec, path: DEFAULT_MANIFEST } : undefined);
+}
+
+/**
+ * The spec as config.json keeps it: `<repo>//<file>`, or an absolute path, so it reads the same
+ * from any folder. A link that names a branch stays the link, the one form that keeps the branch.
+ */
 export function canonicalManifestSpec(spec: string): string {
   const remote = remoteManifest(spec);
+  if (remote?.ref) return spec;
   return remote ? `${remote.repo}//${remote.path}` : expandPath(spec);
 }
 
@@ -398,7 +438,7 @@ export async function locateManifest(
       : path;
   }
   const url = gitUrl(remote.repo);
-  const clone = await fetchClone(url, undefined, cacheRoot, { offline });
+  const clone = await fetchClone(url, remote.ref, cacheRoot, { offline });
   const file = join(clone.dir, remote.path);
   if (!existsSync(file))
     throw new ManifestError(

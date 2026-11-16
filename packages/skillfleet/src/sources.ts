@@ -12,9 +12,9 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "skills";
-import { git, gitOut } from "./exec.ts";
-import { changedFiles, copyDir, hashDir, isRecord, sameTree } from "./fs.ts";
-import { fetchClone, gitUrl } from "./gitcache.ts";
+import { git, GitError, gitOut } from "./exec.ts";
+import { changedFiles, copyDir, hashDir, isRecord, listFiles, sameTree } from "./fs.ts";
+import { fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
 import type { CloneSource, InPlaceSource, Source, VendoredSource } from "./manifest.ts";
 import { assertSegment, nameKey, segmentProblem } from "./names.ts";
@@ -45,7 +45,10 @@ export interface SourceResult {
   skills: SkillEntry[];
   from?: string;
   to?: string;
-  /** Changed files, relative to the source (vendored: `<skill>/<file>`), for hooks. */
+  /**
+   * Changed files, for hooks: relative to the repository of a git source, to the package of an npm
+   * source and to the folder of a local one; `<skill>/<file>` for a well-known index.
+   */
   changed: string[];
   held?: { reason: string; files: string[] };
   /** Skills with an upstream change that was not applied. */
@@ -283,9 +286,7 @@ export async function syncClone(
     }
     try {
       if (existsSync(dir)) throw new Error(`${dir} exists and is not a git repository`);
-      const args = ["clone", "--quiet"];
-      if (source.ref) args.push("--branch", source.ref);
-      await git([...args, "--", gitUrl(source.git), dir], { timeoutMs: 600_000 });
+      await cloneAt(source, dir);
       out.status = "installed";
       out.to = await gitOut(["rev-parse", "HEAD"], dir);
       out.changed = (await gitOut(["ls-files", "-z"], dir)).split("\0").filter(Boolean);
@@ -318,6 +319,118 @@ export async function syncClone(
   return out;
 }
 
+/** Clones a working clone at its `ref`: a branch or tag, or else a commit, checked out detached. */
+async function cloneAt(source: CloneSource, dir: string) {
+  const url = gitUrl(source.git);
+  const clone = (ref?: string) =>
+    git(["clone", "--quiet", ...(ref ? ["--branch", ref] : []), "--", url, dir], {
+      timeoutMs: 600_000,
+      allowFail: true,
+    });
+  const ref = source.ref;
+  let cloned = await clone(ref);
+  if (cloned.code === 0 || !ref || !isCommitRef(ref)) {
+    if (cloned.code !== 0)
+      throw new GitError(["clone", ...(ref ? ["--branch", ref] : []), "--", url, dir], cloned);
+    return;
+  }
+  cloned = await clone();
+  if (cloned.code !== 0) throw new GitError(["clone", "--", url, dir], cloned);
+  try {
+    const commit = await findCommit(dir, ref);
+    if (!commit) throw new Error(`${url} has no branch, tag or commit ${ref}`);
+    await git(["checkout", "--quiet", "--detach", commit], { cwd: dir });
+  } catch (error) {
+    // Nobody worked in a clone made a moment ago, and left on the default branch it would follow it.
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+/** The commit a ref names in a clone, fetching it from origin when the clone does not have it. */
+async function findCommit(dir: string, ref: string): Promise<string | undefined> {
+  const resolve = async () => {
+    const found = await git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+      cwd: dir,
+      allowFail: true,
+    });
+    return found.code === 0 ? found.stdout.trim() : undefined;
+  };
+  const known = await resolve();
+  if (known) return known;
+  // A commit on no branch is fetched by its full id; a shorter one can only be looked up locally.
+  if (ref.length !== 40) return undefined;
+  const fetched = await git(["fetch", "--quiet", "--", "origin", ref], {
+    cwd: dir,
+    allowFail: true,
+    timeoutMs: 300_000,
+  });
+  return fetched.code === 0 ? resolve() : undefined;
+}
+
+/**
+ * A working clone pinned to a commit stays on it: nothing is fast-forwarded. When the manifest
+ * names another commit, the clone moves to it unless local edits touch files that differ.
+ */
+async function updatePinned(
+  source: CloneSource,
+  ref: string,
+  dir: string,
+  before: string,
+  ctx: SourceContext,
+  out: SourceResult,
+) {
+  if (before.startsWith(ref.toLowerCase())) return;
+  if (ctx.dryRun) {
+    out.warnings.push(`${source.id}: ${dir} is at ${before.slice(0, 7)}; sync checks out ${ref}`);
+    return;
+  }
+  let commit = await findCommit(dir, ref);
+  if (!commit) {
+    await git(["fetch", "--quiet", "--", "origin"], { cwd: dir, timeoutMs: 300_000 });
+    commit = await findCommit(dir, ref);
+  }
+  if (!commit) {
+    out.status = "error";
+    out.error = `${gitUrl(source.git)} has no branch, tag or commit ${ref}`;
+    return;
+  }
+  const incoming = (await gitOut(["diff", "--name-only", "-z", "HEAD", commit], dir))
+    .split("\0")
+    .filter(Boolean);
+  if (source.update === "review" && !ctx.apply) {
+    out.status = "review";
+    out.pending = [{ skill: "*", reason: "review", files: incoming }];
+    return;
+  }
+  const dirty = new Set(
+    parsePorcelain(
+      (await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: dir })).stdout,
+    ),
+  );
+  const overlap = incoming.filter((file) => dirty.has(file));
+  if (overlap.length > 0) {
+    out.status = "held";
+    out.held = {
+      reason: "local edits touch files that differ at the pinned commit",
+      files: overlap,
+    };
+    return;
+  }
+  const moved = await git(["checkout", "--quiet", "--detach", commit], {
+    cwd: dir,
+    allowFail: true,
+  });
+  if (moved.code !== 0) {
+    out.status = "held";
+    out.held = { reason: moved.stderr.trim() || "git checkout failed", files: [] };
+    return;
+  }
+  out.status = "updated";
+  out.to = commit;
+  out.changed = [...new Set([...out.changed, ...incoming])];
+}
+
 async function updateClone(
   source: CloneSource,
   dir: string,
@@ -325,6 +438,10 @@ async function updateClone(
   ctx: SourceContext,
   out: SourceResult,
 ) {
+  if (source.ref && isCommitRef(source.ref)) {
+    const branch = await git(["symbolic-ref", "--quiet", "HEAD"], { cwd: dir, allowFail: true });
+    if (branch.code !== 0) return updatePinned(source, source.ref, dir, before, ctx, out);
+  }
   const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], {
     cwd: dir,
     allowFail: true,
@@ -450,10 +567,9 @@ export async function syncLocal(
   out.skills = await discoverInPlace(source, source.local, out.warnings);
   if (!state.fetchedAt) {
     out.status = "installed";
-    out.changed = out.skills.flatMap((skill) => {
-      const prefix = skill.path && skill.path !== "." ? `${skill.path}/` : "";
-      return Object.keys(hashDir(skill.dir)).map((file) => `${prefix}${file}`);
-    });
+    out.changed = out.skills.flatMap((skill) =>
+      listFiles(skill.dir).map((file) => `${filesAt(source, skill)}${file}`),
+    );
   }
   state.fetchedAt = ctx.now;
   return out;
@@ -473,10 +589,21 @@ export function storePaths(storeDir: string, name: string) {
 }
 
 /** Fetches a vendored source and returns the skills `skills` would install from it. */
-async function openVendored(source: VendoredSource, state: SourceState, ctx: SourceContext) {
+async function openVendored(
+  source: VendoredSource,
+  state: SourceState,
+  ctx: SourceContext,
+  warnings: string[],
+) {
   switch (source.kind) {
     case "git": {
       const clone = await fetchClone(gitUrl(source.git), source.ref, join(ctx.cacheDir, "git"));
+      const base = source.skills ? globBase(source.skills) : "";
+      for (const { path, kept } of clone.collisions)
+        if (!base || path === base || path.startsWith(`${base}/`) || base.startsWith(`${path}/`))
+          warnings.push(
+            `${source.id}: left out ${path}: macOS and Windows keep it in the same folder as ${kept}`,
+          );
       return {
         handle: await discover(clone.dir, source.skills),
         version: clone.commit,
@@ -587,7 +714,7 @@ export async function syncVendored(
   }
   let opened: Awaited<ReturnType<typeof openVendored>>;
   try {
-    opened = await openVendored(source, state, ctx);
+    opened = await openVendored(source, state, ctx, out.warnings);
   } catch (error) {
     out.status = "error";
     out.error = message(error);
@@ -679,6 +806,14 @@ function linkedSkillMds(
   }
 }
 
+/** The folder of a skill's files in what `changed` lists. */
+const filesAt = (source: Source, skill: Found) =>
+  source.kind === "index" || skill.path === undefined
+    ? `${skill.name}/`
+    : skill.path === "."
+      ? ""
+      : `${skill.path}/`;
+
 function applyVendored(
   source: VendoredSource,
   state: SourceState,
@@ -727,7 +862,7 @@ function applyVendored(
       out.skills.push({ name: skill.name, dir: paths.live, path: skill.path });
       // New to the records (a killed sync may have copied it), so hooks hear about it again.
       out.added.push(skill.name);
-      out.changed.push(...Object.keys(incoming).map((file) => `${skill.name}/${file}`));
+      out.changed.push(...Object.keys(incoming).map((file) => `${filesAt(source, skill)}${file}`));
       if (files.length > 0) {
         out.edited.push({ skill: skill.name, files });
         out.warnings.push(
@@ -748,7 +883,7 @@ function applyVendored(
         state.skills[skill.name] = { hashes: incoming, path: skill.path };
       }
       out.added.push(skill.name);
-      out.changed.push(...Object.keys(incoming).map((file) => `${skill.name}/${file}`));
+      out.changed.push(...Object.keys(incoming).map((file) => `${filesAt(source, skill)}${file}`));
       continue;
     }
     const files = changedFiles(record.hashes, incoming);
@@ -770,7 +905,7 @@ function applyVendored(
       delete state.pending[skill.name];
     }
     out.updated.push(skill.name);
-    out.changed.push(...files.map((file) => `${skill.name}/${file}`));
+    out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
   }
   out.pending = [...pending.values()].sort((a, b) => (a.skill < b.skill ? -1 : 1));
   if (write)
@@ -803,6 +938,17 @@ function applyVendored(
   else if (out.updated.length > 0 || out.added.length > 0 || out.removed.length > 0)
     out.status = "updated";
   else if (out.pending.some((entry) => entry.reason === "review")) out.status = "review";
+}
+
+/** Every file a hook pattern for this source could match, named as in `changed`. */
+export async function sourceFiles(source: Source, result: SourceResult): Promise<string[]> {
+  if (source.kind === "clone") {
+    const listed = await git(["ls-files", "-z"], { cwd: source.path, allowFail: true });
+    return listed.code === 0 ? listed.stdout.split("\0").filter(Boolean) : [];
+  }
+  return result.skills.flatMap((skill) =>
+    listFiles(skill.dir).map((file) => `${filesAt(source, skill)}${file}`),
+  );
 }
 
 export async function syncSource(

@@ -159,10 +159,11 @@ export class GitError extends Error {
 /** Runs git without prompts; throws GitError on a non-zero exit unless `allowFail`. */
 export async function git(
   args: readonly string[],
-  options: { cwd?: string; timeoutMs?: number; allowFail?: boolean } = {},
+  options: { cwd?: string; timeoutMs?: number; allowFail?: boolean; input?: string } = {},
 ): Promise<ExecResult> {
   const result = await exec("git", args, {
     cwd: options.cwd,
+    input: options.input,
     timeoutMs: options.timeoutMs ?? 120_000,
     env: { ...process.env, ...GIT_ENV },
     // File lists are parsed whole; a cut one would be wrong, not just short.

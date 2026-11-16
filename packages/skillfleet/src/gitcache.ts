@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { git, GitError, gitOut } from "./exec.ts";
-import { sha256 } from "./fs.ts";
+import { isRecord, readJsonOrNothing, sha256, writeJson } from "./fs.ts";
+import { nameKey } from "./names.ts";
 
 /** `owner/repo` and `github:owner/repo` become GitHub HTTPS URLs; anything else is a git URL already. */
 export function gitUrl(spec: string): string {
@@ -21,15 +22,66 @@ export const repoKey = (spec: string) =>
     .replace(":", "/")
     .replace(/(\.git)?\/?$/, "");
 
+/** A ref that names a commit: a full id, or a prefix of one at least 7 hex digits long. */
+export const isCommitRef = (ref: string) => /^[0-9a-f]{7,40}$/i.test(ref);
+
+/** A path left out of a checkout because another path takes its folder on macOS and Windows. */
+export interface Collision {
+  /** The path left out, up to the part that collides. */
+  path: string;
+  /** The path kept in its place. */
+  kept: string;
+}
+
 export interface CachedClone {
+  /** The files of `commit`, without a .git folder. */
   dir: string;
   commit: string;
+  collisions: Collision[];
 }
 
 /**
- * A shallow clone of `url` at `ref` (default branch when absent), kept under `root` between runs.
- * The `skills` package clones into a temporary folder on every call; this cache is what lets a
- * timer run cheap and lets `--offline` work.
+ * Paths that macOS and Windows would write into one folder (names that differ by case, Unicode
+ * normalization or trailing dots), other than the first of each, comparing names byte by byte. Every system leaves
+ * the same ones out, so a fleet gets the same skills on Linux too.
+ */
+export function collisions(paths: readonly string[]): Collision[] {
+  const parts = paths.map((path) => path.split("/").map((part) => Buffer.from(part)));
+  const byFolder = (a: Buffer[], b: Buffer[]) => {
+    for (let i = 0; i < Math.min(a.length, b.length); i++) {
+      const order = Buffer.compare(a[i]!, b[i]!);
+      if (order !== 0) return order;
+    }
+    return a.length - b.length;
+  };
+  const owner = new Map<string, string>();
+  const found = new Map<string, string>();
+  for (const path of parts.sort(byFolder)) {
+    let key = "";
+    let actual = "";
+    for (const part of path) {
+      key += `/${nameKey(part.toString())}`;
+      actual += `/${part.toString()}`;
+      const kept = owner.get(key);
+      if (kept === undefined) owner.set(key, actual);
+      else if (kept !== actual) {
+        found.set(actual.slice(1), kept.slice(1));
+        break;
+      }
+    }
+  }
+  return [...found].map(([path, kept]) => ({ path, kept }));
+}
+
+/**
+ * The files of `url` at `ref` (default branch when absent), kept under `root` between runs. The
+ * `skills` package clones into a temporary folder on every call; this cache is what lets a timer
+ * run cheap and lets `--offline` work.
+ *
+ * git keeps a bare repository, and each new commit is written out to a fresh folder from its tree,
+ * never updated in place: a checkout that git later compares with the disk misreads names on
+ * macOS, where the file system folds case and Unicode normalization, and `git clean` then deletes
+ * files it took for untracked.
  */
 export async function fetchClone(
   url: string,
@@ -37,65 +89,148 @@ export async function fetchClone(
   root: string,
   { offline = false }: { offline?: boolean } = {},
 ): Promise<CachedClone> {
-  const dir = join(root, sha256(`${url}#${ref ?? ""}`).slice(0, 16));
+  const key = sha256(`${url}#${ref ?? ""}`).slice(0, 16);
+  const cache = {
+    repo: join(root, `${key}.git`),
+    tree: join(root, key),
+    marker: join(root, `${key}.json`),
+  };
+  let written = readMarker(cache.marker, cache.tree);
   if (offline) {
-    if (!existsSync(join(dir, ".git")))
-      throw new Error(`${url} has never been fetched and --offline is set`);
-    return { dir, commit: await gitOut(["rev-parse", "HEAD"], dir) };
+    if (!written) throw new Error(`${url} has never been fetched and --offline is set`);
+    return { dir: cache.tree, ...written };
   }
-  // A cache a killed clone left half made has a .git folder but no commit: clone it again.
-  const cloned = existsSync(join(dir, ".git")) && (await usable(dir));
-  if (!cloned) {
-    rmSync(dir, { recursive: true, force: true });
-    mkdirSync(root, { recursive: true });
-    const args = ["clone", "--quiet", "--depth", "1", "--no-tags"];
-    if (ref && !/^[0-9a-f]{40}$/.test(ref)) args.push("--branch", ref);
+  // A commit never changes: once written out, a ref that names one needs no fetch.
+  if (written && ref && isCommitRef(ref) && written.commit.startsWith(ref.toLowerCase()))
+    return { dir: cache.tree, ...written };
+  for (let attempt = 0; ; attempt++) {
+    const fresh = !(existsSync(cache.repo) && (await usable(cache.repo)));
+    if (fresh) {
+      rmSync(cache.repo, { recursive: true, force: true });
+      mkdirSync(root, { recursive: true });
+      await git(["init", "--quiet", "--bare", "--", cache.repo]);
+    }
+    let commit: string;
     try {
-      await git([...args, "--", url, dir]);
-      if (ref && /^[0-9a-f]{40}$/.test(ref)) await checkoutCommit(dir, ref);
+      commit = await fetchCommit(url, ref, cache.repo);
     } catch (error) {
-      rmSync(dir, { recursive: true, force: true });
+      // The network or the remote: a cache with a commit stays for --offline and later runs.
+      if (fresh) rmSync(cache.repo, { recursive: true, force: true });
       throw error;
     }
-  } else {
-    // A failed fetch is the network or the remote; the cache stays for --offline and later runs.
-    await git(["fetch", "--quiet", "--depth", "1", "--no-tags", "--", "origin", ref ?? "HEAD"], {
-      cwd: dir,
-    });
     try {
-      await git(["reset", "--quiet", "--hard", "FETCH_HEAD"], { cwd: dir });
-      await git(["clean", "-qfdx"], { cwd: dir });
+      if (written?.commit === commit) return { dir: cache.tree, ...written };
+      return { dir: cache.tree, commit, collisions: await writeTree(cache, commit) };
     } catch (error) {
-      // The fetch worked, so the cache itself is broken: start it over.
-      if (!(error instanceof GitError) || error.result.code === null) throw error;
-      rmSync(dir, { recursive: true, force: true });
-      return fetchClone(url, ref, root);
+      // The fetch worked, so the cache itself is broken: start it over, once.
+      if (attempt > 0 || !(error instanceof GitError) || error.result.code === null) throw error;
+      for (const path of Object.values(cache)) rmSync(path, { recursive: true, force: true });
+      written = undefined;
     }
   }
-  return { dir, commit: await gitOut(["rev-parse", "HEAD"], dir) };
+}
+
+function readMarker(marker: string, tree: string): Omit<CachedClone, "dir"> | undefined {
+  if (!existsSync(tree)) return undefined;
+  const raw = readJsonOrNothing(marker);
+  if (!isRecord(raw) || typeof raw.commit !== "string" || !Array.isArray(raw.collisions))
+    return undefined;
+  return { commit: raw.commit, collisions: raw.collisions as Collision[] };
+}
+
+/** Fetches `ref` and returns its commit. A ref that is no branch or tag is read as a commit. */
+async function fetchCommit(url: string, ref: string | undefined, repo: string): Promise<string> {
+  const args = ["fetch", "--quiet", "--depth", "1", "--no-tags", "--", url, ref ?? "HEAD"];
+  const fetched = await git(args, { cwd: repo, allowFail: true, timeoutMs: 600_000 });
+  if (fetched.code === 0) {
+    const commit = await gitOut(["rev-parse", "--verify", "FETCH_HEAD^{commit}"], repo);
+    // A ref of its own, so the next fetch sends only what changed.
+    await git(["update-ref", "refs/skillfleet/fetched", commit], { cwd: repo });
+    return commit;
+  }
+  // A full commit id is fetched as it is; a remote gives no way to look up a shorter one, so it
+  // is found in the history of every branch and tag.
+  if (fetched.code === null || !ref || !isCommitRef(ref) || ref.length === 40)
+    throw new GitError(args, fetched);
+  const shallow = (await gitOut(["rev-parse", "--is-shallow-repository"], repo)) === "true";
+  await git(
+    [
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      ...(shallow ? ["--unshallow"] : []),
+      "--",
+      url,
+      "+refs/heads/*:refs/skillfleet/heads/*",
+      "+refs/tags/*:refs/skillfleet/tags/*",
+    ],
+    { cwd: repo, timeoutMs: 600_000 },
+  );
+  const found = await git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+    cwd: repo,
+    allowFail: true,
+  });
+  if (found.code !== 0)
+    throw new Error(
+      `${url} has no branch, tag or commit ${ref}${found.stderr ? `: ${found.stderr.trim()}` : ""}`,
+    );
+  return found.stdout.trim();
 }
 
 /**
- * The cache is a repository of its own (git does not climb from a broken one to a parent repository,
- * such as a HOME kept in git), with a commit checked out and an origin. Throws when git can't run.
+ * Writes the files of `commit` to a new folder that then replaces `cache.tree`, leaving out the
+ * paths that would share a folder on macOS and Windows. Returns those.
  */
-async function usable(dir: string): Promise<boolean> {
-  const answer = async (args: string[]) => {
-    const run = await git(args, { cwd: dir, allowFail: true });
-    if (run.code === null && !run.timedOut) throw new GitError(args, run);
-    return run.code === 0 ? run.stdout.trim() : undefined;
-  };
-  const gitDir = await answer(["rev-parse", "--absolute-git-dir"]);
-  if (!gitDir || realpathSync(gitDir) !== realpathSync(join(dir, ".git"))) return false;
-  return (
-    (await answer(["rev-parse", "--verify", "--quiet", "HEAD"])) !== undefined &&
-    (await answer(["remote", "get-url", "origin"])) !== undefined
+async function writeTree(
+  cache: { repo: string; tree: string; marker: string },
+  commit: string,
+): Promise<Collision[]> {
+  const listed = await gitOut(
+    ["ls-tree", "-r", "-z", "--full-tree", "--name-only", commit],
+    cache.repo,
   );
+  const left = collisions(listed.split("\0").filter(Boolean));
+  const temp = `${cache.tree}.${process.pid}.tmp`;
+  rmSync(temp, { recursive: true, force: true });
+  mkdirSync(temp, { recursive: true });
+  try {
+    // Names go to and from git byte for byte, compared with their case.
+    const at = [
+      "-c",
+      "core.precomposeunicode=false",
+      "-c",
+      "core.ignorecase=false",
+      `--work-tree=${temp}`,
+    ];
+    await git([...at, "read-tree", commit], { cwd: cache.repo });
+    if (left.length > 0) {
+      const files = listed
+        .split("\0")
+        .filter((file) => left.some(({ path }) => file === path || file.startsWith(`${path}/`)));
+      await git([...at, "update-index", "-z", "--force-remove", "--stdin"], {
+        cwd: cache.repo,
+        input: files.map((file) => `${file}\0`).join(""),
+      });
+    }
+    await git([...at, "checkout-index", "--all", "--force"], { cwd: cache.repo });
+    rmSync(cache.tree, { recursive: true, force: true });
+    renameSync(temp, cache.tree);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+  writeJson(cache.marker, { commit, collisions: left });
+  return left;
 }
 
-async function checkoutCommit(dir: string, commit: string) {
-  await git(["fetch", "--quiet", "--depth", "1", "--", "origin", commit], { cwd: dir });
-  await git(["reset", "--quiet", "--hard", "FETCH_HEAD"], { cwd: dir });
+/**
+ * The cache is a repository of its own (git does not climb from a broken one to a parent
+ * repository, such as a HOME kept in git). Throws when git can't run.
+ */
+async function usable(repo: string): Promise<boolean> {
+  const run = await git(["rev-parse", "--absolute-git-dir"], { cwd: repo, allowFail: true });
+  if (run.code === null && !run.timedOut) throw new GitError(["rev-parse"], run);
+  const gitDir = run.code === 0 ? run.stdout.trim() : undefined;
+  return gitDir !== undefined && realpathSync(gitDir) === realpathSync(repo);
 }
 
 /** Splits `<repo>//<path>` (as in `github:org/repo//skills.json`) into the repository and the file. */
