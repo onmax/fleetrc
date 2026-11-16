@@ -156,8 +156,10 @@ describe("cli and environments", () => {
       join(bin, "ps"),
       [
         "#!/bin/sh",
-        `echo "  4242 ${uid + 1} Mon Nov 16 10:00:00 2020 /usr/bin/claude"`,
-        `echo "  4343 ${uid} Mon Nov 16 10:00:00 2020 /usr/bin/claude --resume"`,
+        `echo "  4242 ${uid + 1} Mon Nov 16 10:00:00 2020 /usr/bin/codex"`,
+        `echo "  4343 ${uid} Mon Nov 16 10:00:00 2020 /usr/bin/codex resume"`,
+        // Claude Code loads new skills mid-session, so it never needs a restart.
+        `echo "  4444 ${uid} Mon Nov 16 10:00:00 2020 /usr/bin/claude --resume"`,
         "",
       ].join("\n"),
     );

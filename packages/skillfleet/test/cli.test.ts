@@ -82,14 +82,15 @@ describe("skillfleet", () => {
     await m.run("sync");
     const announced = await prompt();
     expect(announced.code).toBe(0);
-    expect(announced.stdout).toContain("a new skill arrived after this session started");
-    expect(announced.stdout).toContain(
-      `- second: ${join(m.stateDir, "store", "vendor", "live", "second", "SKILL.md")}`,
+    // Claude Code loads a skill linked mid-session on the next turn, so the model is told to use
+    // it, not that it is missing.
+    expect(announced.stdout).toBe(
+      "skillfleet: a new skill arrived after this session started and is available now: second. Use it like any other skill, with the Skill tool.",
     );
     expect((await prompt()).stdout).toBe("");
   });
 
-  it("status lists agent sessions started before the last skill change", async () => {
+  it("status lists Codex sessions started before the last skill change, and not Claude Code's", async () => {
     const m = machine({ scheduler: "empty" });
     const vendor = remote(m, "vendor", skills("skills/", "first"));
     const manifest = m.manifest({
@@ -97,10 +98,14 @@ describe("skillfleet", () => {
       sources: [{ id: "vendor", git: vendor.url }],
     });
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
-    // A process that looks like Claude Code: node running a script named claude.
-    const fake = join(m.root, "claude.mjs");
-    writeFileSync(fake, "setInterval(() => {}, 1000);\n");
-    const session = spawn(process.execPath, [fake], { stdio: "ignore" });
+    // Processes that look like Codex and Claude Code: node running a script named codex or claude.
+    const fake = (name: string) => {
+      const file = join(m.root, `${name}.mjs`);
+      writeFileSync(file, "setInterval(() => {}, 1000);\n");
+      return spawn(process.execPath, [file], { stdio: "ignore" });
+    };
+    const session = fake("codex");
+    const claude = fake("claude");
     try {
       await new Promise((done) => setTimeout(done, 2500));
       vendor.commit({ "skills/second/SKILL.md": "---\nname: second\ndescription: Second\n---\n" });
@@ -108,11 +113,13 @@ describe("skillfleet", () => {
       const status = await m.run("status");
       expect(status.code).toBe(0);
       expect(status.stdout).toMatch(
-        new RegExp(`^restart: claude \\(pid ${session.pid}\\) started `, "m"),
+        new RegExp(`^restart: codex \\(pid ${session.pid}\\) started `, "m"),
       );
+      expect(status.stdout).not.toContain(`pid ${claude.pid}`);
       expect(status.stdout).toContain("+ added: second");
     } finally {
       session.kill();
+      claude.kill();
     }
   });
 });
