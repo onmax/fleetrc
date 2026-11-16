@@ -19,6 +19,7 @@ import {
   sameTree,
   writeJson,
 } from "./fs.ts";
+import { segmentProblem } from "./names.ts";
 import { tildify } from "./paths.ts";
 
 export const MANIFEST_FILE = ".skillfleet-manifest.json";
@@ -62,6 +63,8 @@ export function readTargetManifest(dir: string): TargetManifest {
   for (const [name, record] of Object.entries(raw.links)) {
     if (!isRecord(record) || typeof record.target !== "string" || typeof record.source !== "string")
       continue;
+    // A record is only trusted to name a folder directly inside this one.
+    if (segmentProblem(name)) continue;
     const kind = record.kind === "junction" || record.kind === "copy" ? record.kind : "symlink";
     links[name] = {
       target: record.target,
@@ -144,7 +147,12 @@ export function linkTargetDir(
   }
   if (!stat && !dryRun) mkdirSync(dir, { recursive: true });
   const manifest = readTargetManifest(dir);
-  const wanted = new Map(desired.map((link) => [link.name, link]));
+  const wanted = new Map<string, DesiredLink>();
+  for (const link of desired) {
+    const problem = segmentProblem(link.name);
+    if (problem) report.warnings.push(`skipped the skill "${link.name}": its name ${problem}`);
+    else wanted.set(link.name, link);
+  }
   const write = (name: string, link: DesiredLink, replacing: boolean) => {
     const path = join(dir, name);
     if (!dryRun) {

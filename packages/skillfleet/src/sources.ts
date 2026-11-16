@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "skills";
@@ -7,6 +7,7 @@ import { changedFiles, copyDir, hashDir, isRecord, sameTree } from "./fs.ts";
 import { fetchClone, gitUrl } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
 import type { CloneSource, InPlaceSource, Source, VendoredSource } from "./manifest.ts";
+import { assertSegment, nameKey, segmentProblem } from "./names.ts";
 import { fetchNpm } from "./npm.ts";
 import type { SourceState } from "./state.ts";
 
@@ -81,6 +82,30 @@ interface Found {
   path?: string;
 }
 
+/**
+ * Drops skills whose name cannot be a folder on every system, and the second of two names that
+ * macOS and Windows would store in one folder, warning for each.
+ */
+function plainNames(source: Source, found: readonly Found[], warnings: string[]): Found[] {
+  const keys = new Map<string, string>();
+  return found.filter((skill) => {
+    const problem = segmentProblem(skill.name);
+    if (problem) {
+      warnings.push(`${source.id}: skipped the skill "${skill.name}": its name ${problem}`);
+      return false;
+    }
+    const other = keys.get(nameKey(skill.name));
+    if (other !== undefined) {
+      warnings.push(
+        `${source.id}: skipped the skill "${skill.name}": macOS and Windows store it in the same folder as "${other}"`,
+      );
+      return false;
+    }
+    keys.set(nameKey(skill.name), skill.name);
+    return true;
+  });
+}
+
 /** Applies a source's `skills` glob, `include` and `exclude` to what discovery found. */
 export function select(source: Source, found: readonly Found[], warnings: string[]): Found[] {
   const glob = source.kind === "index" ? undefined : source.skills;
@@ -98,14 +123,33 @@ export function select(source: Source, found: readonly Found[], warnings: string
   return chosen;
 }
 
+const inside = (root: string, path: string) => {
+  const rel = relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
+
+/**
+ * The folder a `skills` glob starts from, which must stay inside the source. A fetched source
+ * cannot leave it through a link either; a folder on this machine may link elsewhere.
+ */
+function globRoot(root: string, glob: string | undefined, followLinks: boolean): string {
+  const base = glob ? globBase(glob) : "";
+  const dir = base ? join(root, base) : root;
+  const escapes =
+    !inside(root, dir) ||
+    (!followLinks && existsSync(dir) && !inside(realpathSync(root), realpathSync(dir)));
+  if (escapes) throw new Error(`the skills glob "${glob}" leaves the source`);
+  return dir;
+}
+
 /** Discovers skills in a folder through the `skills` package, limited to the `skills` glob's base folder. */
 async function discover(
   root: string,
   glob: string | undefined,
   skipped: string[] = [],
+  followLinks = false,
 ): Promise<SkillSource> {
-  const base = glob ? globBase(glob) : "";
-  return resolveSource(base ? join(root, base) : root, {
+  return resolveSource(globRoot(root, glob, followLinks), {
     config: SKILLS_OPTIONS,
     onWarning: (warning) => {
       const data: unknown = warning.data;
@@ -140,7 +184,7 @@ async function discoverInPlace(
   const skipped: string[] = [];
   let handle: SkillSource | undefined;
   try {
-    handle = await discover(root, source.skills, skipped);
+    handle = await discover(root, source.skills, skipped, true);
   } catch (error) {
     if (!isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") || skipped.length === 0) {
       warnings.push(`${source.id}: ${message(error)}`);
@@ -165,7 +209,7 @@ async function discoverInPlace(
         `${source.id}: ${path}/SKILL.md frontmatter is not valid YAML; linked anyway, but tools that parse it strictly skip ${name}`,
       );
     }
-    return select(source, found, warnings).map((skill) => ({
+    return select(source, plainNames(source, found, warnings), warnings).map((skill) => ({
       name: skill.name,
       path: skill.path,
       dir: skill.path && skill.path !== "." ? join(root, skill.path) : root,
@@ -211,7 +255,7 @@ export async function syncClone(
       if (existsSync(dir)) throw new Error(`${dir} exists and is not a git repository`);
       const args = ["clone", "--quiet"];
       if (source.ref) args.push("--branch", source.ref);
-      await git([...args, gitUrl(source.git), dir], { timeoutMs: 600_000 });
+      await git([...args, "--", gitUrl(source.git), dir], { timeoutMs: 600_000 });
       out.status = "installed";
       out.to = await gitOut(["rev-parse", "HEAD"], dir);
       out.changed = (await gitOut(["ls-files", "-z"], dir)).split("\0").filter(Boolean);
@@ -253,7 +297,7 @@ async function updateClone(
   const tracking = upstream.stdout.trim();
   if (ctx.dryRun) {
     const [remote, ...branch] = tracking.split("/");
-    const remoteHead = await git(["ls-remote", remote!, `refs/heads/${branch.join("/")}`], {
+    const remoteHead = await git(["ls-remote", "--", remote!, `refs/heads/${branch.join("/")}`], {
       cwd: dir,
       allowFail: true,
       timeoutMs: 30_000,
@@ -355,11 +399,15 @@ export async function syncLocal(
 // ---------------------------------------------------------------------------
 // Vendored sources: copied into the store, guarded against overwriting local edits.
 
-export const storePaths = (storeDir: string, name: string) => ({
-  live: join(storeDir, "live", name),
-  base: join(storeDir, "base", name),
-  upstream: join(storeDir, "upstream", name),
-});
+/** A skill's three folders in its source's store. Throws for a name that is not one plain folder name. */
+export function storePaths(storeDir: string, name: string) {
+  assertSegment(name);
+  return {
+    live: join(storeDir, "live", name),
+    base: join(storeDir, "base", name),
+    upstream: join(storeDir, "upstream", name),
+  };
+}
 
 /** Fetches a vendored source and returns the skills `skills` would install from it. */
 async function openVendored(source: VendoredSource, state: SourceState, ctx: SourceContext) {
@@ -373,7 +421,9 @@ async function openVendored(source: VendoredSource, state: SourceState, ctx: Sou
       };
     }
     case "npm": {
-      const pkg = await fetchNpm(source.npm, source.registry, join(ctx.cacheDir, "npm"));
+      const pkg = await fetchNpm(source.npm, source.registry, join(ctx.cacheDir, "npm"), {
+        sendToken: source.sendToken,
+      });
       return {
         handle: await discover(pkg.dir, source.skills),
         version: pkg.version,
@@ -437,6 +487,15 @@ export async function syncVendored(
 ): Promise<SourceResult> {
   const out = result(source, "unchanged");
   out.from = state.commit ?? state.version;
+  // A name recorded before names were checked cannot be touched safely, so it is forgotten.
+  for (const name of new Set([...Object.keys(state.skills), ...Object.keys(state.pending)]))
+    if (segmentProblem(name)) {
+      delete state.skills[name];
+      delete state.pending[name];
+      out.warnings.push(
+        `${source.id}: forgot the skill "${name}": its name ${segmentProblem(name)}`,
+      );
+    }
   const firstRun = Object.keys(state.skills).length === 0;
   // Local edits are checked on every run, online or not.
   for (const [name, copy] of Object.entries(state.skills)) {
@@ -478,7 +537,7 @@ export async function syncVendored(
       name: skill.name,
       path: withBase(opened.glob, skill.path),
     }));
-    const chosen = select(source, found, out.warnings);
+    const chosen = select(source, plainNames(source, found, out.warnings), out.warnings);
     if (source.kind === "index") {
       const listed = await indexNames(source.index);
       const got = new Set(found.map((skill) => skill.name));

@@ -7,6 +7,7 @@ import { writeJson } from "./fs.ts";
 import { matchesGlob } from "./glob.ts";
 import { type DesiredLink, linkTargetDir } from "./linker.ts";
 import { type LoadedManifest, loadManifest, ManifestError, readConfig } from "./manifest.ts";
+import { nameKey } from "./names.ts";
 import { paths } from "./paths.ts";
 import type { HookRun, Report } from "./report.ts";
 import { type SourceResult, syncSource } from "./sources.ts";
@@ -179,18 +180,22 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         delete state.sources[id];
       }
 
-    // First source with a name wins; later ones are shadowed.
+    // First source with a name wins; later ones are shadowed. Names that differ only by case or
+    // Unicode normalization count as one, since macOS and Windows keep them in one folder.
     const winners = new Map<string, DesiredLink>();
+    const byKey = new Map<string, DesiredLink>();
     const shadowed: Report["shadowed"] = [];
     for (const result of results) {
       for (const skill of result.skills) {
-        const winner = winners.get(skill.name);
+        const winner = byKey.get(nameKey(skill.name));
         if (winner) {
           if (winner.source !== result.id)
             shadowed.push({ skill: skill.name, winner: winner.source, loser: result.id });
           continue;
         }
-        winners.set(skill.name, { name: skill.name, target: skill.dir, source: result.id });
+        const link = { name: skill.name, target: skill.dir, source: result.id };
+        winners.set(skill.name, link);
+        byKey.set(nameKey(skill.name), link);
       }
     }
 

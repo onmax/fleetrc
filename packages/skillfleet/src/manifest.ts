@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
 import { isRecord, readJson, writeJson } from "./fs.ts";
+import { nameKey, sourceIdProblem } from "./names.ts";
+import { registryUrl, urlOrigin } from "./npm.ts";
 import { expandPath, paths } from "./paths.ts";
 
 export type UpdateMode = "auto" | "review";
@@ -43,6 +45,8 @@ export interface NpmSource extends SourceCommon {
   kind: "npm";
   npm: string;
   registry?: string;
+  /** Send NPM_TOKEN to this registry: false when only an extended manifest names it. */
+  sendToken: boolean;
 }
 
 /** A folder on this machine, linked in place. */
@@ -132,6 +136,21 @@ function optionalString(file: string, at: string, value: unknown): string | unde
   return value;
 }
 
+/** A `skills` glob stays inside its source: relative, with no `..` folder. */
+function skillsGlob(file: string, at: string, value: unknown): string | undefined {
+  const glob = optionalString(file, at, value);
+  if (glob === undefined) return undefined;
+  if (/^[/\\]|^[A-Za-z]:/.test(glob)) fail(file, at, `"${glob}" must be relative to the source`);
+  if (glob.split(/[/\\]/).includes("..")) fail(file, at, `"${glob}" must not leave the source`);
+  return glob;
+}
+
+/** git reads a URL, path or ref that starts with `-` as an option. */
+function notOption(file: string, at: string, value: string | undefined): string | undefined {
+  if (value?.startsWith("-")) fail(file, at, `"${value}" must not start with "-"`);
+  return value;
+}
+
 /** The id a source gets when the manifest does not name one. */
 export function defaultSourceId(raw: Record<string, unknown>): string {
   const spec = [raw.git, raw.index, raw.npm, raw.local].find((value) => typeof value === "string");
@@ -156,6 +175,8 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
   const id = optionalString(file, `${at}.id`, raw.id) ?? defaultSourceId(raw);
   if (!/^[a-z0-9][a-z0-9._-]*$/i.test(id))
     fail(file, `${at}.id`, `"${id}" may only use letters, digits, ".", "_" and "-"`);
+  const idProblem = sourceIdProblem(id);
+  if (idProblem) fail(file, `${at}.id`, `"${id}" ${idProblem}`);
   const update = raw.update ?? "auto";
   if (update !== "auto" && update !== "review")
     fail(file, `${at}.update`, 'must be "auto" or "review"');
@@ -165,11 +186,11 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
     id,
     update,
     origin: file,
-    skills: optionalString(file, `${at}.skills`, raw.skills),
+    skills: skillsGlob(file, `${at}.skills`, raw.skills),
     include: stringList(file, `${at}.include`, raw.include),
     exclude: stringList(file, `${at}.exclude`, raw.exclude),
   };
-  const ref = optionalString(file, `${at}.ref`, raw.ref);
+  const ref = notOption(file, `${at}.ref`, optionalString(file, `${at}.ref`, raw.ref));
   const kind = kinds[0]!;
   const spec = optionalString(file, `${at}.${kind}`, raw[kind])!;
   const onlyFor = (key: string, kinds: string) => {
@@ -178,6 +199,7 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
   switch (kind) {
     case "git": {
       onlyFor("registry", "npm");
+      notOption(file, `${at}.git`, spec);
       const path = optionalString(file, `${at}.path`, raw.path);
       if (path)
         return {
@@ -209,6 +231,7 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
         kind: "npm",
         npm: spec,
         registry: optionalString(file, `${at}.registry`, raw.registry),
+        sendToken: true,
       };
     case "local":
       for (const key of ["ref", "path", "registry"])
@@ -233,10 +256,17 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
   const sources = ((raw.sources ?? []) as unknown[]).map((source, i) =>
     parseSource(file, `sources[${i}]`, source, base),
   );
-  const ids = new Set<string>();
+  const ids = new Map<string, string>();
   for (const source of sources) {
-    if (ids.has(source.id)) fail(file, "sources", `declare "${source.id}" twice; give one an id`);
-    ids.add(source.id);
+    const seen = ids.get(nameKey(source.id));
+    if (seen === source.id) fail(file, "sources", `declare "${source.id}" twice; give one an id`);
+    if (seen !== undefined)
+      fail(
+        file,
+        "sources",
+        `declare "${seen}" and "${source.id}", which differ only by case or a trailing dot; macOS and Windows keep them in the same folder`,
+      );
+    ids.set(nameKey(source.id), source.id);
   }
   const forks: Record<string, Fork> = {};
   if (raw.forks !== undefined) {
@@ -359,7 +389,14 @@ export async function loadManifest(
   const warnings: string[] = [];
   const sources = [...root.sources];
   const seen = new Set([rootFile]);
-  const ids = new Set(sources.map((source) => source.id));
+  const ids = new Set(sources.map((source) => nameKey(source.id)));
+  // NPM_TOKEN goes to the registry the user configured and to registries the root manifest names.
+  const tokenOrigins = new Set([
+    urlOrigin(registryUrl(undefined)),
+    ...root.sources.flatMap((source) =>
+      source.kind === "npm" && source.registry ? [urlOrigin(source.registry)] : [],
+    ),
+  ]);
   const visit = async (manifest: Manifest) => {
     for (const parent of manifest.extends) {
       let file: string;
@@ -393,13 +430,21 @@ export async function loadManifest(
           `extends ${parent}: ignored ${ignored.join(", ")}; only the root manifest can run commands or name machines`,
         );
       for (const source of team.sources) {
-        if (ids.has(source.id)) {
+        if (source.kind === "clone" || source.kind === "local") {
+          warnings.push(
+            `extends ${parent}: ignored source "${source.id}"; only the root manifest can name a folder on this machine (${source.kind === "clone" ? "path" : "local"})`,
+          );
+          continue;
+        }
+        if (ids.has(nameKey(source.id))) {
           warnings.push(
             `extends ${parent}: source "${source.id}" is already declared; the first one is used`,
           );
           continue;
         }
-        ids.add(source.id);
+        ids.add(nameKey(source.id));
+        if (source.kind === "npm")
+          source.sendToken = !source.registry || tokenOrigins.has(urlOrigin(source.registry));
         sources.push(source);
       }
       await visit(team);

@@ -118,7 +118,7 @@ export async function doctor(): Promise<Check[]> {
     loaded.sources.map(async (source) => {
       const remote = remoteOf(source);
       if (!remote) return;
-      const run = await git(["ls-remote", "--exit-code", remote, "HEAD"], {
+      const run = await git(["ls-remote", "--exit-code", "--", remote, "HEAD"], {
         allowFail: true,
         timeoutMs: 30_000,
       });

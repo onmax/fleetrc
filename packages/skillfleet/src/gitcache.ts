@@ -40,14 +40,14 @@ export async function fetchClone(
     const args = ["clone", "--quiet", "--depth", "1", "--no-tags"];
     if (ref && !/^[0-9a-f]{40}$/.test(ref)) args.push("--branch", ref);
     try {
-      await git([...args, url, dir]);
+      await git([...args, "--", url, dir]);
       if (ref && /^[0-9a-f]{40}$/.test(ref)) await checkoutCommit(dir, ref);
     } catch (error) {
       rmSync(dir, { recursive: true, force: true });
       throw error;
     }
   } else {
-    await git(["fetch", "--quiet", "--depth", "1", "--no-tags", "origin", ref ?? "HEAD"], {
+    await git(["fetch", "--quiet", "--depth", "1", "--no-tags", "--", "origin", ref ?? "HEAD"], {
       cwd: dir,
     });
     await git(["reset", "--quiet", "--hard", "FETCH_HEAD"], { cwd: dir });
@@ -57,7 +57,7 @@ export async function fetchClone(
 }
 
 async function checkoutCommit(dir: string, commit: string) {
-  await git(["fetch", "--quiet", "--depth", "1", "origin", commit], { cwd: dir });
+  await git(["fetch", "--quiet", "--depth", "1", "--", "origin", commit], { cwd: dir });
   await git(["reset", "--quiet", "--hard", "FETCH_HEAD"], { cwd: dir });
 }
 
