@@ -70,7 +70,7 @@ skillfleet fleet sync            # sync every machine in the manifest over SSH
 - When two sources have a skill with the same name, the first one wins, and `status` prints one line about it. `include` and `exclude` pick skills from a source.
 - `"update": "review"` holds a source's changes until you look at the diff with `skillfleet diff` and take them with `skillfleet update <source>`. Use it for repositories you don't own, since your agents run their skills with your permissions.
 - `"path"` keeps a source in a clone you work in. skillfleet fast-forwards it with `git` and links the skills from there, so an agent that edits a skill edits your clone.
-- `"timer": { "cron": "0 * * * *" }` sets when the timer syncs. It defaults to every 30 minutes, in the machine's time zone, and `skillfleet timer install` applies a change.
+- `"timer": { "cron": "0 * * * *" }` sets when the timer syncs. It defaults to every 30 minutes, in the machine's time zone (`"timeZone": "local"`), even after a daylight saving change or a move to another zone, and `skillfleet timer install` applies a change.
 - `extends` adds a team manifest's sources. Fleet hosts, hooks and reports come only from your own manifest, so a team manifest can't run anything on your machines.
 - `fleet` names SSH destinations: a host, `user@host`, an alias from `~/.ssh/config`, or `ssh://user@host:port` for another port. Each host needs Node.js and its own `skillfleet init`. `fleet upgrade` installs this machine's skillfleet version on every host.
 - `hooks` run a command when files of a source change: `{ "run": "...", "on": ["mine:skills/**"] }`. `"report": { "run": "..." }` gets each run's report as JSON on stdin, and `hub` is a URL the report is posted to.

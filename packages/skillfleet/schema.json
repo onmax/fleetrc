@@ -105,7 +105,7 @@
         },
         "timeZone": {
           "type": "string",
-          "description": "IANA time zone of the cron, such as \"Europe/Madrid\". Defaults to the machine's. launchd and Task Scheduler run timers in the machine's time zone, so on macOS and Windows another zone works only when it gives the same times."
+          "description": "IANA time zone of the cron, such as \"Europe/Madrid\", or \"local\". Defaults to \"local\": the machine's time zone, following its clock changes and a move to another zone. launchd and Task Scheduler run timers in the machine's time zone, so on macOS and Windows another zone works only when it gives the same times."
         }
       }
     }

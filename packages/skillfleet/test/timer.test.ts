@@ -41,8 +41,11 @@ describe("timer", () => {
     const dry = await m.run("timer", "install", "--dry-run");
     expect(dry.code, dry.stderr).toBe(0);
     expect(dry.stdout).toContain(
-      `on "*/30 * * * *" (${Intl.DateTimeFormat().resolvedOptions().timeZone})`,
+      `on "*/30 * * * *" (the machine's time zone, now ${Intl.DateTimeFormat().resolvedOptions().timeZone})`,
     );
+    // "local", not today's zone name, so the timer follows the machine when its zone changes.
+    const spec = await m.json<{ timeZone: string }>("timer", "install", "--dry-run");
+    expect(spec.timeZone).toBe("local");
   });
 
   it("15c. init --dry-run neither installs a timer nor copies skillfleet", async () => {

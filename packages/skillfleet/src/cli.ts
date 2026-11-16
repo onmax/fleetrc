@@ -157,13 +157,13 @@ async function installTimer(): Promise<{
   const spec: TimerSpec = {
     name: TIMER_NAME,
     cron: loaded.root.timer.cron,
-    timeZone: loaded.root.timer.timeZone ?? machineTimeZone(),
+    timeZone: loaded.root.timer.timeZone ?? "local",
     command: [installed?.node ?? process.execPath, installed?.cli ?? installedCli(), "sync"],
     env: timerEnv(await gitPath()),
     logDir: paths.logs(),
   };
   const lines = [
-    `timer ${TIMER_NAME}: \`${spec.command.join(" ")}\` on "${spec.cron}" (${spec.timeZone})`,
+    `timer ${TIMER_NAME}: \`${spec.command.join(" ")}\` on "${spec.cron}" (${spec.timeZone === "local" ? `the machine's time zone, now ${machineTimeZone()}` : spec.timeZone})`,
   ];
   if (dryRun) {
     lines.push(`would install ${timerKind()}`);

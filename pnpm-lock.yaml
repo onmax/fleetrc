@@ -172,8 +172,8 @@ importers:
         specifier: ^26.6.6
         version: 26.6.6
       '@vite-hub/schedule':
-        specifier: https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@0cc5dbb
-        version: https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@0cc5dbb(@voidzero-dev/vite-plus-core@1.6.0(@types/node@26.6.6)(esbuild@0.28.2)(publint@0.3.25)(typescript@7.0.2)(yaml@2.9.1))(typescript@7.0.2)
+        specifier: https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@c741ba2
+        version: https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@c741ba2(@voidzero-dev/vite-plus-core@1.6.0(@types/node@26.6.6)(esbuild@0.28.2)(publint@0.3.25)(typescript@7.0.2)(yaml@2.9.1))(typescript@7.0.2)
       publint:
         specifier: ^0.3.25
         version: 0.3.25
@@ -868,17 +868,17 @@ packages:
     peerDependencies:
       valibot: ^1.5.0
 
-  '@vite-hub/runtime@https://pkg.pr.new/vite-hub/vitehub/@vite-hub/runtime@0cc5dbb60d769c8e02f865adceb5e5f5668962c8':
-    resolution: {integrity: sha512-R5Cz3uiDsDsSoOMvVgmRramXNV0Q0zoUU+RMR6tGXiF5cNbC3RjrwSgDeZG+gaybxD3ldxsRORQf0kPoLKUuqg==, tarball: https://pkg.pr.new/vite-hub/vitehub/@vite-hub/runtime@0cc5dbb60d769c8e02f865adceb5e5f5668962c8}
-    version: 0.0.0-preview-0cc5dbb
+  '@vite-hub/runtime@https://pkg.pr.new/vite-hub/vitehub/@vite-hub/runtime@c741ba230dcfea66062e43d681185a27da3b47a9':
+    resolution: {integrity: sha512-pJ4cATKBZsWEaH+bGi7ll0LJ3xVF3gSybjBybh6Dp7FGeKUbrFdzNKNKK1Gpmhxju89s/iMotuq7lYHSDvCnGA==, tarball: https://pkg.pr.new/vite-hub/vitehub/@vite-hub/runtime@c741ba230dcfea66062e43d681185a27da3b47a9}
+    version: 0.0.0-preview-c741ba2
     engines: {node: '>=22.18.0'}
 
-  '@vite-hub/schedule@https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@0cc5dbb':
-    resolution: {integrity: sha512-z6TryLFzWSJLb2RdVk0NpF01v/iXiM6pcA1O3lMKtrsoYYotOHMzYMLWMzf/xAR/qBHbK2rO/XVmUa+5UAEQaA==, tarball: https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@0cc5dbb}
-    version: 0.0.0-preview-0cc5dbb
+  '@vite-hub/schedule@https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@c741ba2':
+    resolution: {integrity: sha512-YgrjtnnYpQFFa1xLC5S4tzm19CYE4/1xnAxJdTXjg0v/BhGJl27XlwU6rA3Z5wNtv2SEs0mc6pr0lP/6wzduTA==, tarball: https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@c741ba2}
+    version: 0.0.0-preview-c741ba2
     engines: {node: '>=22.18.0'}
     peerDependencies:
-      '@vite-hub/kv': 0.1.0 || 0.0.0-preview-0cc5dbb
+      '@vite-hub/kv': 0.1.0 || 0.0.0-preview-c741ba2
       vite: '>=8.0.0'
     peerDependenciesMeta:
       '@vite-hub/kv':
@@ -1922,7 +1922,7 @@ snapshots:
     dependencies:
       valibot: 1.5.0(typescript@7.0.2)
 
-  '@vite-hub/runtime@https://pkg.pr.new/vite-hub/vitehub/@vite-hub/runtime@0cc5dbb60d769c8e02f865adceb5e5f5668962c8(typescript@7.0.2)':
+  '@vite-hub/runtime@https://pkg.pr.new/vite-hub/vitehub/@vite-hub/runtime@c741ba230dcfea66062e43d681185a27da3b47a9(typescript@7.0.2)':
     dependencies:
       '@standard-schema/spec': 1.1.0
       '@valibot/to-json-schema': 1.8.0(valibot@1.5.0(typescript@7.0.2))
@@ -1935,10 +1935,10 @@ snapshots:
       - ocache
       - typescript
 
-  '@vite-hub/schedule@https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@0cc5dbb(@voidzero-dev/vite-plus-core@1.6.0(@types/node@26.6.6)(esbuild@0.28.2)(publint@0.3.25)(typescript@7.0.2)(yaml@2.9.1))(typescript@7.0.2)':
+  '@vite-hub/schedule@https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@c741ba2(@voidzero-dev/vite-plus-core@1.6.0(@types/node@26.6.6)(esbuild@0.28.2)(publint@0.3.25)(typescript@7.0.2)(yaml@2.9.1))(typescript@7.0.2)':
     dependencies:
       '@valibot/to-json-schema': 1.8.0(valibot@1.5.0(typescript@7.0.2))
-      '@vite-hub/runtime': https://pkg.pr.new/vite-hub/vitehub/@vite-hub/runtime@0cc5dbb60d769c8e02f865adceb5e5f5668962c8(typescript@7.0.2)
+      '@vite-hub/runtime': https://pkg.pr.new/vite-hub/vitehub/@vite-hub/runtime@c741ba230dcfea66062e43d681185a27da3b47a9(typescript@7.0.2)
       cron-schedule: 6.0.0
       esbuild: 0.28.2
       nostics: 1.4.0

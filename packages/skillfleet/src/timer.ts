@@ -1,13 +1,10 @@
-import { realpathSync } from "node:fs";
-import { homedir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname } from "node:path";
 import {
   installOsSchedule,
   osScheduleStatus,
   type OsScheduleStatus,
   uninstallOsSchedule,
 } from "@vite-hub/schedule/os";
-import { exec } from "./exec.ts";
 import { xdgDir } from "./paths.ts";
 
 export const TIMER_NAME = "skillfleet-sync";
@@ -15,6 +12,7 @@ export const TIMER_NAME = "skillfleet-sync";
 export interface TimerSpec {
   name: string;
   cron: string;
+  /** An IANA name, or `"local"`: the machine's zone, following its clock changes. */
   timeZone: string;
   /** Absolute node path, then the installed CLI and its arguments. */
   command: [string, ...string[]];
@@ -41,7 +39,7 @@ export class TimerError extends Error {
   }
 }
 
-/** The machine's time zone, which the timer uses when the manifest names none. */
+/** The machine's time zone now. A timer without `timer.timeZone` runs in it as it changes (`"local"`). */
 export const machineTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 /** What each OS installs, for `timer install --dry-run`. */
@@ -55,72 +53,14 @@ export const timerKind = (platform: string = process.platform) =>
         : `nothing: ${platform} has no supported scheduler`;
 
 /**
- * The folder the systemd user manager reads user units from, as the manager sees it.
- * @vite-hub/schedule writes units to `$XDG_CONFIG_HOME/systemd/user` (else `~/.config/...`) of
- * the installing process. When that shell's HOME or XDG_CONFIG_HOME differs from the manager's,
- * as with an XDG_CONFIG_HOME set only in a shell profile, or a throwaway HOME, the unit lands
- * where the manager never looks and `systemctl --user enable` fails. The manager's first unit path
- * is `<config home>/systemd/user.control`.
- */
-async function systemdConfigHome(): Promise<string | undefined> {
-  const uid = process.getuid?.();
-  const env =
-    process.env.XDG_RUNTIME_DIR || uid === undefined
-      ? process.env
-      : { ...process.env, XDG_RUNTIME_DIR: `/run/user/${uid}` };
-  const run = await exec("systemctl", ["--user", "show", "-p", "UnitPath", "--value"], {
-    env,
-    timeoutMs: 10_000,
-  });
-  if (run.code !== 0) return undefined;
-  const control = run.stdout
-    .trim()
-    .split(/\s+/)
-    .find((path) => path.endsWith("/systemd/user.control") && !path.startsWith("/run/"));
-  return control ? dirname(dirname(control)) : undefined;
-}
-
-/** Runs `operation` with one environment variable changed, and puts it back after. */
-async function withEnv<T>(key: string, value: string, operation: () => Promise<T>): Promise<T> {
-  const saved = process.env[key];
-  if (saved === value) return operation();
-  process.env[key] = value;
-  try {
-    return await operation();
-  } finally {
-    if (saved === undefined) delete process.env[key];
-    else process.env[key] = saved;
-  }
-}
-
-/**
- * Runs a @vite-hub/schedule operation where it finds the timer the OS knows.
- * - Linux: XDG_CONFIG_HOME points where the systemd user manager reads units.
- * - macOS: HOME is a real path. launchd reports the real path of the plist it loaded, and
- *   @vite-hub/schedule treats a job loaded from another path than `$HOME/Library/LaunchAgents`
- *   as someone else's: with HOME under a symlink, such as /var/folders (/private/var/folders),
- *   status says "not installed", remove leaves the job loaded, and a second install fails with
- *   SCHEDULE_OS_NAME_TAKEN.
- */
-async function inSchedulerEnv<T>(operation: () => Promise<T>): Promise<T> {
-  if (process.platform === "darwin") return withEnv("HOME", realpathSync(homedir()), operation);
-  if (process.platform !== "linux") return operation();
-  // A relative XDG_CONFIG_HOME is ignored, as the XDG spec says, so units never land under the cwd.
-  const ours = xdgDir("XDG_CONFIG_HOME") ?? join(homedir(), ".config");
-  return withEnv("XDG_CONFIG_HOME", (await systemdConfigHome()) ?? ours, operation);
-}
-
-/**
  * Installs or updates the timer: a systemd user timer, a launchd agent, or a Task Scheduler task.
  * Installing the same spec again changes nothing.
  */
 export async function installTimer(spec: TimerSpec): Promise<InstalledTimer> {
-  const [error, unit] = await inSchedulerEnv(() =>
-    installOsSchedule(
-      spec.name,
-      { cron: spec.cron, timeZone: spec.timeZone },
-      { command: spec.command, scope: "user", catchUp: true, env: spec.env, logDir: spec.logDir },
-    ),
+  const [error, unit] = await installOsSchedule(
+    spec.name,
+    { cron: spec.cron, timeZone: spec.timeZone },
+    { command: spec.command, scope: "user", catchUp: true, env: spec.env, logDir: spec.logDir },
   );
   if (error) throw new TimerError(error);
   return {
@@ -132,7 +72,7 @@ export async function installTimer(spec: TimerSpec): Promise<InstalledTimer> {
 }
 
 export async function timerStatus(name = TIMER_NAME): Promise<TimerStatus> {
-  const [error, status] = await inSchedulerEnv(() => osScheduleStatus(name, { scope: "user" }));
+  const [error, status] = await osScheduleStatus(name, { scope: "user" });
   if (error) throw new TimerError(error);
   return status;
 }
@@ -141,7 +81,7 @@ export async function timerStatus(name = TIMER_NAME): Promise<TimerStatus> {
 export async function removeTimer(
   name = TIMER_NAME,
 ): Promise<{ existed: boolean; removed: string[] }> {
-  const [error, removal] = await inSchedulerEnv(() => uninstallOsSchedule(name, { scope: "user" }));
+  const [error, removal] = await uninstallOsSchedule(name, { scope: "user" });
   if (error) throw new TimerError(error);
   return { existed: removal.existed, removed: removal.removed };
 }
