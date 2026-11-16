@@ -1,5 +1,5 @@
 <h1>
-  <img src="https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/banner.png" alt="skillfleet: the same skills on every agent and every machine, kept current by a timer" width="100%">
+  <img src="https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/banner-light.png" alt="skillfleet: the same skills on every agent and every machine, kept current by a timer" width="100%">
 </h1>
 
 [![npm version](https://comark-ui.onmax.me/badge.svg?source=npm-version&package=skillfleet&icon=npm)](https://www.npmjs.com/package/skillfleet)

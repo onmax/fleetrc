@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 128 128" role="img" aria-labelledby="t">
 <title id="t">skillfleet</title>
-<rect width="128" height="128" rx="28" fill="#081319"/>
-<rect x="51" y="15" width="26" height="26" rx="7" fill="#59e1a2"/>
-<rect x="33" y="51" width="26" height="26" rx="7" fill="#f5f2e9"/>
-<rect x="69" y="51" width="26" height="26" rx="7" fill="#f5f2e9"/>
-<rect x="15" y="87" width="26" height="26" rx="7" fill="#f5f2e9"/>
-<rect x="87" y="87" width="26" height="26" rx="7" fill="#f5f2e9"/>
+<style>.bg{fill:#f9f5ec}.fg{fill:#111b28;stroke:#111b28}.lead{fill:#2763d7;stroke:#2763d7}.hull{fill:#111b28}@media (prefers-color-scheme:dark){.bg{fill:#0c141f}.fg{fill:#f9f5ec;stroke:#f9f5ec}.lead{fill:#6a9cfb;stroke:#6a9cfb}.hull{fill:#f9f5ec}}</style>
+<rect class="bg" width="128" height="128" rx="28"/>
+<path class="lead" d="M18 98 V24 Q50.3 64.69999999999999 52 98 Z" stroke-width="5" stroke-linejoin="round"/>
+<path class="fg" d="M56 98 V40 Q82.6 71.9 84 98 Z" stroke-width="5" stroke-linejoin="round"/>
+<path class="fg" d="M88 98 V56 Q108.9 79.1 110 98 Z" stroke-width="5" stroke-linejoin="round"/>
+<rect class="hull" x="14" y="104" width="100" height="9" rx="4.5"/>
 </svg>

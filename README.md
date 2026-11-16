@@ -1,5 +1,9 @@
 <h1>
-  <img src="./.github/assets/banner.svg" alt="skillfleet: the same skills on every agent and every machine, kept current by a timer" width="100%">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./.github/assets/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="./.github/assets/banner-light.svg">
+    <img src="./.github/assets/banner-light.svg" alt="skillfleet: the same skills on every agent and every machine, kept current by a timer" width="100%">
+  </picture>
 </h1>
 
 [![npm version](https://comark-ui.onmax.me/badge.svg?source=npm-version&package=skillfleet&icon=npm)](https://www.npmjs.com/package/skillfleet)
@@ -83,7 +87,7 @@ pnpm install
 pnpm ready   # format, build, check and test
 ```
 
-`node --no-warnings .github/scripts/brand.ts` redraws the logo, the favicons and the banner. It needs `sharp`.
+`node --no-warnings .github/scripts/brand.ts` redraws the logo, the favicons and the light and dark banners. It needs `sharp`.
 
 ## License
 
