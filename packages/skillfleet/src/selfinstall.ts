@@ -80,6 +80,25 @@ export function lastingPathDirs(path = process.env.PATH ?? process.env.Path ?? "
   return [...new Set(dirs)];
 }
 
+/**
+ * The first `command` in the folders of `lastingPathDirs`, the way a shell finds it, without
+ * spawning `which` or `where`: a lookup that times out would give the timer another PATH.
+ */
+export function findOnPath(command: string): string | undefined {
+  const names =
+    process.platform === "win32"
+      ? [".exe", ".cmd", ".bat", ".com"].map((ext) => `${command}${ext}`)
+      : [command];
+  for (const dir of lastingPathDirs())
+    for (const name of names) {
+      const file = join(dir, name);
+      try {
+        if (statSync(file).isFile() && isExecutable(file)) return file;
+      } catch {}
+    }
+  return undefined;
+}
+
 /** The Node.js that skillfleet needs: `engines` in package.json and src/entry.ts. */
 const NODE_MIN = [22, 12] as const;
 

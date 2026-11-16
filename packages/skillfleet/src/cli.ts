@@ -26,9 +26,8 @@ import {
   remoteManifest,
 } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
-import { exec } from "./exec.ts";
 import { formatReport, type Report } from "./report.ts";
-import { commandOnPath, installedCli, selfInstall, stableNode } from "./selfinstall.ts";
+import { commandOnPath, findOnPath, installedCli, selfInstall, stableNode } from "./selfinstall.ts";
 import { promptHook, staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
 import { manifestSpec, sync } from "./sync.ts";
@@ -141,14 +140,6 @@ async function runSync(options: { only?: string; apply?: string } = {}) {
   return printReport(report);
 }
 
-/** Absolute path of git, so the timer's PATH has it even when the scheduler's own PATH does not. */
-async function gitPath(): Promise<string | undefined> {
-  const run = await exec(process.platform === "win32" ? "where" : "which", ["git"], {
-    timeoutMs: 5000,
-  });
-  return run.code === 0 ? run.stdout.split(/\r?\n/)[0]?.trim() || undefined : undefined;
-}
-
 async function installTimer(): Promise<{
   code: number;
   lines: string[];
@@ -162,7 +153,7 @@ async function installTimer(): Promise<{
     cron: loaded.root.timer.cron,
     timeZone: loaded.root.timer.timeZone ?? "local",
     command: [node, installed?.cli ?? installedCli(), "sync"],
-    env: timerEnv(await gitPath(), node),
+    env: timerEnv(findOnPath("git"), node),
     logDir: paths.logs(),
   };
   const lines = [
