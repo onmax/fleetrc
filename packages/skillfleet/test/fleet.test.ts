@@ -4,7 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { isWindows, machine, type Machine, pathWith, remote, skills } from "./fixture.ts";
 
 /**
- * A fake `ssh`: skips options, takes the host, and runs the remote command with `sh -c` on this
+ * A fake `ssh`: skips options and the `--` after them, takes the host, and runs the remote command with `sh -c` on this
  * machine for `localhost`. Any other host hangs, like a machine that dropped off the network.
  */
 function sshShim(m: Machine): NodeJS.ProcessEnv {
@@ -16,6 +16,7 @@ function sshShim(m: Machine): NodeJS.ProcessEnv {
     `import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
 while (args[0] === "-o") args.splice(0, 2);
+if (args[0] === "--") args.shift();
 const [host, command] = args;
 if (host !== "localhost") setTimeout(() => {}, 1e9);
 else {

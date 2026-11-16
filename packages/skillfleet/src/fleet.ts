@@ -168,6 +168,8 @@ async function runOnHost(host: string, action: FleetAction, version: string, tim
     "BatchMode=yes",
     "-o",
     `ConnectTimeout=${Math.ceil(timeoutMs / 1000)}`,
+    // hostProblem already refuses a leading "-"; this keeps ssh from reading any host as an option.
+    "--",
     host,
     `sh -c ${quote(remoteScript(action, version))}`,
   ];

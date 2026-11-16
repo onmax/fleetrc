@@ -28,6 +28,7 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
 const rest = args.slice();
 while (rest[0] === "-o" || rest[0] === "-p") rest.splice(0, 2);
+if (rest[0] === "--") rest.shift();
 const [host, command] = rest;
 if (host !== "localhost" && host !== "ssh://localhost") {
   process.stderr.write("ssh: Could not resolve hostname " + host + ": Name or service not known\\n");
