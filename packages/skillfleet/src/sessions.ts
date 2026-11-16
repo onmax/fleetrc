@@ -31,10 +31,15 @@ export function agentOf(args: string[]): AgentProcess["agent"] | undefined {
 export async function agentProcesses(): Promise<AgentProcess[]> {
   if (process.platform === "win32") {
     const script =
-      "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | ForEach-Object { [pscustomobject]@{ pid = $_.ProcessId; start = $_.CreationDate.ToString('o'); cmd = $_.CommandLine } } | ConvertTo-Json -Compress";
-    const out = await exec("powershell.exe", ["-NoProfile", "-Command", script], {
-      timeoutMs: 20_000,
-    });
+      // Asking WMI for these executables only keeps the query to a few seconds.
+      "@(Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='bun.exe' OR Name='claude.exe' OR Name='codex.exe'\" | Where-Object { $_.CommandLine } | ForEach-Object { [pscustomobject]@{ pid = $_.ProcessId; start = $_.CreationDate.ToUniversalTime().ToString('o'); cmd = $_.CommandLine } }) | ConvertTo-Json -Compress";
+    const out = await exec(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      {
+        timeoutMs: 60_000,
+      },
+    );
     if (out.code !== 0 || !out.stdout.trim()) return [];
     const parsed: unknown = JSON.parse(out.stdout);
     const rows = Array.isArray(parsed) ? parsed : [parsed];
