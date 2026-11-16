@@ -19,6 +19,7 @@ import {
   cli,
   clone,
   isLink,
+  isWindows,
   machine,
   type Machine,
   names,
@@ -1157,10 +1158,14 @@ describe("unusual environments", () => {
     expect(names(join(home, ".claude/skills"))).toEqual(["tool"]);
     expect((await m.runWith({ env }, "self-install")).code).toBe(0);
     const launcher = join(home, ".local/state/skillfleet/bin/skillfleet");
-    const out = execFileSync(launcher, ["--version"], {
-      env: { ...m.env, ...env },
-      encoding: "utf8",
-    });
+    // Windows runs the .cmd launcher; the sh one is for Git Bash. A .cmd only runs through cmd.
+    const out = isWindows
+      ? execFileSync(`"${launcher}.cmd"`, ["--version"], {
+          env: { ...m.env, ...env },
+          encoding: "utf8",
+          shell: true,
+        })
+      : execFileSync(launcher, ["--version"], { env: { ...m.env, ...env }, encoding: "utf8" });
     expect(out.trim()).toBe(version);
   });
 

@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
 import { agentTargets, codexLegacyDir } from "./agents.ts";
 import { personalSkillsDir, personalSource } from "./edits.ts";
-import { isRecord, lstat, moveDir } from "./fs.ts";
+import { isRecord, lstat, moveDir, readJsonFile } from "./fs.ts";
 import { linkTarget, MANIFEST_FILE, removeLink } from "./linker.ts";
 import {
   defaultSourceId,
@@ -14,9 +14,9 @@ import {
   type LoadedManifest,
   locateManifest,
   parseManifest,
+  remoteManifest,
   writeConfig,
 } from "./manifest.ts";
-import { splitRepoPath } from "./gitcache.ts";
 import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { sync } from "./sync.ts";
@@ -71,7 +71,7 @@ interface LockEntry {
 /** Entries of a `skills-lock.json` (versions 1 and 2 share these fields). */
 export function readSkillsLock(file: string): LockEntry[] {
   if (!existsSync(file)) return [];
-  const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
+  const raw = readJsonFile(file);
   if (!isRecord(raw) || (raw.version !== 1 && raw.version !== 2) || !isRecord(raw.skills))
     return [];
   return Object.entries(raw.skills).flatMap(([name, entry]) => {
@@ -168,7 +168,7 @@ export async function planInit(
     const loaded = await loadManifest(spec, { offline, ...cache });
     const imports = await collectImports(loaded);
     // Plan the sync against the manifest as it will be once the imports are added.
-    const raw: unknown = JSON.parse(readFileSync(manifestFile, "utf8"));
+    const raw = readJsonFile(manifestFile);
     if (!isRecord(raw)) throw new Error(`${manifestFile} is not a JSON object`);
     const root = parseManifest(manifestFile, {
       ...raw,
@@ -260,7 +260,7 @@ export async function planInit(
     return {
       manifestSpec: spec,
       manifestFile,
-      editable: !splitRepoPath(spec) || existsSync(spec),
+      editable: !remoteManifest(spec),
       before: [...before].sort(),
       after: [...after].sort(),
       lost,
@@ -284,7 +284,8 @@ function readOwnLinks(dir: string): Record<string, unknown> {
   }
 }
 
-export function formatPlan(plan: InitPlan): string {
+/** The plan as text. `errors: false` leaves out the sync's errors, for when the real sync prints them next. */
+export function formatPlan(plan: InitPlan, { errors = true } = {}): string {
   const lines = [`skillfleet init: manifest ${tildify(plan.manifestFile)}`];
   for (const migration of plan.migrations) {
     switch (migration.kind) {
@@ -317,7 +318,7 @@ export function formatPlan(plan: InitPlan): string {
   );
   for (const shadow of plan.sync.shadowed)
     lines.push(`  shadowed: ${shadow.skill} from ${shadow.loser} (${shadow.winner} wins)`);
-  for (const error of plan.sync.errors) lines.push(`  error: ${error}`);
+  if (errors) for (const error of plan.sync.errors) lines.push(`  error: ${error}`);
   for (const warning of new Set(plan.warnings)) lines.push(`  warning: ${warning}`);
   lines.push(
     `  skill names: ${plan.before.length} before, ${plan.after.length} after${plan.lost.length ? `; LOST: ${plan.lost.join(", ")}` : "; none lost"}`,

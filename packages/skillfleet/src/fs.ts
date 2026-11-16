@@ -72,9 +72,16 @@ export function isErrno(error: unknown, ...codes: string[]): boolean {
 /** A JSON file that exists but does not parse: cut short by a crash or a full disk, or hand-edited. */
 export class JsonFileError extends Error {}
 
+/** Some Windows editors start a UTF-8 file with a byte order mark, which JSON.parse refuses. */
+const withoutBom = (text: string) => text.replace(/^\uFEFF/, "");
+
+/** Parses a JSON file, skipping a byte order mark. */
+export const readJsonFile = (path: string): unknown =>
+  JSON.parse(withoutBom(readFileSync(path, "utf8")));
+
 export function readJson(path: string): unknown {
   if (!existsSync(path)) return undefined;
-  const text = readFileSync(path, "utf8");
+  const text = withoutBom(readFileSync(path, "utf8"));
   try {
     return JSON.parse(text);
   } catch (error) {

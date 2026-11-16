@@ -12,6 +12,15 @@ export function gitUrl(spec: string): string {
   return spec;
 }
 
+/** A repository URL reduced to host and path, so its https, ssh and `owner/repo` forms compare equal. */
+export const repoKey = (spec: string) =>
+  gitUrl(spec)
+    .toLowerCase()
+    .replace(/^[a-z+]+:\/\//, "")
+    .replace(/^[^@/]+@/, "")
+    .replace(":", "/")
+    .replace(/(\.git)?\/?$/, "");
+
 export interface CachedClone {
   dir: string;
   commit: string;

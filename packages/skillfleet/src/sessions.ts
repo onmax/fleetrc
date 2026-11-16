@@ -27,12 +27,13 @@ export function agentOf(args: string[]): AgentProcess["agent"] | undefined {
   return undefined;
 }
 
-/** Running Claude Code and Codex processes with their start times. */
+/** This user's running Claude Code and Codex processes, with their start times. */
 export async function agentProcesses(): Promise<AgentProcess[]> {
   if (process.platform === "win32") {
     const script =
-      // Asking WMI for these executables only keeps the query to a few seconds.
-      "@(Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='bun.exe' OR Name='claude.exe' OR Name='codex.exe'\" | Where-Object { $_.CommandLine } | ForEach-Object { [pscustomobject]@{ pid = $_.ProcessId; start = $_.CreationDate.ToUniversalTime().ToString('o'); cmd = $_.CommandLine } }) | ConvertTo-Json -Compress";
+      // Asking WMI for these executables only keeps the query to a few seconds. Other users'
+      // processes run in other logon sessions.
+      "$session = (Get-Process -Id $PID).SessionId; @(Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='bun.exe' OR Name='claude.exe' OR Name='codex.exe'\" | Where-Object { $_.CommandLine -and $_.SessionId -eq $session } | ForEach-Object { [pscustomobject]@{ pid = $_.ProcessId; start = $_.CreationDate.ToUniversalTime().ToString('o'); cmd = $_.CommandLine } }) | ConvertTo-Json -Compress";
     const out = await exec(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command", script],
@@ -50,19 +51,22 @@ export async function agentProcesses(): Promise<AgentProcess[]> {
         : [];
     });
   }
-  const out = await exec("ps", ["-A", "-ww", "-o", "pid=,lstart=,args="], {
+  const uid = process.getuid?.();
+  const out = await exec("ps", ["-A", "-ww", "-o", "pid=,uid=,lstart=,args="], {
     env: { ...process.env, LC_ALL: "C" },
     timeoutMs: 20_000,
     maxOutput: 64 * 1024 * 1024,
   });
   if (out.code !== 0) return [];
   return out.stdout.split("\n").flatMap((line) => {
-    // "  123 Mon Nov 16 10:00:00 2026 /usr/bin/claude --resume"
+    // "  123  1000 Mon Nov 16 10:00:00 2026 /usr/bin/claude --resume"
     const match = line
       .trim()
-      .match(/^(\d+)\s+\w{3}\s+(\w{3})\s+(\d+)\s+([\d:]+)\s+(\d{4})\s+(.*)$/);
+      .match(/^(\d+)\s+(\d+)\s+\w{3}\s+(\w{3})\s+(\d+)\s+([\d:]+)\s+(\d{4})\s+(.*)$/);
     if (!match) return [];
-    const [, pid, month, day, time, year, command] = match;
+    const [, pid, owner, month, day, time, year, command] = match;
+    // Another user's session does not read this user's skills.
+    if (uid !== undefined && Number(owner) !== uid) return [];
     const args = command!.split(/\s+/);
     const agent = agentOf(args);
     if (!agent || Number(pid) === process.pid) return [];

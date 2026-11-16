@@ -1,24 +1,34 @@
-#!/usr/bin/env node
 import { existsSync, readFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { doctor, formatChecks } from "./doctor.ts";
 import { adoptSkill, diffSkill, forkSkill, mergeSkill, UserError } from "./edits.ts";
-import { fleet, type FleetAction, formatFleet, hostProblem, tailscalePeers } from "./fleet.ts";
+import {
+  fleet,
+  type FleetAction,
+  formatFleet,
+  hostProblem,
+  tailscalePeers,
+  unpublished,
+} from "./fleet.ts";
 import { isRecord, JsonFileError, readJsonOrNothing } from "./fs.ts";
 import { applyPlan, formatPlan, planInit } from "./init.ts";
+import { gitUrl, repoKey } from "./gitcache.ts";
 import {
+  canonicalManifestSpec,
   defaultSourceId,
   editManifest,
   loadManifest,
+  type LoadedManifest,
   ManifestError,
   readConfig,
+  remoteManifest,
 } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 import { exec } from "./exec.ts";
 import { formatReport, type Report } from "./report.ts";
-import { installedCli, selfInstall } from "./selfinstall.ts";
+import { commandOnPath, installedCli, selfInstall } from "./selfinstall.ts";
 import { promptHook, staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
 import { manifestSpec, sync } from "./sync.ts";
@@ -303,6 +313,36 @@ function sourceFromSpec(spec: string): Record<string, unknown> {
   return { git: spec };
 }
 
+/**
+ * The file `add`, `remove` and `fleet add` change. A manifest kept in a git repository is read from
+ * a cached copy that the next fetch resets, so it is changed only in a working clone of that
+ * repository (a source with a `path`); the change then reaches this machine once it is pushed.
+ * Without such a clone the command stops and says what to change upstream.
+ */
+function manifestToEdit(loaded: LoadedManifest, change: string): { file: string; push: boolean } {
+  const remote = remoteManifest(manifestSpec(values.manifest));
+  if (!remote) return { file: loaded.root.file, push: false };
+  const key = repoKey(remote.repo);
+  for (const source of loaded.root.sources)
+    if (source.kind === "clone" && repoKey(source.git) === key) {
+      const file = join(source.path, remote.path);
+      if (existsSync(file)) return { file, push: true };
+    }
+  throw new UserError(
+    `the manifest is a copy of the repository ${gitUrl(remote.repo)}, which the next sync fetches again, so skillfleet does not change it. ${change} in ${remote.path} there and push it, or clone it as a source with a "path" to let skillfleet edit the clone.`,
+  );
+}
+
+/** What to tell the user after changing `file`; for a working clone, the change waits for a push. */
+function edited(what: string, target: { file: string; push: boolean }) {
+  console.log(
+    target.push
+      ? `${what} in ${tildify(target.file)}; commit and push it, and the next sync uses it`
+      : `${what} in ${tildify(target.file)}`,
+  );
+  return target.push ? 0 : runSync();
+}
+
 async function add() {
   const spec = one("source");
   const entry: Record<string, unknown> = sourceFromSpec(spec);
@@ -311,59 +351,59 @@ async function add() {
   if (values.include) entry.include = values.include;
   if (values.exclude) entry.exclude = values.exclude;
   if (values.review) entry.update = "review";
-  const file = (await loadManifest(manifestSpec(values.manifest), { offline: true })).root.file;
-  editManifest(file, (raw) => {
+  const source = { id: entry.id, ...entry };
+  const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
+  const target = manifestToEdit(loaded, `Add ${JSON.stringify(source)} to "sources"`);
+  editManifest(target.file, (raw) => {
     const sources = Array.isArray(raw.sources) ? raw.sources : [];
-    raw.sources = [...sources, { id: entry.id, ...entry }];
+    raw.sources = [...sources, source];
   });
-  console.log(`added ${String(entry.id)} to ${tildify(file)}`);
-  return runSync();
+  return edited(`added ${String(entry.id)}`, target);
 }
 
 async function remove() {
   const name = one("source or skill");
   const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
-  const file = loaded.root.file;
   if (loaded.root.sources.some((source) => source.id === name)) {
-    editManifest(file, (raw) => {
+    const target = manifestToEdit(loaded, `Remove the source "${name}" from "sources"`);
+    editManifest(target.file, (raw) => {
       raw.sources = (Array.isArray(raw.sources) ? raw.sources : []).filter(
         (source: unknown) => !isRecord(source) || (source.id ?? defaultSourceId(source)) !== name,
       );
     });
-    console.log(`removed source ${name} from ${tildify(file)}`);
-    return runSync();
+    return edited(`removed source ${name}`, target);
   }
   const owner = loadState().skills[name]?.source;
   const source = loaded.sources.find((candidate) => candidate.id === owner);
   if (!source) throw new UserError(`no source or linked skill named "${name}"`);
-  if (source.origin !== file)
+  if (source.origin !== loaded.root.file)
     throw new UserError(
       `${name} comes from ${source.id} in ${tildify(source.origin)}; exclude it there`,
     );
-  editManifest(file, (raw) => {
+  const target = manifestToEdit(loaded, `Add "${name}" to "exclude" of the source "${source.id}"`);
+  editManifest(target.file, (raw) => {
     for (const entry of Array.isArray(raw.sources) ? raw.sources : [])
       if (isRecord(entry) && (entry.id ?? defaultSourceId(entry)) === source.id)
         entry.exclude = [
           ...new Set([...(Array.isArray(entry.exclude) ? entry.exclude : []), name]),
         ];
   });
-  console.log(`excluded ${name} from ${source.id}`);
-  return runSync();
+  return edited(`excluded ${name} from ${source.id}`, target);
 }
 
 async function init() {
   if (rest.length > 1) usage("init takes one manifest");
-  const spec = rest[0] ?? values.manifest ?? readConfig()?.manifest;
-  if (!spec)
+  const given = rest[0] ?? values.manifest ?? readConfig()?.manifest;
+  if (!given)
     usage(
-      "init needs a manifest: a path, or <repo>//<file> such as github:org/agents//skills.json",
+      "init needs a manifest: a path, a repository such as owner/repo (its skills.json), or <repo>//<file> such as github:org/agents//skills.json",
     );
-  const plan = await planInit(spec, { offline: values.offline, dryRun });
+  const plan = await planInit(canonicalManifestSpec(given), { offline: values.offline, dryRun });
   if (json && dryRun) {
     console.log(JSON.stringify(plan, null, 2));
     return plan.lost.length > 0 ? 1 : 0;
   }
-  console.log(formatPlan(plan));
+  console.log(formatPlan(plan, { errors: dryRun }));
   if (dryRun) return plan.lost.length > 0 ? 1 : 0;
   if (plan.lost.length > 0 && !values.force) {
     console.error(
@@ -373,6 +413,9 @@ async function init() {
   }
   for (const line of applyPlan(plan)) console.log(`  ${line}`);
   const code = await runSync();
+  // The copy that new shells, the timer and `fleet` run, with or without the timer.
+  const installed = selfInstall();
+  if (!json) console.log(commandOnPath(installed.launcher));
   if (values["no-timer"]) return code;
   const timerResult = await installTimer();
   console.log(timerResult.lines.join("\n"));
@@ -402,21 +445,28 @@ async function fleetCommand(action: string | undefined) {
     }
     const problems = hosts.flatMap((host) => hostProblem(host) ?? []);
     if (problems.length > 0) throw new UserError(problems.join("\n"));
-    editManifest(loaded.root.file, (raw) => {
+    const target = manifestToEdit(loaded, `Add ${JSON.stringify(hosts)} to "fleet"`);
+    editManifest(target.file, (raw) => {
       raw.fleet = [...new Set([...(Array.isArray(raw.fleet) ? raw.fleet : []), ...hosts])];
     });
-    console.log(`added ${hosts.join(", ")} to the fleet in ${tildify(loaded.root.file)}`);
+    console.log(
+      `added ${hosts.join(", ")} to the fleet in ${tildify(target.file)}${target.push ? "; commit and push it" : ""}`,
+    );
     return 0;
   }
   if (action !== "sync" && action !== "status" && action !== "upgrade")
     return usage("fleet takes sync, status, upgrade or add");
   const hosts = rest.length > 1 ? rest.slice(1) : loaded.root.fleet;
   if (hosts.length === 0) usage("the manifest has no fleet; add hosts with `skillfleet fleet add`");
+  if (action === "upgrade") {
+    const reason = await unpublished(version);
+    if (reason) throw new UserError(reason);
+  }
   const timeout = values.timeout ? Number(values.timeout) * 1000 : 30_000;
   if (!Number.isFinite(timeout) || timeout <= 0) usage("--timeout takes seconds");
   const results = await fleet(hosts, action satisfies FleetAction, version, timeout);
   console.log(json ? JSON.stringify(results, null, 2) : formatFleet(results));
-  return results.every((result) => result.reachable) ? 0 : 1;
+  return results.every((result) => result.reachable && !result.error) ? 0 : 1;
 }
 
 async function main(): Promise<number> {
@@ -489,6 +539,7 @@ async function main(): Promise<number> {
     case "self-install": {
       const result = selfInstall();
       console.log(`installed ${tildify(result.launcher)} (node ${result.node})`);
+      console.log(commandOnPath(result.launcher));
       return 0;
     }
     default:

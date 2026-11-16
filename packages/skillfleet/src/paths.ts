@@ -16,10 +16,17 @@ export function tildify(path: string): string {
     : path;
 }
 
+/** An XDG base directory variable, or undefined when it is unset or relative, as the XDG spec says. */
+export function xdgDir(name: "XDG_CONFIG_HOME" | "XDG_STATE_HOME"): string | undefined {
+  const value = process.env[name];
+  return value && isAbsolute(value) ? value : undefined;
+}
+
 /** Where `config.json` lives: XDG config, else %APPDATA% on Windows, else ~/.config. */
 export function configDir(): string {
   const env = process.env;
-  if (env.XDG_CONFIG_HOME) return join(env.XDG_CONFIG_HOME, "skillfleet");
+  const xdg = xdgDir("XDG_CONFIG_HOME");
+  if (xdg) return join(xdg, "skillfleet");
   if (process.platform === "win32" && env.APPDATA) return join(env.APPDATA, "skillfleet");
   return join(homedir(), ".config", "skillfleet");
 }
@@ -27,7 +34,8 @@ export function configDir(): string {
 /** Per-machine state: XDG state, else %LOCALAPPDATA% on Windows, else ~/.local/state. */
 export function stateDir(): string {
   const env = process.env;
-  if (env.XDG_STATE_HOME) return join(env.XDG_STATE_HOME, "skillfleet");
+  const xdg = xdgDir("XDG_STATE_HOME");
+  if (xdg) return join(xdg, "skillfleet");
   if (process.platform === "win32" && env.LOCALAPPDATA) return join(env.LOCALAPPDATA, "skillfleet");
   return join(homedir(), ".local", "state", "skillfleet");
 }

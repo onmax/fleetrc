@@ -210,10 +210,12 @@ describe("linux environments", () => {
 
   // L12: after `npx skillfleet init`, the README's next command is `skillfleet status`, but
   // nothing puts `skillfleet` on PATH; the copy sits in ~/.local/state/skillfleet/bin.
+  // With --no-timer: the command has to work without the timer too, and a test that installs the
+  // timer installs it in the real user's systemd, whatever HOME the test sets.
   it.skipIf(isWindows)("L12. init leaves a `skillfleet` command the user can run", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    const init = await m.run("init", manifest);
+    const init = await m.run("init", manifest, "--no-timer");
     const onPath = existsSync(m.at(".local/bin/skillfleet"));
     expect(onPath || /PATH/.test(init.stdout), init.stdout).toBe(true);
   });

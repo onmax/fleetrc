@@ -17,7 +17,7 @@ export default defineConfig({
         "cron-schedule",
       ],
     },
-    entry: { cli: "src/cli.ts" },
+    entry: { cli: "src/entry.ts" },
     format: ["esm"],
     platform: "node",
     fixedExtension: true,

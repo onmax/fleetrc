@@ -8,6 +8,7 @@ import {
   uninstallOsSchedule,
 } from "@vite-hub/schedule/os";
 import { exec } from "./exec.ts";
+import { xdgDir } from "./paths.ts";
 
 export const TIMER_NAME = "skillfleet-sync";
 
@@ -104,10 +105,9 @@ async function withEnv<T>(key: string, value: string, operation: () => Promise<T
 async function inSchedulerEnv<T>(operation: () => Promise<T>): Promise<T> {
   if (process.platform === "darwin") return withEnv("HOME", realpathSync(homedir()), operation);
   if (process.platform !== "linux") return operation();
-  const managerHome = await systemdConfigHome();
-  const ours = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
-  if (!managerHome || managerHome === ours) return operation();
-  return withEnv("XDG_CONFIG_HOME", managerHome, operation);
+  // A relative XDG_CONFIG_HOME is ignored, as the XDG spec says, so units never land under the cwd.
+  const ours = xdgDir("XDG_CONFIG_HOME") ?? join(homedir(), ".config");
+  return withEnv("XDG_CONFIG_HOME", (await systemdConfigHome()) ?? ours, operation);
 }
 
 /**
@@ -179,13 +179,15 @@ export function timerEnv(git: string | undefined): Record<string, string> {
     "USERPROFILE",
     "APPDATA",
     "LOCALAPPDATA",
-    "XDG_CONFIG_HOME",
-    "XDG_STATE_HOME",
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "SSH_AUTH_SOCK",
   ]) {
     const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  for (const key of ["XDG_CONFIG_HOME", "XDG_STATE_HOME"] as const) {
+    const value = xdgDir(key);
     if (value) env[key] = value;
   }
   return env;
