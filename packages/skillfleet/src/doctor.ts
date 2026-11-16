@@ -154,8 +154,10 @@ export async function doctor(): Promise<Check[]> {
     ok: true,
     detail: `${tildify(loaded.root.file)}, ${loaded.sources.length} sources`,
   });
+  // Without git, the git check above already says so once.
+  const reachable = gitVersion.code === 0 ? loaded.sources : [];
   await Promise.all(
-    loaded.sources.map(async (source) => {
+    reachable.map(async (source) => {
       const remote = remoteOf(source);
       if (!remote) return;
       const run = await git(["ls-remote", "--exit-code", remote, "HEAD"], {
