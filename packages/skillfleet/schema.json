@@ -101,11 +101,12 @@
         "cron": {
           "type": "string",
           "default": "*/30 * * * *",
-          "description": "When the timer runs the sync: a five-field cron expression, such as \"*/30 * * * *\". \"* * * * *\" runs it every minute."
+          "pattern": "^\\S+(\\s+\\S+){4}$",
+          "description": "When the timer runs the sync: a five-field cron expression (minute 0-59, hour 0-23, day of month 1-31, month 1-12, day of week 0-7), such as \"*/30 * * * *\". \"* * * * *\" runs it every minute. skillfleet refuses a value out of range when it reads the manifest."
         },
         "timeZone": {
           "type": "string",
-          "description": "IANA time zone of the cron, such as \"Europe/Madrid\", or \"local\". Defaults to \"local\": the machine's time zone, following its clock changes and a move to another zone. launchd and Task Scheduler run timers in the machine's time zone, so on macOS and Windows another zone works only when it gives the same times."
+          "description": "IANA time zone of the cron, such as \"Europe/Madrid\" or \"UTC\", or \"local\"; skillfleet refuses a name Node.js does not know. Defaults to \"local\": the machine's time zone, following its clock changes and a move to another zone. launchd and Task Scheduler run timers in the machine's time zone, so on macOS and Windows another zone works only when it gives the same times."
         }
       }
     }

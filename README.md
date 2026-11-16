@@ -44,7 +44,7 @@ skillfleet fleet sync            # sync every machine in the manifest over SSH
 - a file inside a repository, such as `github:my-team/agents//team/skills.json`.
 - a file or a folder on this machine. A folder means the `skills.json` in it.
 
-`init` copies skillfleet out of the npx cache into its state folder (`~/.local/state/skillfleet`, or `%LOCALAPPDATA%\skillfleet` on Windows), so the timer never points at a folder npm may delete. If `~/.local/bin` is on your PATH, `init` links `skillfleet` there; if not, it prints the folder to add to PATH. `--no-timer` skips the timer and still installs the command.
+`init` copies skillfleet out of the npx cache into its state folder (`~/.local/state/skillfleet`, or `%LOCALAPPDATA%\skillfleet` on Windows), so the timer never points at a folder npm may delete. If `~/.local/bin` is on your PATH, `init` links `skillfleet` there; if not, it prints the folder to add to PATH. `--no-timer` skips the timer and still installs the command. The launcher and the timer run node through a path that outlives a Node.js upgrade, such as `/opt/homebrew/bin/node`; if node moves anyway, `skillfleet doctor` says so and `npx skillfleet@latest timer install` repairs both.
 
 `add`, `remove` and `fleet add` change the manifest. When it lives in a repository, skillfleet reads a copy that the next sync fetches again, so they change a working clone of that repository instead (a source with a `path`, below) and ask you to push. Without one, they print the JSON to add upstream.
 

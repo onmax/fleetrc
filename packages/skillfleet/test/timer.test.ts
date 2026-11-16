@@ -1,6 +1,7 @@
 import { existsSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { stableNode } from "../src/selfinstall.ts";
 import { isWindows, machine, read, remote, skills, version } from "./fixture.ts";
 
 const kind =
@@ -28,7 +29,7 @@ describe("timer", () => {
     const app = join(m.stateDir, "app", "cli.mjs");
     expect(dry.code, dry.stderr).toBe(0);
     expect(dry.stdout).toBe(
-      `timer skillfleet-sync: \`${process.execPath} ${app} sync\` on "*/15 * * * *" (Europe/Madrid)\n` +
+      `timer skillfleet-sync: \`${stableNode({ env: m.env, home: m.home })} ${app} sync\` on "*/15 * * * *" (Europe/Madrid)\n` +
         `would install ${kind}\n`,
     );
     expect(existsSync(app)).toBe(false);
@@ -68,9 +69,10 @@ describe("timer", () => {
     const launcher = join(m.stateDir, "bin", "skillfleet");
     const text = read(launcher);
     expect(text).toBe(
-      `#!/bin/sh\nexec "${process.execPath.replace(/\\/g, "/")}" "${join(m.stateDir, "app", "cli.mjs").replace(/\\/g, "/")}" "$@"\n`,
+      `#!/bin/sh\nexec "${stableNode({ env: m.env, home: m.home }).replace(/\\/g, "/")}" "${join(m.stateDir, "app", "cli.mjs").replace(/\\/g, "/")}" "$@"\n`,
     );
-    if (isWindows) expect(read(`${launcher}.cmd`)).toContain(process.execPath);
+    if (isWindows)
+      expect(read(`${launcher}.cmd`)).toContain(stableNode({ env: m.env, home: m.home }));
     // The copy has no node_modules beside it, so a run proves the bundle is self-contained.
     const { spawnSync } = await import("node:child_process");
     const run = spawnSync(process.execPath, [join(m.stateDir, "app", "cli.mjs"), "--version"], {

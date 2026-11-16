@@ -28,11 +28,13 @@ import {
 import { paths, tildify } from "./paths.ts";
 import { exec } from "./exec.ts";
 import { formatReport, type Report } from "./report.ts";
-import { commandOnPath, installedCli, selfInstall } from "./selfinstall.ts";
+import { commandOnPath, installedCli, selfInstall, stableNode } from "./selfinstall.ts";
 import { promptHook, staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
 import { manifestSpec, sync } from "./sync.ts";
 import {
+  foreignTimer,
+  foreignTimerResource,
   formatTimerStatus,
   installTimer as installOsTimer,
   machineTimeZone,
@@ -154,12 +156,13 @@ async function installTimer(): Promise<{
 }> {
   const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
   const installed = dryRun ? undefined : selfInstall();
+  const node = installed?.node ?? stableNode();
   const spec: TimerSpec = {
     name: TIMER_NAME,
     cron: loaded.root.timer.cron,
     timeZone: loaded.root.timer.timeZone ?? "local",
-    command: [installed?.node ?? process.execPath, installed?.cli ?? installedCli(), "sync"],
-    env: timerEnv(await gitPath()),
+    command: [node, installed?.cli ?? installedCli(), "sync"],
+    env: timerEnv(await gitPath(), node),
     logDir: paths.logs(),
   };
   const lines = [
@@ -212,13 +215,21 @@ async function timer(action: string | undefined) {
         console.error(`skillfleet: ${status.message}`);
         return 1;
       }
+      const foreign = status.installed ? undefined : await foreignTimerResource();
       console.log(
-        json ? JSON.stringify(status, null, 2) : `${TIMER_NAME}: ${formatTimerStatus(status)}`,
+        json
+          ? JSON.stringify(status, null, 2)
+          : `${TIMER_NAME}: ${foreign ? foreignTimer(TIMER_NAME, foreign) : formatTimerStatus(status)}`,
       );
       return status.installed ? 0 : 1;
     }
     case "remove": {
       const removal = await removeTimer();
+      const foreign = removal.existed ? undefined : await foreignTimerResource();
+      if (foreign) {
+        console.error(`skillfleet: nothing removed: ${foreignTimer(TIMER_NAME, foreign)}`);
+        return 1;
+      }
       if (json) console.log(JSON.stringify(removal, null, 2));
       else if (!removal.existed) console.log("no timer installed");
       else {
@@ -429,7 +440,7 @@ async function fleetCommand(action: string | undefined) {
     if (hosts.length === 0) {
       const peers = await tailscalePeers();
       const known = new Set(loaded.root.fleet);
-      const suggestions = peers.filter((peer) => !known.has(peer.host));
+      const suggestions = peers.filter((peer) => !known.has(peer.host) && !known.has(peer.dns));
       if (suggestions.length === 0)
         console.log("no tailnet machines to suggest; name hosts: skillfleet fleet add <host>...");
       else {

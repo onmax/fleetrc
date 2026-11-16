@@ -10,7 +10,15 @@ import { loadManifest, type Source } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 import { installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
 import { manifestSpec } from "./sync.ts";
-import { formatTimerStatus, TimerError, type TimerStatus, timerStatus } from "./timer.ts";
+import {
+  foreignTimer,
+  foreignTimerResource,
+  formatTimerStatus,
+  TIMER_NAME,
+  TimerError,
+  type TimerStatus,
+  timerStatus,
+} from "./timer.ts";
 
 export interface Check {
   name: string;
@@ -34,6 +42,25 @@ function skillNames(dir: string): string[] {
   }
 }
 
+/**
+ * What fixes a launcher whose node or copy is gone. The launcher itself cannot run then, so the fix
+ * goes through npx, which brings its own skillfleet and writes the launcher and the timer again.
+ */
+const REPAIR =
+  "run `npx skillfleet@latest timer install` to write the launcher and the timer again";
+
+/** Why the installed launcher cannot run, or undefined when it can or there is none. */
+function launcherProblem(): string | undefined {
+  const launcher = launcherPath();
+  if (!existsSync(launcher)) return undefined;
+  const node = launcherNode(readFileSync(launcher, "utf8"));
+  if (!node || !existsSync(node))
+    return `${tildify(launcher)} and the timer run ${node ?? "no node"}, which is gone (Node.js was upgraded or removed); ${REPAIR}`;
+  if (!existsSync(installedCli()))
+    return `${tildify(launcher)} runs ${tildify(installedCli())}, which is gone; ${REPAIR}`;
+  return undefined;
+}
+
 async function nodeCheck(): Promise<Check> {
   const launcher = launcherPath();
   if (!existsSync(launcher))
@@ -42,15 +69,11 @@ async function nodeCheck(): Promise<Check> {
       ok: true,
       detail: `${process.execPath} (no installed copy yet; \`skillfleet timer install\` makes one)`,
     };
-  const text = readFileSync(launcher, "utf8");
-  const node = launcherNode(text);
-  const ok = Boolean(node && existsSync(node)) && existsSync(installedCli());
+  const problem = launcherProblem();
   return {
     name: "node",
-    ok,
-    detail: ok
-      ? `${tildify(launcher)} runs ${node}`
-      : `${tildify(launcher)} points at ${node ?? "nothing"}, which is gone; run \`skillfleet timer install\` again`,
+    ok: !problem,
+    detail: problem ?? `${tildify(launcher)} runs ${launcherNode(readFileSync(launcher, "utf8"))}`,
   };
 }
 
@@ -90,7 +113,14 @@ async function timerCheck(): Promise<Check> {
     if (!(error instanceof TimerError)) throw error;
     return { name, ok: false, detail: error.message.split("\n")[0]! };
   }
-  if (!status.installed) return { name, ok: false, detail: formatTimerStatus(status) };
+  if (!status.installed) {
+    const foreign = await foreignTimerResource();
+    return {
+      name,
+      ok: false,
+      detail: foreign ? foreignTimer(TIMER_NAME, foreign) : formatTimerStatus(status),
+    };
+  }
   // One timer name per user: after a change of HOME or XDG_STATE_HOME, it may run another copy.
   const logs = paths.logs();
   if (status.logFile && !status.logFile.startsWith(logs + sep))
@@ -99,6 +129,9 @@ async function timerCheck(): Promise<Check> {
       ok: false,
       detail: `installed, but it syncs another skillfleet state folder (its log is ${tildify(status.logFile)}); run \`skillfleet timer install\` to point it at ${tildify(dirname(logs))}`,
     };
+  // A timer whose node is gone fails before it writes a line to its log: launchd says exit 78.
+  const problem = launcherProblem();
+  if (problem) return { name, ok: false, detail: problem };
   const failed = status.lastExitCode !== undefined && status.lastExitCode !== 0;
   return {
     name,

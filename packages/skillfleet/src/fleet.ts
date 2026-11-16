@@ -26,12 +26,22 @@ const NOTE = "skillfleet-fleet:";
 const HOST_NOTES = {
   "never-synced": undefined,
   "not-installed": "skillfleet is not installed there; run `npx skillfleet init <manifest>` on it",
+  "node-gone":
+    "skillfleet is installed there, but the node its launcher and timer run is gone, as after a Node.js upgrade; run `npx skillfleet@latest timer install` on it",
   "no-node":
     "skillfleet is not installed there, and node is not on the PATH ssh commands get; install Node.js 22.12 or newer, then run `npx skillfleet init <manifest>` on it",
 } as const;
 
 /** Finds skillfleet on the host: the installed launcher, else a `skillfleet` on PATH. */
 const FIND = `f=${STATE}/bin/skillfleet; [ -x "$f" ] || f=$(command -v skillfleet) || f=`;
+/**
+ * The node the installed launcher runs, in `n` when it is still there. ssh runs commands in a
+ * non-interactive shell, without what ~/.zprofile or ~/.bashrc add to PATH (on macOS PATH is
+ * /usr/bin:/bin:/usr/sbin:/sbin), so the launcher's node is the one to trust. The launcher's line is
+ * `exec "<node>" "<cli>" "$@"`, with `\`, `"`, `$` and a backtick escaped by a backslash. A node
+ * the launcher names that is gone, as after a Node.js upgrade, is in `g`.
+ */
+const LAUNCHER_NODE = `l=${STATE}/bin/skillfleet; n=; g=; if [ -f "$l" ]; then n=$(sed -n 's/^exec "\\([^"]*\\)" .*/\\1/p' "$l" | sed 's/\\\\\\(.\\)/\\1/g'); if [ -n "$n" ] && [ ! -x "$n" ]; then g=$n; n=; fi; fi`;
 /** Prints why there is no skillfleet to run. */
 const MISSING = `if command -v node >/dev/null 2>&1; then echo "${NOTE} not-installed"; else echo "${NOTE} no-node"; fi`;
 
@@ -41,9 +51,10 @@ export function remoteScript(action: FleetAction, version: string): string {
     case "status":
       return `r=${STATE}/last-run.json; if [ -f "$r" ]; then cat "$r"; else ${FIND}; if [ -n "$f" ]; then echo "${NOTE} never-synced"; else ${MISSING}; fi; fi`;
     case "sync":
-      return `${FIND}; if [ -n "$f" ]; then "$f" sync --json; else ${MISSING}; fi`;
+      return `${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then "$f" sync --json; else ${MISSING}; fi`;
     case "upgrade":
-      return `if command -v npx >/dev/null 2>&1; then npx -y skillfleet@${version} self-install && ${STATE}/bin/skillfleet sync --json; else echo "${NOTE} no-node"; fi`;
+      // npx next to the launcher's node, with that node first on PATH for npx's own `#!/usr/bin/env node`.
+      return `${LAUNCHER_NODE}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install && "$l" sync --json; else echo "${NOTE} no-node"; fi`;
     default: {
       const exhaustive: never = action;
       return exhaustive;
@@ -295,15 +306,12 @@ export async function tailscalePeers(): Promise<TailscalePeer[]> {
   if (run.code !== 0) return [];
   const parsed: unknown = JSON.parse(run.stdout);
   if (!isRecord(parsed) || !isRecord(parsed.Peer)) return [];
-  return Object.values(parsed.Peer).flatMap((peer) =>
-    isRecord(peer) && typeof peer.HostName === "string"
-      ? [
-          {
-            host: peer.HostName,
-            dns: typeof peer.DNSName === "string" ? peer.DNSName.replace(/\.$/, "") : "",
-            online: peer.Online === true,
-          },
-        ]
-      : [],
-  );
+  // HostName is the machine's own name, which can have spaces ("Maxi's MacBook Pro"); the first
+  // label of its MagicDNS name is the one ssh and `fleet add` take.
+  return Object.values(parsed.Peer).flatMap((peer) => {
+    if (!isRecord(peer)) return [];
+    const dns = typeof peer.DNSName === "string" ? peer.DNSName.replace(/\.$/, "") : "";
+    const host = dns.split(".")[0] || (typeof peer.HostName === "string" ? peer.HostName : "");
+    return host && !hostProblem(host) ? [{ host, dns, online: peer.Online === true }] : [];
+  });
 }

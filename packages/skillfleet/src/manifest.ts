@@ -5,6 +5,7 @@ import { isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
 import { registryUrl, urlOrigin } from "./npm.ts";
 import { expandPath, paths } from "./paths.ts";
+import { cronProblem, timeZoneProblem } from "./timer.ts";
 
 export type UpdateMode = "auto" | "review";
 
@@ -311,9 +312,11 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
   if (raw.timer !== undefined) {
     if (!isRecord(raw.timer)) fail(file, "timer", "must be an object");
     timer.cron = optionalString(file, "timer.cron", raw.timer.cron) ?? timer.cron;
-    if (timer.cron.trim().split(/\s+/).length !== 5)
-      fail(file, "timer.cron", "must have five fields");
+    const cron = cronProblem(timer.cron);
+    if (cron) fail(file, "timer.cron", cron);
     timer.timeZone = optionalString(file, "timer.timeZone", raw.timer.timeZone);
+    const zone = timer.timeZone === undefined ? undefined : timeZoneProblem(timer.timeZone);
+    if (zone) fail(file, "timer.timeZone", zone);
   }
   return {
     file,

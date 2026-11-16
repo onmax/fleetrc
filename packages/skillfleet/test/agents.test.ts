@@ -197,7 +197,7 @@ describe("agents", () => {
     const saved = process.env[key];
     process.env[key] = "/somewhere/else";
     try {
-      expect(timerEnv(undefined)[key]).toBe("/somewhere/else");
+      expect(timerEnv(undefined, process.execPath)[key]).toBe("/somewhere/else");
     } finally {
       if (saved === undefined) delete process.env[key];
       else process.env[key] = saved;

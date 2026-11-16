@@ -56,6 +56,7 @@
   "devDependencies": {
     "@types/node": "^26.6.6",
     "@vite-hub/schedule": "https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@c741ba2",
+    "cron-schedule": "^6.0.0",
     "publint": "^0.3.25",
     "skills": "^1.9.0",
     "tsrs": "0.20.1-ts7.1.0-beta",
