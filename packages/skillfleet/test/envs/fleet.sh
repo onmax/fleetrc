@@ -1,0 +1,143 @@
+#!/bin/sh
+# `skillfleet fleet` over real SSH, against sshd containers with key-only auth and a throwaway key.
+#
+#   sh test/envs/fleet.sh <tarball>
+#
+# Hosts (published on 127.0.0.1, rootless Docker):
+#   sf-u2-h-ok      port 22221  skillfleet installed (init + self-install) as user `fleet`
+#   sf-u2-h-bare    port 22222  node and git, no skillfleet
+#   sf-u2-h-nonode  port 22223  no node at all
+#   127.0.0.1:22229             nothing listening
+#   10.255.255.1                a blackhole, for --timeout
+# The controller is a throwaway HOME on this machine. ssh reads ~/.ssh from the passwd entry, not
+# $HOME, so the controller goes through SKILLFLEET_SSH, a wrapper that passes `-F` with its own
+# config and known_hosts. A second controller runs in a container with plain `ssh` and ~/.ssh.
+set -u
+here="$(cd "$(dirname "$0")" && pwd)"
+tgz="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+cli="$(cd "$here/../.." && pwd)/dist/cli.mjs"
+T="${SF_FLEET_DIR:-$(mktemp -d /tmp/sf-fleet.XXXXXX)}"
+mkdir -p "$T"
+net=sf-u2-net
+
+docker build -q -t sf-u2-sshd -f "$here/docker/sshd.Dockerfile" "$here/docker" >/dev/null
+docker image inspect sf-u2-alpine22 >/dev/null 2>&1 || docker build -q -t sf-u2-alpine22 -f "$here/docker/alpine22.Dockerfile" "$here/docker" >/dev/null
+docker network inspect "$net" >/dev/null 2>&1 || docker network create "$net" >/dev/null
+
+rm -f "$T/key" "$T/key.pub"
+ssh-keygen -q -t ed25519 -N '' -C sf-u2-throwaway -f "$T/key"
+
+host() { # host <name> <port>
+  docker rm -f "$1" >/dev/null 2>&1
+  docker run -d --name "$1" --hostname "$1" --network "$net" -p "127.0.0.1:$2:22" \
+    -v "$tgz:/pkg/skillfleet.tgz:ro" sf-u2-sshd >/dev/null
+  docker cp "$T/key.pub" "$1:/home/fleet/.ssh/authorized_keys"
+  docker exec "$1" sh -c 'chown fleet /home/fleet/.ssh/authorized_keys && chmod 600 /home/fleet/.ssh/authorized_keys'
+}
+host sf-u2-h-ok 22221
+host sf-u2-h-bare 22222
+host sf-u2-h-nonode 22223
+docker exec sf-u2-h-nonode sh -c 'rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack'
+
+# The installed host: its own manifest with one local skill, then init and the launcher.
+docker exec -u fleet sf-u2-h-ok sh -c '
+set -e
+cd ~ && mkdir -p .claude skills/host-skill
+printf -- "---\nname: host-skill\ndescription: d\n---\n" > skills/host-skill/SKILL.md
+echo "{\"sources\":[{\"id\":\"host\",\"local\":\"$HOME/skills\"}]}" > skills.json
+npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/skills.json --no-timer >/dev/null
+npx -y --package /pkg/skillfleet.tgz -- skillfleet self-install'
+
+# Wait for sshd.
+for port in 22221 22222 22223; do
+  i=0
+  until ssh-keyscan -p "$port" 127.0.0.1 >/dev/null 2>&1 || [ $i -gt 20 ]; do i=$((i + 1)); sleep 0.5; done
+done
+
+# --- the controller on this machine --------------------------------------------------------------
+H="$T/home"
+rm -rf "$H"
+mkdir -p "$H/.claude" "$H/l/c-skill"
+printf -- '---\nname: c-skill\ndescription: d\n---\n' >"$H/l/c-skill/SKILL.md"
+: >"$T/known_hosts"
+for port in 22221 22222 22223; do ssh-keyscan -p "$port" 127.0.0.1 2>/dev/null >>"$T/known_hosts"; done
+cat >"$T/ssh_config" <<EOF
+Host alias-ok
+  HostName 127.0.0.1
+  Port 22221
+  User fleet
+Host alias-unknown-key
+  HostName 127.0.0.1
+  Port 22221
+  User fleet
+  UserKnownHostsFile $T/known_hosts.empty
+Host *
+  IdentityFile $T/key
+  IdentitiesOnly yes
+  UserKnownHostsFile $T/known_hosts
+  GlobalKnownHostsFile /dev/null
+EOF
+: >"$T/known_hosts.empty"
+cat >"$T/ssh" <<EOF
+#!/bin/sh
+exec ssh -F "$T/ssh_config" "\$@"
+EOF
+chmod +x "$T/ssh"
+
+cat >"$H/skills.json" <<EOF
+{ "sources": [{ "id": "l", "local": "$H/l" }],
+  "fleet": ["ssh://fleet@127.0.0.1:22221", "ssh://fleet@127.0.0.1:22222", "ssh://fleet@127.0.0.1:22223"] }
+EOF
+sf() { env -i PATH="$PATH" HOME="$H" SKILLFLEET_SSH="$T/ssh" DO_NOT_TRACK=1 node "$cli" "$@"; }
+sf init "$H/skills.json" --no-timer >/dev/null
+
+echo "--- 1. fleet status, ssh:// URLs with ports (ok, no skillfleet, no node)"
+sf fleet status --timeout 10
+echo "exit $?"
+echo "--- 2. fleet sync, same hosts"
+sf fleet sync --timeout 60
+echo "exit $?"
+echo "--- 3. user@host:port, the way scp writes it"
+sf fleet status "fleet@127.0.0.1:22221" --timeout 10
+echo "exit $?"
+echo "--- 4. an ssh_config alias"
+sf fleet sync alias-ok --timeout 30
+echo "exit $?"
+echo "--- 5. unknown host key"
+sf fleet status alias-unknown-key --timeout 10
+echo "exit $?"
+echo "--- 6. nothing listening, and a blackhole with --timeout 3"
+sf fleet status "ssh://fleet@127.0.0.1:22229" "fleet@10.255.255.1" --timeout 3
+echo "exit $?"
+echo "--- 7. two hosts, one failing, --json"
+sf fleet sync alias-ok "ssh://fleet@127.0.0.1:22223" --timeout 30 --json
+echo "exit $?"
+echo "--- 8. fleet upgrade on the installed host"
+sf fleet upgrade alias-ok --timeout 60
+echo "exit $?"
+echo "--- 9. fleet add with a port"
+sf fleet add "fleet@127.0.0.1:22221"
+echo "exit $?"
+grep -A4 '"fleet"' "$H/skills.json"
+
+# --- a controller in a container with plain ssh ---------------------------------------------------
+echo "--- 10. container controller, plain ssh, ~/.ssh/config with Port"
+docker rm -f sf-u2-ctl >/dev/null 2>&1
+docker run --rm --name sf-u2-ctl --network "$net" -v "$tgz:/pkg/skillfleet.tgz:ro" \
+  -e "KEY=$(cat "$T/key")" sf-u2-alpine22 sh -c '
+set -e
+mkdir -p ~/.ssh ~/.claude ~/l/c && printf "%s\n" "$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+printf "Host okhost\n  HostName sf-u2-h-ok\n  Port 22\n  User fleet\n" > ~/.ssh/config
+ssh-keyscan sf-u2-h-ok sf-u2-h-bare 2>/dev/null > ~/.ssh/known_hosts
+printf -- "---\nname: c\ndescription: d\n---\n" > ~/l/c/SKILL.md
+echo "{\"sources\":[{\"local\":\"$HOME/l\"}],\"fleet\":[\"okhost\",\"fleet@sf-u2-h-bare\"]}" > ~/m.json
+npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/m.json --no-timer >/dev/null
+set +e
+npx -y --package /pkg/skillfleet.tgz -- skillfleet fleet sync --timeout 60; echo "exit $?"
+npx -y --package /pkg/skillfleet.tgz -- skillfleet fleet status; echo "exit $?"'
+
+if [ -z "${SF_KEEP:-}" ]; then
+  docker rm -f sf-u2-h-ok sf-u2-h-bare sf-u2-h-nonode >/dev/null
+  docker network rm "$net" >/dev/null
+  rm -rf "$T"
+fi
