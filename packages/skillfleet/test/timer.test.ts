@@ -1,4 +1,4 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { isWindows, machine, read, remote, skills, version } from "./fixture.ts";
@@ -22,6 +22,8 @@ describe("timer", () => {
       timer: { cron: "*/15 * * * *", timeZone: "Europe/Madrid" },
     });
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    // init installs the copy even without the timer, so `skillfleet` runs from a new shell.
+    rmSync(join(m.stateDir, "app"), { recursive: true });
     const dry = await m.run("timer", "install", "--dry-run");
     const app = join(m.stateDir, "app", "cli.mjs");
     expect(dry.code, dry.stderr).toBe(0);
