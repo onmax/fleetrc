@@ -1,7 +1,6 @@
 import {
   accessSync,
   constants,
-  cpSync,
   chmodSync,
   mkdirSync,
   readlinkSync,
@@ -13,7 +12,7 @@ import {
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hashDir, lstat, sameTree } from "./fs.ts";
+import { copyDir, hashDir, lstat, sameTree } from "./fs.ts";
 import { paths, tildify } from "./paths.ts";
 
 /** The launcher the timer and `fleet` run: an absolute node path and skillfleet's own copy. */
@@ -57,11 +56,8 @@ export function selfInstall(): { cli: string; launcher: string; node: string } {
   // An unchanged copy stays as it is: the timer may be running it right now.
   if (dist !== app && !sameTree(hashDir(dist), hashDir(app))) {
     const temp = `${app}.${process.pid}.tmp`;
-    rmSync(temp, { recursive: true, force: true });
-    cpSync(dist, temp, { recursive: true });
-    rmSync(app, { recursive: true, force: true });
-    mkdirSync(dirname(app), { recursive: true });
-    cpSync(temp, app, { recursive: true });
+    copyDir(dist, temp);
+    copyDir(temp, app);
     rmSync(temp, { recursive: true, force: true });
   }
   mkdirSync(paths.bin(), { recursive: true });

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import {
-  cpSync,
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -10,6 +10,7 @@ import {
   renameSync,
   rmSync,
   type Stats,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
@@ -47,10 +48,23 @@ export function changedFiles(before: Hashes, after: Hashes): string[] {
 export const sameTree = (a: Hashes, b: Hashes) => changedFiles(a, b).length === 0;
 
 /** Replaces `to` with a copy of `from`. */
+/**
+ * Copies a file or folder tree; a link is copied as a link with the same target. Not cpSync: on
+ * Windows, Node 22's cpSync fails for a path with non-ASCII characters, such as a HOME named José.
+ */
+function copyTree(from: string, to: string) {
+  const stat = lstatSync(from);
+  if (stat.isSymbolicLink()) symlinkSync(readlinkSync(from), to);
+  else if (stat.isDirectory()) {
+    mkdirSync(to, { recursive: true });
+    for (const name of readdirSync(from)) copyTree(join(from, name), join(to, name));
+  } else copyFileSync(from, to);
+}
+
 export function copyDir(from: string, to: string) {
   rmSync(to, { recursive: true, force: true });
   mkdirSync(dirname(to), { recursive: true });
-  cpSync(from, to, { recursive: true, verbatimSymlinks: true });
+  copyTree(from, to);
 }
 
 /** Moves a directory, copying when it crosses file systems. */
@@ -60,7 +74,7 @@ export function moveDir(from: string, to: string) {
     renameSync(from, to);
   } catch (error) {
     if (!isErrno(error, "EXDEV")) throw error;
-    cpSync(from, to, { recursive: true, verbatimSymlinks: true });
+    copyTree(from, to);
     rmSync(from, { recursive: true, force: true });
   }
 }
