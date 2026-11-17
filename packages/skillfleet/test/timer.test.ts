@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { timeZoneDrift } from "../src/doctor.ts";
-import { launchers, stableNode } from "../src/selfinstall.ts";
+import { stableNode } from "../src/selfinstall.ts";
 import { commandNode, systemdMissing } from "../src/timer.ts";
 import { isWindows, type Machine, machine, read, remote, skills, version } from "./fixture.ts";
 
