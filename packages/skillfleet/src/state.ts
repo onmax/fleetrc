@@ -59,6 +59,11 @@ export interface State {
   timerNotice?: string;
   /** Skills `merge` left conflict markers in, until `merge` runs again after they are resolved. */
   conflicts?: Record<string, MergeConflict>;
+  /**
+   * Changes (`<source>:<file>`) a sync recorded whose hooks have not run yet: a sync stopped before
+   * its hooks leaves them for the next one.
+   */
+  hooksDue?: string[];
 }
 
 /** A merge that left conflicts in a skill's copy in use, as git leaves them in a working tree. */
@@ -112,6 +117,9 @@ export function loadState(warnings?: string[]): State {
     ...(typeof raw.lastChange === "string" ? { lastChange: raw.lastChange } : {}),
     ...(typeof raw.timerNotice === "string" ? { timerNotice: raw.timerNotice } : {}),
     ...(isRecord(raw.conflicts) ? { conflicts: records(raw.conflicts, conflictRecord) } : {}),
+    ...(Array.isArray(raw.hooksDue)
+      ? { hooksDue: raw.hooksDue.filter((due): due is string => typeof due === "string") }
+      : {}),
   };
 }
 

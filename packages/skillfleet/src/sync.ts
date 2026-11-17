@@ -560,15 +560,22 @@ function carryOver(report: Report, only: string) {
   }
 }
 
-/** Runs each hook whose `on` patterns match a changed `<source>:<file>`; the report JSON goes to stdin. */
+/** Each `<source>:<file>` a result changed. */
+const changesOf = (result: SourceResult) => result.changed.map((file) => `${result.id}:${file}`);
+
+/**
+ * Runs each hook whose `on` patterns match a changed `<source>:<file>` (a source id has no `:`);
+ * the report JSON goes to stdin.
+ */
 async function runHooks(
   loaded: LoadedManifest,
-  results: SourceResult[],
+  due: readonly string[],
   report: Report,
 ): Promise<HookRun[]> {
-  const changed = results.flatMap((result) =>
-    result.changed.map((file) => ({ source: result.id, file })),
-  );
+  const changed = due.map((change) => {
+    const at = change.indexOf(":");
+    return { source: change.slice(0, at), file: change.slice(at + 1) };
+  });
   const runs: HookRun[] = [];
   for (const hook of loaded.root.hooks) {
     const matched = changed
@@ -758,8 +765,14 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         results.push({ ...failedResult(source, errorText(error)), skills: lastLinked(source.id) });
       }
       // Saved as each source is done: a sync stopped later (its time limit, a kill) leaves no copy
-      // in the store at a version state.json does not record.
-      if (!dryRun) stateFile.save();
+      // in the store at a version state.json does not record. Its changes stay due to the hooks
+      // until they run, so a sync stopped first leaves them to the next.
+      if (!dryRun) {
+        const changes = changesOf(results.at(-1)!);
+        if (loaded.root.hooks.length > 0 && changes.length > 0)
+          state.hooksDue = [...new Set([...(state.hooksDue ?? []), ...changes])];
+        stateFile.save();
+      }
     }
 
     // Sources in the state that the manifest no longer declares.
@@ -958,7 +971,12 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     }
     if (!dryRun) {
       doing = "running hooks";
-      report.hooks = await runHooks(loaded, results, report);
+      report.hooks = await runHooks(
+        loaded,
+        [...new Set([...(state.hooksDue ?? []), ...results.flatMap(changesOf)])],
+        report,
+      );
+      delete state.hooksDue;
       for (const hook of report.hooks)
         if (hook.code !== 0) report.errors.push(`hook ${hook.name} exited with ${hook.code}`);
       if (recordSkills(state, winners, results, startedAt)) state.lastChange = startedAt;
