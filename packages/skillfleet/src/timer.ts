@@ -175,7 +175,7 @@ export function systemdMissing(
 /** What to say on a Linux machine with no systemd user manager, with a crontab line that does the timer's job. */
 export function noSystemdMessage(cron = "*/30 * * * *"): string {
   const log = join(stateDir(), "logs", `${TIMER_NAME}.log`);
-  return `this machine has no systemd user manager (a container, WSL1, or a system that boots without systemd), so skillfleet can't install a timer here. Run \`skillfleet sync\` from cron instead (\`crontab -e\`, then a line such as: ${cron} ${shQuote(launcherPath())} sync >> ${shQuote(log)} 2>&1), and init with --no-timer`;
+  return `this machine has no systemd user manager (a container, WSL1, or a system that boots without systemd), so skillfleet can't install a timer here. Run \`skillfleet sync\` from cron instead (\`crontab -e\`, then a line such as: ${cron} ${shQuote(launcherPath())} sync >> ${shQuote(log)} 2>&1), and pass --no-timer to init`;
 }
 
 /** A `systemctl` failure that means systemd itself is missing, not that one call went wrong. */

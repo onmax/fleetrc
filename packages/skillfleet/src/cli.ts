@@ -840,7 +840,12 @@ async function fleetCommand(action: string | undefined) {
   const results = await fleet(hosts, action satisfies FleetAction, version, timeout, { dryRun });
   if (json) emit(results);
   else say(formatFleet(results));
-  return results.every((result) => result.reachable && !result.error) ? 0 : 1;
+  // A sync that ran with errors on a host fails here as it does there.
+  const failed = (result: (typeof results)[number]) =>
+    !result.reachable ||
+    result.error !== undefined ||
+    (action !== "status" && result.lastRun?.ok === false);
+  return results.some(failed) ? 1 : 0;
 }
 
 async function main(): Promise<number> {

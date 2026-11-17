@@ -135,4 +135,30 @@ describe("fleet", () => {
       expect(run.stdout.trim(), run.stderr).toBe("skillfleet-fleet: node-gone");
     },
   );
+
+  it.skipIf(isWindows)(
+    "R2-2. fleet sync reads a host whose sync failed for one source as synced with errors, and exits 1",
+    async () => {
+      const m = machine();
+      const vendor = remote(m, "vendor", skills("skills/", "tool"));
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          { id: "vendor", git: vendor.url },
+          { id: "gone", local: join(m.root, "gone") },
+        ],
+        fleet: ["localhost"],
+      });
+      await m.run("init", manifest, "--no-timer");
+      expect((await m.run("self-install")).code).toBe(0);
+      const env = sshShim(m);
+      const sync = await m.runWith({ env }, "fleet", "sync");
+      expect(sync.stdout).toMatch(/^localhost: last run \d+s ago, 1 skills, with errors$/m);
+      expect(sync.code).toBe(1);
+      // status shows the last run as it was; it did not fail now.
+      const status = await m.runWith({ env }, "fleet", "status");
+      expect(status.stdout).toMatch(/^localhost: last run .*, with errors$/m);
+      expect(status.code).toBe(0);
+    },
+  );
 });

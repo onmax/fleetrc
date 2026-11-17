@@ -91,39 +91,57 @@ EOF
 sf() { env -i PATH="$PATH" HOME="$H" SKILLFLEET_SSH="$T/ssh" DO_NOT_TRACK=1 node "$cli" "$@"; }
 sf init "$H/skills.json" --no-timer >/dev/null
 
-echo "--- 1. fleet status, ssh:// URLs with ports (ok, no skillfleet, no node)"
-sf fleet status --timeout 10
-echo "exit $?"
-echo "--- 2. fleet sync, same hosts"
-sf fleet sync --timeout 60
-echo "exit $?"
-echo "--- 3. user@host:port, the way scp writes it"
-sf fleet status "fleet@127.0.0.1:22221" --timeout 10
-echo "exit $?"
-echo "--- 4. an ssh_config alias"
-sf fleet sync alias-ok --timeout 30
-echo "exit $?"
-echo "--- 5. unknown host key"
-sf fleet status alias-unknown-key --timeout 10
-echo "exit $?"
-echo "--- 6. nothing listening, and a blackhole with --timeout 3"
-sf fleet status "ssh://fleet@127.0.0.1:22229" "fleet@10.255.255.1" --timeout 3
-echo "exit $?"
-echo "--- 7. two hosts, one failing, --json"
-sf fleet sync alias-ok "ssh://fleet@127.0.0.1:22223" --timeout 30 --json
-echo "exit $?"
-echo "--- 8. fleet upgrade on the installed host"
-sf fleet upgrade alias-ok --timeout 60
-echo "exit $?"
-echo "--- 9. fleet add with a port"
-sf fleet add "fleet@127.0.0.1:22221"
-echo "exit $?"
+pass=0
+fail=0
+# step <name> <grep pattern>... : runs the command in $cmd, prints its output, and passes when the
+# exit code is $want and every pattern is in the output.
+step() {
+  name="$1"
+  shift
+  echo "--- $name"
+  out="$(eval "$cmd" 2>&1)"
+  code=$?
+  printf '%s\nexit %s\n' "$out" "$code"
+  missing=""
+  for pattern in "$@"; do printf '%s' "$out" | grep -q -- "$pattern" || missing="$missing [$pattern]"; done
+  if [ "$code" = "$want" ] && [ -z "$missing" ]; then pass=$((pass + 1)); echo "PASS $name"; else
+    fail=$((fail + 1))
+    echo "FAIL $name: exit $code (want $want)${missing:+, missing$missing}"
+  fi
+}
+
+want=1 cmd='sf fleet status --timeout 10'
+step "1. fleet status, ssh:// URLs with ports (ok, no skillfleet, no node)" \
+  "22221: last run" "22222: skillfleet is not installed there" "22223: skillfleet is not installed there, and node is not on the PATH"
+want=1 cmd='sf fleet sync --timeout 60'
+step "2. fleet sync, same hosts" "22221: last run" "22222: skillfleet is not installed there" "22223: .*node is not on the PATH"
+want=1 cmd='sf fleet status "fleet@127.0.0.1:22221" --timeout 10'
+step "3. user@host:port, the way scp writes it" "has a port; write it as ssh://fleet@127.0.0.1:22221"
+want=0 cmd='sf fleet sync alias-ok --timeout 30'
+step "4. an ssh_config alias" "alias-ok: last run"
+want=1 cmd='sf fleet status alias-unknown-key --timeout 10'
+step "5. unknown host key" "unreachable (Host key verification failed"
+want=1 cmd='sf fleet status "ssh://fleet@127.0.0.1:22229" "fleet@10.255.255.1" --timeout 3'
+step "6. nothing listening, and a blackhole with --timeout 3" "Connection refused" "timed out after 3s"
+want=1 cmd='sf fleet sync alias-ok "ssh://fleet@127.0.0.1:22223" --timeout 30 --json'
+step "7. two hosts, one failing, --json" '"host": "alias-ok"' '"ok": true' '"error": "skillfleet is not installed there, and node'
+want=1 cmd='sf fleet upgrade alias-ok --timeout 60'
+step "8. fleet upgrade from a development build" "development or preview build (0.0.0)"
+want=1 cmd='sf fleet add "fleet@127.0.0.1:22221"'
+step "9. fleet add with a port" "has a port; write it as ssh://fleet@127.0.0.1:22221"
 grep -A4 '"fleet"' "$H/skills.json"
 
+# A host whose sync fails for one source answers with its report: reachable, synced with errors.
+docker exec -u fleet sf-u2-h-ok sh -c 'cd ~ && echo "{\"sources\":[{\"id\":\"host\",\"local\":\"$HOME/skills\"},{\"id\":\"gone\",\"local\":\"$HOME/gone\"}]}" > skills.json'
+want=1 cmd='sf fleet sync alias-ok --timeout 30'
+step "10. a host with one failing source is reachable, with errors" "alias-ok: last run .*, 1 skills, with errors"
+want=1 cmd='sf fleet sync alias-ok --timeout 30 --json'
+step "11. the same, --json" '"reachable": true' '"ok": false' '"gone: '
+
 # --- a controller in a container with plain ssh ---------------------------------------------------
-echo "--- 10. container controller, plain ssh, ~/.ssh/config with Port"
 docker rm -f sf-u2-ctl >/dev/null 2>&1
-docker run --rm --name sf-u2-ctl --network "$net" -v "$tgz:/pkg/skillfleet.tgz:ro" \
+ctl() {
+  docker run --rm --name sf-u2-ctl --network "$net" -v "$tgz:/pkg/skillfleet.tgz:ro" \
   -e "KEY=$(cat "$T/key")" sf-u2-alpine22 sh -c '
 set -e
 mkdir -p ~/.ssh ~/.claude ~/l/c && printf "%s\n" "$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
@@ -135,9 +153,13 @@ npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/m.json --no-timer >/de
 set +e
 npx -y --package /pkg/skillfleet.tgz -- skillfleet fleet sync --timeout 60; echo "exit $?"
 npx -y --package /pkg/skillfleet.tgz -- skillfleet fleet status; echo "exit $?"'
+}
+want=0 cmd=ctl
+step "12. container controller, plain ssh, ~/.ssh/config with Port" "okhost: last run" "fleet@sf-u2-h-bare: skillfleet is not installed there"
 
 if [ -z "${SF_KEEP:-}" ]; then
   docker rm -f sf-u2-h-ok sf-u2-h-bare sf-u2-h-nonode >/dev/null
   docker network rm "$net" >/dev/null
   rm -rf "$T"
 fi
+echo "SUMMARY pass=$pass fail=$fail"

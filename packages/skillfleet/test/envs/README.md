@@ -26,10 +26,12 @@ sh test/envs/run.sh /tmp/sf/skillfleet-0.0.0.tgz alpine22 fleet
 | `systemd`          | systemd as PID 1: doctor's linger check and the timer commands                            |
 
 `scenario.sh` is the per-machine scenario: a local git manifest repository with two sources (a
-`path` clone in `~/src/my skills` and a vendored one), init, an upstream skill added, `add` of a
-third source, a local edit and an upstream change to the same skill, an edit in the clone, then
-`status`, `list`, `doctor`, `timer`, `sync --offline` and a look for an uninstall command. It runs
-outside Docker too, against a throwaway HOME:
+`path` clone in `~/src/my skills` that adopts a hand-made skill, and a vendored one), init, an
+upstream skill added, `add` refused for the remote manifest and the source added upstream instead,
+a local edit and an upstream change to the same skill, an edit in the clone, then `status`, `list`,
+`doctor`, `timer`, `sync --offline` and a look for an uninstall command. In a container without
+systemd it checks that every timer command says so. It runs outside Docker too, against a throwaway
+HOME; on a machine with systemd it passes `--no-timer` unless `SF_TIMER=1`:
 
 ```sh
 SF_TGZ=/tmp/sf/skillfleet-0.0.0.tgz SF_HOME=/tmp/sf/home sh test/envs/scenario.sh

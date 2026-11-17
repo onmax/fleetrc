@@ -6,7 +6,7 @@ import { exec, git } from "./exec.ts";
 import { lstat } from "./fs.ts";
 import { gitUrl } from "./gitcache.ts";
 import { linkTarget } from "./linker.ts";
-import { loadManifest, readConfig, type Source } from "./manifest.ts";
+import { loadManifest, readConfig, remoteManifest, type Source } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 import { installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
 import { manifestSpec } from "./sync.ts";
@@ -248,7 +248,8 @@ export async function doctor(manifest?: string): Promise<Check[]> {
   checks.push({
     name: "manifest",
     ok: true,
-    detail: `${tildify(loaded.root.file)}, ${loaded.sources.length} sources`,
+    // A remote manifest's file is a cache copy; the user knows it by the spec they gave.
+    detail: `${remoteManifest(spec) ? spec : tildify(loaded.root.file)}, ${loaded.sources.length} sources`,
   });
   const drift = timerDeclined() ? undefined : timeZoneDrift(loaded.root.timer.timeZone);
   if (drift) checks.push({ name: "timer time zone", ok: true, warn: true, detail: drift });

@@ -9,6 +9,8 @@
 #   SF_SRV      where the bare git repositories go (default: $SF_HOME/.scenario/srv)
 #   SF_RUNNER   how init is run: npx (default), pnpm-dlx or global
 #   SF_SKIP     space-separated step names to skip
+#   SF_TIMER    1 to let init install a real timer on a machine with systemd; by default the
+#               scenario passes --no-timer there, so it never leaves a timer on a host
 #
 # Every step prints `PASS <step>` or `FAIL <step>: <why>`, and the script ends with a summary line
 # `SUMMARY pass=<n> fail=<n>`. It never stops at the first failure, so one run shows every break.
@@ -100,7 +102,7 @@ if [ "$HAVE_GIT" = 1 ]; then
 {
   "agents": "all",
   "sources": [
-    { "id": "mine", "git": "$SF_SRV/mine.git", "path": "~/src/my skills", "skills": "skills/*" },
+    { "id": "mine", "git": "$SF_SRV/mine.git", "path": "~/src/my skills", "skills": "skills/*", "adopt": true },
     { "id": "team", "git": "$SF_SRV/team.git", "skills": "skills/*" }
   ]
 }
@@ -124,6 +126,11 @@ if [ "$HAVE_GIT" = 0 ]; then
 JSON
   MANIFEST="$SF_SRV/manifest/skills.json"
 fi
+# A skill the user made by hand before skillfleet: init adopts it into the clone it makes first.
+if [ "$HAVE_GIT" = 1 ]; then
+  mkdir -p "$HOME/.claude/skills/handmade"
+  skill_md handmade >"$HOME/.claude/skills/handmade/SKILL.md"
+fi
 # A folder the user made read-only, e.g. SF_RO=.gemini/skills.
 if [ -n "${SF_RO:-}" ]; then mkdir -p "$HOME/$SF_RO" && chmod 555 "$HOME/$SF_RO"; fi
 
@@ -143,25 +150,52 @@ fi
 run version init_cmd --version
 [ "$code" = 0 ] && ok "version $(head -n1 "$LOG/version.out")" || { bad version "exit $code"; show version; }
 
+# A machine booted with systemd gets a real timer from init; the scenario leaves hosts alone.
+SYSTEMD=0
+[ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1 && SYSTEMD=1
+TIMER_FLAG=""
+[ "$SYSTEMD" = 1 ] && [ "${SF_TIMER:-}" != 1 ] && TIMER_FLAG=--no-timer
 if ! skip init; then
-  run init init_cmd init "$MANIFEST"
-  if [ "$code" = 0 ]; then ok init; else bad init "exit $code"; fi
+  # shellcheck disable=SC2086
+  run init init_cmd init "$MANIFEST" $TIMER_FLAG
+  # Without git, the git source fails, so init reports a sync with errors.
+  if [ "$HAVE_GIT" = 1 ]; then want=0; else want=1; fi
+  if [ "$code" = "$want" ]; then ok "init exit $code"; else bad init "exit $code, expected $want"; fi
   show init 40
+  if [ "$SYSTEMD" = 0 ]; then
+    # No systemd user manager (a container): init says so and what to use instead.
+    if has init "no systemd user manager" && has init "crontab" && ! has init ENOENT; then ok init-no-systemd; else
+      bad init-no-systemd "init does not explain the missing systemd: $(grep -i 'timer' "$LOG/init.out" | head -n2 | tr '\n' ' ')"
+    fi
+  fi
 fi
 
-# Every agent folder skillfleet should have written.
+# Every agent folder skillfleet should have written. Gemini CLI reads ~/.agents/skills, which Codex
+# also reads, so its own folder gets no links: Gemini warns about a skill it finds in both.
 check_linked() { # check_linked <step> <skill>...
   s="$1"
   shift
   missing=""
+  twice=""
   for skill in "$@"; do
-    for dir in .claude/skills .agents/skills .gemini/skills; do
+    for dir in .claude/skills .agents/skills; do
       [ -f "$HOME/$dir/$skill/SKILL.md" ] || missing="$missing $dir/$skill"
     done
+    [ -e "$HOME/.gemini/skills/$skill" ] && twice="$twice .gemini/skills/$skill"
   done
-  [ -z "$missing" ] && ok "$s" || bad "$s" "not linked:$missing"
+  if [ -n "$missing" ]; then bad "$s" "not linked:$missing"
+  elif [ -n "$twice" ]; then bad "$s" "linked into Gemini's own folder too:$twice"
+  else ok "$s"; fi
 }
-if [ "$HAVE_GIT" = 1 ]; then check_linked init-links team-a mine-a; else
+if [ "$HAVE_GIT" = 1 ]; then
+  check_linked init-links team-a mine-a handmade
+  # handmade moved into the clone init made, and every agent sees it from there.
+  if [ -f "$HOME/src/my skills/.git/HEAD" ] && [ -f "$HOME/src/my skills/skills/handmade/SKILL.md" ] && [ -L "$HOME/.claude/skills/handmade" ]; then
+    ok init-adopt
+  else
+    bad init-adopt "handmade is not in the clone, linked: $(ls -la "$HOME/.claude/skills" 2>&1 | grep handmade)"
+  fi
+else
   check_linked init-links-local loc-a
   if grep -Eqi 'git (is not|isn.t) (installed|on PATH)|install git|needs git' "$LOG/init.out"; then ok no-git-message; else
     bad no-git-message "the git source fails without saying git is missing: $(grep -i 'team' "$LOG/init.out" | grep -iv 'link' | head -n2 | tr '\n' ' ')"
@@ -191,13 +225,30 @@ if [ "$HAVE_GIT" = 1 ]; then
   [ "$code" = 0 ] || { bad sync-upstream "exit $code"; show sync-upstream; }
   check_linked sync-upstream-links team-b
 
-  # `add` a third source; it must survive the next sync.
+  # `add` refuses to edit a copy of a remote manifest, which the next sync fetches again, and says
+  # where to make the change; made there and pushed, the source arrives with the next sync.
   run add sf add "$SF_SRV/extra.git" --skills 'skills/*'
-  [ "$code" = 0 ] || { bad add "exit $code"; show add; }
+  if [ "$code" = 1 ] && has add "push it"; then ok add-remote-refused; else
+    bad add-remote-refused "exit $code"
+    show add
+  fi
+  cat >"$SF_SRV/work/manifest/skills.json" <<EOF
+{
+  "agents": "all",
+  "sources": [
+    { "id": "mine", "git": "$SF_SRV/mine.git", "path": "~/src/my skills", "skills": "skills/*", "adopt": true },
+    { "id": "team", "git": "$SF_SRV/team.git", "skills": "skills/*" },
+    { "id": "extra", "git": "$SF_SRV/extra.git", "skills": "skills/*" }
+  ]
+}
+EOF
+  push manifest "add extra"
+  run add-sync sf sync
+  [ "$code" = 0 ] || { bad add-sync "exit $code"; show add-sync; }
   check_linked add-links extra-a
   run add-survives sf sync
   if [ -f "$HOME/.claude/skills/extra-a/SKILL.md" ]; then ok add-survives-sync; else
-    bad add-survives-sync "extra-a was unlinked by the next sync: \`add\` edited $(grep -o 'to [^ ]*' "$LOG/add.out" | head -n1)"
+    bad add-survives-sync "extra-a was unlinked by the next sync"
     show add-survives
   fi
 
@@ -237,12 +288,21 @@ show list
 run doctor sf doctor
 echo "INFO doctor exit $code"
 show doctor 20
-if grep -Eq '^(ok  |FAIL) timer' "$LOG/doctor.out"; then ok doctor-checks-timer; else bad doctor-checks-timer "doctor prints no timer check (exit $code) though no timer is installed"; fi
+if grep -Eq '^(ok  |FAIL|skip) timer' "$LOG/doctor.out"; then ok doctor-checks-timer; else bad doctor-checks-timer "doctor prints no timer check (exit $code)"; fi
 run timer-status sf timer status
 echo "INFO timer status exit $code: $(head -n1 "$LOG/timer-status.out")"
 run timer-dry sf timer install --dry-run
 echo "INFO timer install --dry-run exit $code"
 show timer-dry 6
+if [ "$SYSTEMD" = 0 ]; then
+  # Every timer command names the missing systemd, never spawn ENOENT, and the dry run promises nothing.
+  for step in status doctor timer-status timer-dry; do
+    if has "$step" "no systemd user manager" && ! has "$step" ENOENT; then ok "$step-no-systemd"; else
+      bad "$step-no-systemd" "$(grep -i -m1 'timer' "$LOG/$step.out")"
+    fi
+  done
+  if has timer-dry "would install"; then bad timer-dry-honest "the dry run says it would install a timer"; else ok timer-dry-honest; fi
+fi
 
 # --- offline -------------------------------------------------------------------------------------
 if [ "$HAVE_GIT" = 1 ]; then
