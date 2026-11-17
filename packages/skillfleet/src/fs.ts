@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import {
+  appendFileSync,
+  constants,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -15,7 +17,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 
 export type Hashes = Record<string, string>;
 
@@ -92,10 +94,19 @@ export function changedFiles(before: Hashes, after: Hashes): string[] {
 
 export const sameTree = (a: Hashes, b: Hashes) => changedFiles(a, b).length === 0;
 
-/** Replaces `to` with a copy of `from`. */
+/** Files copied by this process. With SKILLFLEET_DEBUG_COPIES, the count goes to that file at exit. */
+let copiedFiles = 0;
+export const countCopies = (files: number) => {
+  copiedFiles += files;
+};
+const copiesLog = process.env.SKILLFLEET_DEBUG_COPIES;
+if (copiesLog) process.on("exit", () => appendFileSync(copiesLog, `${copiedFiles}\n`));
+
 /**
  * Copies a file or folder tree; a link is copied as a link with the same target. Not cpSync: on
  * Windows, Node 22's cpSync fails for a path with non-ASCII characters, such as a HOME named José.
+ * A file system that can clone a file (Btrfs, XFS, APFS) shares its blocks until either side is
+ * written.
  */
 function copyTree(from: string, to: string) {
   const stat = lstatSync(from);
@@ -103,13 +114,67 @@ function copyTree(from: string, to: string) {
   else if (stat.isDirectory()) {
     mkdirSync(to, { recursive: true });
     for (const name of readdirSync(from)) copyTree(join(from, name), join(to, name));
-  } else copyFileSync(from, to);
+  } else {
+    copyFileSync(from, to, constants.COPYFILE_FICLONE);
+    copiedFiles++;
+  }
 }
 
+/** Replaces `to` with a copy of `from`. */
 export function copyDir(from: string, to: string) {
   rmSync(to, { recursive: true, force: true });
   mkdirSync(dirname(to), { recursive: true });
   copyTree(from, to);
+}
+
+const REPLACING = /^\.(.+)\.(\d+)\.(new|old)$/;
+
+/**
+ * Replaces the folder `to` with `from`, copied or, with `move`, renamed. The new tree is made
+ * beside `to` and renamed into place, so a crash leaves the old tree or the new one, never half of
+ * one; `recoverReplaced` cleans up after it.
+ */
+export function replaceDir(from: string, to: string, { move = false } = {}) {
+  const parent = dirname(to);
+  mkdirSync(parent, { recursive: true });
+  const temp = join(parent, `.${basename(to)}.${process.pid}.new`);
+  const old = join(parent, `.${basename(to)}.${process.pid}.old`);
+  rmSync(temp, { recursive: true, force: true });
+  rmSync(old, { recursive: true, force: true });
+  if (move) moveDir(from, temp);
+  else copyTree(from, temp);
+  const replaced = lstat(to) !== undefined;
+  if (replaced) renameSync(to, old);
+  renameSync(temp, to);
+  if (replaced) rmSync(old, { recursive: true, force: true });
+}
+
+/**
+ * Finishes what a killed `replaceDir` left in `dir`: a new tree that was never renamed into place
+ * is deleted, and an old tree whose replacement never arrived goes back. Folders of a process
+ * still running are left alone.
+ */
+export function recoverReplaced(dir: string) {
+  if (!existsSync(dir)) return;
+  for (const name of readdirSync(dir)) {
+    const match = REPLACING.exec(name);
+    if (!match || isRunning(Number(match[2]))) continue;
+    const path = join(dir, name);
+    const target = join(dir, match[1]!);
+    if (match[3] === "old" && lstat(target) === undefined) renameSync(path, target);
+    else rmSync(path, { recursive: true, force: true });
+  }
+}
+
+/** Whether another process with this pid runs; this process counts as not running. */
+export function isRunning(pid: number): boolean {
+  if (!(pid > 0) || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return isErrno(error, "EPERM");
+  }
 }
 
 /** Moves a directory, copying when it crosses file systems. */

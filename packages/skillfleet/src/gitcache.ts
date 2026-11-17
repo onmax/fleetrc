@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, realpathSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { UserError } from "./errors.ts";
 import { git, GitError, gitOut } from "./exec.ts";
-import { isRecord, readJsonOrNothing, sha256, writeJson } from "./fs.ts";
+import { isRecord, isRunning, readJsonOrNothing, sha256, writeJson } from "./fs.ts";
 import { nameKey } from "./names.ts";
 
 /** `owner/repo` and `github:owner/repo` become GitHub HTTPS URLs; anything else is a git URL already. */
@@ -39,6 +39,8 @@ export interface CachedClone {
   dir: string;
   commit: string;
   collisions: Collision[];
+  /** Paths of git submodules in the commit: their folders are empty, since nothing fetches them. */
+  submodules: string[];
 }
 
 /**
@@ -96,6 +98,7 @@ export async function fetchClone(
     tree: join(root, key),
     marker: join(root, `${key}.json`),
   };
+  await recoverTree(cache, root, key);
   let written = readMarker(cache.marker, cache.tree);
   if (offline) {
     if (!written) throw new UserError(`${url} has never been fetched and --offline is set`);
@@ -121,7 +124,7 @@ export async function fetchClone(
     }
     try {
       if (written?.commit === commit) return { dir: cache.tree, ...written };
-      return { dir: cache.tree, commit, collisions: await writeTree(cache, commit) };
+      return { dir: cache.tree, commit, ...(await writeTree(cache, commit)) };
     } catch (error) {
       // The fetch worked, so the cache itself is broken: start it over, once.
       if (attempt > 0 || !(error instanceof GitError) || error.result.code === null) throw error;
@@ -133,10 +136,47 @@ export async function fetchClone(
 
 function readMarker(marker: string, tree: string): Omit<CachedClone, "dir"> | undefined {
   if (!existsSync(tree)) return undefined;
+  return markedCommit(marker);
+}
+
+function markedCommit(marker: string): Omit<CachedClone, "dir"> | undefined {
   const raw = readJsonOrNothing(marker);
   if (!isRecord(raw) || typeof raw.commit !== "string" || !Array.isArray(raw.collisions))
     return undefined;
-  return { commit: raw.commit, collisions: raw.collisions as Collision[] };
+  return {
+    commit: raw.commit,
+    collisions: raw.collisions as Collision[],
+    submodules: Array.isArray(raw.submodules) ? (raw.submodules as string[]) : [],
+  };
+}
+
+/**
+ * Finishes what a killed `writeTree` left: its folders beside the tree are deleted, or the old
+ * tree goes back when it was moved aside and the new one never arrived. A tree that is missing
+ * altogether is written again from the repository, which needs no network, so `--offline` works.
+ */
+async function recoverTree(cache: CacheFiles, root: string, key: string) {
+  if (!existsSync(root)) return;
+  const pattern = new RegExp(`^${key}\\.(\\d+)\\.(tmp|old)$`);
+  let busy = false;
+  for (const name of readdirSync(root)) {
+    const match = pattern.exec(name);
+    if (!match) continue;
+    // Another process writing this tree right now finishes it itself.
+    if (isRunning(Number(match[1]))) busy = true;
+    else if (match[2] === "old" && !existsSync(cache.tree))
+      renameSync(join(root, name), cache.tree);
+    else rmSync(join(root, name), { recursive: true, force: true });
+  }
+  if (busy || existsSync(cache.tree) || !existsSync(cache.repo)) return;
+  const marked = markedCommit(cache.marker);
+  if (!marked || !(await usable(cache.repo))) return;
+  try {
+    await writeTree(cache, marked.commit);
+  } catch (error) {
+    // The commit is not in the repository after all: the next fetch writes the tree.
+    if (!(error instanceof GitError)) throw error;
+  }
 }
 
 /** Fetches `ref` and returns its commit. A ref that is no branch or tag is read as a commit. */
@@ -178,20 +218,32 @@ async function fetchCommit(url: string, ref: string | undefined, repo: string): 
   return found.stdout.trim();
 }
 
+interface CacheFiles {
+  repo: string;
+  tree: string;
+  marker: string;
+}
+
 /**
  * Writes the files of `commit` to a new folder that then replaces `cache.tree`, leaving out the
- * paths that would share a folder on macOS and Windows. Returns those.
+ * paths that would share a folder on macOS and Windows. Returns those, and the submodules.
  */
 async function writeTree(
-  cache: { repo: string; tree: string; marker: string },
+  cache: CacheFiles,
   commit: string,
-): Promise<Collision[]> {
-  const listed = await gitOut(
-    ["ls-tree", "-r", "-z", "--full-tree", "--name-only", commit],
-    cache.repo,
-  );
-  const left = collisions(listed.split("\0").filter(Boolean));
+): Promise<Pick<CachedClone, "collisions" | "submodules">> {
+  const entries = (await gitOut(["ls-tree", "-r", "-z", "--full-tree", commit], cache.repo))
+    .split("\0")
+    .filter(Boolean)
+    .map((entry) => {
+      const tab = entry.indexOf("\t");
+      return { mode: entry.slice(0, entry.indexOf(" ")), path: entry.slice(tab + 1) };
+    });
+  const listed = entries.map((entry) => entry.path);
+  const submodules = entries.filter((entry) => entry.mode === "160000").map((entry) => entry.path);
+  const left = collisions(listed);
   const temp = `${cache.tree}.${process.pid}.tmp`;
+  const old = `${cache.tree}.${process.pid}.old`;
   rmSync(temp, { recursive: true, force: true });
   mkdirSync(temp, { recursive: true });
   try {
@@ -205,22 +257,25 @@ async function writeTree(
     ];
     await git([...at, "read-tree", commit], { cwd: cache.repo });
     if (left.length > 0) {
-      const files = listed
-        .split("\0")
-        .filter((file) => left.some(({ path }) => file === path || file.startsWith(`${path}/`)));
+      const files = listed.filter((file) =>
+        left.some(({ path }) => file === path || file.startsWith(`${path}/`)),
+      );
       await git([...at, "update-index", "-z", "--force-remove", "--stdin"], {
         cwd: cache.repo,
         input: files.map((file) => `${file}\0`).join(""),
       });
     }
     await git([...at, "checkout-index", "--all", "--force"], { cwd: cache.repo });
-    rmSync(cache.tree, { recursive: true, force: true });
+    // Moved aside, not deleted, so a kill here leaves a whole tree for `recoverTree`.
+    const replaced = existsSync(cache.tree);
+    if (replaced) renameSync(cache.tree, old);
     renameSync(temp, cache.tree);
+    if (replaced) rmSync(old, { recursive: true, force: true });
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
-  writeJson(cache.marker, { commit, collisions: left });
-  return left;
+  writeJson(cache.marker, { commit, collisions: left, submodules });
+  return { collisions: left, submodules };
 }
 
 /**
