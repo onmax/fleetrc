@@ -72,8 +72,75 @@ export function loadState(warnings?: string[]): State {
       );
     return emptyState();
   }
-  // Our own file, written by saveState: the shape was checked when it was written.
-  return raw as unknown as State;
+  // An older build, or a hand edit, may have left records of another shape inside: each one is
+  // read on its own, and one that can't be read is lost, which the sync rebuilds from the store.
+  return {
+    version: 1,
+    sources: records(raw.sources, sourceRecord),
+    skills: records(raw.skills, skillRecord),
+    ...(typeof raw.lastChange === "string" ? { lastChange: raw.lastChange } : {}),
+  };
+}
+
+const KINDS: readonly string[] = [
+  "git",
+  "npm",
+  "index",
+  "clone",
+  "local",
+] satisfies Source["kind"][];
+
+/** The entries of `value` that `read` accepts, as read. */
+function records<T>(value: unknown, read: (record: unknown) => T | undefined): Record<string, T> {
+  const out: Record<string, T> = {};
+  if (!isRecord(value)) return out;
+  for (const [key, record] of Object.entries(value)) {
+    const parsed = read(record);
+    if (parsed !== undefined) out[key] = parsed;
+  }
+  return out;
+}
+
+const text = (value: unknown) => (typeof value === "string" ? value : undefined);
+
+/** Optional string fields of `record` that are strings. */
+const strings = <K extends string>(record: Record<string, unknown>, ...keys: K[]) =>
+  Object.fromEntries(keys.flatMap((key) => (text(record[key]) ? [[key, record[key]]] : []))) as {
+    [P in K]?: string;
+  };
+
+function sourceRecord(record: unknown): SourceState | undefined {
+  if (!isRecord(record) || !KINDS.includes(String(record.kind))) return undefined;
+  return {
+    kind: record.kind as Source["kind"],
+    ...strings(record, "commit", "version", "fetchedAt"),
+    skills: records(record.skills, installedCopy),
+    pending: records(record.pending, pendingUpdate),
+  };
+}
+
+function installedCopy(record: unknown): InstalledCopy | undefined {
+  if (!isRecord(record) || !isRecord(record.hashes)) return undefined;
+  const hashes = Object.entries(record.hashes);
+  if (hashes.some(([, hash]) => typeof hash !== "string")) return undefined;
+  return { hashes: Object.fromEntries(hashes) as Hashes, ...strings(record, "path") };
+}
+
+function pendingUpdate(record: unknown): PendingUpdate | undefined {
+  if (!isRecord(record) || (record.reason !== "review" && record.reason !== "edited"))
+    return undefined;
+  return { reason: record.reason, since: text(record.since) ?? new Date(0).toISOString() };
+}
+
+function skillRecord(record: unknown): SkillRecord | undefined {
+  if (!isRecord(record) || !text(record.source) || !text(record.dir)) return undefined;
+  const at = text(record.addedAt) ?? text(record.changedAt) ?? new Date(0).toISOString();
+  return {
+    source: record.source as string,
+    dir: record.dir as string,
+    addedAt: at,
+    changedAt: text(record.changedAt) ?? at,
+  };
 }
 
 function backUp(problem: string, warnings: string[]) {
