@@ -272,6 +272,14 @@ try {
   const text = skillfleet("timer", "install");
   assert.match(text.stdout, /already installed, unchanged/);
 
+  step("a dry run and doctor see the timer as installed, running the launcher's node");
+  const dry = skillfleet("timer", "install", "--dry-run");
+  assert.match(dry.stdout, /already installed, unchanged/, dry.stdout);
+  const doctor = skillfleet("doctor");
+  console.log(doctor.stdout);
+  assert.match(doctor.stdout, /^ok {3}node: /m, "doctor does not find the node the timer runs");
+  assert.doesNotMatch(doctor.stdout, /^FAIL (node|timer):/m);
+
   await waitFor("run the sync on its own", FIRST_RUN_MS, () => {
     const report = lastRun();
     return report && report.finishedAt > initRun.finishedAt;
