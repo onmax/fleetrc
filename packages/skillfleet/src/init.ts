@@ -379,7 +379,41 @@ export async function cloneBeforeAdopt(plan: InitPlan): Promise<string[]> {
   try {
     if (existsSync(clone.path)) throw new Error(`${clone.path} exists and is not a git repository`);
     await cloneAt(clone, clone.path);
-    return [`cloned ${clone.git} into ${tildify(clone.path)}`];
+    // An occupied folder is only a replacement if source discovery actually provides its name.
+    const loaded = await loadManifest(plan.manifestFile, { offline: true });
+    const report = await sync({ loaded, dryRun: true, offline: true });
+    const provided = new Set(report.skills.names);
+    const blocked = new Set<string>();
+    const messages: string[] = [];
+    plan.migrations = plan.migrations.flatMap((migration): Migration[] => {
+      if (migration.kind !== "adopt" || !lstat(migration.to)) return [migration];
+      const name = basename(migration.to);
+      if (provided.has(name))
+        return [
+          {
+            kind: "backup",
+            path: migration.path,
+            reason: `the cloned repository provides ${name}`,
+          },
+        ];
+      blocked.add(name);
+      if (!plan.kept.includes(name)) plan.kept.push(name);
+      messages.push(
+        `adoption blocked: ${tildify(migration.to)} exists but no source provides ${name}; ${tildify(migration.path)} stays where it is`,
+      );
+      return [];
+    });
+    // Other agent copies were to be backed up only because this adoption would preserve the name.
+    plan.migrations = plan.migrations.filter(
+      (migration) =>
+        !(
+          migration.kind === "backup" &&
+          migration.reason.includes(ADOPTED_ELSEWHERE) &&
+          blocked.has(basename(migration.path))
+        ),
+    );
+    plan.warnings.push(...messages);
+    return [`cloned ${clone.git} into ${tildify(clone.path)}`, ...messages];
   } catch (error) {
     const stay = plan.migrations.flatMap((migration) =>
       migration.kind === "adopt" ? [tildify(migration.path)] : [],
