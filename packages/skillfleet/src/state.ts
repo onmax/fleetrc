@@ -55,6 +55,18 @@ export interface State {
   forks?: Record<string, ForkState>;
   /** Last time any linked skill was added, removed or changed. */
   lastChange?: string;
+  /** The manifest's timer schedule a sync last said differs from the installed timer's. */
+  timerNotice?: string;
+  /** Skills `merge` left conflict markers in, until `merge` runs again after they are resolved. */
+  conflicts?: Record<string, MergeConflict>;
+}
+
+/** A merge that left conflicts in a skill's copy in use, as git leaves them in a working tree. */
+export interface MergeConflict {
+  /** The copy agents use, which holds the markers. */
+  dir: string;
+  /** Files with conflicts, `/`-separated, relative to `dir`. */
+  files: string[];
 }
 
 export const emptyState = (): State => ({ version: 1, sources: dict(), skills: dict() });
@@ -93,6 +105,8 @@ export function loadState(warnings?: string[]): State {
     skills: records(raw.skills, skillRecord),
     ...(isRecord(raw.forks) ? { forks: records(raw.forks, forkRecord) } : {}),
     ...(typeof raw.lastChange === "string" ? { lastChange: raw.lastChange } : {}),
+    ...(typeof raw.timerNotice === "string" ? { timerNotice: raw.timerNotice } : {}),
+    ...(isRecord(raw.conflicts) ? { conflicts: records(raw.conflicts, conflictRecord) } : {}),
   };
 }
 
@@ -156,6 +170,14 @@ function forkRecord(record: unknown): ForkState | undefined {
     upstream: record.upstream as string,
     tree: text(record.tree) ?? "",
     files,
+  };
+}
+
+function conflictRecord(record: unknown): MergeConflict | undefined {
+  if (!isRecord(record) || !text(record.dir) || !Array.isArray(record.files)) return undefined;
+  return {
+    dir: record.dir as string,
+    files: record.files.filter((file): file is string => typeof file === "string"),
   };
 }
 

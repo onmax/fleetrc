@@ -11,9 +11,35 @@
       "description": "This schema, for editors: https://unpkg.com/skillfleet/schema.json"
     },
     "extends": {
-      "description": "Team manifests, as paths or <repo>//<file> such as github:org/agents//skills.json. They add sources only; their hooks, fleet, hub and report are ignored.",
+      "description": "Team manifests, as paths or <repo>//<file> such as github:org/agents//skills.json. They add sources only; their hooks, fleet, hub and report are ignored. An entry may be an object that leaves some of the team's skills or sources out; `skillfleet remove` writes it.",
       "type": "array",
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "oneOf": [
+          { "type": "string", "minLength": 1 },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["manifest"],
+            "properties": {
+              "manifest": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The team manifest, as a path or <repo>//<file>."
+              },
+              "exclude": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Skill names left out of every source the team manifest (and what it extends) declares."
+              },
+              "excludeSources": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Source ids of the team manifest left out."
+              }
+            }
+          }
+        ]
+      }
     },
     "agents": {
       "description": "\"all\" for every agent installed on the machine (one whose folder is in your home, such as ~/.claude for Claude Code), or agent ids from the skills package (claude-code, codex, gemini-cli, opencode, cursor, github-copilot, ...). `skillfleet agents` lists the ids.",

@@ -189,6 +189,20 @@ async function diffDirs(name: string, from: Side, to: Side): Promise<string> {
   }
 }
 
+/**
+ * Throws for a fork of an index or npm source, which an older skillfleet recorded: they have no
+ * history to compare with.
+ */
+function gitFork(loaded: LoadedManifest, name: string, fork: Fork) {
+  if (
+    fork.from.startsWith("npm:") ||
+    loaded.sources.some((source) => source.kind === "index" && source.index === fork.from)
+  )
+    throw new UserError(
+      `${name} was forked from ${fork.from}, which is not a git repository, so skillfleet has no upstream version to compare with; compare by hand, or fork it again from a git source`,
+    );
+}
+
 /** The fork's folder in its upstream repository, which must not lead out of the repository. */
 async function forkUpstream(fork: { from: string; path: string }, ref?: string) {
   const clone = await fetchClone(gitUrl(fork.from), ref, join(paths.cache(), "forks"));
@@ -267,6 +281,36 @@ export function forkLines(state: State): string[] {
     );
 }
 
+/**
+ * The files of a merge's conflicts that are not resolved yet: they still hold git's markers, or
+ * upstream's side still sits beside them as `<file>.upstream`.
+ */
+export function unresolvedFiles(conflict: { dir: string; files: readonly string[] }): string[] {
+  return conflict.files.filter((file) => {
+    const path = join(conflict.dir, file);
+    if (lstat(`${path}.upstream`)) return true;
+    try {
+      if (!lstat(path)?.isFile()) return false;
+      const text = readFileSync(path, "utf8");
+      return /^<<<<<<< local\r?$/m.test(text) && /^>>>>>>> upstream\r?$/m.test(text);
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** What `status` and a sync say of each skill a merge left conflicts in. */
+export function conflictLines(state: State): string[] {
+  return Object.entries(state.conflicts ?? {}).flatMap(([name, conflict]) => {
+    const files = unresolvedFiles(conflict);
+    return files.length === 0
+      ? []
+      : [
+          `${name}: unresolved merge conflicts in ${files.join(", ")} (${tildify(conflict.dir)}); resolve them, then run \`skillfleet merge ${name}\``,
+        ];
+  });
+}
+
 /** A vendored skill's pending update against the copy in use, or else its local edits. */
 function diffVendored(state: State, source: Source, name: string): Promise<string> {
   const store = storePaths(paths.store(source.id), name);
@@ -285,8 +329,9 @@ function diffVendored(state: State, source: Source, name: string): Promise<strin
 
 /** `skillfleet diff <skill>`: local edits against upstream, or a pending update against what is installed. */
 export async function diffSkill(spec: string, typed: string): Promise<string> {
-  const { state, source, name, fork } = await locate(spec, typed);
+  const { loaded, state, source, name, fork } = await locate(spec, typed);
   if (fork) {
+    gitFork(loaded, name, fork.fork);
     const upstream = await forkUpstream(fork.fork);
     const local = state.skills[name]!.dir;
     return diffDirs(name, { dir: upstream.dir, label: "upstream" }, { dir: local, label: "local" });
@@ -325,6 +370,8 @@ export async function diffPending(spec: string): Promise<string> {
 interface MergeResult {
   merged: string[];
   conflicts: string[];
+  /** The conflicts an earlier merge left were resolved, and this merge recorded that. */
+  resolved?: boolean;
 }
 
 /** A file in one tree of a merge: its bytes, or the target of a link, which merge never follows. */
@@ -459,7 +506,31 @@ export async function mergeSkill(
   { dryRun = false } = {},
 ): Promise<MergeResult & { into: string; manifest?: ManifestTarget }> {
   const { loaded, state, source, name, fork } = await locate(spec, typed);
+  // An earlier merge's conflicts: resolved by hand now, or still in the way.
+  const earlier = state.conflicts?.[name];
+  let resolved = false;
+  if (earlier) {
+    const open = unresolvedFiles(earlier);
+    if (open.length > 0)
+      throw new UserError(
+        `${name} still has merge conflicts in ${open.join(", ")} (${tildify(earlier.dir)}); resolve the markers (and remove the .upstream files), then run \`skillfleet merge ${name}\` again`,
+      );
+    resolved = true;
+    if (!dryRun) {
+      delete state.conflicts![name];
+      saveState(state);
+    }
+  }
+  /** Records the conflicts a merge left in `into`, which status, doctor and sync report. */
+  const record = (result: MergeResult, into: string): MergeResult & { into: string } => {
+    if (!dryRun && result.conflicts.length > 0) {
+      (state.conflicts ??= {})[name] = { dir: into, files: result.conflicts };
+      saveState(state);
+    }
+    return { ...result, ...(resolved ? { resolved } : {}), into };
+  };
   if (fork) {
+    gitFork(loaded, name, fork.fork);
     const head = await forkUpstream(fork.fork);
     const base = await forkUpstream(fork.fork, fork.fork.base);
     const live = state.skills[name]!.dir;
@@ -479,7 +550,7 @@ export async function mergeSkill(
       },
       { dryRun },
     );
-    return { ...result, into: live, manifest };
+    return { ...record(result, live), manifest };
   }
   if (!isVendored(source))
     throw new UserError(
@@ -487,16 +558,18 @@ export async function mergeSkill(
     );
   const store = storePaths(paths.store(source.id), name);
   const sourceState = state.sources[source.id]!;
-  if (!existsSync(store.upstream))
+  if (!existsSync(store.upstream)) {
+    if (resolved) return { merged: [], conflicts: [], resolved, into: store.live };
     throw new UserError(`${name} has no upstream change to merge; \`skillfleet sync\` fetches one`);
+  }
   const result = await mergeTrees(store.live, store.base, store.upstream, dryRun);
-  if (dryRun) return { ...result, into: store.live };
+  if (dryRun) return { ...result, ...(resolved ? { resolved } : {}), into: store.live };
   copyDir(store.upstream, store.base);
   sourceState.skills[name] = { ...sourceState.skills[name], hashes: hashDir(store.upstream) };
   rmSync(store.upstream, { recursive: true, force: true });
   delete sourceState.pending[name];
   saveState(state);
-  return { ...result, into: store.live };
+  return record(result, store.live);
 }
 
 /** What `fork` did, or would do in a dry run. */
@@ -517,6 +590,10 @@ export async function forkSkill(
 ): Promise<Forked> {
   const { loaded, state, source, name } = await locate(spec, typed);
   if (!isVendored(source)) throw new UserError(`${name} already lives in ${source.id}`);
+  if (source.kind !== "git")
+    throw new UserError(
+      `fork follows a skill's upstream through its git history, and ${source.id} is ${source.kind === "npm" ? "an npm package" : "an index site"}, which has none. To edit ${name} where it is, edit it in place: sync keeps your edits and holds upstream changes for \`skillfleet merge ${name}\``,
+    );
   const personal = personalSource(loaded.sources);
   if (!personal)
     throw new UserError("no personal source: mark a git source with a path as `adopt: true`");
@@ -527,14 +604,9 @@ export async function forkSkill(
     throw new UserError(`${name} has no copy on this machine yet; run \`skillfleet sync\``);
   const sourceState = state.sources[source.id]!;
   const fork: Fork = {
-    from:
-      source.kind === "git"
-        ? source.git
-        : source.kind === "index"
-          ? source.index
-          : `npm:${source.npm}`,
+    from: source.git,
     path: sourceState.skills[name]?.path ?? name,
-    base: source.kind === "npm" ? (sourceState.version ?? "") : (sourceState.commit ?? ""),
+    base: sourceState.commit ?? "",
   };
   const excluded = source.origin === loaded.root.file;
   const manifest = manifestToEdit(

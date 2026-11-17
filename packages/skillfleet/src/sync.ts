@@ -16,7 +16,7 @@ import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { agentTargets, formerTargets } from "./agents.ts";
 import { UserError } from "./errors.ts";
-import { checkForks } from "./edits.ts";
+import { checkForks, unresolvedFiles } from "./edits.ts";
 import { exec, stopAll } from "./exec.ts";
 import {
   changedFiles,
@@ -62,6 +62,7 @@ import {
 import type { HookRun, Report } from "./report.ts";
 import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sources.ts";
 import { loadState, saveState, sourceState, type State } from "./state.ts";
+import { installedSchedule } from "./timer.ts";
 import { version } from "./version.ts";
 
 export interface SyncOptions {
@@ -76,6 +77,28 @@ export interface SyncOptions {
   manifest?: string;
   /** An already loaded manifest (init plans with one that is not on disk yet). */
   loaded?: LoadedManifest;
+  /** Leave out the note about a timer whose schedule the manifest changed (init installs it next). */
+  skipTimerCheck?: boolean;
+}
+
+/**
+ * A note, once for each new schedule, when the manifest's `timer` differs from the one the installed
+ * timer runs on. The sync does not install it again: it may be the timer's own run, and launchd
+ * stops a job's running process when the job is replaced.
+ */
+function timerDrift(timer: { cron: string; timeZone?: string }, state: State): string | undefined {
+  const installed = installedSchedule();
+  const want = { cron: timer.cron, timeZone: timer.timeZone ?? "local" };
+  if (!installed || (installed.cron === want.cron && installed.timeZone === want.timeZone)) {
+    delete state.timerNotice;
+    return undefined;
+  }
+  const key = `${want.cron} ${want.timeZone}`;
+  if (state.timerNotice === key) return undefined;
+  state.timerNotice = key;
+  const zone = (spec: { timeZone: string }) =>
+    spec.timeZone === "local" ? "" : ` (${spec.timeZone})`;
+  return `the manifest's timer is now "${want.cron}"${zone(want)}, but the installed timer runs on "${installed.cron}"${zone(installed)}; run \`skillfleet timer install\` to apply it`;
 }
 
 export function manifestSpec(override?: string): string {
@@ -628,6 +651,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
     const state = loadState(dryRun ? undefined : warnings);
+    if (!dryRun && !options.skipTimerCheck) {
+      const drift = timerDrift(loaded.root.timer, state);
+      if (drift) warnings.push(drift);
+    }
     const targets = await agentTargets(loaded.root.agents);
     const adoptionErrors: string[] = [];
     // Before the sources look for local edits, so they find the ones made in a copy.
@@ -858,6 +885,17 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       ],
     };
     if (options.only) carryOver(report, options.only);
+    // A merge's conflict markers are in the copy agents use, as git leaves them in a working tree;
+    // until they are resolved and `merge` runs again, the skill is reported as held.
+    for (const [name, conflict] of Object.entries(state.conflicts ?? {})) {
+      const files = unresolvedFiles(conflict);
+      if (files.length > 0)
+        report.held.push({
+          source: state.skills[name]?.source ?? name,
+          reason: `${name} has unresolved merge conflicts; resolve them, then run \`skillfleet merge ${name}\``,
+          files,
+        });
+    }
     if (!dryRun) {
       doing = "running hooks";
       report.hooks = await runHooks(loaded, results, report);

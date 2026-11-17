@@ -559,6 +559,19 @@ export async function syncClone(
       out.status = "installed";
       out.warnings.push(`${source.id}: ${dir} is not cloned yet; sync clones it`);
       if (existsSync(dir)) out.skills = await discoverInPlace(source, dir, out.warnings);
+      else
+        // What the clone will hold, read from the repository through the (dry run's) git cache,
+        // so a plan counts the skills the clone brings.
+        try {
+          const upstream = await fetchClone(
+            gitUrl(source.git),
+            source.ref,
+            join(ctx.cacheDir, "git"),
+          );
+          out.skills = await discoverInPlace(source, upstream.dir, out.warnings);
+        } catch (error) {
+          out.warnings.push(`${source.id}: cannot read ${gitUrl(source.git)}: ${message(error)}`);
+        }
       return out;
     }
     try {

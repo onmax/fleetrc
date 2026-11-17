@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join, sep } from "node:path";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
+import { conflictLines } from "./edits.ts";
 import { exec, git } from "./exec.ts";
 import { isErrno, lstat } from "./fs.ts";
 import { gitUrl } from "./gitcache.ts";
@@ -9,6 +10,7 @@ import { linkTarget } from "./linker.ts";
 import { loadManifest, readConfig, remoteManifest, type Source } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 import { installedBuild, installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
+import { loadState } from "./state.ts";
 import { manifestSpec } from "./sync.ts";
 import {
   formatTimerStatus,
@@ -317,6 +319,13 @@ export async function doctor(manifest?: string): Promise<Check[]> {
         ]
       : []),
   ];
+  const conflicts = conflictLines(loadState());
+  checks.push({
+    name: "merge conflicts",
+    ok: conflicts.length === 0,
+    detail:
+      conflicts.length === 0 ? "no skill has unresolved merge conflicts" : conflicts.join("; "),
+  });
   checks.push({
     name: "agents agree",
     ok: problems.length === 0,

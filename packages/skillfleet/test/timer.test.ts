@@ -122,7 +122,9 @@ describe("timer", () => {
       // Linking worked; a timer is impossible here, which init says, with what to do instead.
       expect(init.code, said).toBe(0);
       expect(said).toContain("this machine has no systemd user manager");
-      expect(said).toMatch(/crontab -e.*\*\/30 \* \* \* \* '.*\/bin\/skillfleet' sync >> /);
+      expect(said).toMatch(
+        /crontab -e.*\*\/30 \* \* \* \* mkdir -p '[^']*' && '.*\/bin\/skillfleet' sync >> /,
+      );
       expect(said).toContain("--no-timer");
       expect(said).not.toContain("ENOENT");
       const status = await m.run("status");

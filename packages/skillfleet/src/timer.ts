@@ -174,8 +174,10 @@ export function systemdMissing(
 
 /** What to say on a Linux machine with no systemd user manager, with a crontab line that does the timer's job. */
 export function noSystemdMessage(cron = "*/30 * * * *"): string {
-  const log = join(stateDir(), "logs", `${TIMER_NAME}.log`);
-  return `this machine has no systemd user manager (a container, WSL1, or a system that boots without systemd), so skillfleet can't install a timer here. Run \`skillfleet sync\` from cron instead (\`crontab -e\`, then a line such as: ${cron} ${shQuote(launcherPath())} sync >> ${shQuote(log)} 2>&1), and pass --no-timer to init`;
+  const logs = join(stateDir(), "logs");
+  const log = join(logs, `${TIMER_NAME}.log`);
+  // cron's shell opens the log before skillfleet starts, so the line makes its folder first.
+  return `this machine has no systemd user manager (a container, WSL1, or a system that boots without systemd), so skillfleet can't install a timer here. Run \`skillfleet sync\` from cron instead (\`crontab -e\`, then a line such as: ${cron} mkdir -p ${shQuote(logs)} && ${shQuote(launcherPath())} sync >> ${shQuote(log)} 2>&1), and pass --no-timer to init`;
 }
 
 /** A `systemctl` failure that means systemd itself is missing, not that one call went wrong. */
@@ -296,6 +298,14 @@ export function sameAsInstalled(spec: TimerSpec): boolean | undefined {
   const held = record.files.filter((file) => typeof file === "string" && !file.endsWith(".log"));
   if (!held.every((file) => existsSync(file))) return false;
   return JSON.stringify(record.spec) === JSON.stringify(spec);
+}
+
+/** The schedule of the timer skillfleet installed last, from its record. */
+export function installedSchedule(): { cron: string; timeZone: string } | undefined {
+  const raw = readJsonOrNothing(recordFile());
+  if (!isRecord(raw) || !isRecord(raw.spec)) return undefined;
+  const { cron, timeZone } = raw.spec;
+  return typeof cron === "string" && typeof timeZone === "string" ? { cron, timeZone } : undefined;
 }
 
 /** The files the OS scheduler reads the timer's command from, where skillfleet's timer would be. */

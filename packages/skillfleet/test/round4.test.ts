@@ -9,6 +9,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -122,6 +123,12 @@ describe("the user's journey", () => {
       expect(log, said).toBeDefined();
       // `>> file` in cron's shell fails before skillfleet starts when the folder is missing.
       expect(existsSync(dirname(log!)), `${dirname(log!)} does not exist`).toBe(true);
+      // The line itself makes the folder, for when it goes (a cleaned state folder): run it as cron would.
+      const line = said.match(/\*\/30 \* \* \* \* (.*? 2>&1)/)?.[1];
+      expect(line, said).toBeDefined();
+      rmSync(dirname(log!), { recursive: true, force: true });
+      execFileSync("/bin/sh", ["-c", line!], { env: m.env });
+      expect(read(log!)).toContain("skills");
     },
   );
 
@@ -210,9 +217,21 @@ describe("the user's journey", () => {
     // exclude it there", a cache copy the next sync overwrites.
     expect(skill.stdout + skill.stderr).not.toMatch(/cache[\\/]manifests/);
 
+    // Your own manifest leaves the team's skill out, and the next sync unlinks it.
+    expect(skill.code, skill.stdout + skill.stderr).toBe(0);
+    expect(JSON.parse(read(manifest)).extends).toEqual([
+      { manifest: team.https, exclude: ["tool"] },
+    ]);
+    expect(names(m.at(".claude", "skills"))).toEqual(["other"]);
+
     const source = await m.run("remove", "vendor");
     // It said: 'no source or linked skill named "vendor"', though vendor is a source of the sync.
     expect(source.stdout + source.stderr).not.toContain('no source or linked skill named "vendor"');
+    expect(source.code, source.stdout + source.stderr).toBe(0);
+    expect(JSON.parse(read(manifest)).extends).toEqual([
+      { manifest: team.https, exclude: ["tool"], excludeSources: ["vendor"] },
+    ]);
+    expect(names(m.at(".claude", "skills"))).toEqual([]);
   });
 
   it("R7-8. after a pushed timer.cron change, `timer install` applies the new cron, as the README says", async () => {
@@ -235,6 +254,19 @@ describe("the user's journey", () => {
     // It reads the manifest copy the last sync fetched, so it shows (and would install) "*/30 * * * *".
     const dry = await m.run("timer", "install", "--dry-run");
     expect(dry.stdout + dry.stderr).toContain('"0 * * * *"');
+    // A timer installed on the old schedule (the record `timer install` keeps): the next sync says
+    // once that the manifest changed it, and does not reinstall it itself.
+    writeFileSync(
+      join(m.stateDir, "timer.json"),
+      JSON.stringify({
+        spec: { name: "skillfleet-sync", cron: "*/30 * * * *", timeZone: "local" },
+        files: [],
+      }),
+    );
+    const note =
+      'the manifest\'s timer is now "0 * * * *", but the installed timer runs on "*/30 * * * *"; run `skillfleet timer install` to apply it';
+    expect((await m.json("sync")).warnings).toContain(note);
+    expect((await m.json("sync")).warnings).not.toContain(note);
   });
 
   it("R7-10. add changes only the manifest lines it adds", async () => {

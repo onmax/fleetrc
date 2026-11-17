@@ -1,9 +1,11 @@
-import { existsSync, statSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
 import { dict, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
+import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
 import { registryUrl, urlOrigin } from "./npm.ts";
 import { expandPath, paths } from "./paths.ts";
@@ -13,6 +15,8 @@ export type UpdateMode = "auto" | "review";
 
 interface SourceCommon {
   id: string;
+  /** For a source an extended manifest declares: the root manifest's `extends` entry it came through. */
+  via?: number;
   /** Glob of skill folders inside the source, e.g. `skills/*`. */
   skills?: string;
   include?: string[];
@@ -87,9 +91,18 @@ export interface Fork {
   base: string;
 }
 
+/** A manifest `extends` names, and what the extending manifest leaves out of it. */
+export interface Extends {
+  manifest: string;
+  /** Skill names left out of every source it (and what it extends) declares. */
+  exclude: string[];
+  /** Source ids left out. */
+  excludeSources: string[];
+}
+
 export interface Manifest {
   file: string;
-  extends: string[];
+  extends: Extends[];
   agents: "all" | string[];
   sources: Source[];
   forks: Record<string, Fork>;
@@ -287,6 +300,30 @@ export function closest(word: string, known: readonly string[]): string | undefi
     : undefined;
 }
 
+/** `extends`: manifest specs, or `{ "manifest", "exclude", "excludeSources" }` to leave parts out. */
+function extendsList(file: string, value: unknown): Extends[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) fail(file, "extends", "must be an array");
+  return value.map((entry, i): Extends => {
+    const at = `extends[${i}]`;
+    if (typeof entry === "string") {
+      if (entry === "") fail(file, at, "must be a non-empty string");
+      return { manifest: entry, exclude: [], excludeSources: [] };
+    }
+    if (!isRecord(entry)) fail(file, at, "must be a manifest spec or an object");
+    for (const key of Object.keys(entry))
+      if (!["manifest", "exclude", "excludeSources"].includes(key))
+        fail(file, `${at}.${key}`, "is not an extends field");
+    return {
+      manifest:
+        optionalString(file, `${at}.manifest`, entry.manifest) ??
+        fail(file, `${at}.manifest`, "is required"),
+      exclude: stringList(file, `${at}.exclude`, entry.exclude) ?? [],
+      excludeSources: stringList(file, `${at}.excludeSources`, entry.excludeSources) ?? [],
+    };
+  });
+}
+
 /** Validates a manifest file's JSON. `base` resolves relative paths. */
 export function parseManifest(file: string, raw: unknown, base = dirname(file)): Manifest {
   if (!isRecord(raw)) fail(file, "the manifest", "must be a JSON object");
@@ -374,7 +411,7 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
   }
   return {
     file,
-    extends: stringList(file, "extends", raw.extends) ?? [],
+    extends: extendsList(file, raw.extends),
     agents: agents === "all" ? "all" : (agents as string[]),
     sources,
     forks,
@@ -678,8 +715,21 @@ export async function loadManifest(
     ),
   ]);
   let rules: UrlRewrite[] | undefined;
-  const visit = async (manifest: Manifest) => {
-    for (const parent of manifest.extends) {
+  /** What the root's `extends` entry a manifest came through leaves out. */
+  interface Through {
+    via: number;
+    exclude: string[];
+    excludeSources: Set<string>;
+  }
+  const visit = async (manifest: Manifest, through?: Through) => {
+    for (const [i, entry] of manifest.extends.entries()) {
+      const parent = entry.manifest;
+      // Exclusions apply in the root manifest only, to everything its entry brings in.
+      const filter: Through = through ?? {
+        via: i,
+        exclude: entry.exclude,
+        excludeSources: new Set(entry.excludeSources.map(nameKey)),
+      };
       let file: string;
       try {
         file = await locateManifest(parent, { ...options, base: dirname(manifest.file) });
@@ -721,6 +771,10 @@ export async function loadManifest(
           `extends ${parent}: ignored ${ignored.join(", ")}; only the root manifest can run commands or name machines`,
         );
       for (const source of team.sources) {
+        if (filter.excludeSources.has(nameKey(source.id))) continue;
+        source.via = filter.via;
+        if (filter.exclude.length > 0)
+          source.exclude = [...new Set([...(source.exclude ?? []), ...filter.exclude])];
         if (source.kind === "clone" || source.kind === "local") {
           warnings.push(
             `extends ${parent}: ignored source "${source.id}"; only the root manifest can name a folder on this machine (${source.kind === "clone" ? "path" : "local"})`,
@@ -751,7 +805,7 @@ export async function loadManifest(
           source.sendToken = !source.registry || tokenOrigins.has(urlOrigin(source.registry));
         sources.push(source);
       }
-      await visit(team);
+      await visit(team, filter);
     }
   };
   await visit(root);
@@ -760,7 +814,9 @@ export async function loadManifest(
 
 /**
  * Reads, changes and writes back the root manifest's JSON, keeping fields skillfleet does not know.
- * A dry run checks that the changed manifest is valid and writes nothing.
+ * Only the parts that change are rewritten, so the file keeps its layout; a file the text edit
+ * can't follow is written out whole. A dry run checks that the changed manifest is valid and
+ * writes nothing.
  */
 export function editManifest(
   file: string,
@@ -769,7 +825,16 @@ export function editManifest(
 ) {
   const raw = readJson(file);
   if (!isRecord(raw)) throw new ManifestError(`${file}: the manifest must be a JSON object`);
+  const before = readJson(file);
   change(raw);
   parseManifest(file, raw);
-  if (!dryRun) writeJson(file, raw);
+  if (dryRun) return;
+  const edited = editJsonText(readFileSync(file, "utf8"), before, raw);
+  if (edited === undefined) {
+    writeJson(file, raw);
+    return;
+  }
+  const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  writeFileSync(temp, edited);
+  renameSync(temp, file);
 }

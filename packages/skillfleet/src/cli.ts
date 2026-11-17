@@ -1,11 +1,12 @@
-import { existsSync, readFileSync } from "node:fs";
-import { userInfo } from "node:os";
-import { dirname, resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { agentRows } from "./agents.ts";
 import { doctor, formatChecks } from "./doctor.ts";
 import {
   adoptSkill,
+  conflictLines,
   diffPending,
   diffSkill,
   forkLines,
@@ -332,7 +333,9 @@ function reportText(report: Report): string {
   return process.env.SKILLFLEET_TIMER ? `${report.finishedAt} ${text}` : text;
 }
 
-async function syncReport(options: { only?: string; apply?: string } = {}): Promise<Report> {
+async function syncReport(
+  options: { only?: string; apply?: string; skipTimerCheck?: boolean } = {},
+): Promise<Report> {
   const copy = copyMode();
   const report = await sync({
     ...options,
@@ -361,6 +364,28 @@ async function runSync(options: { only?: string; apply?: string } = {}) {
   return report.ok ? 0 : 1;
 }
 
+/**
+ * The manifest's `timer` as it is now: a manifest in a repository is fetched, since a pushed
+ * `timer.cron` reaches the cached copy only with the next sync. A dry run fetches into a scratch
+ * folder. Without the network, the copy from the last sync is used, and `notes` says so.
+ */
+async function currentTimerSettings(notes: string[]): Promise<Manifest["timer"]> {
+  const spec = manifestSpec(values.manifest);
+  const scratch = dryRun ? mkdtempSync(join(tmpdir(), "skillfleet-timer-")) : undefined;
+  try {
+    return (await loadManifest(spec, scratch ? { cacheRoot: join(scratch, "manifests") } : {})).root
+      .timer;
+  } catch (error) {
+    if (!(error instanceof GitError)) throw error;
+    notes.push(
+      `could not fetch the manifest (${gitProblem(error)}); using the copy from the last sync`,
+    );
+    return (await loadManifest(spec, { offline: true })).root.timer;
+  } finally {
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 async function installTimer(settings?: Manifest["timer"]): Promise<{
   code: number;
   lines: string[];
@@ -368,8 +393,8 @@ async function installTimer(settings?: Manifest["timer"]): Promise<{
   /** The machine has no systemd user manager, so it can't have a timer. */
   noSystemd?: boolean;
 }> {
-  const timer =
-    settings ?? (await loadManifest(manifestSpec(values.manifest), { offline: true })).root.timer;
+  const notes: string[] = [];
+  const timer = settings ?? (await currentTimerSettings(notes));
   const installed = dryRun ? undefined : selfInstall();
   const node = installed?.node ?? stableNode();
   const spec: TimerSpec = {
@@ -382,6 +407,7 @@ async function installTimer(settings?: Manifest["timer"]): Promise<{
     logDir: paths.logs(),
   };
   const lines = [
+    ...notes,
     `timer ${TIMER_NAME}: \`${spec.command.join(" ")}\` on "${spec.cron}" (${spec.timeZone === "local" ? `the machine's time zone, now ${machineTimeZone()}` : spec.timeZone})`,
   ];
   if (dryRun) {
@@ -527,7 +553,7 @@ async function status() {
   if (!report) say("no sync has run on this machine yet");
   else
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
-  for (const line of forkLines(state)) say(line);
+  for (const line of [...forkLines(state), ...conflictLines(state)]) say(line);
   const declined = config?.timer === false;
   say(
     `timer: ${
@@ -686,11 +712,32 @@ async function add() {
   );
 }
 
+/**
+ * Adds `value` to `key` of the root manifest's `extends` entry `via`, turning a plain spec into
+ * `{ "manifest": spec }` first.
+ */
+function excludeInExtends(
+  raw: Record<string, unknown>,
+  via: number,
+  key: "exclude" | "excludeSources",
+  value: string,
+) {
+  const list = Array.isArray(raw.extends) ? raw.extends : [];
+  const entry: unknown = list[via];
+  const object: Record<string, unknown> | undefined =
+    typeof entry === "string" ? { manifest: entry } : isRecord(entry) ? entry : undefined;
+  if (!object) return;
+  const before = object[key];
+  object[key] = [...new Set([...(Array.isArray(before) ? before : []), value])];
+  list[via] = object;
+}
+
 async function remove() {
   const name = one("source or skill");
   const manifest = manifestSpec(values.manifest);
   const loaded = await loadManifest(manifest, { offline: true });
-  if (loaded.root.sources.some((source) => source.id === name)) {
+  const declared = loaded.sources.find((source) => source.id === name);
+  if (declared && declared.via === undefined) {
     const target = manifestToEdit(loaded, manifest, `Remove the source "${name}" from "sources"`);
     return changeManifest(
       `remove source ${name}`,
@@ -703,16 +750,43 @@ async function remove() {
       { removed: name },
     );
   }
+  if (declared?.via !== undefined) {
+    // A team manifest's source: the team's file is not yours, so your manifest leaves it out.
+    const via = declared.via;
+    const parent = loaded.root.extends[via]!.manifest;
+    const target = manifestToEdit(
+      loaded,
+      manifest,
+      `Add "${name}" to "excludeSources" of the "extends" entry ${JSON.stringify(parent)}`,
+    );
+    return changeManifest(
+      `leave out source ${name} of ${parent}`,
+      target,
+      (raw) => excludeInExtends(raw, via, "excludeSources", name),
+      { removed: name, extends: parent },
+    );
+  }
   const linked = loadState().skills;
   // The skill as skillfleet keeps it, typed in any case or Unicode form.
   const skill = findName(Object.keys(linked), name);
   const owner = skill === undefined ? undefined : linked[skill]!.source;
   const source = loaded.sources.find((candidate) => candidate.id === owner);
   if (!skill || !source) throw new UserError(`no source or linked skill named "${name}"`);
-  if (source.origin !== loaded.root.file)
-    throw new UserError(
-      `${skill} comes from ${source.id} in ${tildify(source.origin)}; exclude it there`,
+  if (source.via !== undefined) {
+    const via = source.via;
+    const parent = loaded.root.extends[via]!.manifest;
+    const target = manifestToEdit(
+      loaded,
+      manifest,
+      `Add "${skill}" to "exclude" of the "extends" entry ${JSON.stringify(parent)}`,
     );
+    return changeManifest(
+      `exclude ${skill} (from ${source.id} of ${parent})`,
+      target,
+      (raw) => excludeInExtends(raw, via, "exclude", skill),
+      { excluded: skill, source: source.id, extends: parent },
+    );
+  }
   const target = manifestToEdit(
     loaded,
     manifest,
@@ -761,10 +835,13 @@ async function init() {
   const applied = [...(await cloneBeforeAdopt(plan)), ...applyPlan(plan)];
   say(...applied.map((line) => `  ${line}`));
   if (values["no-timer"]) updateConfig({ timer: false });
-  const report = await syncReport();
+  // init installs the timer from the manifest next, so the sync need not say it differs.
+  const report = await syncReport({ skipTimerCheck: !values["no-timer"] });
   if (!json) console.log(reportText(report));
   // The copy that new shells, the timer and `fleet` run, with or without the timer.
   const installed = selfInstall();
+  // The timer's log folder, which a crontab line on a machine without systemd appends to too.
+  mkdirSync(paths.logs(), { recursive: true });
   const onPath = commandOnPath(installed.launcher);
   say(onPath, ...installed.notes);
   const timerResult = values["no-timer"] ? undefined : await installTimer(plan.timer);
@@ -954,7 +1031,8 @@ async function main(): Promise<number> {
         say(
           `${dryRun ? "would conflict" : "conflicts"}: ${result.conflicts.join(", ")} in ${tildify(result.into)}${dryRun ? "" : "; resolve the markers by hand"}`,
         );
-      if (!result.merged.length && !result.conflicts.length) say("nothing to merge");
+      if (!result.merged.length && !result.conflicts.length)
+        say(result.resolved ? "merged; nothing left to do" : "nothing to merge");
       if (result.manifest?.push && !dryRun)
         say(`recorded the new base in ${tildify(result.manifest.file)}; commit and push it`);
       if (json) emit({ ...result, dryRun });
