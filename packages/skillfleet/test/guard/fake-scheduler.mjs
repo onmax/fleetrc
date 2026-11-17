@@ -5,6 +5,8 @@
 //   refuse            refuses every call, for tests that check how skillfleet reports the failure.
 //   empty             answers reads like a machine with no timer and linger off; refuses changes,
 //                     and the fixture fails the test for those.
+//   absent            answers systemctl, loginctl and journalctl as a Linux machine without
+//                     systemd does: they are not installed (exit 127, spawn ENOENT).
 // A refused call exits 97 with a message that names the call.
 import { appendFileSync } from "node:fs";
 
@@ -69,7 +71,13 @@ function emptyAnswer() {
   }
 }
 
-const answer = mode === "empty" ? emptyAnswer() : undefined;
+/** A Linux machine without systemd, such as a container: its commands are not installed. */
+function absentAnswer() {
+  if (!["systemctl", "loginctl", "journalctl"].includes(name)) return undefined;
+  return { code: 127, stderr: `spawn ${name} ENOENT\n` };
+}
+
+const answer = mode === "empty" ? emptyAnswer() : mode === "absent" ? absentAnswer() : undefined;
 const shown =
   name === "powershell" || name === "pwsh" ? `${name} ${script()}` : [name, ...args].join(" ");
 if (process.env.SKILLFLEET_TEST_SCHEDULER_LOG)

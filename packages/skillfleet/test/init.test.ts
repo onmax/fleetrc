@@ -271,4 +271,30 @@ describe("init", () => {
         expect(sync.targets.filter((target) => target.skipped)).toEqual([]);
       });
   });
+
+  it("R3-8. a remote manifest is reported as the user named it, not as a cache or a deleted scratch copy", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const team = remote(m, "team", {
+      "skills.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      }),
+    });
+    const spec = `${team.url}//skills.json`;
+    const dry = await m.json<{ manifestFile: string; sync: { manifest: string } }>(
+      "init",
+      team.url,
+      "--dry-run",
+    );
+    expect(dry.sync.manifest).toBe(spec);
+    expect(dry.manifestFile).toBe(spec);
+    const text = await m.run("init", team.url, "--dry-run");
+    expect(text.stdout).toMatch(
+      new RegExp(`^skillfleet init: manifest ${spec.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}$`, "m"),
+    );
+    expect((await m.run("init", team.url, "--no-timer")).code).toBe(0);
+    expect((await m.json("sync", "--dry-run")).manifest).toBe(spec);
+    expect((await m.json("sync")).manifest).toBe(spec);
+  });
 });

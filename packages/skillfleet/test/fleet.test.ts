@@ -118,8 +118,10 @@ describe("fleet", () => {
       // Node.js was upgraded: the launcher still names the old node, and ssh's PATH has no node or npx.
       writeFileSync(
         launcher,
-        launchers(join(m.root, "node-v22.1.0", "bin", "node"), join(state, "skillfleet", "app", "cli.mjs"))
-          .sh,
+        launchers(
+          join(m.root, "node-v22.1.0", "bin", "node"),
+          join(state, "skillfleet", "app", "cli.mjs"),
+        ).sh,
       );
       chmodSync(launcher, 0o755);
       const bin = join(m.root, "ssh-bin");

@@ -504,7 +504,9 @@ export function remoteManifest(spec: string, base = process.cwd()): RemoteManife
     const repo = expandPath(split.repo, base);
     return isBareRepository(repo) ? { ...split, repo } : split;
   }
-  return webManifest(spec) ?? (isRepository(spec) ? { repo: spec, path: DEFAULT_MANIFEST } : undefined);
+  return (
+    webManifest(spec) ?? (isRepository(spec) ? { repo: spec, path: DEFAULT_MANIFEST } : undefined)
+  );
 }
 
 /**

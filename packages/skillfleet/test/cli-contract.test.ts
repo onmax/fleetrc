@@ -471,16 +471,19 @@ describe("what users paste and how errors read (R2-13, R2-15, R2-16, R2-17)", ()
       ref: "main",
       skills: "skills/**",
     });
-    expect(
-      await added("https://github.com/o/r/blob/v2/skills/review/SKILL.md?plain=1#L3"),
-    ).toEqual({ id: "r", git: "https://github.com/o/r", ref: "v2", skills: "skills/review" });
+    expect(await added("https://github.com/o/r/blob/v2/skills/review/SKILL.md?plain=1#L3")).toEqual(
+      { id: "r", git: "https://github.com/o/r", ref: "v2", skills: "skills/review" },
+    );
     expect(await added("https://gitlab.com/g/r/-/tree/main")).toEqual({
       id: "r",
       git: "https://gitlab.com/g/r",
       ref: "main",
     });
     // A repository link stays as it was: git clones it.
-    expect(await added("https://github.com/o/r")).toEqual({ id: "r", git: "https://github.com/o/r" });
+    expect(await added("https://github.com/o/r")).toEqual({
+      id: "r",
+      git: "https://github.com/o/r",
+    });
   });
 
   it("R2-13. the skills globs add writes find a folder of skills and a single skill", async () => {
@@ -531,4 +534,3 @@ describe("what users paste and how errors read (R2-13, R2-15, R2-16, R2-17)", ()
     expect(broken.stderr).toContain("skills.json");
   });
 });
-

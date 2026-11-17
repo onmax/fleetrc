@@ -436,9 +436,11 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   const lock = dryRun ? { release: () => {} } : acquireLock();
   const warnings: string[] = lock.note ? [lock.note] : [];
   try {
+    // The manifest as the user named it: a remote one's file is a cache copy (a scratch one in a dry run).
+    const spec = options.loaded ? options.loaded.root.file : manifestSpec(options.manifest);
     const loaded =
       options.loaded ??
-      (await loadManifest(manifestSpec(options.manifest), {
+      (await loadManifest(spec, {
         offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
       }));
@@ -609,7 +611,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       version: 1,
       host: hostname(),
       skillfleet: version,
-      manifest: loaded.root.file,
+      manifest: spec,
       startedAt,
       finishedAt: startedAt,
       dryRun,

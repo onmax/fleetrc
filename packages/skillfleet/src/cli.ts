@@ -33,6 +33,7 @@ import {
   defaultSourceId,
   editManifest,
   loadManifest,
+  type Manifest,
   ManifestError,
   readConfig,
   updateConfig,
@@ -41,7 +42,14 @@ import {
 import { findName } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import { formatReport, type Report } from "./report.ts";
-import { commandOnPath, findOnPath, installedCli, selfInstall, stableNode } from "./selfinstall.ts";
+import {
+  commandOnPath,
+  findOnPath,
+  installedCli,
+  launcherPath,
+  selfInstall,
+  stableNode,
+} from "./selfinstall.ts";
 import { promptHook, staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
 import { LockHeldError, manifestSpec, sync } from "./sync.ts";
@@ -49,15 +57,22 @@ import {
   foreignTimer,
   foreignTimerResource,
   formatTimerStatus,
+  forgetTimer,
   installTimer as installOsTimer,
   machineTimeZone,
+  missingTimer,
+  noSystemdMessage,
+  recordTimer,
   removeTimer,
+  sameAsInstalled,
+  systemdMissing,
   TIMER_NAME,
   TimerError,
   timerKind,
   type TimerSpec,
   type TimerStatus,
   timerEnv,
+  timerNode,
   timerStatus,
 } from "./timer.ts";
 import { version } from "./version.ts";
@@ -257,8 +272,7 @@ const jsonRequested = () => {
  * stdout gets the error as a document too.
  */
 function usageError(message: string): never {
-  if (jsonRequested())
-    console.log(JSON.stringify({ ok: false, error: message }, null, 2));
+  if (jsonRequested()) console.log(JSON.stringify({ ok: false, error: message }, null, 2));
   console.error(`skillfleet: ${message}`);
   process.exit(2);
 }
@@ -346,18 +360,21 @@ async function runSync(options: { only?: string; apply?: string } = {}) {
   return report.ok ? 0 : 1;
 }
 
-async function installTimer(): Promise<{
+async function installTimer(settings?: Manifest["timer"]): Promise<{
   code: number;
   lines: string[];
   json: Record<string, unknown>;
+  /** The machine has no systemd user manager, so it can't have a timer. */
+  noSystemd?: boolean;
 }> {
-  const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
+  const timer =
+    settings ?? (await loadManifest(manifestSpec(values.manifest), { offline: true })).root.timer;
   const installed = dryRun ? undefined : selfInstall();
   const node = installed?.node ?? stableNode();
   const spec: TimerSpec = {
     name: TIMER_NAME,
-    cron: loaded.root.timer.cron,
-    timeZone: loaded.root.timer.timeZone ?? "local",
+    cron: timer.cron,
+    timeZone: timer.timeZone ?? "local",
     command: [node, installed?.cli ?? installedCli(), "sync"],
     // SKILLFLEET_TIMER puts the time of each run in the log.
     env: { ...timerEnv(findOnPath("git"), node), SKILLFLEET_TIMER: "1" },
@@ -367,11 +384,24 @@ async function installTimer(): Promise<{
     `timer ${TIMER_NAME}: \`${spec.command.join(" ")}\` on "${spec.cron}" (${spec.timeZone === "local" ? `the machine's time zone, now ${machineTimeZone()}` : spec.timeZone})`,
   ];
   if (dryRun) {
-    lines.push(`would install ${timerKind()}`);
-    return { code: 0, lines, json: { dryRun: true, ...spec } };
+    if (systemdMissing()) {
+      const error = noSystemdMessage(spec.cron);
+      lines.push(`would not install a timer: ${error}`);
+      return { code: 1, lines, json: { dryRun: true, ...spec, error }, noSystemd: true };
+    }
+    const same = sameAsInstalled(spec);
+    lines.push(
+      same
+        ? `${timerKind()}: already installed, unchanged`
+        : same === false
+          ? `would update the installed timer (${timerKind()})`
+          : `would install ${timerKind()}`,
+    );
+    return { code: 0, lines, json: { dryRun: true, ...spec, ...(same ? { changed: false } : {}) } };
   }
   try {
     const result = await installOsTimer(spec);
+    recordTimer(spec, result.files);
     updateConfig({ timer: true });
     lines.push(
       result.changed
@@ -386,9 +416,34 @@ async function installTimer(): Promise<{
     return { code: 0, lines, json: { ...spec, ...result } };
   } catch (error) {
     if (!(error instanceof TimerError)) throw error;
-    lines.push(`the timer was not installed: ${error.message}`);
-    return { code: 1, lines, json: { ...spec, error: error.message } };
+    const message = error.noSystemd ? noSystemdMessage(spec.cron) : error.message;
+    lines.push(`the timer was not installed: ${message}`);
+    return {
+      code: 1,
+      lines,
+      json: { ...spec, error: message },
+      ...(error.noSystemd ? { noSystemd: true } : {}),
+    };
   }
+}
+
+/**
+ * After the launcher changed node (self-install or init under another Node.js), a timer installed
+ * earlier would still run the old one, which may be gone: install it again with the new node.
+ */
+async function followLauncherNode(node: string): Promise<string[]> {
+  const timer = timerNode();
+  if (!timer || timer.node === node) return [];
+  let settings: Manifest["timer"];
+  try {
+    settings = (await loadManifest(manifestSpec(values.manifest), { offline: true })).root.timer;
+  } catch (error) {
+    return [
+      `the timer still runs ${timer.node}, and the manifest to install it again does not load (${(error as Error).message.split("\n")[0]}); run \`skillfleet timer install\``,
+    ];
+  }
+  const result = await installTimer(settings);
+  return [`the timer ran ${timer.node}; installing it again with ${node}`, ...result.lines];
 }
 
 /** The OS's view of the timer, or why it could not be read. */
@@ -433,6 +488,7 @@ async function timer(action: string | undefined) {
       const removal = await removeTimer();
       const foreign = removal.existed ? undefined : await foreignTimerResource();
       if (foreign) throw new UserError(`nothing removed: ${foreignTimer(TIMER_NAME, foreign)}`);
+      forgetTimer();
       updateConfig({ timer: false });
       if (json) emit(removal);
       else if (!removal.existed) say("no timer installed");
@@ -469,8 +525,17 @@ async function status() {
   if (!report) say("no sync has run on this machine yet");
   else
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
+  const declined = config?.timer === false;
   say(
-    `timer: ${timerState instanceof TimerError ? `unknown (${timerState.message.split("\n")[0]})` : formatTimerStatus(timerState)}`,
+    `timer: ${
+      timerState instanceof TimerError
+        ? timerState.noSystemd || declined
+          ? `${declined ? "not installed, as you chose; " : ""}${timerState.message.split("\n")[0]}`
+          : `unknown (${timerState.message.split("\n")[0]})`
+        : timerState.installed
+          ? formatTimerStatus(timerState)
+          : await missingTimer(timerState, declined)
+    }`,
   );
   for (const proc of stale)
     say(
@@ -523,7 +588,11 @@ function sourceFromSpec(spec: string): Record<string, unknown> {
   const page = webPage(spec);
   if (page?.kind) {
     const folder =
-      page.kind === "blob" ? (page.path?.includes("/") ? dirname(page.path) : undefined) : page.path;
+      page.kind === "blob"
+        ? page.path?.includes("/")
+          ? dirname(page.path)
+          : undefined
+        : page.path;
     const skillFile = page.kind === "blob" && /(^|\/)SKILL\.md$/.test(page.path ?? "");
     return {
       git: page.repo,
@@ -669,8 +738,16 @@ async function init() {
     );
   const plan = await planInit(canonicalManifestSpec(given), { offline: values.offline, dryRun });
   if (dryRun) {
-    if (json) emit(plan);
-    else say(formatPlan(plan));
+    const launcher = `would install ${tildify(launcherPath())}, the copy new shells, the timer and \`fleet\` run (node ${stableNode()})`;
+    const timer = values["no-timer"] ? undefined : await installTimer(plan.timer);
+    const timerLines = timer?.lines ?? ["no timer (--no-timer)"];
+    if (json)
+      emit({
+        ...plan,
+        launcher: { path: launcherPath(), node: stableNode() },
+        timer: timer?.json ?? { declined: true },
+      });
+    else say(formatPlan(plan), ...[launcher, ...timerLines].map((line) => `  ${line}`));
     return plan.lost.length > 0 ? 1 : 0;
   }
   say(formatPlan(plan, { errors: false }));
@@ -687,8 +764,10 @@ async function init() {
   const installed = selfInstall();
   const onPath = commandOnPath(installed.launcher);
   say(onPath);
-  const timerResult = values["no-timer"] ? undefined : await installTimer();
+  const timerResult = values["no-timer"] ? undefined : await installTimer(plan.timer);
   if (timerResult) say(...timerResult.lines);
+  // With --no-timer, a timer installed before still runs; it must not keep a node that is gone.
+  else say(...(await followLauncherNode(installed.node)));
   if (json)
     emit({
       plan,
@@ -697,7 +776,8 @@ async function init() {
       installed: { ...installed, onPath },
       ...(timerResult ? { timer: timerResult.json } : {}),
     });
-  return (report.ok ? 0 : 1) || (timerResult?.code ?? 0);
+  // A machine without systemd can't have a timer; init did its job and said what to use instead.
+  return (report.ok ? 0 : 1) || (timerResult?.noSystemd ? 0 : (timerResult?.code ?? 0));
 }
 
 async function fleetCommand(action: string | undefined) {
@@ -885,6 +965,7 @@ async function main(): Promise<number> {
       say(
         `installed ${tildify(result.launcher)} (node ${result.node})`,
         commandOnPath(result.launcher),
+        ...(await followLauncherNode(result.node)),
       );
       return 0;
     }

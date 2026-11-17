@@ -101,8 +101,9 @@ export const UNIVERSAL_DIRS = [
  * - forbid: every call fails, and the test fails when it ends.
  * - refuse: every call fails, for tests of how skillfleet reports that.
  * - empty: reads answer as on a machine with no timer and linger off; changes fail the test.
+ * - absent: systemd's commands answer as on Linux without systemd (a container): not installed.
  */
-export type Scheduler = "forbid" | "refuse" | "empty";
+export type Scheduler = "forbid" | "refuse" | "empty" | "absent";
 
 const guardDir = resolve("test", "guard");
 /** Commands that reach the scheduler; their shims go first on PATH, for shells too. */
@@ -161,6 +162,7 @@ export interface Machine {
 
 export interface Report {
   ok: boolean;
+  manifest: string;
   skills: { total: number; names: string[]; added: string[]; removed: string[]; updated: string[] };
   sources: {
     id: string;

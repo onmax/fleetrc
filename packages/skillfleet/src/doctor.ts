@@ -11,12 +11,13 @@ import { paths, tildify } from "./paths.ts";
 import { installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
 import { manifestSpec } from "./sync.ts";
 import {
-  foreignTimer,
-  foreignTimerResource,
   formatTimerStatus,
-  TIMER_NAME,
+  machineTimeZone,
+  missingTimer,
+  systemdMissing,
   TimerError,
   type TimerStatus,
+  timerNode,
   timerStatus,
 } from "./timer.ts";
 
@@ -26,6 +27,24 @@ export interface Check {
   detail: string;
   /** Not checked, by the user's choice (a timer they chose not to install). */
   skipped?: boolean;
+  /** Worth knowing, but not a failure. */
+  warn?: boolean;
+}
+
+/**
+ * Why the timer runs at other times than the manifest's `timer.timeZone` says, or undefined. launchd
+ * and Task Scheduler run a timer in the machine's zone, so an explicit zone holds only while the
+ * machine stays in it; systemd takes the zone itself.
+ */
+export function timeZoneDrift(
+  timeZone: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+  machine = machineTimeZone(),
+): string | undefined {
+  if (!timeZone || timeZone === "local" || platform === "linux" || timeZone === machine)
+    return undefined;
+  const scheduler = platform === "darwin" ? "launchd" : "Task Scheduler";
+  return `timer.timeZone is ${timeZone}, but this machine is now in ${machine}, and ${scheduler} runs the timer in the machine's zone, so it may run at other times than the manifest says; run \`skillfleet timer install\` to install it for this zone, or remove timer.timeZone`;
 }
 
 function remoteOf(source: Source): string | undefined {
@@ -63,6 +82,22 @@ function launcherProblem(): string | undefined {
   return undefined;
 }
 
+/**
+ * Why the node the timer's unit, plist or task names cannot run the timer, or undefined when it
+ * can. `self-install` under another Node.js rewrites the launcher, and the timer keeps the old node.
+ */
+function timerNodeProblem(): string | undefined {
+  const timer = timerNode();
+  if (!timer) return undefined;
+  if (!existsSync(timer.node))
+    return `the timer (${tildify(timer.file)}) runs ${timer.node}, which is gone (Node.js was upgraded or removed); ${REPAIR}`;
+  const launcher = launcherPath();
+  const node = existsSync(launcher) ? launcherNode(readFileSync(launcher, "utf8")) : undefined;
+  if (node && node !== timer.node)
+    return `the timer (${tildify(timer.file)}) runs ${timer.node}, while ${tildify(launcher)} runs ${node}; run \`skillfleet timer install\` to run the timer with the launcher's node`;
+  return undefined;
+}
+
 async function nodeCheck(): Promise<Check> {
   const launcher = launcherPath();
   if (!existsSync(launcher))
@@ -71,7 +106,7 @@ async function nodeCheck(): Promise<Check> {
       ok: true,
       detail: `${process.execPath} (no installed copy yet; \`skillfleet timer install\` makes one)`,
     };
-  const problem = launcherProblem();
+  const problem = launcherProblem() ?? timerNodeProblem();
   return {
     name: "node",
     ok: !problem,
@@ -115,29 +150,34 @@ function timerDeclined(): boolean {
 }
 
 /** Whether the OS scheduler has the timer, and how its last run ended. */
-async function timerCheck(): Promise<Check> {
+async function timerCheck(): Promise<Check & { noSystemd?: boolean }> {
   const name = "timer";
   let status: TimerStatus;
   try {
     status = await timerStatus();
   } catch (error) {
     if (!(error instanceof TimerError)) throw error;
-    return { name, ok: false, detail: error.message.split("\n")[0]! };
-  }
-  if (!status.installed) {
     if (timerDeclined())
       return {
         name,
         ok: true,
         skipped: true,
-        detail:
-          "not installed, as you chose (`init --no-timer` or `timer remove`); `skillfleet timer install` adds it",
+        detail: `not installed, as you chose; ${error.message.split("\n")[0]!}`,
       };
-    const foreign = await foreignTimerResource();
     return {
       name,
       ok: false,
-      detail: foreign ? foreignTimer(TIMER_NAME, foreign) : formatTimerStatus(status),
+      detail: error.message.split("\n")[0]!,
+      ...(error.noSystemd ? { noSystemd: true } : {}),
+    };
+  }
+  if (!status.installed) {
+    const declined = timerDeclined();
+    return {
+      name,
+      ok: declined,
+      ...(declined ? { skipped: true } : {}),
+      detail: await missingTimer(status, declined),
     };
   }
   // One timer name per user: after a change of HOME or XDG_STATE_HOME, it may run another copy.
@@ -149,7 +189,7 @@ async function timerCheck(): Promise<Check> {
       detail: `installed, but it syncs another skillfleet state folder (its log is ${tildify(status.logFile)}); run \`skillfleet timer install\` to point it at ${tildify(dirname(logs))}`,
     };
   // A timer whose node is gone fails before it writes a line to its log: launchd says exit 78.
-  const problem = launcherProblem();
+  const problem = launcherProblem() ?? timerNodeProblem();
   if (problem) return { name, ok: false, detail: problem };
   const failed = status.lastExitCode !== undefined && status.lastExitCode !== 0;
   return {
@@ -187,9 +227,10 @@ export async function doctor(manifest?: string): Promise<Check[]> {
     ok: gitVersion.code === 0,
     detail: gitVersion.code === 0 ? gitVersion.stdout.trim() : "git is not on PATH",
   });
-  checks.push(await timerCheck());
+  const { noSystemd, ...timer } = await timerCheck();
+  checks.push(timer);
   // Linger and launchd's PATH only matter to a timer.
-  if (!timerDeclined())
+  if (!timerDeclined() && !noSystemd && !systemdMissing())
     for (const check of [await lingerCheck(), await launchdCheck()]) if (check) checks.push(check);
 
   let spec: string;
@@ -209,6 +250,8 @@ export async function doctor(manifest?: string): Promise<Check[]> {
     ok: true,
     detail: `${tildify(loaded.root.file)}, ${loaded.sources.length} sources`,
   });
+  const drift = timerDeclined() ? undefined : timeZoneDrift(loaded.root.timer.timeZone);
+  if (drift) checks.push({ name: "timer time zone", ok: true, warn: true, detail: drift });
   // Without git, the git check above already says so once.
   const reachable = gitVersion.code === 0 ? loaded.sources : [];
   await Promise.all(
@@ -270,6 +313,6 @@ export const formatChecks = (checks: readonly Check[]) =>
   checks
     .map(
       (check) =>
-        `${check.skipped ? "skip" : check.ok ? "ok  " : "FAIL"} ${check.name}: ${check.detail}`,
+        `${check.skipped ? "skip" : check.warn ? "warn" : check.ok ? "ok  " : "FAIL"} ${check.name}: ${check.detail}`,
     )
     .join("\n");

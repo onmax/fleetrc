@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 import {
@@ -10,8 +10,9 @@ import {
 } from "@vite-hub/schedule/os";
 import { parseCronExpression } from "cron-schedule";
 import { exec } from "./exec.ts";
-import { tildify, xdgDir } from "./paths.ts";
-import { lastingPathDirs } from "./selfinstall.ts";
+import { isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
+import { stateDir, tildify, xdgDir } from "./paths.ts";
+import { lastingPathDirs, launcherPath } from "./selfinstall.ts";
 
 export const TIMER_NAME = "skillfleet-sync";
 
@@ -148,6 +149,43 @@ export async function foreignTimerResource(name = TIMER_NAME): Promise<string | 
   return undefined;
 }
 
+/**
+ * Whether this Linux machine lacks a systemd user manager: no `systemctl` on PATH, or systemd is
+ * not the init system (/run/systemd/system is missing), as in most containers, WSL1 and distributions
+ * that boot with OpenRC, runit or s6.
+ */
+export function systemdMissing(
+  path = process.env.PATH ?? "",
+  booted = "/run/systemd/system",
+): boolean {
+  if (process.platform !== "linux") return false;
+  const onPath = path
+    .split(delimiter)
+    .filter((dir) => isAbsolute(dir))
+    .some((dir) => {
+      try {
+        return statSync(join(dir, "systemctl")).isFile();
+      } catch {
+        return false;
+      }
+    });
+  return !onPath || !existsSync(booted);
+}
+
+/** What to say on a Linux machine with no systemd user manager, with a crontab line that does the timer's job. */
+export function noSystemdMessage(cron = "*/30 * * * *"): string {
+  const log = join(stateDir(), "logs", `${TIMER_NAME}.log`);
+  return `this machine has no systemd user manager (a container, WSL1, or a system that boots without systemd), so skillfleet can't install a timer here. Run \`skillfleet sync\` from cron instead (\`crontab -e\`, then a line such as: ${cron} ${shQuote(launcherPath())} sync >> ${shQuote(log)} 2>&1), and init with --no-timer`;
+}
+
+/** A `systemctl` failure that means systemd itself is missing, not that one call went wrong. */
+const meansNoSystemd = (command: string, exitCode: number, output: string) =>
+  process.platform === "linux" &&
+  /^systemctl\b/.test(command) &&
+  (exitCode === 127 ||
+    /ENOENT|command not found|not booted with systemd|System has not been booted/i.test(output) ||
+    (/connect to bus/i.test(output) && !existsSync("/run/systemd/system")));
+
 interface ScheduleError {
   code: string;
   message: string;
@@ -160,6 +198,7 @@ function explain(error: ScheduleError): string {
   const bug = `skillfleet asked ${scheduler} for a timer it refused, which is a bug in skillfleet; please report it at https://github.com/onmax/skillfleet/issues`;
   if (osScheduleErrors.SCHEDULE_OS_COMMAND_FAILED.is(error)) {
     const { command, exitCode, output } = error.data;
+    if (meansNoSystemd(command, exitCode, output)) return noSystemdMessage();
     const why = `\`${command}\` failed with exit code ${exitCode}: ${output || "no output"}`;
     if (process.platform === "linux" && /connect to bus|XDG_RUNTIME_DIR/i.test(output))
       return `${why}\n  fix: this login has no systemd user manager; run \`loginctl enable-linger ${userInfo().username}\`, or run \`skillfleet timer install\` from a login session`;
@@ -187,8 +226,13 @@ function explain(error: ScheduleError): string {
 }
 
 export class TimerError extends Error {
+  /** The machine has no systemd user manager, so it can't have a timer at all. */
+  readonly noSystemd: boolean;
   constructor(error: ScheduleError) {
     super(explain(error));
+    this.noSystemd =
+      osScheduleErrors.SCHEDULE_OS_COMMAND_FAILED.is(error) &&
+      meansNoSystemd(error.data.command, error.data.exitCode, error.data.output);
   }
 }
 
@@ -224,6 +268,99 @@ export async function installTimer(spec: TimerSpec): Promise<InstalledTimer> {
   };
 }
 
+/** The spec skillfleet last installed and the files that hold it, so a dry run can tell when nothing would change. */
+interface TimerRecord {
+  spec: TimerSpec;
+  files: string[];
+}
+
+const recordFile = () => join(stateDir(), "timer.json");
+
+export function recordTimer(spec: TimerSpec, files: readonly string[]) {
+  writeJson(recordFile(), { spec, files });
+}
+
+export function forgetTimer() {
+  rmSync(recordFile(), { force: true });
+}
+
+/**
+ * Whether `spec` is the timer skillfleet installed last, with its files still in place. Undefined
+ * when there is no record of an install (an older skillfleet, or none).
+ */
+export function sameAsInstalled(spec: TimerSpec): boolean | undefined {
+  const raw = readJsonOrNothing(recordFile());
+  if (!isRecord(raw) || !isRecord(raw.spec) || !Array.isArray(raw.files)) return undefined;
+  const record = raw as unknown as TimerRecord;
+  // The log appears with the first run; the unit files, plist or task wrapper must still be there.
+  const held = record.files.filter((file) => typeof file === "string" && !file.endsWith(".log"));
+  if (!held.every((file) => existsSync(file))) return false;
+  return JSON.stringify(record.spec) === JSON.stringify(spec);
+}
+
+/** The files the OS scheduler reads the timer's command from, where skillfleet's timer would be. */
+function timerCommandFiles(): string[] {
+  const raw = readJsonOrNothing(recordFile());
+  const recorded =
+    isRecord(raw) && Array.isArray(raw.files)
+      ? raw.files.filter((file): file is string => typeof file === "string")
+      : [];
+  const own =
+    process.platform === "darwin"
+      ? [join(homedir(), "Library", "LaunchAgents", `${TIMER_NAME}.plist`)]
+      : process.platform === "win32"
+        ? [
+            join(
+              process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"),
+              "ViteHub",
+              "schedules",
+              `${TIMER_NAME}.ps1`,
+            ),
+          ]
+        : [
+            ...new Set([
+              join(xdgDir("XDG_CONFIG_HOME") ?? join(homedir(), ".config"), "systemd", "user"),
+              join(homedir(), ".config", "systemd", "user"),
+            ]),
+          ].map((dir) => join(dir, `${TIMER_NAME}.service`));
+  return [...new Set([...recorded.filter((file) => /\.(service|plist|ps1)$/.test(file)), ...own])];
+}
+
+/** The program a systemd unit, launchd plist or Task Scheduler wrapper of @vite-hub/schedule runs. */
+export function commandNode(text: string): string | undefined {
+  const exec = text.match(/^ExecStart=(.*)$/m)?.[1];
+  if (exec !== undefined) {
+    const quoted = exec.match(/^"((?:[^"\\]|\\.)*)"/)?.[1]?.replace(/\\(.)/g, "$1");
+    const first = quoted ?? exec.split(/\s/)[0]!;
+    return first.replace(/\$\$/g, "$").replace(/%%/g, "%");
+  }
+  const plist = text.match(
+    /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/,
+  )?.[1];
+  if (plist !== undefined) return unxml(plist);
+  const ps = text.match(
+    /^& '((?:[^'\u2018\u2019\u201A\u201B]|['\u2018\u2019\u201A\u201B]{2})*)'/m,
+  )?.[1];
+  return ps?.replace(/(['\u2018\u2019\u201A\u201B])\1/g, "$1");
+}
+
+/** The node skillfleet's installed timer runs, and the file that names it. */
+export function timerNode(): { file: string; node: string } | undefined {
+  for (const file of timerCommandFiles()) {
+    let text: string;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    // Only a timer that runs this state folder's copy is this install's.
+    if (!text.includes(join(stateDir(), "app"))) continue;
+    const node = commandNode(text);
+    if (node) return { file, node };
+  }
+  return undefined;
+}
+
 export async function timerStatus(name = TIMER_NAME): Promise<TimerStatus> {
   const [error, status] = await osScheduleStatus(name, { scope: "user" });
   if (error) throw new TimerError(error);
@@ -237,6 +374,20 @@ export async function removeTimer(
   const [error, removal] = await uninstallOsSchedule(name, { scope: "user" });
   if (error) throw new TimerError(error);
   return { existed: removal.existed, removed: removal.removed };
+}
+
+/**
+ * What to say about a timer this install does not have. `declined` is the user's choice of no
+ * timer; another install's timer that holds the name is named either way, since it runs instead.
+ */
+export async function missingTimer(status: TimerStatus, declined: boolean): Promise<string> {
+  const foreign = await foreignTimerResource();
+  if (declined) {
+    const chose =
+      "not installed, as you chose (`init --no-timer` or `timer remove`); `skillfleet timer install` adds it";
+    return foreign ? `${chose}. Note: ${foreignTimer(TIMER_NAME, foreign)}` : chose;
+  }
+  return foreign ? foreignTimer(TIMER_NAME, foreign) : formatTimerStatus(status);
 }
 
 /** One line about the timer for `status` and `timer status`. */

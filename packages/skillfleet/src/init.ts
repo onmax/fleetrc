@@ -13,6 +13,7 @@ import {
   loadManifest,
   type LoadedManifest,
   locateManifest,
+  type Manifest,
   parseManifest,
   remoteManifest,
   writeConfig,
@@ -48,6 +49,8 @@ export interface InitPlan {
   kept: string[];
   sync: Report;
   warnings: string[];
+  /** The manifest's `timer` settings, for the timer init installs. */
+  timer: Manifest["timer"];
 }
 
 /** Names shown in a skills folder (following a whole-folder link), without dotfiles. */
@@ -186,7 +189,8 @@ export async function planInit(
       failed: loaded.failed,
     };
     const report = await sync({ loaded: augmented, dryRun: true, offline });
-    report.manifest = manifestFile;
+    // A remote manifest's file is a cache copy, or in a dry run a scratch one this function deletes.
+    report.manifest = remoteManifest(spec) ? spec : manifestFile;
     const provided = new Set(report.skills.names);
     const targets = (await agentTargets(loaded.root.agents)).map((target) => target.dir);
     const legacy = codexLegacyDir();
@@ -262,7 +266,8 @@ export async function planInit(
     const lost = [...before].filter((name) => !after.has(name)).sort();
     return {
       manifestSpec: spec,
-      manifestFile,
+      // A dry run's copy of a remote manifest is gone when this returns.
+      manifestFile: dryRun && remoteManifest(spec) ? spec : manifestFile,
       editable: !remoteManifest(spec),
       before: [...before].sort(),
       after: [...after].sort(),
@@ -272,6 +277,7 @@ export async function planInit(
       kept: [...kept].sort(),
       sync: report,
       warnings,
+      timer: root.timer,
     };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -289,7 +295,9 @@ function readOwnLinks(dir: string): Record<string, unknown> {
 
 /** The plan as text. `errors: false` leaves out the sync's errors, for when the real sync prints them next. */
 export function formatPlan(plan: InitPlan, { errors = true } = {}): string {
-  const lines = [`skillfleet init: manifest ${tildify(plan.manifestFile)}`];
+  const lines = [
+    `skillfleet init: manifest ${plan.editable ? tildify(plan.manifestFile) : plan.manifestSpec}`,
+  ];
   for (const migration of plan.migrations) {
     switch (migration.kind) {
       case "unfold":
