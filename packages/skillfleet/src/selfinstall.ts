@@ -66,8 +66,9 @@ export function launchers(
       "",
     ].join("\r\n"),
     ps1: `\uFEFF${[
-      "# skillfleet's launcher for PowerShell: arguments reach node as typed.",
-      "$cli = Join-Path $PSScriptRoot '..\\app\\cli.mjs'",
+      "# skillfleet's launcher for PowerShell: arguments reach node as typed. It calls no cmdlet, which",
+      "# Windows PowerShell would first look for in every module, for seconds under a new profile.",
+      '$cli = "$PSScriptRoot\\..\\app\\cli.mjs"',
       `if ($MyInvocation.ExpectingInput) { $input | & ${psNode} $cli $args } else { & ${psNode} $cli $args }`,
       "exit $LASTEXITCODE",
       "",
