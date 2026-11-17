@@ -464,7 +464,7 @@ export async function syncClone(
 }
 
 /** Clones a working clone at its `ref`: a branch or tag, or else a commit, checked out detached. */
-async function cloneAt(source: CloneSource, dir: string) {
+export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: string) {
   const url = gitUrl(source.git);
   const clone = (ref?: string) =>
     git(["clone", "--quiet", ...(ref ? ["--branch", ref] : []), "--", url, dir], {

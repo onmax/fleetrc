@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   readdirSync,
   readlinkSync,
@@ -296,5 +297,72 @@ describe("init", () => {
     expect((await m.run("init", team.url, "--no-timer")).code).toBe(0);
     expect((await m.json("sync", "--dry-run")).manifest).toBe(spec);
     expect((await m.json("sync")).manifest).toBe(spec);
+  });
+
+  describe("R3-1. init adopts hand-made skills into a clone it has not made yet", () => {
+    /** The README's new-machine flow: a personal manifest repository whose clone adopts skills. */
+    function newMachine(m: Machine, { reachable = true } = {}) {
+      const mine = remote(m, "mine", skills("skills/", "kept"));
+      const team = remote(m, "team", {
+        "skills.json": JSON.stringify({
+          agents: ["claude-code"],
+          sources: [
+            { id: "mine", git: mine.url, path: "~/code/mine", skills: "skills/*", adopt: true },
+          ],
+        }),
+      });
+      mkdirSync(m.at(".claude/skills/handmade"), { recursive: true });
+      writeFileSync(m.at(".claude/skills/handmade/SKILL.md"), skillMd("handmade"));
+      if (!reachable) rmSync(mine.url, { recursive: true, force: true });
+      return team;
+    }
+
+    it("clones first, then adopts, and the dry run says so in that order", async () => {
+      const m = machine();
+      const team = newMachine(m);
+      const dry = await m.run("init", team.url, "--dry-run", "--no-timer");
+      expect(dry.code, dry.stdout + dry.stderr).toBe(0);
+      const clone = dry.stdout.indexOf("clone ");
+      const adopt = dry.stdout.indexOf(
+        "adopt ~/.claude/skills/handmade into ~/code/mine/skills/handmade",
+      );
+      expect(clone).toBeGreaterThan(-1);
+      expect(adopt).toBeGreaterThan(clone);
+      const init = await m.run("init", team.url, "--no-timer");
+      expect(init.code, init.stdout + init.stderr).toBe(0);
+      expect(read(m.at("code/mine/skills/handmade/SKILL.md"))).toBe(skillMd("handmade"));
+      expect(isLink(m.at(".claude/skills/handmade"))).toBe(true);
+      expect(names(m.at(".claude/skills"))).toEqual(["handmade", "kept"]);
+      expect((await m.json("sync")).errors).toEqual([]);
+    });
+
+    it("leaves the hand-made skill where it is when the clone fails", async () => {
+      const m = machine();
+      const team = newMachine(m, { reachable: false });
+      const init = await m.run("init", team.url, "--no-timer");
+      expect(init.stdout + init.stderr).toMatch(
+        /could not clone mine into ~\/code\/mine .*nothing is adopted/,
+      );
+      expect(read(m.at(".claude/skills/handmade/SKILL.md"))).toBe(skillMd("handmade"));
+      expect(isLink(m.at(".claude/skills/handmade"))).toBe(false);
+      expect(existsSync(m.at("code/mine"))).toBe(false);
+    });
+
+    it("adopts nothing into a folder at the clone's path that is not a clone", async () => {
+      const m = machine();
+      const team = newMachine(m);
+      mkdirSync(m.at("code/mine/notes"), { recursive: true });
+      const dry = await m.json<{
+        migrations: { kind: string }[];
+        lost: string[];
+        warnings: string[];
+      }>("init", team.url, "--dry-run", "--no-timer");
+      expect(dry.migrations.map((migration) => migration.kind)).toEqual([]);
+      expect(dry.lost).toEqual([]);
+      expect(dry.warnings.join("\n")).toContain("~/code/mine exists and is not a git repository");
+      await m.run("init", team.url, "--no-timer");
+      expect(read(m.at(".claude/skills/handmade/SKILL.md"))).toBe(skillMd("handmade"));
+      expect(existsSync(m.at("code/mine/skills"))).toBe(false);
+    });
   });
 });

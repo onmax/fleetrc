@@ -24,7 +24,7 @@ import {
   unpublished,
 } from "./fleet.ts";
 import { isRecord, JsonFileError, readJsonOrNothing } from "./fs.ts";
-import { applyPlan, formatPlan, planInit } from "./init.ts";
+import { applyPlan, cloneBeforeAdopt, formatPlan, planInit } from "./init.ts";
 import { gitUrl } from "./gitcache.ts";
 import { errorText } from "./linker.ts";
 import {
@@ -755,7 +755,7 @@ async function init() {
     throw new UserError(
       `init would lose ${plan.lost.join(", ")}; add a source for them, or pass --force`,
     );
-  const applied = applyPlan(plan);
+  const applied = [...(await cloneBeforeAdopt(plan)), ...applyPlan(plan)];
   say(...applied.map((line) => `  ${line}`));
   if (values["no-timer"]) updateConfig({ timer: false });
   const report = await syncReport();

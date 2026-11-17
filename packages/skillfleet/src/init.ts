@@ -21,13 +21,19 @@ import {
 import { findName } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
+import { GitError } from "./exec.ts";
+import { cloneAt } from "./sources.ts";
 import { sync } from "./sync.ts";
 
 export type Migration =
+  /** The adopt source's clone, made before anything moves into it. */
+  | { kind: "clone"; source: string; git: string; ref?: string; path: string }
   | { kind: "unfold"; dir: string; target: string }
   | { kind: "unlink"; path: string; target: string }
   | { kind: "backup"; path: string; reason: string }
   | { kind: "adopt"; path: string; to: string };
+
+const ADOPTED_ELSEWHERE = "is adopted from another folder";
 
 export interface Imports {
   sources: Record<string, unknown>[];
@@ -197,11 +203,21 @@ export async function planInit(
     const folders = targets.includes(legacy) ? targets : [...targets, legacy];
     const before = new Set(folders.flatMap(entries));
     const personal = personalSource(loaded.sources);
-    const adoptInto = personal?.adopt ? personalSkillsDir(personal) : undefined;
+    const warnings: string[] = [...report.warnings];
+    let adoptInto = personal?.adopt ? personalSkillsDir(personal) : undefined;
+    // Skills are adopted into a working clone only once it is one: init clones it first, and a
+    // folder there that is not a clone gets nothing, since sync could never update it.
+    const cloneFirst =
+      personal?.kind === "clone" && !existsSync(join(personal.path, ".git")) ? personal : undefined;
+    if (adoptInto && cloneFirst && existsSync(cloneFirst.path)) {
+      warnings.push(
+        `${tildify(cloneFirst.path)} exists and is not a git repository, so nothing is adopted into it; move it away and run init again to clone ${cloneFirst.git} there`,
+      );
+      adoptInto = undefined;
+    }
     const migrations: Migration[] = [];
     const kept = new Set<string>();
     const adopted = new Set<string>();
-    const warnings: string[] = [...report.warnings];
 
     const handleReal = (path: string, name: string, removeEvenIfKept: boolean) => {
       const hasSkill = existsSync(join(path, "SKILL.md"));
@@ -211,7 +227,7 @@ export async function planInit(
         migrations.push({ kind: "adopt", path, to: join(adoptInto, name) });
         adopted.add(name);
       } else if (removeEvenIfKept && adopted.has(name)) {
-        migrations.push({ kind: "backup", path, reason: `${name} is adopted from another folder` });
+        migrations.push({ kind: "backup", path, reason: `${name} ${ADOPTED_ELSEWHERE}` });
       } else {
         kept.add(name);
         warnings.push(
@@ -261,6 +277,14 @@ export async function planInit(
               reason: "list of an old installer's copies",
             });
     }
+    if (adopted.size > 0 && cloneFirst)
+      migrations.unshift({
+        kind: "clone",
+        source: cloneFirst.id,
+        git: cloneFirst.git,
+        ...(cloneFirst.ref ? { ref: cloneFirst.ref } : {}),
+        path: cloneFirst.path,
+      });
     // A name that only lived in Codex's old folder and was unlinked there is lost unless something else keeps it.
     const after = new Set([...provided, ...kept, ...adopted]);
     const lost = [...before].filter((name) => !after.has(name)).sort();
@@ -300,6 +324,11 @@ export function formatPlan(plan: InitPlan, { errors = true } = {}): string {
   ];
   for (const migration of plan.migrations) {
     switch (migration.kind) {
+      case "clone":
+        lines.push(
+          `  clone ${migration.git} into ${tildify(migration.path)} (${migration.source}), before adopting skills into it`,
+        );
+        break;
       case "unfold":
         lines.push(
           `  replace the link ${tildify(migration.dir)} -> ${tildify(migration.target)} with one link per skill`,
@@ -338,6 +367,37 @@ export function formatPlan(plan: InitPlan, { errors = true } = {}): string {
   return lines.join("\n");
 }
 
+/**
+ * Makes the clone a plan adopts skills into. When git can't, the plan adopts nothing: the hand-made
+ * skills stay where they are, in every agent folder that shows them, and the line says why.
+ */
+export async function cloneBeforeAdopt(plan: InitPlan): Promise<string[]> {
+  const clone = plan.migrations.find(
+    (migration): migration is Extract<Migration, { kind: "clone" }> => migration.kind === "clone",
+  );
+  if (!clone) return [];
+  try {
+    if (existsSync(clone.path)) throw new Error(`${clone.path} exists and is not a git repository`);
+    await cloneAt(clone, clone.path);
+    return [`cloned ${clone.git} into ${tildify(clone.path)}`];
+  } catch (error) {
+    const stay = plan.migrations.flatMap((migration) =>
+      migration.kind === "adopt" ? [tildify(migration.path)] : [],
+    );
+    plan.migrations = plan.migrations.filter(
+      (migration) =>
+        migration.kind !== "clone" &&
+        migration.kind !== "adopt" &&
+        !(migration.kind === "backup" && migration.reason.includes(ADOPTED_ELSEWHERE)),
+    );
+    const said =
+      error instanceof GitError ? error.message.split("\n")[0] : (error as Error).message;
+    return [
+      `could not clone ${clone.source} into ${tildify(clone.path)} (${said}), so nothing is adopted: ${stay.join(", ")} stay where they are`,
+    ];
+  }
+}
+
 /** Carries out a plan: back up, adopt, unfold folder links, write config and imports. Sync runs after. */
 export function applyPlan(plan: InitPlan): string[] {
   const done: string[] = [];
@@ -345,6 +405,9 @@ export function applyPlan(plan: InitPlan): string[] {
   const unfold: Extract<Migration, { kind: "unfold" }>[] = [];
   for (const migration of plan.migrations) {
     switch (migration.kind) {
+      case "clone":
+        // cloneBeforeAdopt made it.
+        break;
       case "unfold":
         unfold.push(migration);
         break;
