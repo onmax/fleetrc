@@ -16,6 +16,7 @@ import { basename, dirname, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vite-plus/test";
+import { jsonTemp } from "../src/fs.ts";
 import {
   cli,
   clone,
@@ -1102,9 +1103,9 @@ describe("what a killed sync left beside state.json", () => {
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
     const gone = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
     await new Promise((done) => gone.on("exit", done));
-    const dead = join(m.stateDir, `state.json.${gone.pid}.tmp`);
+    const dead = jsonTemp(join(m.stateDir, "state.json"), gone.pid!);
     // Another command writing state.json right now, such as merge.
-    const live = join(m.stateDir, `state.json.${process.pid}.tmp`);
+    const live = jsonTemp(join(m.stateDir, "state.json"), process.pid);
     writeFileSync(dead, "{");
     writeFileSync(live, "{");
     expect((await m.run("sync")).code).toBe(0);

@@ -10,13 +10,15 @@ import {
   readdirSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
+import { jsonTemp } from "../src/fs.ts";
 import { whereabouts } from "../src/process.ts";
-import { LockHeldError, takeLock } from "../src/sync.ts";
+import { LockHeldError, sweepJsonTemps, takeLock } from "../src/sync.ts";
 import {
   cli,
   http,
@@ -120,6 +122,44 @@ describe("R7-3. a sync lock taken on another machine or in another container", (
       expect(takeLock(file, mine())).toContain("the machine restarted");
     },
   );
+});
+
+describe("temporary files of state.json on a HOME other machines share", () => {
+  it("go when this host wrote them and their process is gone, or when they are over an hour old", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "skillfleet-temps-"));
+    try {
+      const gone = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+      await new Promise((done) => gone.on("exit", done));
+      const state = join(dir, "state.json");
+      const file = (name: string, hoursOld = 0) => {
+        const path = join(dir, name);
+        writeFileSync(path, "{");
+        const at = new Date(Date.now() - hoursOld * 3_600_000);
+        utimesSync(path, at, at);
+        return path;
+      };
+      const base = (path: string) => path.slice(dir.length + 1);
+      const mineDead = file(base(jsonTemp(state, gone.pid!)));
+      const mineRunning = file(base(jsonTemp(state, process.ppid)));
+      // Another machine's write in progress: its pid means nothing here.
+      const otherHost = file(`state.json.laptop.${gone.pid}.0123456789ab.tmp`);
+      const otherHostOld = file(`last-run.json.laptop.${gone.pid}.0123456789ab.tmp`, 2);
+      // Written by an older skillfleet, which named no host.
+      const unknown = file(`state.json.${gone.pid}.0123456789ab.tmp`);
+      const unknownOld = file(`state.json.${gone.pid}.tmp`, 2);
+      const unrelated = file("notes.json.tmp", 2);
+      sweepJsonTemps(dir);
+      expect(existsSync(mineDead)).toBe(false);
+      expect(existsSync(mineRunning)).toBe(true);
+      expect(existsSync(otherHost)).toBe(true);
+      expect(existsSync(otherHostOld)).toBe(false);
+      expect(existsSync(unknown)).toBe(true);
+      expect(existsSync(unknownOld)).toBe(false);
+      expect(existsSync(unrelated)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("R7-5. a sync that never ends", () => {

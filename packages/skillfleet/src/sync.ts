@@ -24,12 +24,14 @@ import {
   isErrno,
   isRecord,
   isRunning,
+  jsonTempWriter,
   lstat,
   moveDir,
   readJsonOrNothing,
   resolvedHashes,
   sameTree,
   sha256,
+  tempOwner,
   writeJson,
 } from "./fs.ts";
 import { matchesGlob } from "./glob.ts";
@@ -370,13 +372,17 @@ function sweepBreakMarkers(file: string, judge: (holder: LockHolder) => string |
   }
 }
 
+/** A write of state.json takes well under this, so a temp file this old is no write in progress. */
+const JSON_TEMP_MAX_AGE_MS = 60 * 60_000;
+
 /**
  * Deletes the temporary files a killed sync left while it wrote state.json or last-run.json
- * (`writeJson`). Other commands write state.json without the lock, so a file goes only when its
- * process is gone, or when it is older than any write takes, in case its pid was reused.
+ * (`writeJson`). Other commands write state.json without the lock, and other machines or
+ * containers may share this folder, so a file goes when this host and pid namespace wrote it and
+ * its process is gone, or when it is older than any write takes: its pid may be reused, or name a
+ * process elsewhere.
  */
-function sweepJsonTemps() {
-  const dir = dirname(paths.state());
+export function sweepJsonTemps(dir = dirname(paths.state())) {
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -384,11 +390,13 @@ function sweepJsonTemps() {
     return;
   }
   for (const name of names) {
-    const match = /^(?:state|last-run)\.json\.(\d+)(?:\.[0-9a-f]+)?\.tmp$/.exec(name);
-    if (!match) continue;
+    if (!/^(?:state|last-run)\.json\..*\.tmp$/.test(name)) continue;
     const file = join(dir, name);
     const age = Date.now() - (lstat(file)?.mtimeMs ?? Date.now());
-    if (!isRunning(Number(match[1])) || age > 10 * 60_000) rmSync(file, { force: true });
+    const writer = jsonTempWriter(name);
+    const mine = writer?.owner === tempOwner();
+    if ((mine && !isRunning(writer!.pid)) || age > JSON_TEMP_MAX_AGE_MS)
+      rmSync(file, { force: true });
   }
 }
 

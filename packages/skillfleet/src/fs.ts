@@ -17,6 +17,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 export type Hashes = Record<string, string>;
@@ -435,11 +436,44 @@ export function readJsonOrNothing(path: string): unknown {
   }
 }
 
+let owner: string | undefined;
+
+/**
+ * Where this process's pid means something, for the names of its temporary files: the host name,
+ * and on Linux the pid namespace too. Machines and containers that share one HOME repeat pids, so
+ * a temp file whose pid is not running here may be another one's write in progress.
+ */
+export function tempOwner(): string {
+  if (owner !== undefined) return owner;
+  let ns = "";
+  if (process.platform === "linux")
+    try {
+      ns = `-ns${readlinkSync("/proc/self/ns/pid").replace(/\D/g, "")}`;
+    } catch {}
+  owner = `${
+    hostname()
+      .replace(/[^A-Za-z0-9-]/g, "-")
+      .slice(0, 64) || "host"
+  }${ns}`;
+  return owner;
+}
+
+/** The temporary file `writeJson` writes `path` through. */
+export function jsonTemp(path: string, pid = process.pid): string {
+  return `${path}.${tempOwner()}.${pid}.${randomBytes(6).toString("hex")}.tmp`;
+}
+
+/** Who wrote a temporary file named by `jsonTemp`, or undefined for any other name. */
+export function jsonTempWriter(name: string): { owner: string; pid: number } | undefined {
+  const match = /\.json\.([A-Za-z0-9-]+)\.(\d+)\.[0-9a-f]{12}\.tmp$/.exec(name);
+  return match ? { owner: match[1]!, pid: Number(match[2]) } : undefined;
+}
+
 /** Writes JSON through a temporary file, so a crash never leaves half a file. */
 export function writeJson(path: string, value: unknown) {
   mkdirSync(dirname(path), { recursive: true });
-  // The pid for sweeping after a kill, and a random part: containers sharing HOME repeat pids.
-  const temp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  // Who wrote it, for sweeping after a kill, and a random part, since pids repeat.
+  const temp = jsonTemp(path);
   writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`);
   renameSync(temp, path);
 }
