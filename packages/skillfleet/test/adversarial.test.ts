@@ -1095,6 +1095,24 @@ describe("who holds the sync lock", () => {
   });
 });
 
+describe("what a killed sync left beside state.json", () => {
+  it("W-LOCK-2. the next sync deletes a dead sync's state.json temp and keeps a running command's", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    const gone = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    await new Promise((done) => gone.on("exit", done));
+    const dead = join(m.stateDir, `state.json.${gone.pid}.tmp`);
+    // Another command writing state.json right now, such as merge.
+    const live = join(m.stateDir, `state.json.${process.pid}.tmp`);
+    writeFileSync(dead, "{");
+    writeFileSync(live, "{");
+    expect((await m.run("sync")).code).toBe(0);
+    expect(existsSync(dead)).toBe(false);
+    expect(existsSync(live)).toBe(true);
+  });
+});
+
 describe("syncs started at the same moment", () => {
   it("S1. of several syncs started together, exactly one takes the lock", async () => {
     const m = machine();

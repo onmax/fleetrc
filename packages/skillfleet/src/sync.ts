@@ -4,6 +4,7 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -21,6 +22,7 @@ import {
   hashDir,
   isErrno,
   isRecord,
+  isRunning,
   lstat,
   moveDir,
   readJsonOrNothing,
@@ -192,6 +194,28 @@ function acquireLock(): { release: () => void; note?: string } {
     note = `removed a stale sync lock: ${reason}`;
   }
   throw new Error(`could not take the sync lock ${tildify(file)}`);
+}
+
+/**
+ * Deletes the temporary files a killed sync left while it wrote state.json or last-run.json
+ * (`writeJson`). Other commands write state.json without the lock, so a file goes only when its
+ * process is gone, or when it is older than any write takes, in case its pid was reused.
+ */
+function sweepJsonTemps() {
+  const dir = dirname(paths.state());
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const match = /^(?:state|last-run)\.json\.(\d+)\.tmp$/.exec(name);
+    if (!match) continue;
+    const file = join(dir, name);
+    const age = Date.now() - (lstat(file)?.mtimeMs ?? Date.now());
+    if (!isRunning(Number(match[1])) || age > 10 * 60_000) rmSync(file, { force: true });
+  }
 }
 
 /** Creates `file` with `text` only if it does not exist, never leaving it half written. */
@@ -416,6 +440,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   const offline = options.offline ?? false;
   const scratch = dryRun ? mkdtempSync(join(tmpdir(), "skillfleet-dry-")) : undefined;
   const lock = dryRun ? { release: () => {} } : acquireLock();
+  if (!dryRun) sweepJsonTemps();
   const warnings: string[] = lock.note ? [lock.note] : [];
   try {
     // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
