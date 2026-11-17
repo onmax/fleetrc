@@ -168,33 +168,61 @@ describe("R7-5. a sync that never ends", () => {
     async () => {
       const m = machine();
       const vendor = remote(m, "vendor", skills("skills/", "tool"));
+      const pass = join(m.root, "hook.pass");
       const pidFile = join(m.root, "hook.pid");
+      const release = join(m.root, "hook.release");
       const script = join(m.root, "hang.mjs");
+      // Passes while `pass` exists; otherwise says it started and waits for `release`, which only
+      // the test's cleanup writes, so it ends only when the sync's time limit stops it.
       writeFileSync(
         script,
-        `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetTimeout(() => {}, 120_000);\n`,
+        [
+          `import { existsSync, writeFileSync } from "node:fs";`,
+          `if (existsSync(${JSON.stringify(pass)})) process.exit(0);`,
+          `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+          `setInterval(() => existsSync(${JSON.stringify(release)}) && process.exit(0), 100);`,
+        ].join("\n"),
       );
+      writeFileSync(pass, "");
       const manifest = m.manifest({
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
         hooks: [{ name: "hang", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
       });
-      const started = Date.now();
-      const run = await m.runWith(
-        { env: { ...m.env, SKILLFLEET_SYNC_TIMEOUT_MS: "4000" } },
-        "init",
-        manifest,
-        "--no-timer",
-      );
-      expect(Date.now() - started).toBeLessThan(60_000);
-      expect(run.code).not.toBe(0);
-      expect(run.stderr).toContain("the sync was stopped after 4 s while running hooks");
-      expect(readdirSync(m.stateDir).filter((name) => name.startsWith("sync.lock"))).toEqual([]);
-      const hook = Number(read(pidFile));
-      await new Promise((done) => setTimeout(done, 300));
-      expect(() => process.kill(hook, 0)).toThrow();
+      try {
+        await init(m, manifest);
+        rmSync(pass);
+        // The limit counts from the start of the sync, so on a loaded machine the fetch can use it
+        // up before the hook starts. That run says so and proves nothing: it is tried again with a
+        // longer limit, and only a run whose hook started is checked.
+        for (const [i, limit] of [4_000, 15_000, 45_000].entries()) {
+          vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", `v${i + 2}`) });
+          const run = await m.runWith(
+            { env: { ...m.env, SKILLFLEET_SYNC_TIMEOUT_MS: String(limit) } },
+            "sync",
+          );
+          expect(run.code).not.toBe(0);
+          expect(readdirSync(m.stateDir).filter((name) => name.startsWith("sync.lock"))).toEqual(
+            [],
+          );
+          if (!existsSync(pidFile)) {
+            expect(run.stderr).toContain(`the sync was stopped after ${limit / 1000} s while`);
+            continue;
+          }
+          expect(run.stderr).toContain(
+            `the sync was stopped after ${limit / 1000} s while running hooks`,
+          );
+          const hook = Number(read(pidFile));
+          await new Promise((done) => setTimeout(done, 300));
+          expect(() => process.kill(hook, 0)).toThrow();
+          return;
+        }
+        throw new Error("no sync reached its hooks within 45 s");
+      } finally {
+        writeFileSync(release, "");
+      }
     },
-    90_000,
+    120_000,
   );
 });
 
