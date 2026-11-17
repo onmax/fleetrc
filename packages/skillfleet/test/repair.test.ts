@@ -72,6 +72,28 @@ describe("review regression cases", () => {
     },
   );
 
+  it("keeps a hand-made skill when the cloned destination is not a replacement", async () => {
+    const m = machine();
+    const mine = remote(m, "mine", {
+      "skills/tool/README.md": "Not a skill",
+      "skills/other/SKILL.md": skillMd("other"),
+    });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        { id: "mine", git: mine.url, path: "~/code/mine", skills: "skills/*", adopt: true },
+      ],
+    });
+    mkdirSync(m.at(".claude/skills/tool"), { recursive: true });
+    writeFileSync(m.at(".claude/skills/tool/SKILL.md"), skillMd("tool", "handmade"));
+    const init = await m.run("init", manifest, "--no-timer");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool", "handmade"));
+    expect(read(m.at(".claude/skills/other/SKILL.md"))).toBe(skillMd("other"));
+    expect(init.stdout).toContain("adoption blocked");
+    expect(read(m.at("code/mine/skills/tool/README.md"))).toBe("Not a skill");
+  });
+
   it.skipIf(isWindows).each(["local", "clone", "git"])(
     "discovers linked-only %s collections",
     async (kind) => {
@@ -109,7 +131,7 @@ describe("review regression cases", () => {
       const record = m.at(".claude/skills/.skillfleet-manifest.json");
       chmodSync(record, 0);
       try {
-        vendor.commit(skills("skills/", "newtool"));
+        vendor.commit({ "skills/newtool/SKILL.md": skillMd("newtool") });
         const run = await m.run("sync");
         expect(run.code).toBe(1);
         expect(existsSync(m.at(".agents/skills/newtool/SKILL.md"))).toBe(true);
