@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { join } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vite-plus/test";
@@ -1008,6 +1008,91 @@ describe("two syncs and a killed sync", () => {
       stopHooks(log);
     }
   }, 60_000);
+});
+
+describe("who holds the sync lock", () => {
+  /** A sync that holds the lock for a while, started as `node <script> sync`. */
+  async function holdingSync(m: Machine, script: string) {
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const log = join(m.root, "hook.log");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+      hooks: [{ name: "slow", run: slowHook(m, log, 20), on: ["vendor:**"] }],
+    });
+    mkdirSync(join(m.home, ".config", "skillfleet"), { recursive: true });
+    writeFileSync(m.at(".config/skillfleet/config.json"), JSON.stringify({ manifest }));
+    const first = spawn(process.execPath, [script, "sync"], {
+      cwd: m.home,
+      env: m.env,
+      stdio: "ignore",
+    });
+    const exited = new Promise((done) => first.on("exit", done));
+    for (let i = 0; i < 300 && !existsSync(log); i++) await new Promise((r) => setTimeout(r, 100));
+    expect(existsSync(log)).toBe(true);
+    return {
+      stop: async () => {
+        first.kill("SIGKILL");
+        await exited;
+        stopHooks(log);
+      },
+    };
+  }
+
+  it("W-1. a sync started by another spelling of skillfleet's path holds the lock against a second sync", async () => {
+    const m = machine();
+    // A launcher's `bin/../app/cli.mjs`, or a path relative to the current folder: node's argv[1]
+    // is the resolved path, and the command line the OS keeps is not.
+    const spelled =
+      relative(m.home, join(dirname(cli), "..", basename(dirname(cli)))) +
+      sep +
+      "." +
+      sep +
+      "cli.mjs";
+    const holder = await holdingSync(m, spelled);
+    try {
+      const second = await m.run("sync");
+      expect(second.code, second.stdout + second.stderr).toBe(1);
+      expect(second.stderr).toContain("another skillfleet sync is running");
+    } finally {
+      await holder.stop();
+    }
+  }, 60_000);
+
+  it("W-1. a lock whose pid now runs a process that started after the lock's holder is stale", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+      stdio: "ignore",
+    });
+    try {
+      const now = Date.now();
+      writeFileSync(
+        join(m.stateDir, "sync.lock"),
+        JSON.stringify({ pid: other.pid, started: now - 60_000, at: now - 30_000 }),
+      );
+      const report = await m.json("sync");
+      expect(report.warnings.join("\n")).toContain(`pid ${other.pid} is now another program`);
+    } finally {
+      other.kill("SIGKILL");
+    }
+  });
+
+  it("W-1. a lock whose pid runs a process that started no later than the lock's holder is held", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    // This test's own process, as if it were the sync that wrote the lock.
+    const started = Math.floor(performance.timeOrigin);
+    writeFileSync(
+      join(m.stateDir, "sync.lock"),
+      JSON.stringify({ pid: process.pid, started, at: Date.now() }),
+    );
+    const run = await m.run("sync");
+    expect(run.code).toBe(1);
+    expect(run.stderr).toContain(`another skillfleet sync is running (pid ${process.pid})`);
+  });
 });
 
 describe("syncs started at the same moment", () => {

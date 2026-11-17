@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { copyDir, hashDir, lstat, sameTree } from "./fs.ts";
+import { removeLink } from "./linker.ts";
 import { paths, tildify } from "./paths.ts";
 
 /** The launcher the timer and `fleet` run: an absolute node path and skillfleet's own copy. */
@@ -26,25 +27,67 @@ export const installedCli = () => join(paths.app(), "cli.mjs");
 const shQuote = (path: string) => `"${path.replace(/[$`"\\]/g, "\\$&")}"`;
 
 /**
- * The sh launcher. On Windows it is for Git Bash, which takes forward slashes. The .cmd launcher
+ * Beside the .cmd launcher, a junction to node's folder when node's path is not ASCII: cmd reads a
+ * batch file in the console's code page, where `C:\Users\José\scoop\…` is another path, while
+ * `%~dp0` is expanded as Unicode. A short (8.3) name would do only where the volume keeps them, and
+ * `chcp 65001` changes the console the user goes on typing in.
+ */
+export const NODE_LINK = "node-dir";
+
+/**
+ * The launchers. The sh one is, on Windows, for Git Bash, which takes forward slashes. The .cmd one
  * finds the copy next to itself through `%~dp0`, so the state folder's path (the user's name, in
  * the code page cmd reads the file in) is never written into it; `%` in node's path is doubled,
- * since cmd expands it even inside quotes.
+ * since cmd expands it even inside quotes. Started by a quoted name it found on PATH
+ * (`"skillfleet" sync`), cmd gives `%~dp0` the current folder, so it then finds itself on PATH.
+ * The .ps1 one is what PowerShell runs for `skillfleet`: it passes arguments to node as typed,
+ * where through the .cmd, cmd would act on `&`, `|`, `^` and `%` in them first. It is UTF-8 with a
+ * byte order mark, which Windows PowerShell needs to read it as UTF-8.
  */
-export function launchers(node: string, cli: string): { sh: string; cmd: string } {
+export function launchers(
+  node: string,
+  cli: string,
+  options: { nodeLink?: boolean } = {},
+): { sh: string; cmd: string; ps1: string } {
   const posix = (path: string) => (process.platform === "win32" ? path.replace(/\\/g, "/") : path);
+  const doubled = (path: string) => path.replace(/%/g, "%%");
+  const cmdNode = (dir: string) =>
+    options.nodeLink ? `${dir}${NODE_LINK}\\${doubled(basename(node))}` : doubled(node);
+  const run = (dir: string) => `@"${cmdNode(dir)}" "${dir}..\\app\\cli.mjs" %*`;
+  const psNode = `'${node.replace(/['\u2018\u2019\u201A\u201B]/g, "$&$&")}'`;
   return {
     sh: `#!/bin/sh\nexec ${shQuote(posix(node))} ${shQuote(posix(cli))} "$@"\n`,
-    cmd: `@"${node.replace(/%/g, "%%")}" "%~dp0..\\app\\cli.mjs" %*\r\n`,
+    cmd: [
+      `@if not exist "%~dp0..\\app\\cli.mjs" goto path`,
+      run("%~dp0"),
+      "@goto :eof",
+      ":path",
+      run("%~dp$PATH:0"),
+      "",
+    ].join("\r\n"),
+    ps1: `\uFEFF${[
+      "# skillfleet's launcher for PowerShell: arguments reach node as typed.",
+      "$cli = Join-Path $PSScriptRoot '..\\app\\cli.mjs'",
+      `if ($MyInvocation.ExpectingInput) { $input | & ${psNode} $cli $args } else { & ${psNode} $cli $args }`,
+      "exit $LASTEXITCODE",
+      "",
+    ].join("\r\n")}`,
   };
 }
 
-/** The node path a launcher written by `launchers` runs. */
-export function launcherNode(text: string): string | undefined {
+/** The node path a launcher written by `launchers` runs; `dir` is the launcher's folder. */
+export function launcherNode(text: string, dir = paths.bin()): string | undefined {
   const sh = text.match(/^exec "((?:[^"\\]|\\.)*)"/m);
   if (sh) return sh[1]!.replace(/\\(.)/g, "$1");
-  const cmd = text.match(/^@"([^"]+)"/m);
-  return cmd?.[1]!.replace(/%%/g, "%");
+  const cmd = text.match(/^@"([^"]+)"/m)?.[1];
+  if (cmd === undefined) return undefined;
+  const linked = cmd.match(new RegExp(`^%~dp0${NODE_LINK}\\\\(.+)$`))?.[1];
+  if (linked === undefined) return cmd.replace(/%%/g, "%");
+  try {
+    return join(readlinkSync(join(dir, NODE_LINK)), linked.replace(/%%/g, "%"));
+  } catch {
+    return undefined;
+  }
 }
 
 const realpath = (path: string) => {
@@ -175,7 +218,7 @@ export function stableNode(
  * Copies the running build (one bundled file plus chunks) into the state folder and writes
  * launchers, so scheduled runs never depend on the npx cache or on PATH.
  */
-export function selfInstall(): { cli: string; launcher: string; node: string } {
+export function selfInstall(): { cli: string; launcher: string; node: string; notes: string[] } {
   const dist = dirname(fileURLToPath(import.meta.url));
   const app = paths.app();
   const node = stableNode();
@@ -186,14 +229,68 @@ export function selfInstall(): { cli: string; launcher: string; node: string } {
     copyDir(temp, app);
     rmSync(temp, { recursive: true, force: true });
   }
-  mkdirSync(paths.bin(), { recursive: true });
+  const bin = paths.bin();
+  mkdirSync(bin, { recursive: true });
   const cli = installedCli();
-  const text = launchers(node, cli);
-  const sh = join(paths.bin(), "skillfleet");
+  const notes: string[] = [];
+  let nodeLink = false;
+  if (process.platform === "win32") {
+    const link = join(bin, NODE_LINK);
+    if (lstat(link)) removeLink(link);
+    if (/[^\x20-\x7e]/.test(node))
+      try {
+        symlinkSync(dirname(node), link, "junction");
+        nodeLink = true;
+      } catch (error) {
+        notes.push(
+          `could not link ${link} to ${dirname(node)} (${(error as Error).message}), so the .cmd launcher names node's path, which cmd may read in another code page`,
+        );
+      }
+  }
+  const text = launchers(node, cli, { nodeLink });
+  const sh = join(bin, "skillfleet");
   writeFileSync(sh, text.sh);
   chmodSync(sh, 0o755);
-  if (process.platform === "win32") writeFileSync(join(paths.bin(), "skillfleet.cmd"), text.cmd);
-  return { cli, launcher: launcherPath(), node };
+  if (process.platform === "win32") {
+    writeFileSync(join(bin, "skillfleet.cmd"), text.cmd);
+    const ps1 = join(bin, "skillfleet.ps1");
+    const blocked = scriptsBlocked();
+    if (blocked) {
+      rmSync(ps1, { force: true });
+      notes.push(
+        `PowerShell's execution policy is ${blocked}, so \`skillfleet\` in PowerShell runs the .cmd launcher, where cmd acts on & | ^ % in arguments; to pass them as typed, run \`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned\`, then \`skillfleet self-install\``,
+      );
+    } else writeFileSync(ps1, text.ps1);
+  }
+  return { cli, launcher: launcherPath(), node, notes };
+}
+
+/**
+ * The execution policy that keeps PowerShell from running a local script (Restricted or
+ * AllSigned), in Windows PowerShell or PowerShell 7, or undefined when both run one. PowerShell
+ * prefers skillfleet.ps1 to skillfleet.cmd, and with such a policy it fails instead of falling back,
+ * so the .ps1 is written only when every PowerShell here runs it. The policy a parent PowerShell
+ * set for its own process (`-ExecutionPolicy Bypass`) is not what a new shell gets, so it is left out.
+ */
+function scriptsBlocked(): string | undefined {
+  const env = { ...process.env };
+  delete env.PSExecutionPolicyPreference;
+  for (const shell of ["powershell.exe", findOnPath("pwsh")]) {
+    if (!shell) continue;
+    const run = spawnSync(
+      shell,
+      ["-NoProfile", "-NonInteractive", "-Command", "Get-ExecutionPolicy"],
+      {
+        encoding: "utf8",
+        env,
+        timeout: 30_000,
+        windowsHide: true,
+      },
+    );
+    const policy = (run.stdout ?? "").trim();
+    if (/^(Restricted|AllSigned)$/i.test(policy)) return policy;
+  }
+  return undefined;
 }
 
 const isExecutable = (file: string) => {

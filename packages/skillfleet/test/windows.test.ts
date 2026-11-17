@@ -291,9 +291,11 @@ describe.skipIf(!isWindows)(
             "cmd: skillfleet --version",
             await cmd("skillfleet --version", { env, cwd: m.root }),
           );
+          // PowerShell runs skillfleet.ps1. Through the .cmd, cmd expands a %VAR% in its own path,
+          // as it would for any batch file in that folder.
           check(
             "PowerShell: & <launcher> --version",
-            await ps(`& ${psQuote(join(bin(m), "skillfleet.cmd"))} --version; exit $LASTEXITCODE`, {
+            await ps(`& ${psQuote(join(bin(m), "skillfleet.ps1"))} --version; exit $LASTEXITCODE`, {
               env,
               cwd: m.root,
             }),
@@ -349,7 +351,8 @@ describe.skipIf(!isWindows)(
         delete env.Path;
         const install = await start(node, [cli, "self-install"], { env, cwd: m.home }).done;
         expect(install.code, both(install)).toBe(0);
-        expect(read(join(bin(m), "skillfleet.cmd"))).toContain("José");
+        // The launchers run that node; the .cmd reaches it through a junction, with an ASCII path.
+        expect(read(join(bin(m), "skillfleet"))).toContain("José");
         const run = await cmd("skillfleet --version", {
           env: { ...env, PATH: [bin(m), system].join(";") },
           cwd: m.root,

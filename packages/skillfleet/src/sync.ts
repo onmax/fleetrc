@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import {
   copyFileSync,
   existsSync,
@@ -48,6 +47,7 @@ import {
 } from "./manifest.ts";
 import { nameKey, segmentProblem } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
+import { processStartedAt } from "./process.ts";
 import type { HookRun, Report } from "./report.ts";
 import { failedResult, type SourceResult, sourceFiles, storePaths, syncSource } from "./sources.ts";
 import { loadState, saveState, sourceState, type State } from "./state.ts";
@@ -80,10 +80,17 @@ const SKIP_LINKED_SKILL_MD: Record<string, string> = { codex: "Codex", cursor: "
 /** No sync takes this long; a lock older than this was left by one that hung or was killed. */
 const LOCK_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
+/**
+ * How far the start the OS records for a process may come after the start it measured itself
+ * (`performance.timeOrigin`): `ps` gives whole seconds, and Linux places a start through the boot
+ * time, which moves when the clock is set.
+ */
+const START_SLACK_MS = 10_000;
+
 interface LockHolder {
   pid: number;
-  /** The script the holder runs, to tell it from another program that got its pid. */
-  script?: string;
+  /** When the holder started, by its own clock, to tell it from a later process with its pid. */
+  started?: number;
   at: number;
 }
 
@@ -101,53 +108,23 @@ function readLock(file: string): { text: string; holder: LockHolder } | undefine
   try {
     raw = JSON.parse(text);
   } catch {}
-  // Locks written before 0.0.1 hold just the pid.
-  if (typeof raw === "number") return { text, holder: { pid: raw, at: mtime } };
   if (isRecord(raw) && typeof raw.pid === "number")
     return {
       text,
       holder: {
         pid: raw.pid,
-        script: typeof raw.script === "string" ? raw.script : undefined,
+        started: typeof raw.started === "number" ? raw.started : undefined,
         at: typeof raw.at === "number" ? raw.at : mtime,
       },
     };
-  return { text, holder: { pid: 0, at: mtime } };
+  return { text, holder: { pid: typeof raw === "number" ? raw : 0, at: mtime } };
 }
 
-/** The command line of a running process, or undefined when the OS does not tell. */
-function commandLine(pid: number): string | undefined {
-  try {
-    if (process.platform === "linux")
-      return readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ");
-    if (process.platform === "win32")
-      // Only runs when a lock names a live pid. [wmisearcher] loads no module: Get-CimInstance
-      // would, and with a fresh profile PowerShell first spends seconds indexing every module.
-      return execFileSync(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          `([wmisearcher]'SELECT CommandLine FROM Win32_Process WHERE ProcessId=${pid}').Get() | ForEach-Object { $_.CommandLine }`,
-        ],
-        {
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "ignore"],
-          timeout: 30_000,
-          windowsHide: true,
-        },
-      );
-    return execFileSync("ps", ["-o", "command=", "-p", String(pid)], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5000,
-    });
-  } catch {}
-  return undefined;
-}
-
-/** Why a lock no longer guards a running sync, or undefined while it does. */
+/**
+ * Why a lock no longer guards a running sync, or undefined while it does. The holder is the
+ * process with its pid that started no later than it did; one that started after it got the pid
+ * when the holder was gone.
+ */
 function staleBecause(holder: LockHolder): string | undefined {
   const { pid } = holder;
   if (!(pid > 0) || pid === process.pid) return `it names no running sync`;
@@ -157,12 +134,11 @@ function staleBecause(holder: LockHolder): string | undefined {
     if (!isErrno(error, "EPERM")) return `its sync (pid ${pid}) is gone`;
   }
   if (Date.now() - holder.at > LOCK_MAX_AGE_MS) return `it is more than two hours old`;
-  // An empty answer means the OS would not say, not that the command line is empty.
-  const command = commandLine(pid)?.trim() || undefined;
-  const script = holder.script ?? process.argv[1];
-  // Windows paths compare without case.
-  const fold = (text: string) => (process.platform === "win32" ? text.toLowerCase() : text);
-  if (command !== undefined && script && !fold(command).includes(fold(script)))
+  // Every lock since 0.0.1 says when its holder started; an older one can't tell a live sync from
+  // another program, and none was ever released.
+  if (holder.started === undefined) return `an older skillfleet wrote it`;
+  const started = processStartedAt(pid);
+  if (started !== undefined && started > holder.started + START_SLACK_MS)
     return `pid ${pid} is now another program`;
   return undefined;
 }
@@ -180,7 +156,11 @@ export class LockHeldError extends UserError {
 function acquireLock(): { release: () => void; note?: string } {
   const file = paths.lock();
   mkdirSync(dirname(file), { recursive: true });
-  const mine = JSON.stringify({ pid: process.pid, script: process.argv[1], at: Date.now() });
+  const mine = JSON.stringify({
+    pid: process.pid,
+    started: Math.floor(performance.timeOrigin),
+    at: Date.now(),
+  });
   const release = () => {
     if (readLock(file)?.text === mine) rmSync(file, { force: true });
   };

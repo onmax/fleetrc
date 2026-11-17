@@ -763,7 +763,7 @@ async function init() {
   // The copy that new shells, the timer and `fleet` run, with or without the timer.
   const installed = selfInstall();
   const onPath = commandOnPath(installed.launcher);
-  say(onPath);
+  say(onPath, ...installed.notes);
   const timerResult = values["no-timer"] ? undefined : await installTimer(plan.timer);
   if (timerResult) say(...timerResult.lines);
   // With --no-timer, a timer installed before still runs; it must not keep a node that is gone.
@@ -970,6 +970,7 @@ async function main(): Promise<number> {
       say(
         `installed ${tildify(result.launcher)} (node ${result.node})`,
         commandOnPath(result.launcher),
+        ...result.notes,
         ...(await followLauncherNode(result.node)),
       );
       return 0;

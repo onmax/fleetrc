@@ -218,14 +218,16 @@ export function replaceDir(from: string, to: string, { move = false } = {}) {
 /**
  * Finishes what a killed `replaceDir` or `renameFolder` left in `dir`: a new tree that was never
  * renamed into place is deleted, and an old tree whose replacement never arrived, or a folder left
- * under its third name, goes back. Folders of a process still running are left alone.
+ * under its third name, goes back. Only for a folder that one process at a time writes, such as
+ * the store under the sync lock: every `replaceDir` tree in it is a killed process's, even when its
+ * pid now belongs to a running one.
  */
 export function recoverReplaced(dir: string) {
   if (!existsSync(dir)) return;
   recoverRenames(dir);
   for (const name of readdirSync(dir)) {
     const match = REPLACING.exec(name);
-    if (!match || isRunning(Number(match[2]))) continue;
+    if (!match) continue;
     const path = join(dir, name);
     const target = join(dir, match[1]!);
     if (match[3] === "old" && lstat(target) === undefined) renameSync(path, target);

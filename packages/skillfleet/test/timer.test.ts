@@ -14,7 +14,7 @@ import { delimiter, join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { timeZoneDrift } from "../src/doctor.ts";
 import { stableNode } from "../src/selfinstall.ts";
-import { commandNode, systemdMissing } from "../src/timer.ts";
+import { commandArgs, commandNode, systemdMissing } from "../src/timer.ts";
 import { isWindows, type Machine, machine, read, remote, skills, version } from "./fixture.ts";
 
 const kind =
@@ -182,6 +182,24 @@ describe("timer", () => {
       ),
     ).toBe("C:\\Program Files\\nodejs\\node.exe");
     expect(commandNode("& 'C:\\it''s\\node.exe' 'x'\n")).toBe("C:\\it's\\node.exe");
+  });
+
+  it("R5-10. reads every argument of the timer's command, with each scheduler's escapes undone", () => {
+    expect(
+      commandArgs(
+        '[Service]\nExecStart=/opt/node "/h/50%%off/$$HOME/\\"q\\"/app/cli.mjs" sync\nEnvironment="A=b"\n',
+      ),
+    ).toEqual(["/opt/node", '/h/50%off/$HOME/"q"/app/cli.mjs', "sync"]);
+    expect(
+      commandArgs(
+        "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>/n</string>\n\t\t<string>/Users/O&apos;Brien &amp; co/app/cli.mjs</string>\n\t\t<string>sync</string>\n\t</array>\n",
+      ),
+    ).toEqual(["/n", "/Users/O'Brien & co/app/cli.mjs", "sync"]);
+    expect(
+      commandArgs(
+        "$log = 'C:\\O''Brien\\x.log'\n& 'C:\\node.exe' 'C:\\Users\\O''Brien\\app\\cli.mjs' 'sync' 2>&1 | ForEach-Object { \"$_\" }\n",
+      ),
+    ).toEqual(["C:\\node.exe", "C:\\Users\\O'Brien\\app\\cli.mjs", "sync"]);
   });
 
   it("R3-8. doctor warns when an explicit timer.timeZone is not the machine's, where the scheduler uses the machine's", () => {

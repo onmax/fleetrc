@@ -21,7 +21,6 @@ import {
   hashDir,
   inside,
   isRecord,
-  isRunning,
   listFiles,
   recoverReplaced,
   renameFolder,
@@ -951,15 +950,13 @@ const STAGE = /^\.stage-(\d+)$/;
 
 /**
  * Cleans up after a sync that was killed: its staging folder goes, and a folder it was replacing
- * is finished or put back (see `replaceDir`).
+ * is finished or put back (see `replaceDir`). It runs under the sync lock, so no other sync is
+ * using any of them, whoever has the pid in their names now.
  */
 function recoverStore(storeDir: string) {
   if (!existsSync(storeDir)) return;
-  for (const name of readdirSync(storeDir)) {
-    const match = STAGE.exec(name);
-    if (match && !isRunning(Number(match[1])))
-      rmSync(join(storeDir, name), { recursive: true, force: true });
-  }
+  for (const name of readdirSync(storeDir))
+    if (STAGE.test(name)) rmSync(join(storeDir, name), { recursive: true, force: true });
   for (const part of ["live", "base", "upstream"]) recoverReplaced(join(storeDir, part));
 }
 
