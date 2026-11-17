@@ -12,7 +12,6 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, sep } from "node:path";
 import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "skills";
@@ -1435,6 +1434,9 @@ async function withDigestCheck<T>(work: () => Promise<T>, mismatched: Map<string
   }
 }
 
+const mismatchText = (name: string, digest: string) =>
+  `the archive of "${name}" does not match the digest the index gives (received ${digest})`;
+
 async function fetchVendored(
   source: VendoredSource,
   state: SourceState,
@@ -1487,7 +1489,11 @@ async function fetchVendored(
     opened = await openVendored(source, state, ctx, out.warnings);
   } catch (error) {
     out.status = "error";
-    out.error = message(error);
+    // Every archive was refused for its digest, which leaves `skills` with nothing to read.
+    out.error =
+      mismatched.size > 0
+        ? [...mismatched].map(([name, digest]) => mismatchText(name, digest)).join("; ")
+        : message(error);
     out.skills = keptSkills(state, ctx.storeDir);
     if (out.skills.length > 0)
       out.warnings.push(
@@ -1533,7 +1539,7 @@ async function fetchVendored(
         select(source, [{ name }], []).length > 0;
       if (kept) heldBack.add(name);
       out.warnings.push(
-        `${source.id}: the archive of "${name}" does not match the digest the index gives (received ${digest}), so ${kept ? "it keeps its last good copy" : "it is not installed"}; the index's other skills update as usual`,
+        `${source.id}: ${mismatchText(name, digest)}, so ${kept ? "it keeps its last good copy" : "it is not installed"}; the index's other skills update as usual`,
       );
     }
     if (nothingNew(source, state, ctx, opened.version, chosen)) {
