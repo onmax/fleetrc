@@ -27,7 +27,8 @@ export function safeRelativePath(raw: string): string | undefined {
 const UNPACKED_LIMIT = 100 * 1024 * 1024;
 const ENTRY_LIMIT = 50_000;
 
-function gunzipCapped(gz: Uint8Array): Buffer {
+/** Unpacks a gzip stream, refusing one that unpacks to more than the limit. */
+export function gunzipCapped(gz: Uint8Array): Buffer {
   try {
     return gunzipSync(gz, { maxOutputLength: UNPACKED_LIMIT });
   } catch (error) {

@@ -857,7 +857,7 @@ async function main(): Promise<number> {
     console.log(USAGE);
     return 0;
   }
-  const entry = COMMANDS[command];
+  const entry = Object.hasOwn(COMMANDS, command) ? COMMANDS[command] : undefined;
   if (!entry) {
     const near = closest(command, Object.keys(COMMANDS));
     usageError(

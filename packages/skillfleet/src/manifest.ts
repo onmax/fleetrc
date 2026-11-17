@@ -2,7 +2,7 @@ import { existsSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
-import { isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
+import { dict, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
 import { registryUrl, urlOrigin } from "./npm.ts";
 import { expandPath, paths } from "./paths.ts";
@@ -312,7 +312,7 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
       );
     ids.set(nameKey(source.id), source.id);
   }
-  const forks: Record<string, Fork> = {};
+  const forks = dict<Fork>();
   if (raw.forks !== undefined) {
     if (!isRecord(raw.forks)) fail(file, "forks", "must be an object");
     for (const [name, fork] of Object.entries(raw.forks)) {
@@ -552,6 +552,19 @@ export async function locateManifest(
   return file;
 }
 
+/**
+ * Whether a git source names a repository on another machine: an https or ssh URL, `user@host:path`,
+ * or a GitHub or GitLab shorthand. Not a path, a file: URL or a transport such as ext::, which reach
+ * this machine's files or run a command.
+ */
+export function isRemoteGit(spec: string): boolean {
+  const url = gitUrl(spec);
+  return (
+    /^(?:https|ssh):\/\/(?:[^@/]+@)?[a-z0-9[]/i.test(url) ||
+    /^[a-z0-9_][\w.-]*@[a-z0-9][\w.-]*:/i.test(url)
+  );
+}
+
 function readManifestFile(file: string): Manifest {
   if (!existsSync(file)) throw new ManifestError(`${file}: no such manifest`);
   let raw: unknown;
@@ -620,6 +633,12 @@ export async function loadManifest(
         if (source.kind === "clone" || source.kind === "local") {
           warnings.push(
             `extends ${parent}: ignored source "${source.id}"; only the root manifest can name a folder on this machine (${source.kind === "clone" ? "path" : "local"})`,
+          );
+          continue;
+        }
+        if (source.kind === "git" && !isRemoteGit(source.git)) {
+          warnings.push(
+            `extends ${parent}: ignored source "${source.id}"; a team manifest names only remote repositories (https, ssh or owner/repo), not ${source.git}`,
           );
           continue;
         }

@@ -3,9 +3,9 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
-import { personalSkillsDir, personalSource } from "./edits.ts";
+import { confine, personalSkillsDir, personalSource } from "./edits.ts";
 import { UserError } from "./errors.ts";
-import { isRecord, lstat, moveDir, readJsonFile } from "./fs.ts";
+import { dict, isRecord, lstat, moveDir, readJsonFile } from "./fs.ts";
 import { linkTarget, MANIFEST_FILE, removeLink } from "./linker.ts";
 import {
   defaultSourceId,
@@ -32,7 +32,8 @@ export type Migration =
   | { kind: "unfold"; dir: string; target: string }
   | { kind: "unlink"; path: string; target: string }
   | { kind: "backup"; path: string; reason: string }
-  | { kind: "adopt"; path: string; to: string };
+  /** `within`: the working clone `to` is in, which `to` must not lead out of through a link. */
+  | { kind: "adopt"; path: string; to: string; within?: string };
 
 const ADOPTED_ELSEWHERE = "is adopted from another folder";
 
@@ -105,7 +106,7 @@ export function readSkillsLock(file: string): LockEntry[] {
 
 /** Turns `skills` lock entries into manifest sources and forks. */
 async function collectImports(loaded: LoadedManifest): Promise<Imports> {
-  const imports: Imports = { sources: [], forks: {}, notes: [] };
+  const imports: Imports = { sources: [], forks: dict(), notes: [] };
   const personal = personalSource(loaded.sources);
   const lockEntries: LockEntry[] = [];
   for (const source of loaded.sources)
@@ -216,6 +217,15 @@ export async function planInit(
       );
       adoptInto = undefined;
     }
+    const within = personal?.kind === "clone" ? personal.path : undefined;
+    if (adoptInto && within)
+      try {
+        confine(within, adoptInto, "adopt into it");
+      } catch (error) {
+        if (!(error instanceof UserError)) throw error;
+        warnings.push(`${error.message}; the skills there stay where they are`);
+        adoptInto = undefined;
+      }
     const migrations: Migration[] = [];
     const kept = new Set<string>();
     const adopted = new Set<string>();
@@ -225,7 +235,7 @@ export async function planInit(
       if (provided.has(name)) {
         migrations.push({ kind: "backup", path, reason: `the manifest provides ${name}` });
       } else if (hasSkill && adoptInto && !lstat(join(adoptInto, name)) && !adopted.has(name)) {
-        migrations.push({ kind: "adopt", path, to: join(adoptInto, name) });
+        migrations.push({ kind: "adopt", path, to: join(adoptInto, name), within });
         adopted.add(name);
       } else if (removeEvenIfKept && adopted.has(name)) {
         migrations.push({ kind: "backup", path, reason: `${name} ${ADOPTED_ELSEWHERE}` });
@@ -445,6 +455,14 @@ function checkMoves(migrations: readonly Migration[]) {
     if (migration.kind !== "adopt" && migration.kind !== "backup") continue;
     if (!lstat(migration.path)) problems.push(`${tildify(migration.path)} is gone`);
     if (migration.kind !== "adopt") continue;
+    // The clone is made after the plan, so what it holds is checked again here.
+    if (migration.within)
+      try {
+        confine(migration.within, migration.to, "adopt into it");
+      } catch (error) {
+        if (!(error instanceof UserError)) throw error;
+        problems.push(error.message);
+      }
     const key = nameKey(migration.to);
     if (lstat(migration.to) || taken.has(key))
       problems.push(

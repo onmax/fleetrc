@@ -1,5 +1,5 @@
 import { exec } from "./exec.ts";
-import { isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
+import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
 import type { Report } from "./report.ts";
 
@@ -142,7 +142,7 @@ function summarize(raw: unknown): HostResult["lastRun"] {
   const errors = Array.isArray(raw.errors)
     ? raw.errors.filter((error): error is string => typeof error === "string")
     : [];
-  const sources: Record<string, string | undefined> = {};
+  const sources = dict<string | undefined>();
   if (Array.isArray(raw.sources)) {
     for (const source of raw.sources)
       if (isRecord(source) && typeof source.id === "string")
@@ -164,7 +164,7 @@ function summarize(raw: unknown): HostResult["lastRun"] {
 
 function readCache(): Record<string, NonNullable<HostResult["lastRun"]>> {
   const raw = readJsonOrNothing(paths.fleet());
-  const cache: Record<string, NonNullable<HostResult["lastRun"]>> = {};
+  const cache = dict<NonNullable<HostResult["lastRun"]>>();
   if (isRecord(raw))
     for (const [host, entry] of Object.entries(raw)) {
       const run = summarize(entry);

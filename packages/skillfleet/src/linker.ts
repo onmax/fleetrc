@@ -16,6 +16,7 @@ import {
   copyResolved,
   type DroppedLink,
   type Hashes,
+  dict,
   hashDir,
   isErrno,
   isRecord,
@@ -87,10 +88,11 @@ export function readTargetManifest(dir: string, warnings: string[] = []): Target
     warnings.push(
       `${tildify(join(dir, MANIFEST_FILE))} is not valid JSON, so skillfleet started a new one; links it no longer knows it made stay where they are`,
     );
-    return { version: 1, links: {} };
+    return { version: 1, links: dict() };
   }
-  if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.links)) return { version: 1, links: {} };
-  const links: Record<string, LinkRecord> = {};
+  if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.links))
+    return { version: 1, links: dict() };
+  const links = dict<LinkRecord>();
   for (const [name, record] of Object.entries(raw.links)) {
     if (!isRecord(record) || typeof record.target !== "string" || typeof record.source !== "string")
       continue;
@@ -104,9 +106,7 @@ export function readTargetManifest(dir: string, warnings: string[] = []): Target
       ...(typeof record.root === "string" ? { root: record.root } : {}),
       ...(isRecord(record.hashes)
         ? {
-            hashes: Object.fromEntries(
-              Object.entries(record.hashes).map(([k, v]) => [k, String(v)]),
-            ),
+            hashes: dict(Object.entries(record.hashes).map(([k, v]) => [k, String(v)])),
           }
         : {}),
     };

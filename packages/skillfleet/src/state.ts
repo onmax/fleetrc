@@ -1,6 +1,6 @@
 import { mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { type Hashes, isRecord, JsonFileError, readJson, writeJson } from "./fs.ts";
+import { dict, type Hashes, isRecord, JsonFileError, readJson, writeJson } from "./fs.ts";
 import { isVendoredKind, type Source } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 
@@ -44,7 +44,7 @@ export interface State {
   lastChange?: string;
 }
 
-export const emptyState = (): State => ({ version: 1, sources: {}, skills: {} });
+export const emptyState = (): State => ({ version: 1, sources: dict(), skills: dict() });
 
 /**
  * Reads state.json. A file that does not parse, or has a shape this version does not know (another
@@ -92,7 +92,7 @@ const KINDS: readonly string[] = [
 
 /** The entries of `value` that `read` accepts, as read. */
 function records<T>(value: unknown, read: (record: unknown) => T | undefined): Record<string, T> {
-  const out: Record<string, T> = {};
+  const out = dict<T>();
   if (!isRecord(value)) return out;
   for (const [key, record] of Object.entries(value)) {
     const parsed = read(record);
@@ -123,7 +123,7 @@ function installedCopy(record: unknown): InstalledCopy | undefined {
   if (!isRecord(record) || !isRecord(record.hashes)) return undefined;
   const hashes = Object.entries(record.hashes);
   if (hashes.some(([, hash]) => typeof hash !== "string")) return undefined;
-  return { hashes: Object.fromEntries(hashes) as Hashes, ...strings(record, "path") };
+  return { hashes: dict(hashes as [string, string][]), ...strings(record, "path") };
 }
 
 function pendingUpdate(record: unknown): PendingUpdate | undefined {
@@ -170,7 +170,7 @@ export function sourceState(state: State, source: Source): SourceState {
     state.sources[source.id] = moved;
     return moved;
   }
-  const fresh: SourceState = { kind: source.kind, skills: {}, pending: {} };
+  const fresh: SourceState = { kind: source.kind, skills: dict(), pending: dict() };
   state.sources[source.id] = fresh;
   return fresh;
 }

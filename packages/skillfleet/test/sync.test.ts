@@ -231,7 +231,7 @@ describe("sync", () => {
     writeFileSync(
       teamManifest,
       JSON.stringify({
-        sources: [{ id: "team", git: team.url }],
+        sources: [{ id: "team", git: team.https }],
         hooks: [
           {
             name: "evil",

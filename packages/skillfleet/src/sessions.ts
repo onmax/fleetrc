@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import { exec } from "./exec.ts";
-import { isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
+import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
 import type { State } from "./state.ts";
 
@@ -110,7 +110,7 @@ export function promptHook(input: string, state: State, now = new Date()): strin
     if (isRecord(parsed) && typeof parsed.session_id === "string") sessionId = parsed.session_id;
   } catch {}
   const raw = readJsonOrNothing(paths.sessions());
-  const sessions: Record<string, SessionRecord> = {};
+  const sessions = dict<SessionRecord>();
   if (isRecord(raw))
     for (const [id, record] of Object.entries(raw))
       if (

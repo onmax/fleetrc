@@ -31,7 +31,7 @@ import { collisions, fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
 import type { CloneSource, InPlaceSource, Source, VendoredSource } from "./manifest.ts";
 import { assertSegment, nameKey, segmentProblem } from "./names.ts";
-import { fetchNpm } from "./npm.ts";
+import { fetchNpm, withCappedFetch } from "./npm.ts";
 import type { SourceState } from "./state.ts";
 
 export interface SkillEntry {
@@ -187,14 +187,116 @@ function globRoot(root: string, glob: string | undefined, followLinks: boolean):
   return dir;
 }
 
-/** Discovers skills in a folder through the `skills` package, limited to the `skills` glob's base folder. */
+/**
+ * Throws when a file or folder that `skills` reads to find skills in `dir` leads out of `root`
+ * through a link: the files that configure discovery (skills.sh.json, plugin manifests, the
+ * skills lock) and the folders they name. `skills` checks those folders by their names only, and
+ * would read and install what a link there leads to.
+ */
+function checkDiscoveryPaths(root: string, dir: string) {
+  const realRoot = realpathSync(root);
+  const check = (path: string) => {
+    if (!lstatSync(path, { throwIfNoEntry: false })) return;
+    let real: string;
+    try {
+      real = realpathSync(path);
+    } catch {
+      return; // A link to nothing: nothing to read through it.
+    }
+    if (!inside(realRoot, real))
+      throw new Error(
+        `${relative(root, path).split(sep).join("/") || "."} links out of the source, so it is not read`,
+      );
+  };
+  const readConfig = (file: string): unknown => {
+    const path = join(dir, file);
+    check(path);
+    try {
+      return JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      return undefined;
+    }
+  };
+  const strings = (value: unknown) =>
+    Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+  check(dir);
+  readConfig("skills-lock.json");
+  const config = readConfig("skills.sh.json");
+  if (isRecord(config)) for (const path of strings(config.paths)) check(join(dir, path));
+  // A plugin's folder, its skills folder, and each skill folder it lists, as `skills` reads them.
+  const plugin = (base: string, skills: unknown) => {
+    check(base);
+    check(join(base, "skills"));
+    for (const path of strings(skills)) {
+      check(join(base, path));
+      check(dirname(join(base, path)));
+    }
+  };
+  const marketplace = readConfig(".claude-plugin/marketplace.json");
+  if (isRecord(marketplace)) {
+    const pluginRoot =
+      isRecord(marketplace.metadata) && typeof marketplace.metadata.pluginRoot === "string"
+        ? marketplace.metadata.pluginRoot
+        : "";
+    for (const entry of Array.isArray(marketplace.plugins) ? marketplace.plugins : [])
+      if (isRecord(entry))
+        plugin(
+          join(dir, pluginRoot, typeof entry.source === "string" ? entry.source : ""),
+          entry.skills,
+        );
+  }
+  const manifest = readConfig(".claude-plugin/plugin.json");
+  if (isRecord(manifest)) plugin(dir, manifest.skills);
+}
+
+/**
+ * Skills that `handle`, discovered in `dir`, found through a link out of `root`: a skill folder
+ * that is one, or sits in a folder `skills` searches by name that is one. Each is
+ * named in a warning; the caller leaves them out.
+ */
+function escapingSkills(
+  source: Source,
+  handle: SkillSource,
+  dir: string,
+  root: string,
+  warnings: string[],
+): Set<string> {
+  const realRoot = realpathSync(root);
+  const escaping = new Set<string>();
+  for (const skill of handle.skills) {
+    if (skill.path === undefined) continue;
+    const folder = join(dir, skill.path);
+    // A SKILL.md that is a link is `linkedSkillMds`'s to judge.
+    let leaves: boolean;
+    try {
+      leaves = !inside(realRoot, realpathSync(folder));
+    } catch {
+      leaves = true;
+    }
+    if (!leaves) continue;
+    escaping.add(skill.name);
+    warnings.push(
+      `${source.id}: ${relative(root, folder).split(sep).join("/")} links out of the source, so its skill "${skill.name}" is not read`,
+    );
+  }
+  return escaping;
+}
+
+/**
+ * Discovers skills in a folder through the `skills` package, limited to the `skills` glob's base
+ * folder. Without `followLinks` (a folder skillfleet fetched, or a working clone), what configures
+ * discovery must stay inside `bound`, the source; the caller then leaves out `escapingSkills`.
+ */
 async function discover(
   root: string,
   glob: string | undefined,
   skipped: string[] = [],
   followLinks = false,
+  bound = root,
 ): Promise<SkillSource> {
-  return resolveSource(globRoot(root, glob, followLinks), {
+  const dir = globRoot(root, glob, followLinks);
+  if (!followLinks) checkDiscoveryPaths(bound, dir);
+  return resolveSource(dir, {
     config: SKILLS_OPTIONS,
     onWarning: (warning) => {
       const data: unknown = warning.data;
@@ -349,7 +451,7 @@ async function discoverInPlace(
   const skipped: string[] = [];
   let handle: SkillSource | undefined;
   try {
-    handle = await discover(root, source.skills, skipped, true);
+    handle = await discover(root, source.skills, skipped, source.kind === "local");
   } catch (error) {
     if (
       !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
@@ -360,10 +462,16 @@ async function discoverInPlace(
     }
   }
   try {
-    const found: Found[] = (handle?.skills ?? []).map((skill) => ({
-      name: skill.name,
-      path: withBase(source.skills, skill.path),
-    }));
+    const escaping =
+      handle && source.kind === "clone"
+        ? escapingSkills(source, handle, join(root, globBase(source.skills ?? "")), root, warnings)
+        : new Set();
+    const found: Found[] = (handle?.skills ?? [])
+      .filter((skill) => !escaping.has(skill.name))
+      .map((skill) => ({
+        name: skill.name,
+        path: withBase(source.skills, skill.path),
+      }));
     // Agents read a SKILL.md that `skills` rejects (Claude Code parses frontmatter leniently),
     // so a folder in place is linked anyway rather than dropped.
     for (const file of skipped) {
@@ -1014,6 +1122,19 @@ export async function syncVendored(
   state: SourceState,
   ctx: SourceContext,
 ): Promise<SourceResult> {
+  if (source.kind !== "index") return fetchVendored(source, state, ctx);
+  // `skills` downloads and unpacks an index's archives itself, with no limit on either.
+  const refused: string[] = [];
+  const out = await withCappedFetch(() => fetchVendored(source, state, ctx), refused);
+  out.warnings.push(...refused.map((why) => `${source.id}: refused ${why}`));
+  return out;
+}
+
+async function fetchVendored(
+  source: VendoredSource,
+  state: SourceState,
+  ctx: SourceContext,
+): Promise<SourceResult> {
   const out = result(source, "unchanged");
   out.from = state.commit ?? state.version;
   // A name recorded before names were checked cannot be touched safely, so it is forgotten.
@@ -1069,10 +1190,21 @@ export async function syncVendored(
   }
   let staging: string | undefined;
   try {
-    const found: Found[] = opened.handle.skills.map((skill) => ({
-      name: skill.name,
-      path: withBase(opened.glob, skill.path),
-    }));
+    const escaping = opened.root
+      ? escapingSkills(
+          source,
+          opened.handle,
+          join(opened.root, globBase(opened.glob ?? "")),
+          opened.root,
+          out.warnings,
+        )
+      : new Set<string>();
+    const found: Found[] = opened.handle.skills
+      .filter((skill) => !escaping.has(skill.name))
+      .map((skill) => ({
+        name: skill.name,
+        path: withBase(opened.glob, skill.path),
+      }));
     const linked = opened.root ? linkedFolders(source, opened.root, found, out.warnings) : [];
     found.push(...linked);
     if (opened.root)
@@ -1128,10 +1260,11 @@ export async function syncVendored(
     for (const [i, link] of linked.entries()) {
       if (!chosen.includes(link)) continue;
       // Each from its own folder, which `skills` reads as a source of one skill.
-      const handle = await discover(link.real, undefined);
+      const handle = await discover(link.real, undefined, [], false, opened.root);
       try {
         const name = handle.skills[0]?.name;
-        if (handle.skills.length !== 1 || name !== link.name) {
+        const escaped = escapingSkills(source, handle, link.real, opened.root!, out.warnings);
+        if (handle.skills.length !== 1 || name !== link.name || escaped.size > 0) {
           out.warnings.push(
             `${source.id}: skipped the skill "${link.name}" that ${link.path} links to: its SKILL.md names ${name ?? "no skill"}`,
           );

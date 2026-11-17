@@ -229,7 +229,7 @@ describe("hostile manifests", () => {
     writeFileSync(
       team,
       JSON.stringify({
-        sources: [{ id: "team", git: vendor.url }],
+        sources: [{ id: "team", git: vendor.https }],
         hooks: [{ run: `touch "${join(m.root, "hook-ran")}"` }],
         report: { run: `touch "${join(m.root, "report-ran")}"` },
         fleet: ["-oProxyCommand=touch pwned"],
@@ -269,7 +269,7 @@ describe("hostile manifests", () => {
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const team = join(m.root, "team", "skills.json");
     mkdirSync(join(m.root, "team"), { recursive: true });
-    writeFileSync(team, JSON.stringify({ sources: [{ id: "team", git: vendor.url }] }));
+    writeFileSync(team, JSON.stringify({ sources: [{ id: "team", git: vendor.https }] }));
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
     expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
     const edited = `${skillMd("tool")}\nmy notes, written over a week\n`;
@@ -1148,7 +1148,7 @@ describe("prune never deletes what it did not make", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const team = remote(m, "team", {
-      "skills.json": JSON.stringify({ sources: [{ id: "team", git: vendor.url }] }),
+      "skills.json": JSON.stringify({ sources: [{ id: "team", git: vendor.https }] }),
     });
     const manifest = m.manifest({
       agents: ["claude-code"],

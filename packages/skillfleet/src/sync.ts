@@ -7,13 +7,12 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
-  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { agentTargets, formerTargets } from "./agents.ts";
 import { UserError } from "./errors.ts";
 import { exec } from "./exec.ts";
@@ -28,6 +27,7 @@ import {
   readJsonOrNothing,
   resolvedHashes,
   sameTree,
+  sha256,
   writeJson,
 } from "./fs.ts";
 import { matchesGlob } from "./glob.ts";
@@ -47,11 +47,11 @@ import {
   readConfig,
   remoteManifest,
 } from "./manifest.ts";
-import { nameKey, segmentProblem } from "./names.ts";
+import { nameKey } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import { processStartedAt } from "./process.ts";
 import type { HookRun, Report } from "./report.ts";
-import { failedResult, type SourceResult, sourceFiles, storePaths, syncSource } from "./sources.ts";
+import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sources.ts";
 import { loadState, saveState, sourceState, type State } from "./state.ts";
 import { version } from "./version.ts";
 
@@ -89,7 +89,7 @@ const LOCK_MAX_AGE_MS = 2 * 60 * 60 * 1000;
  */
 const START_SLACK_MS = 10_000;
 
-interface LockHolder {
+export interface LockHolder {
   pid: number;
   /** When the holder started, by its own clock, to tell it from a later process with its pid. */
   started?: number;
@@ -154,6 +154,14 @@ export class LockHeldError extends UserError {
   }
 }
 
+/** How `takeLock` judges a lock and, in tests, lets other contenders in between its steps. */
+export interface LockOptions {
+  /** Why a holder no longer guards a running sync, or undefined while it does. */
+  staleBecause?: (holder: LockHolder) => string | undefined;
+  /** Called after each step that reads or changes the lock's files. */
+  step?: () => void;
+}
+
 /** Takes the sync lock atomically; a stale lock is moved aside first. Returns the release and a note. */
 function acquireLock(): { release: () => void; note?: string } {
   const file = paths.lock();
@@ -166,34 +174,91 @@ function acquireLock(): { release: () => void; note?: string } {
   const release = () => {
     if (readLock(file)?.text === mine) rmSync(file, { force: true });
   };
+  return { release, note: takeLock(file, mine) };
+}
+
+/**
+ * Creates the lock `file` holding `mine`, breaking a stale lock first. Returns a note when it broke
+ * one. Throws LockHeldError while a running sync holds it, or is breaking it.
+ */
+export function takeLock(
+  file: string,
+  mine: string,
+  options: LockOptions = {},
+): string | undefined {
+  const judge = options.staleBecause ?? staleBecause;
+  const step = options.step ?? (() => {});
   let note: string | undefined;
   for (let attempt = 0; attempt < 5; attempt++) {
-    if (create(file, mine)) return { release, note };
+    if (create(file, mine)) {
+      sweepBreakMarkers(file, judge);
+      return note;
+    }
+    step();
     const lock = readLock(file);
     if (!lock) continue;
-    const reason = staleBecause(lock.holder);
+    const reason = judge(lock.holder);
     if (!reason) throw new LockHeldError(lock.holder.pid);
-    // Move it aside, then check it is still the lock judged stale: another sync may have broken
-    // it and taken a fresh one in between, and that one goes back.
-    const aside = `${file}.${process.pid}.stale`;
-    try {
-      renameSync(file, aside);
-    } catch (error) {
-      if (isErrno(error, "ENOENT")) continue;
-      throw error;
-    }
-    const moved = readFileSync(aside, "utf8");
-    if (moved !== lock.text) {
-      try {
-        linkSync(aside, file);
-      } catch {}
-      rmSync(aside, { force: true });
-      continue;
-    }
-    rmSync(aside, { force: true });
-    note = `removed a stale sync lock: ${reason}`;
+    step();
+    if (breakLock(file, lock.text, mine, judge, step))
+      note = `removed a stale sync lock: ${reason}`;
   }
   throw new Error(`could not take the sync lock ${tildify(file)}`);
+}
+
+/** The marker that one breaker of the lock `file` holding `text` creates; named for that text. */
+const breakMarker = (file: string, text: string) => `${file}.${sha256(text).slice(0, 16)}.break`;
+
+/**
+ * Deletes the lock `file` if it still holds `text`, the lock judged stale. Breakers of one lock go
+ * one at a time: each first creates its marker, exclusively. A lock leaves its path only through its
+ * breaker, or its own sync's release, so while the marker is held, the lock read again is still the
+ * one judged stale, and a sync that took the path since is never removed. A marker left by a breaker
+ * that died is broken the same way. Returns whether it deleted the lock.
+ */
+function breakLock(
+  file: string,
+  text: string,
+  mine: string,
+  judge: (holder: LockHolder) => string | undefined,
+  step: () => void,
+  depth = 0,
+): boolean {
+  const marker = breakMarker(file, text);
+  if (!create(marker, mine)) {
+    step();
+    const breaker = readLock(marker);
+    if (!breaker) return false;
+    if (depth >= 3 || !judge(breaker.holder)) throw new LockHeldError(breaker.holder.pid);
+    breakLock(marker, breaker.text, mine, judge, step, depth + 1);
+    return false;
+  }
+  try {
+    step();
+    if (readLock(file)?.text !== text) return false;
+    rmSync(file, { force: true });
+    step();
+    return true;
+  } finally {
+    rmSync(marker, { force: true });
+  }
+}
+
+/** Deletes break markers whose breaker is gone; the caller holds the lock, so none is in use for it. */
+function sweepBreakMarkers(file: string, judge: (holder: LockHolder) => string | undefined) {
+  const dir = dirname(file);
+  const prefix = `${basename(file)}.`;
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith(".break")) continue;
+    const marker = readLock(join(dir, name));
+    if (marker && judge(marker.holder)) rmSync(join(dir, name), { force: true });
+  }
 }
 
 /**
@@ -769,23 +834,29 @@ function adoptCopyEdits(dirs: readonly string[], dryRun: boolean, errors: string
 
 /**
  * Forgets the vendored copies of a source the manifest no longer declares, or no longer vendors
- * (`why` says which). Copies with local edits move to the backup folder first; unedited ones are
- * deleted with the store. Returns what to tell the user.
+ * (`why` says which). Every copy in the store moves to the backup folder first when it has local
+ * edits, or has no install record to tell: a sync killed before it saved state.json leaves copies
+ * without one, which the user may have edited since. Unedited ones are deleted with the store.
+ * Returns what to tell the user.
  */
 function retireStore(id: string, state: State, backupRoot: string, why: string): string[] {
   const said: string[] = [];
   const store = paths.store(id);
-  for (const [name, copy] of Object.entries(state.sources[id]?.skills ?? {})) {
-    // A name that is not one plain folder name was never written by this version.
-    if (segmentProblem(name)) continue;
-    const live = storePaths(store, name).live;
-    if (!existsSync(live)) continue;
-    const files = changedFiles(copy.hashes, hashDir(live));
-    if (files.length === 0) continue;
+  const records = state.sources[id]?.skills ?? {};
+  const liveDir = join(store, "live");
+  const onDisk = existsSync(liveDir) ? readdirSync(liveDir) : [];
+  for (const name of onDisk) {
+    const live = join(liveDir, name);
+    if (!lstat(live)?.isDirectory()) continue;
+    const record = Object.hasOwn(records, name) ? records[name] : undefined;
+    const files = record ? changedFiles(record.hashes, hashDir(live)) : [];
+    if (record && files.length === 0) continue;
     const to = join(backupRoot, id, name);
     moveDir(live, to);
     said.push(
-      `${why}; ${name} had local edits (${files.join(", ")}), so it was moved to ${tildify(to)}`,
+      record
+        ? `${why}; ${name} had local edits (${files.join(", ")}), so it was moved to ${tildify(to)}`
+        : `${why}; ${name} had no install record to tell whether it was edited, so it was moved to ${tildify(to)}`,
     );
   }
   rmSync(store, { recursive: true, force: true });

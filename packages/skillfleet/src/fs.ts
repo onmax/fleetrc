@@ -21,12 +21,22 @@ import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 export type Hashes = Record<string, string>;
 
+/**
+ * An object keyed by names that come from folders, files or JSON. It has no prototype, so a name
+ * such as `__proto__` or `constructor` is a key like any other, and a missing one reads undefined.
+ */
+export function dict<T>(entries: Iterable<readonly [string, T]> = []): Record<string, T> {
+  const out = Object.create(null) as Record<string, T>;
+  for (const [key, value] of entries) out[key] = value;
+  return out;
+}
+
 export const lstat = (path: string): Stats | undefined =>
   lstatSync(path, { throwIfNoEntry: false });
 
 /** sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target text. */
 export function hashDir(dir: string): Hashes {
-  const hashes: Hashes = {};
+  const hashes = dict<string>();
   const walk = (current: string) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
@@ -41,7 +51,7 @@ export function hashDir(dir: string): Hashes {
 }
 
 const sorted = (hashes: Hashes): Hashes =>
-  Object.fromEntries(Object.entries(hashes).sort(([a], [b]) => (a < b ? -1 : 1)));
+  dict(Object.entries(hashes).sort(([a], [b]) => (a < b ? -1 : 1)));
 
 /** Every file and link under `dir`, as `/`-separated relative paths. */
 export function listFiles(dir: string): string[] {
@@ -125,7 +135,7 @@ function resolvedTree(dir: string, within: string | undefined, dropped: DroppedL
  * fresh copy reads.
  */
 export function resolvedHashes(dir: string, within?: string): Hashes {
-  const hashes: Hashes = {};
+  const hashes = dict<string>();
   if (!existsSync(dir)) return hashes;
   for (const entry of resolvedTree(dir, within, []))
     if (!entry.dir) hashes[entry.rel] = sha256(readFileSync(entry.real));
@@ -135,7 +145,9 @@ export function resolvedHashes(dir: string, within?: string): Hashes {
 /** Files whose hash differs between two trees, including added and removed ones. */
 export function changedFiles(before: Hashes, after: Hashes): string[] {
   const files = new Set([...Object.keys(before), ...Object.keys(after)]);
-  return [...files].filter((file) => before[file] !== after[file]).sort();
+  const hash = (hashes: Hashes, file: string) =>
+    Object.hasOwn(hashes, file) ? hashes[file] : undefined;
+  return [...files].filter((file) => hash(before, file) !== hash(after, file)).sort();
 }
 
 export const sameTree = (a: Hashes, b: Hashes) => changedFiles(a, b).length === 0;
@@ -303,15 +315,21 @@ export class JsonFileError extends Error {}
 /** Some Windows editors start a UTF-8 file with a byte order mark, which JSON.parse refuses. */
 const withoutBom = (text: string) => text.replace(/^\uFEFF/, "");
 
+/** Every JSON object as a `dict`, so the names it is keyed by never reach Object.prototype. */
+const parse = (text: string): unknown =>
+  JSON.parse(text, (_key, value: unknown) =>
+    isRecord(value) ? dict(Object.entries(value)) : value,
+  );
+
 /** Parses a JSON file, skipping a byte order mark. */
 export const readJsonFile = (path: string): unknown =>
-  JSON.parse(withoutBom(readFileSync(path, "utf8")));
+  parse(withoutBom(readFileSync(path, "utf8")));
 
 export function readJson(path: string): unknown {
   if (!existsSync(path)) return undefined;
   const text = withoutBom(readFileSync(path, "utf8"));
   try {
-    return JSON.parse(text);
+    return parse(text);
   } catch (error) {
     throw new JsonFileError(`${path} is not valid JSON: ${(error as Error).message}`);
   }

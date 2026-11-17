@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { join, relative } from "node:path";
 import { isRecord } from "./fs.ts";
-import { extractStripped, readTgz } from "./tar.ts";
+import { extractStripped, gunzipCapped, readTgz } from "./tar.ts";
 
 /** `@scope/name@1.2.3` → name and version or dist-tag (default `latest`). */
 export function parseNpmSpec(spec: string): { name: string; want: string } {
@@ -54,6 +54,45 @@ async function readCapped(response: Response, label: string): Promise<Uint8Array
     chunks.push(chunk);
   }
   return new Uint8Array(Buffer.concat(chunks));
+}
+
+/** Statuses whose response has no body, which `new Response` refuses one for. */
+const NO_BODY = new Set([101, 103, 204, 205, 304]);
+
+/**
+ * Runs `work` with every fetch it makes read whole under the tarball limit, and a gzip body
+ * unpacked once under the unpack limit, before `work` sees a byte. The `skills` package downloads
+ * and unpacks index archives without a limit, and drops the skill when its fetch fails, so why a
+ * download was refused goes into `refused`.
+ */
+export async function withCappedFetch<T>(work: () => Promise<T>, refused: string[]): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const response = await original(input, init);
+    const url = response.url || (input instanceof Request ? input.url : String(input));
+    let body: Uint8Array | null = null;
+    try {
+      if (!NO_BODY.has(response.status)) {
+        body = await readCapped(response, url);
+        if (body[0] === 0x1f && body[1] === 0x8b) gunzipCapped(body);
+      }
+    } catch (error) {
+      refused.push(`${url}: ${(error as Error).message}`);
+      throw error;
+    }
+    const capped = new Response(body as Uint8Array<ArrayBuffer> | null, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+    Object.defineProperty(capped, "url", { value: response.url });
+    return capped;
+  };
+  try {
+    return await work();
+  } finally {
+    globalThis.fetch = original;
+  }
 }
 
 function verify(bytes: Uint8Array, dist: Record<string, unknown>, label: string) {

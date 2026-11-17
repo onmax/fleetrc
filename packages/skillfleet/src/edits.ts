@@ -1,9 +1,18 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
-import { copyDir, hashDir, isRecord, lstat, moveDir } from "./fs.ts";
+import { copyDir, hashDir, inside, isErrno, isRecord, lstat, moveDir } from "./fs.ts";
 import { fetchClone, gitUrl, repoKey } from "./gitcache.ts";
 import { globBase } from "./glob.ts";
 import {
@@ -102,6 +111,37 @@ export function personalSkillsDir(source: InPlaceSource): string {
   return base ? join(root, base) : root;
 }
 
+/**
+ * Throws unless `path`, where it exists, resolves inside the folder `root`: a link in a repository
+ * may lead anywhere on this machine, and skillfleet reads and writes only inside it. Where `path`
+ * does not exist yet, its nearest existing folder is checked, which is where it would be made.
+ */
+export function confine(root: string, path: string, what = "it") {
+  if (!existsSync(root)) return;
+  let existing = path;
+  while (!lstat(existing) && dirname(existing) !== existing) existing = dirname(existing);
+  let real: string | undefined;
+  try {
+    real = realpathSync(existing);
+  } catch (error) {
+    if (!isErrno(error, "ENOENT", "ELOOP")) throw error;
+  }
+  if (real === undefined || !inside(realpathSync(root), real))
+    throw new UserError(
+      `${tildify(path)} leads out of ${tildify(root)} through a link, so skillfleet does not ${what}`,
+    );
+}
+
+/**
+ * Where `fork` and `adopt` put the skill `name`: in the personal source's skills folder, which must
+ * not lead out of a working clone, since its links come from whoever pushes to the repository.
+ */
+export function personalDestination(source: InPlaceSource, name: string, what: string): string {
+  const to = join(personalSkillsDir(source), name);
+  if (source.kind === "clone") confine(source.path, to, what);
+  return to;
+}
+
 /** One side of a diff: a folder (missing reads as empty) and the name its files get in the patch. */
 interface Side {
   dir: string;
@@ -139,9 +179,12 @@ async function diffDirs(name: string, from: Side, to: Side): Promise<string> {
   }
 }
 
+/** The fork's folder in its upstream repository, which must not lead out of the repository. */
 async function forkUpstream(fork: { from: string; path: string }, ref?: string) {
   const clone = await fetchClone(gitUrl(fork.from), ref, join(paths.cache(), "forks"));
-  return { dir: join(clone.dir, fork.path), commit: clone.commit };
+  const dir = join(clone.dir, fork.path);
+  confine(clone.dir, dir, `read it as the fork's upstream`);
+  return { dir, commit: clone.commit };
 }
 
 /** A vendored skill's pending update against the copy in use, or else its local edits. */
@@ -204,9 +247,57 @@ interface MergeResult {
   conflicts: string[];
 }
 
+/** A file in one tree of a merge: its bytes, or the target of a link, which merge never follows. */
+type Content = Buffer | { link: string };
+
+const sameContent = (a: Content | undefined, b: Content | undefined) => {
+  if (a === undefined || b === undefined) return a === b;
+  if (Buffer.isBuffer(a) || Buffer.isBuffer(b))
+    return Buffer.isBuffer(a) && Buffer.isBuffer(b) && a.equals(b);
+  return a.link === b.link;
+};
+
+/** The first of `file`'s folders under `dir` that is a link, `/`-separated, or undefined. */
+function linkedFolder(dir: string, file: string): string | undefined {
+  const parts = file.split("/").slice(0, -1);
+  for (let i = 1; i <= parts.length; i++) {
+    const folder = parts.slice(0, i).join("/");
+    if (lstat(join(dir, folder))?.isSymbolicLink()) return folder;
+  }
+  return undefined;
+}
+
+/** `file` in the tree `dir`, read without following a link; one inside a linked folder reads as that link. */
+function readContent(dir: string, file: string): Content | undefined {
+  const folder = linkedFolder(dir, file);
+  if (folder !== undefined) return { link: readlinkSync(join(dir, folder)) };
+  const path = join(dir, file);
+  const stat = lstat(path);
+  if (stat?.isSymbolicLink()) return { link: readlinkSync(path) };
+  return stat?.isFile() ? readFileSync(path) : undefined;
+}
+
+/**
+ * Writes upstream's side of a conflict beside the local file, at `<file>.upstream`, or
+ * `<file>.upstream.<n>` when that is taken: created, never overwritten, and never through a link.
+ */
+function writeSidecar(target: string, content: Buffer): string {
+  for (let n = 0; ; n++) {
+    const path = n === 0 ? `${target}.upstream` : `${target}.upstream.${n}`;
+    try {
+      writeFileSync(path, content, { flag: "wx" });
+      return path;
+    } catch (error) {
+      if (!isErrno(error, "EEXIST")) throw error;
+    }
+  }
+}
+
 /**
  * Three-way merge of one folder: `base` to `upstream` changes applied onto `live`, file by file.
- * A dry run works out the same result and writes nothing.
+ * Links are compared by their targets and never followed, read through or written: a file that is
+ * a link, or sits in a linked folder, on any side, and changed upstream, is a conflict. A dry run
+ * works out the same result and writes nothing.
  */
 async function mergeTrees(
   live: string,
@@ -219,36 +310,39 @@ async function mergeTrees(
     ...Object.keys(hashDir(base)),
     ...Object.keys(hashDir(upstream)),
   ]);
-  const read = (dir: string, file: string) =>
-    existsSync(join(dir, file)) ? readFileSync(join(dir, file)) : undefined;
-  const same = (a: Buffer | undefined, b: Buffer | undefined) =>
-    a === undefined || b === undefined ? a === b : a.equals(b);
   const result: MergeResult = { merged: [], conflicts: [] };
   for (const file of [...files].sort()) {
-    const b = read(base, file);
-    const l = read(live, file);
-    const u = read(upstream, file);
+    const b = readContent(base, file);
+    const l = readContent(live, file);
+    const u = readContent(upstream, file);
     const target = join(live, file);
-    if (same(u, b) || same(l, u)) continue;
-    if (same(l, b)) {
-      if (!dryRun && u === undefined) rmSync(target, { force: true });
+    if (sameContent(u, b) || sameContent(l, u)) continue;
+    const plain = (content: Content | undefined) =>
+      content === undefined || Buffer.isBuffer(content);
+    if (!plain(b) || !plain(l) || !plain(u)) {
+      result.conflicts.push(file);
+      continue;
+    }
+    const [lb, bb, ub] = [l, b, u] as (Buffer | undefined)[];
+    if (sameContent(lb, bb)) {
+      if (!dryRun && ub === undefined) rmSync(target, { force: true });
       else if (!dryRun) {
         mkdirSync(dirname(target), { recursive: true });
-        writeFileSync(target, u!);
+        writeFileSync(target, ub!);
       }
       result.merged.push(file);
       continue;
     }
-    if (l === undefined || u === undefined || b === undefined) {
+    if (lb === undefined || ub === undefined || bb === undefined) {
       // Added or deleted on one side and changed on the other: keep the local file, put upstream's beside it.
-      if (u !== undefined && !dryRun) writeFileSync(`${target}.upstream`, u);
+      if (ub !== undefined && !dryRun) writeSidecar(target, ub);
       result.conflicts.push(file);
       continue;
     }
     const scratch = mkdtempSync(join(tmpdir(), "skillfleet-merge-"));
     try {
-      writeFileSync(join(scratch, "base"), b);
-      writeFileSync(join(scratch, "upstream"), u);
+      writeFileSync(join(scratch, "base"), bb);
+      writeFileSync(join(scratch, "upstream"), ub);
       // -p prints the merge instead of writing it into the local file.
       const merge = await git(
         [
@@ -289,6 +383,7 @@ export async function mergeSkill(
     const head = await forkUpstream(fork.fork);
     const base = await forkUpstream(fork.fork, fork.fork.base);
     const live = state.skills[name]!.dir;
+    if (source.kind === "clone") confine(source.path, live, "merge into it");
     // Where the new base is recorded, checked before the merge touches a file.
     const manifest = manifestToEdit(
       loaded,
@@ -345,7 +440,7 @@ export async function forkSkill(
   const personal = personalSource(loaded.sources);
   if (!personal)
     throw new UserError("no personal source: mark a git source with a path as `adopt: true`");
-  const to = join(personalSkillsDir(personal), name);
+  const to = personalDestination(personal, name, "fork into it");
   if (lstat(to)) throw new UserError(`${tildify(to)} already exists`);
   const store = storePaths(paths.store(source.id), name);
   if (!existsSync(store.live))
@@ -410,7 +505,7 @@ export async function adoptSkill(
   if (!personal)
     throw new UserError("no personal source: mark a git source with a path as `adopt: true`");
   const name = basename(path);
-  const to = join(personalSkillsDir(personal), name);
+  const to = personalDestination(personal, name, "adopt into it");
   if (lstat(to)) throw new UserError(`${tildify(to)} already exists`);
   if (!dryRun) moveDir(path, to);
   return { to, name };

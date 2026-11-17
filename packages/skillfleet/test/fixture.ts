@@ -235,6 +235,8 @@ export function machine({
       "[core]\n\tautocrlf = false\n\tsymlinks = true",
       '[protocol "file"]\n\tallow = always',
       "[advice]\n\tdetachedHead = false",
+      // Every remote's https URL (`Remote.https`) reaches its bare repository, as a manifest names one.
+      `[url "${root.replace(/\\/g, "/")}/remotes/"]\n\tinsteadOf = ${HTTPS_REMOTES}`,
     ].join("\n") + "\n",
   );
   const env: NodeJS.ProcessEnv = {
@@ -315,9 +317,17 @@ export function machine({
   return self;
 }
 
+/** The https URL prefix that each test machine's git config rewrites to its bare remotes. */
+const HTTPS_REMOTES = "https://git.skillfleet.test/";
+
 export interface Remote {
   /** The bare repository: what sources point at. */
   url: string;
+  /**
+   * The repository as an https URL, which the machine's git config rewrites to `url`: what a team
+   * manifest, which may not name a path on this machine, points at.
+   */
+  https: string;
   /** A clone where tests make upstream commits. */
   work: string;
   /** Writes files (null deletes), commits and pushes. Returns the new commit. */
@@ -340,6 +350,7 @@ export function remote(m: Machine, name: string, files: Files): Remote {
   m.git(work, "push", "--quiet", "-u", "origin", "main");
   const self: Remote = {
     url,
+    https: `${HTTPS_REMOTES}${name}.git`,
     work,
     commit(changes, message = "change") {
       for (const [file, content] of Object.entries(changes)) {
