@@ -379,6 +379,17 @@ export async function cloneBeforeAdopt(plan: InitPlan): Promise<string[]> {
   try {
     if (existsSync(clone.path)) throw new Error(`${clone.path} exists and is not a git repository`);
     await cloneAt(clone, clone.path);
+    // Reconcile every adoption before any migration moves a hand-made skill.
+    // Use the existing conflict policy: keep the repository version and back up the local one.
+    plan.migrations = plan.migrations.map((migration) =>
+      migration.kind === "adopt" && lstat(migration.to)
+        ? {
+            kind: "backup",
+            path: migration.path,
+            reason: `the cloned repository provides ${basename(migration.to)}`,
+          }
+        : migration,
+    );
     return [`cloned ${clone.git} into ${tildify(clone.path)}`];
   } catch (error) {
     const stay = plan.migrations.flatMap((migration) =>

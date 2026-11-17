@@ -354,7 +354,10 @@ async function discoverInPlace(
   try {
     handle = await discover(root, source.skills, skipped, true);
   } catch (error) {
-    if (!isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") || skipped.length === 0) {
+    if (
+      !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
+      (skipped.length === 0 && linkedFolders(source, root, [], []).length === 0)
+    ) {
       warnings.push(`${source.id}: ${message(error)}`);
       return [];
     }
@@ -859,7 +862,20 @@ async function openVendored(
             `${source.id}: left out ${path}: macOS and Windows keep it in the same folder as ${kept}`,
           );
       return {
-        handle: await discover(clone.dir, source.skills),
+        handle: await discover(clone.dir, source.skills).catch((error: unknown): SkillSource => {
+          // Only the linked-folder pass can rescue this specific empty discovery result.
+          if (
+            !source.skills ||
+            !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
+            linkedFolders(source, clone.dir, [], []).length === 0
+          )
+            throw error;
+          return {
+            source: { input: clone.dir, type: "local", url: clone.dir },
+            skills: [],
+            dispose: async () => {},
+          };
+        }),
         version: clone.commit,
         glob: source.skills,
         root: clone.dir,

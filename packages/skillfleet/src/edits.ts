@@ -386,6 +386,9 @@ export async function forkSkill(
   if (dryRun) return result;
   copyDir(store.live, to);
   editManifest(manifest.file, change);
+  // A remote manifest still names this store until its working-copy edit is pushed.
+  // Keep the live snapshot and its state available to existing agent links meanwhile.
+  if (manifest.push) return result;
   for (const dir of Object.values(store)) rmSync(dir, { recursive: true, force: true });
   delete sourceState.skills[name];
   delete sourceState.pending[name];

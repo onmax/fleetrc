@@ -157,6 +157,19 @@ function markedCommit(marker: string): Omit<CachedClone, "dir"> | undefined {
  */
 async function recoverTree(cache: CacheFiles, root: string, key: string) {
   if (!existsSync(root)) return;
+  // The publication journal precedes both renames. With no temp tree left, the
+  // new tree arrived: finish its metadata before considering the old tree garbage.
+  for (const name of readdirSync(root)) {
+    const match = new RegExp(`^${key}\\.(\\d+)\\.pending$`).exec(name);
+    if (!match || isRunning(Number(match[1]))) continue;
+    const pending = join(root, name);
+    const temp = join(root, `${key}.${match[1]}.tmp`);
+    if (!existsSync(temp) && existsSync(cache.tree)) {
+      const metadata = markedCommit(pending);
+      if (metadata) writeJson(cache.marker, metadata);
+    }
+    rmSync(pending, { force: true });
+  }
   const pattern = new RegExp(`^${key}\\.(\\d+)\\.(tmp|old)$`);
   let busy = false;
   for (const name of readdirSync(root)) {
@@ -268,15 +281,19 @@ async function writeTree(
       });
     }
     await git([...at, "checkout-index", "--all", "--force"], { cwd: cache.repo });
+    writeJson(`${cache.tree}.${process.pid}.pending`, { commit, collisions: left, submodules });
     // Moved aside, not deleted, so a kill here leaves a whole tree for `recoverTree`.
     const replaced = existsSync(cache.tree);
     if (replaced) renameSync(cache.tree, old);
     renameSync(temp, cache.tree);
+    writeJson(cache.marker, { commit, collisions: left, submodules });
+    rmSync(`${cache.tree}.${process.pid}.pending`, { force: true });
     if (replaced) rmSync(old, { recursive: true, force: true });
   } finally {
-    rmSync(temp, { recursive: true, force: true });
+    // Keep an unpublished temp beside its journal so recovery can distinguish rollback.
+    if (!existsSync(`${cache.tree}.${process.pid}.pending`))
+      rmSync(temp, { recursive: true, force: true });
   }
-  writeJson(cache.marker, { commit, collisions: left, submodules });
   return { collisions: left, submodules };
 }
 

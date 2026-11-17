@@ -449,11 +449,13 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       throw new ManifestError(`no source "${options.only}" in the manifest`);
     const state = loadState(dryRun ? undefined : warnings);
     const targets = await agentTargets(loaded.root.agents);
+    const adoptionErrors: string[] = [];
     // Before the sources look for local edits, so they find the ones made in a copy.
     warnings.push(
       ...adoptCopyEdits(
         targets.map((target) => target.dir),
         dryRun,
+        adoptionErrors,
       ),
     );
     // Skills linked last time, by source: what a source that fails, or can't be read, keeps.
@@ -653,6 +655,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         ...(await unmatchedHooks(loaded, results)),
       ],
       errors: [
+        ...adoptionErrors,
         ...results.flatMap((result) => (result.error ? [`${result.id}: ${result.error}`] : [])),
         ...targetReports.flatMap((target) => target.errors),
       ],
@@ -700,49 +703,55 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
  * When that folder changed too since the copy was made, both stay as they are and the link step
  * warns. Returns what to tell the user.
  */
-function adoptCopyEdits(dirs: readonly string[], dryRun: boolean): string[] {
+function adoptCopyEdits(dirs: readonly string[], dryRun: boolean, errors: string[]): string[] {
   const said: string[] = [];
   for (const dir of dirs) {
     if (!existsSync(join(dir, MANIFEST_FILE))) continue;
-    const manifest = readTargetManifest(dir);
-    let changed = false;
-    for (const [name, record] of Object.entries(manifest.links)) {
-      if (record.kind !== "copy" || !record.hashes) continue;
-      const copy = join(dir, name);
-      try {
-        if (!lstat(copy)?.isDirectory() || !lstat(record.target)?.isDirectory()) continue;
-        const now = hashDir(copy);
-        const files = changedFiles(record.hashes, now);
-        if (files.length === 0) continue;
-        if (!sameTree(hashDir(record.target, { skillMdAsFile: true }), record.hashes)) continue;
-        // A link moves as the file it points to, and a linked SKILL.md in place stays a link.
-        const linked = (path: string) => lstat(path)?.isSymbolicLink();
-        if (files.some((file) => linked(join(copy, file)) || linked(join(record.target, file))))
-          continue;
-        if (dryRun) {
-          said.push(
-            `would move the edits in ${tildify(copy)} (${files.join(", ")}) into ${tildify(record.target)}, which every agent shows`,
-          );
-          continue;
-        }
-        for (const file of files) {
-          const to = join(record.target, file);
-          if (now[file] === undefined) rmSync(to, { force: true });
-          else {
-            mkdirSync(dirname(to), { recursive: true });
-            copyFileSync(join(copy, file), to);
+    try {
+      const manifest = readTargetManifest(dir);
+      let changed = false;
+      for (const [name, record] of Object.entries(manifest.links)) {
+        if (record.kind !== "copy" || !record.hashes) continue;
+        const copy = join(dir, name);
+        try {
+          if (!lstat(copy)?.isDirectory() || !lstat(record.target)?.isDirectory()) continue;
+          const now = hashDir(copy);
+          const files = changedFiles(record.hashes, now);
+          if (files.length === 0) continue;
+          if (!sameTree(hashDir(record.target, { skillMdAsFile: true }), record.hashes)) continue;
+          // A link moves as the file it points to, and a linked SKILL.md in place stays a link.
+          const linked = (path: string) => lstat(path)?.isSymbolicLink();
+          if (files.some((file) => linked(join(copy, file)) || linked(join(record.target, file))))
+            continue;
+          if (dryRun) {
+            said.push(
+              `would move the edits in ${tildify(copy)} (${files.join(", ")}) into ${tildify(record.target)}, which every agent shows`,
+            );
+            continue;
           }
+          for (const file of files) {
+            const to = join(record.target, file);
+            if (now[file] === undefined) rmSync(to, { force: true });
+            else {
+              mkdirSync(dirname(to), { recursive: true });
+              copyFileSync(join(copy, file), to);
+            }
+          }
+          record.hashes = now;
+          changed = true;
+          said.push(
+            `${tildify(copy)} had local edits (${files.join(", ")}); they are now edits of ${name} in ${tildify(record.target)}, which every agent shows`,
+          );
+        } catch (error) {
+          said.push(
+            `${tildify(copy)} has local edits that could not be moved: ${errorText(error)}`,
+          );
         }
-        record.hashes = now;
-        changed = true;
-        said.push(
-          `${tildify(copy)} had local edits (${files.join(", ")}); they are now edits of ${name} in ${tildify(record.target)}, which every agent shows`,
-        );
-      } catch (error) {
-        said.push(`${tildify(copy)} has local edits that could not be moved: ${errorText(error)}`);
       }
+      if (changed) writeJson(join(dir, MANIFEST_FILE), manifest);
+    } catch (error) {
+      errors.push(`${tildify(dir)}: could not adopt copied edits: ${errorText(error)}`);
     }
-    if (changed) writeJson(join(dir, MANIFEST_FILE), manifest);
   }
   return said;
 }
