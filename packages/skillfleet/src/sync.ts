@@ -43,6 +43,7 @@ import {
   loadManifest,
   ManifestError,
   readConfig,
+  remoteManifest,
 } from "./manifest.ts";
 import { nameKey, segmentProblem } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
@@ -436,7 +437,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   const lock = dryRun ? { release: () => {} } : acquireLock();
   const warnings: string[] = lock.note ? [lock.note] : [];
   try {
-    // The manifest as the user named it: a remote one's file is a cache copy (a scratch one in a dry run).
+    // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
     const spec = options.loaded ? options.loaded.root.file : manifestSpec(options.manifest);
     const loaded =
       options.loaded ??
@@ -611,7 +612,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       version: 1,
       host: hostname(),
       skillfleet: version,
-      manifest: spec,
+      manifest: remoteManifest(spec) ? spec : loaded.root.file,
       startedAt,
       finishedAt: startedAt,
       dryRun,
