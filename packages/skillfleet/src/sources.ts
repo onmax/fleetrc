@@ -855,10 +855,17 @@ async function openVendored(
     case "git": {
       const clone = await fetchClone(gitUrl(source.git), source.ref, join(ctx.cacheDir, "git"));
       const base = source.skills ? globBase(source.skills) : "";
+      const looked = (path: string) =>
+        !base || path === base || path.startsWith(`${base}/`) || base.startsWith(`${path}/`);
       for (const { path, kept } of clone.collisions)
-        if (!base || path === base || path.startsWith(`${base}/`) || base.startsWith(`${path}/`))
+        if (looked(path))
           warnings.push(
             `${source.id}: left out ${path}: macOS and Windows keep it in the same folder as ${kept}`,
+          );
+      for (const { path, problem } of clone.refused)
+        if (looked(path))
+          warnings.push(
+            `${source.id}: left out ${path} on every system: its name ${problem}; rename it upstream`,
           );
       return {
         handle: await discover(clone.dir, source.skills).catch((error: unknown): SkillSource => {

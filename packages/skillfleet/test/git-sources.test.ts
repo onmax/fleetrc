@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { collisions } from "../src/gitcache.ts";
+import { collisions, refusals } from "../src/gitcache.ts";
 import {
   clone,
   type Machine,
@@ -169,6 +169,83 @@ describe("names macOS and Windows fold together", () => {
       { path: "skills/foo", kept: "skills/Foo" },
     ]);
   });
+
+  it("W-NAME. refusals name the first part of each path that Windows can't write", () => {
+    expect(
+      refusals([
+        "skills/good/SKILL.md",
+        "skills/bad/aux.txt",
+        "skills/bad/AUX .md",
+        "skills/bad/nul",
+        "skills/bad/notes.",
+        "skills/bad/notes ",
+        "skills/bad/foo:bar",
+        "skills/bad/back\\slash",
+        "skills/con/SKILL.md",
+        "skills/con/notes.md",
+        "skills/longna~1/SKILL.md",
+        "skills/PROGRA~1.TXT",
+        "skills/.GIT/config",
+        "skills/console/SKILL.md",
+        "skills/auxiliary.md",
+        "skills/tilde~1-skill/SKILL.md",
+        "skills/longname~1.json5",
+      ]).map((refusal) => refusal.path),
+    ).toEqual([
+      "skills/bad/aux.txt",
+      "skills/bad/AUX .md",
+      "skills/bad/nul",
+      "skills/bad/notes.",
+      "skills/bad/notes ",
+      "skills/bad/foo:bar",
+      "skills/bad/back\\slash",
+      "skills/con",
+      "skills/longna~1",
+      "skills/PROGRA~1.TXT",
+      "skills/.GIT",
+    ]);
+  });
+
+  // windows.test.ts runs this on Windows, where git refuses to write such a commit through an index.
+  it.skipIf(process.platform === "win32")(
+    "W-NAME. names Windows can't write are left out on every system, with a warning each sync; the rest links",
+    async () => {
+      const m = machine();
+      const vendor = remote(m, "vendor", skills("skills/", "good"));
+      commitRaw(m, vendor, {
+        ...skills("skills/", "good"),
+        "skills/bad/SKILL.md": skillMd("bad"),
+        "skills/bad/aux.txt": "device\n",
+        "skills/bad/notes.": "dot\n",
+        "skills/aux/SKILL.md": skillMd("aux"),
+        "skills/longname-skill/SKILL.md": skillMd("longname-skill", "the real one"),
+        "skills/longna~1/SKILL.md": skillMd("longna~1", "HIJACKED"),
+      });
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      });
+      const init = await m.run("init", manifest, "--no-timer");
+      expect(init.code, init.stdout + init.stderr).toBe(0);
+      const warnings = [
+        "vendor: left out skills/aux on every system: its name is a device name on Windows; rename it upstream",
+        "vendor: left out skills/bad/aux.txt on every system: its name is a device name on Windows; rename it upstream",
+        "vendor: left out skills/bad/notes. on every system: its name ends with a dot or a space, which Windows drops; rename it upstream",
+        "vendor: left out skills/longna~1 on every system: its name looks like an 8.3 short name, which Windows can resolve to another folder; rename it upstream",
+      ];
+      for (let run = 0; run < 2; run++) {
+        const report = await m.json("sync");
+        expect(report.ok, JSON.stringify(report.errors)).toBe(true);
+        expect(report.skills.names).toEqual(["bad", "good", "longname-skill"]);
+        expect(report.skills.added).toEqual([]);
+        expect([...report.warnings].sort()).toEqual(warnings);
+      }
+      expect(names(m.at(".claude/skills/bad"))).toEqual(["SKILL.md"]);
+      expect(read(m.at(".claude/skills/longname-skill/SKILL.md"))).toBe(
+        skillMd("longname-skill", "the real one"),
+      );
+    },
+  );
 
   it("R3-3. a working clone with Foo and foo keeps updating, warns once a sync, and links Foo", async () => {
     const m = machine();

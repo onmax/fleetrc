@@ -163,7 +163,9 @@ export async function git(
   args: readonly string[],
   options: { cwd?: string; timeoutMs?: number; allowFail?: boolean; input?: string } = {},
 ): Promise<ExecResult> {
-  const result = await exec("git", args, {
+  // Git for Windows writes no path past 260 characters without core.longpaths, and skillfleet's
+  // cache sits deep under HOME. Other systems ignore it.
+  const result = await exec("git", ["-c", "core.longpaths=true", ...args], {
     cwd: options.cwd,
     input: options.input,
     timeoutMs: options.timeoutMs ?? 120_000,

@@ -23,6 +23,27 @@ export function segmentProblem(name: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Why Windows can't write a file or folder named `segment` where a repository has it, or where
+ * writing it would open another one: a device name (`aux.txt`), a trailing dot or space, a
+ * character NTFS refuses, git's own folder, or an 8.3 short name (`longna~1`), which NTFS gives
+ * a longer name in the same folder. Undefined when it can.
+ */
+export function checkoutProblem(segment: string): string | undefined {
+  if (/[\p{Cc}<>:"|?*\\]/u.test(segment))
+    return 'has a control character or one of < > : " | ? * \\, which Windows does not allow';
+  if (/[. ]$/.test(segment)) return "ends with a dot or a space, which Windows drops";
+  if (/^(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³]) *(\..*)?$/i.test(segment))
+    return "is a device name on Windows";
+  if (nameKey(segment) === ".git") return "is git's own folder";
+  const dot = segment.lastIndexOf(".");
+  const [stem, extension] =
+    dot > 0 ? [segment.slice(0, dot), segment.slice(dot + 1)] : [segment, ""];
+  if (/~\d+$/.test(stem) && stem.length <= 8 && extension.length <= 3)
+    return "looks like an 8.3 short name, which Windows can resolve to another folder";
+  return undefined;
+}
+
 /** Throws unless `name` is one plain path segment: the last check before a path is created or removed. */
 export function assertSegment(name: string): string {
   const problem = segmentProblem(name);
