@@ -162,9 +162,11 @@ async function recoverTree(cache: CacheFiles, root: string, key: string) {
   for (const name of readdirSync(root)) {
     const match = pattern.exec(name);
     if (!match) continue;
-    // Another process writing this tree right now finishes it itself.
-    if (isRunning(Number(match[1]))) busy = true;
-    else if (match[2] === "old" && !existsSync(cache.tree))
+    if (isRunning(Number(match[1]))) {
+      // A process between moving the tree aside and renaming its new one in finishes it itself;
+      // one still writing its .tmp finds the tree written here and replaces it as usual.
+      if (match[2] === "old") busy = true;
+    } else if (match[2] === "old" && !existsSync(cache.tree))
       renameSync(join(root, name), cache.tree);
     else rmSync(join(root, name), { recursive: true, force: true });
   }

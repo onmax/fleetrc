@@ -169,6 +169,8 @@ export function recoverReplaced(dir: string) {
 /** Whether another process with this pid runs; this process counts as not running. */
 export function isRunning(pid: number): boolean {
   if (!(pid > 0) || pid === process.pid) return false;
+  // Windows pids are multiples of 4, and it ignores the low two bits: 4242 would ask about 4240.
+  if (process.platform === "win32" && pid % 4 !== 0) return false;
   try {
     process.kill(pid, 0);
     return true;

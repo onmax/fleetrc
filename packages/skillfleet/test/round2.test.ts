@@ -179,7 +179,8 @@ describe("a sync killed or left without its records", () => {
     expect(readdirSync(store).filter((name) => name.startsWith("."))).toEqual([]);
     for (const part of ["live", "base"])
       expect(readdirSync(join(store, part)).filter((name) => name.startsWith("."))).toEqual([]);
-  }, 120_000);
+    // Windows runners take about two minutes for these 8000 files.
+  }, 300_000);
 
   it("R2-4. after state.json is lost, a vendored skill nobody edited still takes upstream's update", async () => {
     const m = machine();
