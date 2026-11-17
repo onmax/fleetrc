@@ -174,6 +174,7 @@ const DROPPED = {
   outside: "to a place outside the source",
   nothing: "to nothing",
   loop: "to a folder that holds it",
+  again: "to a folder the copy holds already",
 } as const;
 
 /**

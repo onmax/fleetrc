@@ -68,6 +68,14 @@ function killGroup(pid: number, signal: NodeJS.Signals) {
   } catch {}
 }
 
+/** Every command running now, so a sync stopped for taking too long stops them too. */
+const running = new Set<ChildProcess>();
+
+/** Kills every command `exec` started that is still running, and what they started. */
+export function stopAll() {
+  for (const child of running) killTree(child);
+}
+
 function killTree(child: ChildProcess) {
   if (child.pid === undefined) return;
   if (groups.has(child.pid)) killGroup(child.pid, "SIGKILL");
@@ -96,6 +104,7 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
       detached: group,
     };
     const child = spawn(command, args, spawnOptions);
+    running.add(child);
     const max = options.maxOutput ?? DEFAULT_MAX_OUTPUT;
     const stdout = new Tail(max);
     const stderr = new Tail(max);
@@ -108,6 +117,7 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
     const finish = (code: number | null, error?: Error) => {
       if (done) return;
       done = true;
+      running.delete(child);
       clearTimeout(timer);
       if (child.pid !== undefined && groups.delete(child.pid) && groups.size === 0)
         for (const name of FORWARDED) process.removeListener(name, forward);
@@ -142,6 +152,8 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
   });
 }
 
+const GIT_SLOW = ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"];
+
 const GIT_ENV = { GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "", LC_ALL: "C" };
 
 export class GitError extends Error {
@@ -151,7 +163,9 @@ export class GitError extends Error {
     super(
       result.spawnError === "ENOENT"
         ? "git is not installed, or not on PATH; install git to fetch this source"
-        : `git ${args.join(" ")} failed: ${(result.stderr || result.stdout).trim()}`,
+        : result.timedOut
+          ? `git ${args.join(" ")} did not finish in time, so it was stopped${result.stderr.trim() ? `: ${result.stderr.trim()}` : ""}`
+          : `git ${args.join(" ")} failed: ${(result.stderr || result.stdout).trim()}`,
     );
     this.args = args;
     this.result = result;
@@ -165,7 +179,9 @@ export async function git(
 ): Promise<ExecResult> {
   // Git for Windows writes no path past 260 characters without core.longpaths, and skillfleet's
   // cache sits deep under HOME. Other systems ignore it.
-  const result = await exec("git", ["-c", "core.longpaths=true", ...args], {
+  // A remote that stops sending: under 1 KB/s for a minute ends the transfer, over http(s). Other
+  // transports, such as ssh, end at the timeout.
+  const result = await exec("git", ["-c", "core.longpaths=true", ...GIT_SLOW, ...args], {
     cwd: options.cwd,
     input: options.input,
     timeoutMs: options.timeoutMs ?? 120_000,

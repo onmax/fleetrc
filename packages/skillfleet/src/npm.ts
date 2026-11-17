@@ -42,13 +42,19 @@ const VERSION = /^[0-9A-Za-z](?:[0-9A-Za-z.+_-]{0,126}[0-9A-Za-z])?$/;
 /** Largest tarball skillfleet downloads, and the most it unpacks to. */
 const TARBALL_LIMIT = 100 * 1024 * 1024;
 
-async function readCapped(response: Response, label: string): Promise<Uint8Array> {
+async function readCapped(
+  response: Response,
+  label: string,
+  onChunk: () => void = () => {},
+): Promise<Uint8Array> {
   const declared = Number(response.headers.get("content-length"));
   if (declared > TARBALL_LIMIT)
     throw new Error(`${label}: the tarball is too large (${declared} bytes)`);
   const chunks: Uint8Array[] = [];
   let size = 0;
+  onChunk();
   for await (const chunk of response.body ?? []) {
+    onChunk();
     size += chunk.byteLength;
     if (size > TARBALL_LIMIT) throw new Error(`${label}: the tarball is larger than 100 MB`);
     chunks.push(chunk);
@@ -60,25 +66,65 @@ async function readCapped(response: Response, label: string): Promise<Uint8Array
 const NO_BODY = new Set([101, 103, 204, 205, 304]);
 
 /**
+ * How long a download may wait: for the server to answer, for its next bytes, in all, and for all
+ * the downloads of one source. A server that stops answering would otherwise hold the sync, and
+ * its lock, forever.
+ */
+export const FETCH_LIMITS = {
+  answerMs: 30_000,
+  idleMs: 30_000,
+  totalMs: 5 * 60_000,
+  sourceMs: 15 * 60_000,
+};
+
+/**
  * Runs `work` with every fetch it makes read whole under the tarball limit, and a gzip body
- * unpacked once under the unpack limit, before `work` sees a byte. The `skills` package downloads
- * and unpacks index archives without a limit, and drops the skill when its fetch fails, so why a
- * download was refused goes into `refused`.
+ * unpacked once under the unpack limit, before `work` sees a byte. Each fetch is stopped when the
+ * server takes longer than `FETCH_LIMITS` allows, and so is every fetch once `work` has spent
+ * `sourceMs`. The `skills` package downloads and unpacks index archives without a limit or a
+ * timeout, and drops the skill when its fetch fails, so why a download was refused goes into
+ * `refused`.
  */
 export async function withCappedFetch<T>(work: () => Promise<T>, refused: string[]): Promise<T> {
   const original = globalThis.fetch;
+  const source = AbortSignal.timeout(FETCH_LIMITS.sourceMs);
   globalThis.fetch = async (input, init) => {
-    const response = await original(input, init);
-    const url = response.url || (input instanceof Request ? input.url : String(input));
+    const url = input instanceof Request ? input.url : String(input);
+    const stop = new AbortController();
+    let why = "";
+    const after = (ms: number, what: string) =>
+      setTimeout(() => {
+        why = what;
+        stop.abort(new Error(what));
+      }, ms);
+    const signals = [stop.signal, source, ...(init?.signal ? [init.signal] : [])];
+    const total = after(
+      FETCH_LIMITS.totalMs,
+      `took more than ${FETCH_LIMITS.totalMs / 60_000} minutes`,
+    );
+    let idle = after(FETCH_LIMITS.answerMs, `did not answer in ${FETCH_LIMITS.answerMs / 1000} s`);
     let body: Uint8Array | null = null;
+    let response: Response;
     try {
+      response = await original(input, { ...init, signal: AbortSignal.any(signals) });
       if (!NO_BODY.has(response.status)) {
-        body = await readCapped(response, url);
+        body = await readCapped(response, response.url || url, () => {
+          clearTimeout(idle);
+          idle = after(FETCH_LIMITS.idleMs, `sent nothing for ${FETCH_LIMITS.idleMs / 1000} s`);
+        });
         if (body[0] === 0x1f && body[1] === 0x8b) gunzipCapped(body);
       }
     } catch (error) {
-      refused.push(`${url}: ${(error as Error).message}`);
-      throw error;
+      const message = why
+        ? why
+        : source.aborted
+          ? `the source's downloads took more than ${FETCH_LIMITS.sourceMs / 60_000} minutes`
+          : (error as Error).message;
+      refused.push(`${url}: ${message}`);
+      throw why || source.aborted ? new Error(`${url} ${message}`) : error;
+    } finally {
+      clearTimeout(total);
+      clearTimeout(idle);
     }
     const capped = new Response(body as Uint8Array<ArrayBuffer> | null, {
       status: response.status,

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
@@ -15,7 +16,7 @@ import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { agentTargets, formerTargets } from "./agents.ts";
 import { UserError } from "./errors.ts";
-import { exec } from "./exec.ts";
+import { exec, stopAll } from "./exec.ts";
 import {
   changedFiles,
   hashDir,
@@ -49,7 +50,14 @@ import {
 } from "./manifest.ts";
 import { nameKey } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
-import { processStartedAt } from "./process.ts";
+import {
+  sameBoot as bootsMatch,
+  processAge,
+  processStartedAt,
+  processStartTicks,
+  type Whereabouts,
+  whereabouts,
+} from "./process.ts";
 import type { HookRun, Report } from "./report.ts";
 import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sources.ts";
 import { loadState, saveState, sourceState, type State } from "./state.ts";
@@ -79,7 +87,10 @@ export function manifestSpec(override?: string): string {
 /** Agents that skip a skill whose SKILL.md is a symlink, found by running them. */
 const SKIP_LINKED_SKILL_MD: Record<string, string> = { codex: "Codex", cursor: "Cursor" };
 
-/** No sync takes this long; a lock older than this was left by one that hung or was killed. */
+/**
+ * No sync takes this long (a whole run is stopped after `SYNC_TIMEOUT_MS`); a lock older than this
+ * was left by one that hung or was killed.
+ */
 const LOCK_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
 /**
@@ -94,7 +105,21 @@ export interface LockHolder {
   /** When the holder started, by its own clock, to tell it from a later process with its pid. */
   started?: number;
   at: number;
+  /** The holder's machine (hostname), boot and pid namespace; see `Whereabouts`. */
+  host?: string;
+  boot?: string;
+  ns?: string;
+  /** Milliseconds since boot when the lock was taken, to age it on a clock nobody sets. */
+  uptime?: number;
+  /** Linux: the holder's start in clock ticks since boot, which setting the clock does not move. */
+  ticks?: number;
 }
+
+const optional = <T extends "string" | "number">(
+  raw: Record<string, unknown>,
+  key: string,
+  type: T,
+) => (typeof raw[key] === type ? (raw[key] as T extends "string" ? string : number) : undefined);
 
 function readLock(file: string): { text: string; holder: LockHolder } | undefined {
   let text: string;
@@ -115,44 +140,108 @@ function readLock(file: string): { text: string; holder: LockHolder } | undefine
       text,
       holder: {
         pid: raw.pid,
-        started: typeof raw.started === "number" ? raw.started : undefined,
-        at: typeof raw.at === "number" ? raw.at : mtime,
+        started: optional(raw, "started", "number"),
+        at: optional(raw, "at", "number") ?? mtime,
+        host: optional(raw, "host", "string"),
+        boot: optional(raw, "boot", "string"),
+        ns: optional(raw, "ns", "string"),
+        uptime: optional(raw, "uptime", "number"),
+        ticks: optional(raw, "ticks", "number"),
       },
     };
   return { text, holder: { pid: typeof raw === "number" ? raw : 0, at: mtime } };
 }
 
+/** What this process writes into the sync lock: who it is, and where. */
+export function lockText(): string {
+  const here = whereabouts();
+  const ticks = processStartTicks();
+  return JSON.stringify({
+    pid: process.pid,
+    started: Math.floor(performance.timeOrigin),
+    at: Date.now(),
+    ...here,
+    ...(ticks === undefined ? {} : { ticks }),
+  });
+}
+
+/** Where a lock's holder runs, when that is not here: another machine, or another container. */
+function elsewhere(holder: LockHolder, here: Whereabouts): string | undefined {
+  if (holder.host !== undefined && holder.host !== here.host) return `on ${holder.host}`;
+  if (holder.ns !== undefined && here.ns !== undefined && holder.ns !== here.ns)
+    return `in another container on ${holder.host ?? here.host}`;
+  return undefined;
+}
+
 /**
  * Why a lock no longer guards a running sync, or undefined while it does. The holder is the
  * process with its pid that started no later than it did; one that started after it got the pid
- * when the holder was gone.
+ * when the holder was gone. A pid names a process only on its own machine, boot and pid
+ * namespace, so a lock taken elsewhere (two containers or two machines sharing HOME) is held until
+ * it is too old.
  */
 function staleBecause(holder: LockHolder): string | undefined {
+  const here = whereabouts();
   const { pid } = holder;
+  const sameBoot = holder.boot !== undefined && bootsMatch(holder.boot, here.boot);
+  // On one boot, the time since boot ages a lock whatever the clock does.
+  const lockAge =
+    sameBoot && holder.uptime !== undefined ? here.uptime - holder.uptime : Date.now() - holder.at;
+  const away = elsewhere(holder, here);
+  if (away)
+    return lockAge > LOCK_MAX_AGE_MS
+      ? `its sync ${away} took it more than two hours ago`
+      : undefined;
+  // A boot id differs only after a restart; a boot time elsewhere moves with the clock too.
+  if (
+    process.platform === "linux" &&
+    holder.boot !== undefined &&
+    !holder.boot.startsWith("t:") &&
+    !sameBoot
+  )
+    return `the machine restarted since its sync (pid ${pid}) took it`;
   if (!(pid > 0) || pid === process.pid) return `it names no running sync`;
   try {
     process.kill(pid, 0);
   } catch (error) {
     if (!isErrno(error, "EPERM")) return `its sync (pid ${pid}) is gone`;
   }
-  if (Date.now() - holder.at > LOCK_MAX_AGE_MS) return `it is more than two hours old`;
   // Every lock since 0.0.1 says when its holder started; an older one can't tell a live sync from
   // another program, and none was ever released.
-  if (holder.started === undefined) return `an older skillfleet wrote it`;
-  const started = processStartedAt(pid);
-  if (started !== undefined && started > holder.started + START_SLACK_MS)
-    return `pid ${pid} is now another program`;
+  if (holder.started === undefined && holder.ticks === undefined)
+    return `an older skillfleet wrote it`;
+  if (holder.ticks !== undefined && sameBoot) {
+    const ticks = processStartTicks(pid);
+    if (ticks !== undefined && ticks !== holder.ticks) return `pid ${pid} is now another program`;
+  } else {
+    // By the clock: a process that started after the holder did and after the lock was taken got
+    // the pid later. Both, since a clock set forward moves where the OS places a start.
+    const started = processStartedAt(pid);
+    if (
+      started !== undefined &&
+      started > (holder.started ?? 0) + START_SLACK_MS &&
+      started > holder.at + START_SLACK_MS
+    )
+      return `pid ${pid} is now another program`;
+  }
+  // The holder is this process, so the lock is no older than it: a clock set forward ages the lock
+  // by the clock, never the process by its time since boot.
+  const age = Math.min(lockAge, processAge(pid) ?? lockAge);
+  if (age > LOCK_MAX_AGE_MS) return `it is more than two hours old`;
   return undefined;
 }
 
 /** Another sync holds the lock and is still running. */
 export class LockHeldError extends UserError {
   readonly pid: number;
-  constructor(pid: number) {
-    super(`another skillfleet sync is running (pid ${pid})`);
+  constructor(pid: number, where?: string) {
+    super(`another skillfleet sync is running (pid ${pid}${where ? ` ${where}` : ""})`);
     this.pid = pid;
   }
 }
+
+const heldError = (holder: LockHolder) =>
+  new LockHeldError(holder.pid, elsewhere(holder, whereabouts()));
 
 /** How `takeLock` judges a lock and, in tests, lets other contenders in between its steps. */
 export interface LockOptions {
@@ -166,11 +255,7 @@ export interface LockOptions {
 function acquireLock(): { release: () => void; note?: string } {
   const file = paths.lock();
   mkdirSync(dirname(file), { recursive: true });
-  const mine = JSON.stringify({
-    pid: process.pid,
-    started: Math.floor(performance.timeOrigin),
-    at: Date.now(),
-  });
+  const mine = lockText();
   const release = () => {
     if (readLock(file)?.text === mine) rmSync(file, { force: true });
   };
@@ -198,7 +283,7 @@ export function takeLock(
     const lock = readLock(file);
     if (!lock) continue;
     const reason = judge(lock.holder);
-    if (!reason) throw new LockHeldError(lock.holder.pid);
+    if (!reason) throw heldError(lock.holder);
     step();
     if (breakLock(file, lock.text, mine, judge, step))
       note = `removed a stale sync lock: ${reason}`;
@@ -229,7 +314,7 @@ function breakLock(
     step();
     const breaker = readLock(marker);
     if (!breaker) return false;
-    if (depth >= 3 || !judge(breaker.holder)) throw new LockHeldError(breaker.holder.pid);
+    if (depth >= 3 || !judge(breaker.holder)) throw heldError(breaker.holder);
     breakLock(marker, breaker.text, mine, judge, step, depth + 1);
     return false;
   }
@@ -275,7 +360,7 @@ function sweepJsonTemps() {
     return;
   }
   for (const name of names) {
-    const match = /^(?:state|last-run)\.json\.(\d+)\.tmp$/.exec(name);
+    const match = /^(?:state|last-run)\.json\.(\d+)(?:\.[0-9a-f]+)?\.tmp$/.exec(name);
     if (!match) continue;
     const file = join(dir, name);
     const age = Date.now() - (lstat(file)?.mtimeMs ?? Date.now());
@@ -285,7 +370,8 @@ function sweepJsonTemps() {
 
 /** Creates `file` with `text` only if it does not exist, never leaving it half written. */
 function create(file: string, text: string): boolean {
-  const temp = `${file}.${process.pid}.tmp`;
+  // Unique across machines and containers that share this folder, where pids repeat.
+  const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   writeFileSync(temp, text);
   try {
     linkSync(temp, file);
@@ -303,6 +389,15 @@ function create(file: string, text: string): boolean {
   } finally {
     rmSync(temp, { force: true });
   }
+}
+
+/**
+ * The longest a whole sync may take: well under `LOCK_MAX_AGE_MS`, so a lock this old is never a
+ * live sync's. SKILLFLEET_SYNC_TIMEOUT_MS sets it, for tests.
+ */
+function syncTimeoutMs(): number {
+  const set = Number(process.env.SKILLFLEET_SYNC_TIMEOUT_MS);
+  return set > 0 && set < LOCK_MAX_AGE_MS ? set : 60 * 60_000;
 }
 
 /** Hooks run while the sync holds its lock, so a stuck one is stopped after this long. */
@@ -507,6 +602,19 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   const lock = dryRun ? { release: () => {} } : acquireLock();
   if (!dryRun) sweepJsonTemps();
   const warnings: string[] = lock.note ? [lock.note] : [];
+  // Every download and command has its own timeout; this bounds the whole run, so a sync stuck
+  // anyway lets go of the lock and says so, and the next timer run starts over.
+  let doing = "loading the manifest";
+  const limit = syncTimeoutMs();
+  const watchdog = setTimeout(() => {
+    stopAll();
+    lock.release();
+    process.stderr.write(
+      `skillfleet: the sync was stopped after ${limit >= 60_000 ? `${Math.round(limit / 60_000)} minutes` : `${limit / 1000} s`} while ${doing}; its lock is released, and the next sync starts over\n`,
+    );
+    process.exit(1);
+  }, limit);
+  watchdog.unref();
   try {
     // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
     const spec = options.loaded ? options.loaded.root.file : manifestSpec(options.manifest);
@@ -558,6 +666,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         storeDir: paths.store(source.id),
         now: startedAt,
       };
+      doing = `fetching ${source.id}`;
       try {
         results.push(await syncSource(source, sourceState(state, source), ctx));
       } catch (error) {
@@ -627,6 +736,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           : "none of the manifest's agents has a global skills folder, so no skills were linked",
       );
     const desired = [...winners.values()];
+    doing = "linking skills into agent folders";
     // One folder that can't be written must not stop the others.
     const linkInto = (dir: string, links: DesiredLink[]): TargetReport => {
       try {
@@ -738,6 +848,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     };
     if (options.only) carryOver(report, options.only);
     if (!dryRun) {
+      doing = "running hooks";
       report.hooks = await runHooks(loaded, results, report);
       for (const hook of report.hooks)
         if (hook.code !== 0) report.errors.push(`hook ${hook.name} exited with ${hook.code}`);
@@ -767,6 +878,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     }
     return report;
   } finally {
+    clearTimeout(watchdog);
     lock.release();
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }

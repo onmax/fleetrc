@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   appendFileSync,
   constants,
@@ -77,7 +77,39 @@ export const inside = (root: string, path: string) => {
 /** A link an agent's copy of a skill leaves out, `/`-separated from the skill folder, and why. */
 export interface DroppedLink {
   path: string;
-  reason: "outside" | "nothing" | "loop";
+  reason: "outside" | "nothing" | "loop" | "again";
+}
+
+/**
+ * The most one skill's copy holds. Folder links that fan out to one another (four links per
+ * folder, five deep) reach one file through a thousand paths, so a copy that followed each would
+ * fill the disk; no skill is near these.
+ */
+export const SKILL_LIMITS = { files: 10_000, bytes: 200 * 1024 * 1024, depth: 32 };
+
+/** A skill folder past `SKILL_LIMITS`. */
+export class SkillTooLargeError extends Error {}
+
+/** Counts what a copy of one skill would hold, and throws once it is past `SKILL_LIMITS`. */
+export function skillBudget() {
+  let files = 0;
+  let bytes = 0;
+  return {
+    file(size: number) {
+      files++;
+      bytes += size;
+      if (files > SKILL_LIMITS.files)
+        throw new SkillTooLargeError(`it holds more than ${SKILL_LIMITS.files} files`);
+      if (bytes > SKILL_LIMITS.bytes)
+        throw new SkillTooLargeError(`it holds more than ${SKILL_LIMITS.bytes / 1024 / 1024} MB`);
+    },
+    depth(rel: string) {
+      if (rel.split("/").length > SKILL_LIMITS.depth)
+        throw new SkillTooLargeError(
+          `it nests folders more than ${SKILL_LIMITS.depth} deep (${rel})`,
+        );
+    },
+  };
 }
 
 interface ResolvedEntry {
@@ -87,22 +119,46 @@ interface ResolvedEntry {
   dir: boolean;
 }
 
+/** Every real folder under `root`, links not followed, within the budget. */
+function ownFolders(root: string, budget: ReturnType<typeof skillBudget>): Set<string> {
+  const own = new Set<string>([root]);
+  const walk = (dir: string, rel: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      budget.depth(childRel);
+      own.add(join(dir, entry.name));
+      walk(join(dir, entry.name), childRel);
+    }
+  };
+  walk(root, "");
+  return own;
+}
+
 /**
  * The tree of the skill folder `dir` as an agent's copy holds it: the folder and every link in it
  * are followed to what they resolve to. Copied, a relative link would point at nothing, and a link
  * into the source would no longer lead into it. A link that leaves `within` (when given), leads to
- * nothing, or leads to a folder that holds it is left out and named in `dropped`.
+ * nothing, or leads to a folder that holds it is left out and named in `dropped`. So is a link to a
+ * folder the copy holds already, at its own place in the skill or through an earlier link: each
+ * folder is copied once, so links that fan out cannot multiply it. Throws SkillTooLargeError past
+ * `SKILL_LIMITS`.
  */
 function resolvedTree(dir: string, within: string | undefined, dropped: DroppedLink[]) {
   const bound = within === undefined ? undefined : realpathSync(within);
   const entries: ResolvedEntry[] = [];
+  const budget = skillBudget();
+  const root = realpathSync(dir);
+  const reached = ownFolders(root, skillBudget());
   const walk = (real: string, rel: string, open: readonly string[]) => {
     for (const name of readdirSync(real)) {
       const path = join(real, name);
       const childRel = rel ? `${rel}/${name}` : name;
+      budget.depth(childRel);
       let target = path;
       let stat = lstatSync(path);
-      if (stat.isSymbolicLink()) {
+      const linked = stat.isSymbolicLink();
+      if (linked) {
         try {
           target = realpathSync(path);
           stat = statSync(target);
@@ -120,12 +176,21 @@ function resolvedTree(dir: string, within: string | undefined, dropped: DroppedL
           dropped.push({ path: childRel, reason: "loop" });
           continue;
         }
+        if (linked) {
+          if (reached.has(target)) {
+            dropped.push({ path: childRel, reason: "again" });
+            continue;
+          }
+          reached.add(target);
+        }
         entries.push({ rel: childRel, real: target, dir: true });
         walk(target, childRel, [...open, target]);
-      } else if (stat.isFile()) entries.push({ rel: childRel, real: target, dir: false });
+      } else if (stat.isFile()) {
+        budget.file(stat.size);
+        entries.push({ rel: childRel, real: target, dir: false });
+      }
     }
   };
-  const root = realpathSync(dir);
   walk(root, "", [root]);
   return entries;
 }
@@ -225,6 +290,31 @@ export function replaceDir(from: string, to: string, { move = false } = {}) {
   if (replaced) renameSync(to, old);
   renameSync(temp, to);
   if (replaced) rmSync(old, { recursive: true, force: true });
+}
+
+/**
+ * Replaces the folder `to` with a copy of `from` only while `to` still hashes to `expected`, and
+ * returns the files that differ when it does not, changing nothing. An edit saved after the caller
+ * last looked is caught: the copy is checked, renamed aside in one step, and checked again before
+ * the new tree takes its place.
+ */
+export function replaceUnchanged(from: string, to: string, expected: Hashes): string[] {
+  const parent = dirname(to);
+  const temp = join(parent, `.${basename(to)}.${process.pid}.new`);
+  const old = join(parent, `.${basename(to)}.${process.pid}.old`);
+  rmSync(temp, { recursive: true, force: true });
+  rmSync(old, { recursive: true, force: true });
+  copyTree(from, temp);
+  let edited = changedFiles(expected, hashDir(to));
+  if (edited.length === 0) {
+    renameSync(to, old);
+    edited = changedFiles(expected, hashDir(old));
+    if (edited.length > 0) renameSync(old, to);
+    else renameSync(temp, to);
+  }
+  rmSync(temp, { recursive: true, force: true });
+  rmSync(old, { recursive: true, force: true });
+  return edited;
 }
 
 /**
@@ -348,7 +438,8 @@ export function readJsonOrNothing(path: string): unknown {
 /** Writes JSON through a temporary file, so a crash never leaves half a file. */
 export function writeJson(path: string, value: unknown) {
   mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.tmp`;
+  // The pid for sweeping after a kill, and a random part: containers sharing HOME repeat pids.
+  const temp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`);
   renameSync(temp, path);
 }

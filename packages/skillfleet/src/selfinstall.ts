@@ -3,9 +3,13 @@ import {
   accessSync,
   constants,
   chmodSync,
+  copyFileSync,
   mkdirSync,
+  readdirSync,
+  readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -14,7 +18,7 @@ import {
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { copyDir, hashDir, lstat, sameTree } from "./fs.ts";
+import { hashDir, isErrno, lstat, sameTree, sha256 } from "./fs.ts";
 import { removeLink } from "./linker.ts";
 import { paths, tildify } from "./paths.ts";
 
@@ -22,6 +26,18 @@ import { paths, tildify } from "./paths.ts";
 export const launcherPath = () =>
   join(paths.bin(), process.platform === "win32" ? "skillfleet.cmd" : "skillfleet");
 export const installedCli = () => join(paths.app(), "cli.mjs");
+
+/** The build `installedCli` loads, or undefined when it is not a file `selfInstall` wrote. */
+export function installedBuild(): string | undefined {
+  try {
+    const id = /^import "\.\/([0-9a-f]{12})\/cli\.mjs";$/m.exec(
+      readFileSync(installedCli(), "utf8"),
+    )?.[1];
+    return id === undefined ? undefined : join(paths.app(), id, "cli.mjs");
+  } catch {
+    return undefined;
+  }
+}
 
 /** A path inside sh double quotes, where `$`, a backtick, `"` and `\` keep a special meaning. */
 const shQuote = (path: string) => `"${path.replace(/[$`"\\]/g, "\\$&")}"`;
@@ -215,24 +231,63 @@ export function stableNode(
   return execPath;
 }
 
+/** How long a build `selfInstall` replaced stays: longer than a sync may run (see sync.ts). */
+const RETIRED_MS = 3 * 60 * 60_000;
+
+/** The folder name of a build in the state folder: from its files' hashes, so one build has one folder. */
+const buildId = (hashes: Record<string, string>) => sha256(JSON.stringify(hashes)).slice(0, 12);
+
+const BUILD = /^[0-9a-f]{12}$/;
+
 /**
  * Copies the running build (one bundled file plus chunks) into the state folder and writes
  * launchers, so scheduled runs never depend on the npx cache or on PATH.
+ *
+ * Each build goes into a folder of its own, `app/<id>/`, and `app/cli.mjs`, the path the launchers
+ * and the timer name, is a one-line file that loads the current one; it is replaced by a rename.
+ * A run that loaded the old `app/cli.mjs` and has yet to load its chunks still finds them: a build
+ * that was replaced stays for `RETIRED_MS`, longer than any sync, and goes on a later install.
  */
 export function selfInstall(): { cli: string; launcher: string; node: string; notes: string[] } {
   const dist = dirname(fileURLToPath(import.meta.url));
   const app = paths.app();
   const node = stableNode();
+  // The build is the files beside this one: dist/ holds no folders. (Run from the layout before
+  // builds had folders, they are app/'s own files, beside the folders of other builds.)
+  const files = readdirSync(dist, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && !entry.name.startsWith("."))
+    .map((entry) => entry.name)
+    .sort();
+  const hashes = Object.fromEntries(
+    files.map((name) => [name, sha256(readFileSync(join(dist, name)))]),
+  );
+  const id = buildId(hashes);
+  const build = join(app, id);
+  mkdirSync(app, { recursive: true });
   // An unchanged copy stays as it is: the timer may be running it right now.
-  if (dist !== app && !sameTree(hashDir(dist), hashDir(app))) {
-    const temp = `${app}.${process.pid}.tmp`;
-    copyDir(dist, temp);
-    copyDir(temp, app);
+  if (dist !== build && !sameTree(hashes, hashDir(build))) {
+    const temp = join(app, `.${id}.${process.pid}.tmp`);
     rmSync(temp, { recursive: true, force: true });
+    mkdirSync(temp);
+    for (const name of files) copyFileSync(join(dist, name), join(temp, name));
+    rmSync(build, { recursive: true, force: true });
+    renameSync(temp, build);
   }
+  const entry = installedCli();
+  const stub = `// skillfleet's installed build; \`skillfleet self-install\` points this at a new one.\nimport "./${id}/cli.mjs";\n`;
+  let current: string | undefined;
+  try {
+    current = readFileSync(entry, "utf8");
+  } catch {}
+  if (current !== stub) {
+    const temp = join(app, `.cli.mjs.${process.pid}.tmp`);
+    writeFileSync(temp, stub);
+    renameOver(temp, entry);
+  }
+  retireBuilds(app, id);
   const bin = paths.bin();
   mkdirSync(bin, { recursive: true });
-  const cli = installedCli();
+  const cli = entry;
   const notes: string[] = [];
   let nodeLink = false;
   if (process.platform === "win32") {
@@ -264,6 +319,65 @@ export function selfInstall(): { cli: string; launcher: string; node: string; no
     } else writeFileSync(ps1, text.ps1);
   }
   return { cli, launcher: launcherPath(), node, notes };
+}
+
+/**
+ * Renames `from` over `to`. Windows refuses while another process has `to` open, as a run that is
+ * loading it does for a moment, so it tries again for a few seconds.
+ */
+function renameOver(from: string, to: string) {
+  for (let attempt = 0; ; attempt++)
+    try {
+      renameSync(from, to);
+      return;
+    } catch (error) {
+      if (
+        process.platform !== "win32" ||
+        attempt >= 50 ||
+        !isErrno(error, "EPERM", "EBUSY", "EACCES")
+      )
+        throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+}
+
+/**
+ * Deletes what `app` holds besides the build `keep` and its entry, once it has been replaced for
+ * `RETIRED_MS`: older builds, and the files of the layout before builds had folders (cli.mjs and
+ * its chunks side by side). Each gets a marker, `.<name>.retired`, when it is first found replaced.
+ */
+function retireBuilds(app: string, keep: string) {
+  const now = Date.now();
+  for (const name of readdirSync(app)) {
+    if (name === keep || name === "cli.mjs" || name.startsWith(".")) continue;
+    if (!BUILD.test(name) && !/\.(?:mjs|js|map)$/.test(name)) continue;
+    const marker = join(app, `.${name}.retired`);
+    const since = lstat(marker)?.mtimeMs;
+    if (since === undefined) writeFileSync(marker, "");
+    else if (now - since > RETIRED_MS)
+      try {
+        rmSync(join(app, name), { recursive: true, force: true });
+        rmSync(marker, { force: true });
+      } catch {
+        // Still open somewhere (Windows): the next install deletes it.
+      }
+  }
+  // A marker whose build came back (installed again) or is gone.
+  for (const name of readdirSync(app)) {
+    const match = /^\.(.+)\.retired$/.exec(name);
+    if (match && (match[1] === keep || !lstat(join(app, match[1]!))))
+      rmSync(join(app, name), { force: true });
+  }
+  // Temporary folders and files of an install that was killed.
+  for (const name of readdirSync(app)) {
+    const match = /^\..+\.(\d+)\.tmp$/.exec(name);
+    if (
+      match &&
+      Number(match[1]) !== process.pid &&
+      now - (lstat(join(app, name))?.mtimeMs ?? now) > 60 * 60_000
+    )
+      rmSync(join(app, name), { recursive: true, force: true });
+  }
 }
 
 /**

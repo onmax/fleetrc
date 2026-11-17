@@ -8,7 +8,7 @@ import { gitUrl } from "./gitcache.ts";
 import { linkTarget } from "./linker.ts";
 import { loadManifest, readConfig, remoteManifest, type Source } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
-import { installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
+import { installedBuild, installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
 import { manifestSpec } from "./sync.ts";
 import {
   formatTimerStatus,
@@ -79,6 +79,9 @@ function launcherProblem(): string | undefined {
     return `${tildify(launcher)} and the timer run ${node ?? "no node"}, which is gone (Node.js was upgraded or removed); ${REPAIR}`;
   if (!existsSync(installedCli()))
     return `${tildify(launcher)} runs ${tildify(installedCli())}, which is gone; ${REPAIR}`;
+  const build = installedBuild();
+  if (build && !existsSync(build))
+    return `${tildify(installedCli())} loads ${tildify(build)}, which is gone; ${REPAIR}`;
   return undefined;
 }
 

@@ -50,6 +50,10 @@ export interface CachedClone {
   refused: Refusal[];
   /** Paths of git submodules in the commit: their folders are empty, since nothing fetches them. */
   submodules: string[];
+  /** The bare repository the cache keeps, which holds `commit` and the commits fetched before. */
+  repo?: string;
+  /** The commit written out before this fetch, when this fetch brought another. */
+  previous?: string;
 }
 
 /**
@@ -151,8 +155,14 @@ export async function fetchClone(
       throw error;
     }
     try {
-      if (written?.commit === commit) return { dir: cache.tree, ...written };
-      return { dir: cache.tree, commit, ...(await writeTree(cache, commit)) };
+      if (written?.commit === commit) return { dir: cache.tree, ...written, repo: cache.repo };
+      return {
+        dir: cache.tree,
+        commit,
+        ...(await writeTree(cache, commit)),
+        repo: cache.repo,
+        ...(written ? { previous: written.commit } : {}),
+      };
     } catch (error) {
       // The fetch worked, so the cache itself is broken: start it over, once.
       if (attempt > 0 || !(error instanceof GitError) || error.result.code === null) throw error;

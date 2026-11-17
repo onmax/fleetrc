@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
@@ -17,6 +18,8 @@ import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "sk
 import { git, GitError, gitOut } from "./exec.ts";
 import {
   changedFiles,
+  copyResolved,
+  type Hashes,
   countCopies,
   hashDir,
   inside,
@@ -25,13 +28,16 @@ import {
   recoverReplaced,
   renameFolder,
   replaceDir,
+  replaceUnchanged,
   sameTree,
+  skillBudget,
+  SkillTooLargeError,
 } from "./fs.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
 import type { CloneSource, InPlaceSource, Source, VendoredSource } from "./manifest.ts";
 import { assertSegment, nameKey, segmentProblem } from "./names.ts";
-import { fetchNpm, withCappedFetch } from "./npm.ts";
+import { fetchNpm, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import type { SourceState } from "./state.ts";
 
 export interface SkillEntry {
@@ -994,6 +1000,17 @@ async function openVendored(
         glob: source.skills,
         root: clone.dir,
         submodules: clone.submodules,
+        earlier: async (path: string, live: string) =>
+          clone.repo !== undefined &&
+          (
+            await Promise.all(
+              [...new Set([state.commit, clone.previous])]
+                .filter(
+                  (commit): commit is string => commit !== undefined && commit !== clone.commit,
+                )
+                .map((commit) => copyOfCommit(clone.repo!, commit, path, live)),
+            )
+          ).some(Boolean),
       };
     }
     case "npm": {
@@ -1006,6 +1023,10 @@ async function openVendored(
         glob: source.skills,
         root: pkg.dir,
         submodules: [],
+        earlier: async (path: string, live: string) =>
+          earlierPackages(join(ctx.cacheDir, "npm"), source.npm, pkg.dir).some((dir) =>
+            sameCopy(join(dir, path), live),
+          ),
       };
     }
     case "index":
@@ -1015,12 +1036,174 @@ async function openVendored(
         glob: undefined,
         root: undefined,
         submodules: [],
+        // `skills` keeps no archive it downloaded, so there is no earlier copy to compare with.
+        earlier: async () => false,
       };
     default: {
       const exhaustive: never = source;
       return exhaustive;
     }
   }
+}
+
+/** The most one source's skills hold together; see `SKILL_LIMITS` for one skill. */
+const SOURCE_LIMITS = { files: 50_000, bytes: 1024 * 1024 * 1024 };
+
+function sourceBudget() {
+  return { files: 0, bytes: 0 };
+}
+
+/**
+ * The folder `skills` should copy the skill `name` from: `dir` itself, or, when `dir` holds links
+ * to folders (which `skills` follows, so links that fan out to one another copy one folder
+ * thousands of times), a copy beside `staging` that holds each folder once (see `copyResolved`).
+ * Undefined, with a warning, for a skill past `SKILL_LIMITS` or the source's `SOURCE_LIMITS`.
+ */
+function copyableSkill(
+  source: Source,
+  name: string,
+  dir: string,
+  staging: string,
+  budget: ReturnType<typeof sourceBudget>,
+  warnings: string[],
+): string | undefined {
+  const skip = (why: string) => {
+    warnings.push(`${source.id}: skipped the skill "${name}": ${why}`);
+    return undefined;
+  };
+  const count = (at: string, files: number, bytes: number) => {
+    budget.files += files;
+    budget.bytes += bytes;
+    if (budget.files > SOURCE_LIMITS.files)
+      return skip(`${source.id}'s skills hold more than ${SOURCE_LIMITS.files} files together`);
+    if (budget.bytes > SOURCE_LIMITS.bytes)
+      return skip(
+        `${source.id}'s skills hold more than ${SOURCE_LIMITS.bytes / 1024 ** 3} GB together`,
+      );
+    return at;
+  };
+  const one = skillBudget();
+  let files = 0;
+  let bytes = 0;
+  let folderLinks = false;
+  const walk = (current: string, rel: string) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const path = join(current, entry.name);
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      one.depth(childRel);
+      if (entry.isDirectory()) walk(path, childRel);
+      else if (entry.isSymbolicLink()) {
+        try {
+          if (statSync(path).isDirectory()) folderLinks = true;
+        } catch {}
+      } else if (entry.isFile()) {
+        const size = lstatSync(path).size;
+        one.file(size);
+        files++;
+        bytes += size;
+      }
+    }
+  };
+  try {
+    walk(dir, "");
+    if (!folderLinks) return count(dir, files, bytes);
+    const copy = join(staging, "fanned-from", name);
+    const again = copyResolved(dir, copy, dir)
+      .filter((link) => link.reason === "again")
+      .map((link) => link.path);
+    if (again.length > 0)
+      warnings.push(
+        `${source.id}: ${name}: left out ${again.length} link${again.length === 1 ? "" : "s"} to a folder the skill holds already (${again.slice(0, 3).join(", ")}${again.length > 3 ? ", …" : ""}); each folder is copied once`,
+      );
+    return count(copy, listFiles(copy).length, bytesOf(copy));
+  } catch (error) {
+    if (error instanceof SkillTooLargeError) return skip(error.message);
+    throw error;
+  }
+}
+
+/** Bytes in the files under `dir`, links not followed. */
+function bytesOf(dir: string): number {
+  let total = 0;
+  for (const file of listFiles(dir)) {
+    const stat = lstatSync(join(dir, file));
+    if (stat.isFile()) total += stat.size;
+  }
+  return total;
+}
+
+/** The file `skills` leaves out of a copy, and the folders it skips. */
+const NOT_COPIED_FILES = new Set(["metadata.json"]);
+const NOT_COPIED_DIRS = new Set([".git", "__pycache__", "__pypackages__"]);
+
+/** Whether `skills` leaves the file at the `/`-separated `rel` out of the copy it installs. */
+const notCopied = (rel: string) => {
+  const parts = rel.split("/");
+  return parts.some((part, i) =>
+    i < parts.length - 1 ? NOT_COPIED_DIRS.has(part) : NOT_COPIED_FILES.has(part),
+  );
+};
+
+/** git's blob id of `data`; a copy written out with CRLF line endings is also tried with LF. */
+const blobIds = (data: Buffer) => {
+  const id = (bytes: Buffer) =>
+    createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+  const ids = [id(data)];
+  if (data.includes("\r\n"))
+    ids.push(id(Buffer.from(data.toString("latin1").replace(/\r\n/g, "\n"), "latin1")));
+  return ids;
+};
+
+/**
+ * Whether the folder `live` holds exactly the files of `path` at `commit` in the repository
+ * `repo`, as `skills` copies them: a copy installed then and never edited.
+ */
+async function copyOfCommit(repo: string, commit: string, path: string, live: string) {
+  const listed = await git(
+    ["ls-tree", "-r", "-z", "--full-tree", commit, ...(path === "." ? [] : ["--", path])],
+    { cwd: repo, allowFail: true },
+  );
+  if (listed.code !== 0) return false;
+  const want = new Map<string, string>();
+  for (const line of listed.stdout.split("\0").filter(Boolean)) {
+    const tab = line.indexOf("\t");
+    const [mode, type, id] = line.slice(0, tab).split(" ");
+    const file = line.slice(tab + 1);
+    const rel = path === "." ? file : file.slice(path.length + 1);
+    if (type !== "blob" || notCopied(rel)) continue;
+    // A link is copied as what it resolves to, which the tree does not say.
+    if (mode === "120000") return false;
+    want.set(rel, id!);
+  }
+  const have = listFiles(live);
+  if (have.length !== want.size) return false;
+  return have.every((rel) => {
+    const id = want.get(rel);
+    const file = join(live, rel);
+    return id !== undefined && lstatSync(file).isFile() && blobIds(readFileSync(file)).includes(id);
+  });
+}
+
+/** Whether `dir` (a skill folder in an unpacked package) is what `skills` copied into `live`. */
+function sameCopy(dir: string, live: string) {
+  if (!existsSync(dir)) return false;
+  const files = Object.entries(hashDir(dir)).filter(([rel]) => !notCopied(rel));
+  return sameTree(Object.fromEntries(files), hashDir(live));
+}
+
+/** Other versions of the npm package `spec` that the cache still holds, unpacked. */
+function earlierPackages(cache: string, spec: string, current: string): string[] {
+  const prefix = `${parseNpmSpec(spec).name.replace("/", "+")}@`;
+  let names: string[];
+  try {
+    names = readdirSync(cache);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((name) => name.startsWith(prefix) && !name.endsWith(".tmp"))
+    .map((name) => join(cache, name))
+    .filter((dir) => dir !== current);
 }
 
 /** The names in a well-known index, read directly so skills it rejected can be reported. */
@@ -1249,7 +1432,24 @@ async function fetchVendored(
         out.warnings.push(`${source.id}: ${failure.skill}: ${failure.message}`);
       return installed.installed;
     };
-    const fromHandle = chosen.filter((skill) => !linked.includes(skill as LinkedFolder));
+    // Each skill's folder is measured before `skills` copies it, which follows folder links.
+    const budget = sourceBudget();
+    const fanned: { skill: Found; dir: string }[] = [];
+    const fromHandle = chosen.filter((skill) => {
+      if (linked.includes(skill as LinkedFolder)) return false;
+      if (!opened.root || skill.path === undefined) return true;
+      const dir = copyableSkill(
+        source,
+        skill.name,
+        join(opened.root, skill.path),
+        staging!,
+        budget,
+        out.warnings,
+      );
+      if (dir === join(opened.root, skill.path)) return true;
+      if (dir) fanned.push({ skill, dir });
+      return false;
+    });
     if (fromHandle.length > 0)
       for (const target of await install(
         opened.handle,
@@ -1257,10 +1457,24 @@ async function fetchVendored(
         staging,
       ))
         staged.set(target.skill, target.path);
+    for (const [i, { skill, dir }] of fanned.entries()) {
+      const handle = await discover(dir, undefined, [], true);
+      try {
+        for (const target of await install(handle, [skill.name], join(staging, `fanned-${i}`)))
+          staged.set(skill.name, target.path);
+      } finally {
+        await handle.dispose();
+      }
+    }
     for (const [i, link] of linked.entries()) {
       if (!chosen.includes(link)) continue;
+      const dir = copyableSkill(source, link.name, link.real, staging, budget, out.warnings);
+      if (!dir) continue;
       // Each from its own folder, which `skills` reads as a source of one skill.
-      const handle = await discover(link.real, undefined, [], false, opened.root);
+      const handle =
+        dir === link.real
+          ? await discover(link.real, undefined, [], false, opened.root)
+          : await discover(dir, undefined, [], true);
       try {
         const name = handle.skills[0]?.name;
         const escaped = escapingSkills(source, handle, link.real, opened.root!, out.warnings);
@@ -1279,7 +1493,19 @@ async function fetchVendored(
     countCopies([...staged.values()].reduce((sum, dir) => sum + listFiles(dir).length, 0));
     if (opened.root) linkedSkillMds(source, opened.root, chosen, staged, out.warnings);
     carryRenames(state, ctx, out, chosen, staged);
-    applyVendored(source, state, ctx, out, chosen, staged, { rebuilt, firstRun });
+    // A copy with no install record and no base (state.json and store/base lost) that differs
+    // from upstream is an earlier upstream version when it matches one, and no edit.
+    const earlier = new Map<string, Hashes>();
+    for (const skill of chosen) {
+      const from = staged.get(skill.name);
+      const live = storePaths(ctx.storeDir, skill.name).live;
+      if (!from || state.skills[skill.name] || skill.path === undefined || !existsSync(live))
+        continue;
+      const seen = hashDir(live);
+      if (sameTree(hashDir(from), seen)) continue;
+      if (await opened.earlier(skill.path, live)) earlier.set(skill.name, seen);
+    }
+    applyVendored(source, state, ctx, out, chosen, staged, { rebuilt, firstRun, earlier });
     state.fetchedAt = ctx.now;
     if (source.kind === "npm") state.version = opened.version;
     else state.commit = opened.version;
@@ -1389,10 +1615,16 @@ function applyVendored(
   {
     rebuilt,
     firstRun,
+    earlier,
   }: {
     /** Skills whose install record was rebuilt from the store this run. */
     rebuilt: readonly string[];
     firstRun: boolean;
+    /**
+     * Skills without an install record whose copy is an earlier upstream version, unedited, and
+     * the copy's hashes then.
+     */
+    earlier: ReadonlyMap<string, Hashes>;
   },
 ) {
   const write = !ctx.dryRun;
@@ -1431,7 +1663,12 @@ function applyVendored(
     if (!record && existsSync(paths.live)) {
       // A copy without an install record (state.json was lost): upstream becomes its base, and a
       // copy that differs from it counts as edited, so it is never overwritten.
-      const files = changedFiles(incoming, hashDir(paths.live));
+      const seen = earlier.get(skill.name);
+      // An earlier upstream copy is updated like any other, unless an edit came since.
+      const files =
+        seen && (!write || replaceUnchanged(from, paths.live, seen).length === 0)
+          ? []
+          : changedFiles(incoming, hashDir(paths.live));
       if (write) {
         replaceDir(from, paths.base);
         state.skills[skill.name] = { hashes: incoming, path: skill.path };
@@ -1497,7 +1734,15 @@ function applyVendored(
       continue;
     }
     if (write) {
-      install(from, paths);
+      // Edits were looked for before the fetch; one saved since then is caught here.
+      const late = replaceUnchanged(from, paths.live, record.hashes);
+      if (late.length > 0) {
+        edited.set(skill.name, late);
+        out.edited.push({ skill: skill.name, files: late });
+        hold(skill.name, from, "edited", files);
+        continue;
+      }
+      replaceDir(from, paths.base);
       rmSync(paths.upstream, { recursive: true, force: true });
       state.skills[skill.name] = { hashes: incoming, path: skill.path };
       delete state.pending[skill.name];
