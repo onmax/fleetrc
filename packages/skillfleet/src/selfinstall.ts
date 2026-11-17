@@ -279,10 +279,18 @@ function scriptsBlocked(): string | undefined {
     if (!shell) continue;
     const run = spawnSync(
       shell,
-      ["-NoProfile", "-NonInteractive", "-Command", "Get-ExecutionPolicy"],
+      // Imported by name: found by autoloading, the cmdlet would first have PowerShell index every
+      // module, which takes seconds under a new profile. With stdin a pipe, PowerShell waits on it.
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Import-Module Microsoft.PowerShell.Security; Get-ExecutionPolicy",
+      ],
       {
         encoding: "utf8",
         env,
+        stdio: ["ignore", "pipe", "ignore"],
         timeout: 30_000,
         windowsHide: true,
       },
