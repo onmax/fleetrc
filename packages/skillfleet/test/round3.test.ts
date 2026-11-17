@@ -396,7 +396,7 @@ describe("init clones an adopt source before adopting", () => {
           { kind: "adopt", path: at("agent", "b"), to: at("clone", "b") },
         ],
       } as unknown as InitPlan;
-      expect(() => applyPlan(plan)).toThrow(/init changed nothing: .*clone\/b exists/);
+      expect(() => applyPlan(plan)).toThrow(/init changed nothing: .*clone[\\/]b exists/);
       expect(readdirSync(at("agent")).sort()).toEqual(["a", "b"]);
       expect(readdirSync(at("clone"))).toEqual(["b"]);
     } finally {
