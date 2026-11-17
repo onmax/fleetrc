@@ -1,3 +1,5 @@
+import { UserError } from "./errors.ts";
+
 // Skill names and source ids become folder names in the store and in every agent folder, so each
 // one has to be a single path segment that Linux, macOS and Windows all create the same way.
 
@@ -39,15 +41,21 @@ export const nameKey = (name: string) =>
     .replace(/[. ]+$/, "");
 
 /**
- * The one of `names` that `typed` means: itself, else the one with the same `nameKey`. Skill names
- * are unique by `nameKey` (sync keeps the first of two that macOS and Windows fold together), so a
- * name typed in another case or Unicode form, as a macOS keyboard types NFC, finds one skill.
+ * The one of `names` that `typed` means: itself, else the one with the same `nameKey`, as a macOS
+ * keyboard types NFC. Linked skills are unique by `nameKey` (sync keeps the first of two that macOS
+ * and Windows fold together), but a skill held for review may share it with a linked one: then the
+ * typed name could mean either, and this throws, naming them.
  */
 export function findName(names: Iterable<string>, typed: string): string | undefined {
-  const list = [...names];
-  if (list.includes(typed)) return typed;
+  const list = new Set(names);
+  if (list.has(typed)) return typed;
   const key = nameKey(typed);
-  return list.find((name) => nameKey(name) === key);
+  const matches = [...list].filter((name) => nameKey(name) === key);
+  if (matches.length > 1)
+    throw new UserError(
+      `"${typed}" could be any of ${matches.map((name) => `"${name}"`).join(", ")}, which differ only in case or Unicode form; type the one you mean exactly`,
+    );
+  return matches[0];
 }
 
 /**
