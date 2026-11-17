@@ -8,6 +8,7 @@ import {
   adoptSkill,
   diffPending,
   diffSkill,
+  forkLines,
   forkSkill,
   manifestToEdit,
   type ManifestTarget,
@@ -516,6 +517,7 @@ async function status() {
       manifest: config?.manifest,
       lastRun: report,
       lastChange: state.lastChange,
+      forks: state.forks ?? {},
       staleSessions: stale,
       timer: timerState instanceof TimerError ? { error: timerState.message } : timerState,
     });
@@ -525,6 +527,7 @@ async function status() {
   if (!report) say("no sync has run on this machine yet");
   else
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
+  for (const line of forkLines(state)) say(line);
   const declined = config?.timer === false;
   say(
     `timer: ${

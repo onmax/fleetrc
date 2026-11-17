@@ -178,9 +178,13 @@
             "adopt": {
               "type": "boolean",
               "description": "init, adopt and fork move hand-made skills into this source. Needs path."
+            },
+            "followLinks": {
+              "type": "boolean",
+              "description": "Follow links that lead out of the working clone, such as a dotfiles repository whose skills link into another repository of yours, to find and link skills. Without it they are left out, since a cloned repository's links come from whoever pushes to it. Only the root manifest can set it; an extended manifest's is ignored. Needs path."
             }
           },
-          "dependentRequired": { "adopt": ["path"] }
+          "dependentRequired": { "adopt": ["path"], "followLinks": ["path"] }
         },
         {
           "description": "A site serving /.well-known/agent-skills/index.json (v0.2.0, with digests) or /.well-known/skills/index.json (v0.1).",

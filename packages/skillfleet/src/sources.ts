@@ -12,6 +12,7 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, sep } from "node:path";
 import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "skills";
@@ -21,6 +22,7 @@ import {
   copyResolved,
   type Hashes,
   countCopies,
+  dict,
   hashDir,
   inside,
   isRecord,
@@ -33,11 +35,12 @@ import {
   skillBudget,
   SkillTooLargeError,
 } from "./fs.ts";
-import { collisions, fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
+import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
 import type { CloneSource, InPlaceSource, Source, VendoredSource } from "./manifest.ts";
-import { assertSegment, nameKey, segmentProblem } from "./names.ts";
+import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
 import { fetchNpm, parseNpmSpec, withCappedFetch } from "./npm.ts";
+import { tildify } from "./paths.ts";
 import type { SourceState } from "./state.ts";
 
 export interface SkillEntry {
@@ -281,8 +284,11 @@ function escapingSkills(
     }
     if (!leaves) continue;
     escaping.add(skill.name);
+    const rel = relative(root, folder).split(sep).join("/");
     warnings.push(
-      `${source.id}: ${relative(root, folder).split(sep).join("/")} links out of the source, so its skill "${skill.name}" is not read`,
+      source.kind === "clone"
+        ? linksOutOfClone(source, rel)
+        : `${source.id}: ${rel} links out of the source, so its skill "${skill.name}" is not read`,
     );
   }
   return escaping;
@@ -381,7 +387,9 @@ function linkedFolders(
       }
       if (!outside && !inside(realRoot, real)) {
         warnings.push(
-          `${source.id}: ${rel} links to a folder outside the source, so it is not read`,
+          source.kind === "clone"
+            ? linksOutOfClone(source, rel)
+            : `${source.id}: ${rel} links to a folder outside the source, so it is not read`,
         );
         continue;
       }
@@ -403,6 +411,10 @@ function linkedFolders(
   }
   return linked.filter((link) => !found.some((skill) => skill.name === link.name));
 }
+
+/** The warning for a path of a working clone that leads out of it, naming the opt-in. */
+const linksOutOfClone = (source: CloneSource, rel: string) =>
+  `${source.id}: ${rel} links outside ${tildify(source.path)}; add "followLinks": true to this source to use it`;
 
 /** The submodules of a working clone. */
 async function cloneSubmodules(dir: string): Promise<string[]> {
@@ -455,21 +467,29 @@ async function discoverInPlace(
   warnings: string[],
 ): Promise<SkillEntry[]> {
   const skipped: string[] = [];
+  // A working clone's links stay inside it unless the root manifest says to follow them.
+  const follow = source.kind === "local" || source.followLinks;
   let handle: SkillSource | undefined;
   try {
-    handle = await discover(root, source.skills, skipped, source.kind === "local");
+    handle = await discover(root, source.skills, skipped, follow);
   } catch (error) {
+    const why: string[] = [];
     if (
       !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
-      (skipped.length === 0 && linkedFolders(source, root, [], []).length === 0)
+      (skipped.length === 0 && linkedFolders(source, root, [], why, follow).length === 0)
     ) {
-      warnings.push(`${source.id}: ${message(error)}`);
+      // Links that lead out were all there was: name them and the rule, not just "no skills".
+      if (why.length > 0) warnings.push(...why);
+      else
+        warnings.push(
+          `${source.id}: ${message(error)}${source.kind === "clone" && /leaves the source|links out of the source/.test(message(error)) ? `; add "followLinks": true to this source to use it` : ""}`,
+        );
       return [];
     }
   }
   try {
     const escaping =
-      handle && source.kind === "clone"
+      handle && !follow
         ? escapingSkills(source, handle, join(root, globBase(source.skills ?? "")), root, warnings)
         : new Set();
     const found: Found[] = (handle?.skills ?? [])
@@ -491,7 +511,7 @@ async function discoverInPlace(
         `${source.id}: ${path}/SKILL.md frontmatter is not valid YAML; linked anyway, but tools that parse it strictly skip ${name}`,
       );
     }
-    found.push(...linkedFolders(source, root, found, warnings, source.kind === "local"));
+    found.push(...linkedFolders(source, root, found, warnings, follow));
     if (source.kind === "clone")
       unfetchedSubmodules(source, root, found, await cloneSubmodules(root), warnings);
     return select(source, plainNames(source, found, warnings), warnings).map((skill) => ({
@@ -499,7 +519,7 @@ async function discoverInPlace(
       path: skill.path,
       dir: skill.path && skill.path !== "." ? join(root, skill.path) : root,
       // A folder of the user's own may link anywhere, as in `linkedFolders`.
-      ...(source.kind === "clone" ? { root } : {}),
+      ...(follow ? {} : { root }),
     }));
   } finally {
     await handle?.dispose();
@@ -813,7 +833,8 @@ async function localEdits(dir: string, clashes: Clashes): Promise<Set<string>> {
 type Clashes = ReadonlyMap<string, string>;
 
 /**
- * Files of a working clone whose paths differ only in case or Unicode form (skills/Foo/SKILL.md
+ * Warns for the paths of a working clone that Windows can't write (`windowsNames`), as for a git
+ * source. Returns the files whose paths differ only in case or Unicode form (skills/Foo/SKILL.md
  * and skills/foo/SKILL.md), when what is on disk is one of their committed versions. macOS and
  * Windows check such paths out into one file, so git sees all but one of them as changed; that is
  * not a local edit, and must not hold the rest of the clone back. Warns once for each clash. With
@@ -833,6 +854,7 @@ async function nameClashes(
       const [meta, path] = line.split("\t") as [string, string];
       return { blob: meta.split(" ")[1]!, path };
     });
+  windowsNames(source, refusals(entries.map((entry) => entry.path)), warnings);
   const found = collisions(entries.map((entry) => entry.path));
   for (const { path, kept } of found)
     warnings.push(
@@ -935,12 +957,27 @@ export async function syncLocal(
     return out;
   }
   out.skills = await discoverInPlace(source, source.local, out.warnings);
-  if (!state.fetchedAt) {
-    out.status = "installed";
-    out.changed = out.skills.flatMap((skill) =>
-      listFiles(skill.dir).map((file) => `${filesAt(source, skill)}${file}`),
-    );
+  // A folder has no commits to compare, so each skill's files are hashed, as the store's are, and
+  // the changes go to hooks as paths inside the folder.
+  const now = new Map(out.skills.map((skill) => [skill.name, hashDir(skill.dir)]));
+  const at = (name: string, path: string | undefined) => filesAt(source, { name, path });
+  for (const [name, record] of Object.entries(state.skills))
+    if (!now.has(name))
+      out.changed.push(
+        ...Object.keys(record.hashes).map((file) => `${at(name, record.path)}${file}`),
+      );
+  for (const skill of out.skills) {
+    const files = changedFiles(state.skills[skill.name]?.hashes ?? {}, now.get(skill.name)!);
+    out.changed.push(...files.map((file) => `${at(skill.name, skill.path)}${file}`));
   }
+  if (!state.fetchedAt) out.status = "installed";
+  else if (out.changed.length > 0) out.status = "updated";
+  state.skills = dict(
+    out.skills.map((skill) => [
+      skill.name,
+      { hashes: now.get(skill.name)!, ...(skill.path === undefined ? {} : { path: skill.path }) },
+    ]),
+  );
   state.fetchedAt = ctx.now;
   return out;
 }
@@ -958,6 +995,31 @@ export function storePaths(storeDir: string, name: string) {
   };
 }
 
+/** Whether a path of a source's repository is where its `skills` glob looks, or on the way there. */
+function lookedAt(source: Source): (path: string) => boolean {
+  const base = source.kind !== "index" && source.skills ? globBase(source.skills) : "";
+  return (path) =>
+    !base || path === base || path.startsWith(`${base}/`) || base.startsWith(`${path}/`);
+}
+
+/**
+ * A warning for each path of a git source or working clone that Windows can't write: Windows
+ * leaves it out, as git does there, and Linux and macOS keep it, as git does there, so the
+ * fleet's Windows machines lack it.
+ */
+function windowsNames(source: Source, refused: readonly Refusal[], warnings: string[]) {
+  const looked = lookedAt(source);
+  for (const { path, problem } of refused)
+    if (looked(path))
+      warnings.push(
+        problem === GIT_FOLDER
+          ? `${source.id}: left out ${path} on every system: its name ${problem}; rename it upstream`
+          : process.platform === "win32"
+            ? `${source.id}: left out ${path}: its name ${problem}; rename it upstream`
+            : `${source.id}: Windows machines lack ${path}: its name ${problem}; rename it upstream so every machine has it`,
+      );
+}
+
 /** Fetches a vendored source and returns the skills `skills` would install from it. */
 async function openVendored(
   source: VendoredSource,
@@ -968,19 +1030,13 @@ async function openVendored(
   switch (source.kind) {
     case "git": {
       const clone = await fetchClone(gitUrl(source.git), source.ref, join(ctx.cacheDir, "git"));
-      const base = source.skills ? globBase(source.skills) : "";
-      const looked = (path: string) =>
-        !base || path === base || path.startsWith(`${base}/`) || base.startsWith(`${path}/`);
+      const looked = lookedAt(source);
       for (const { path, kept } of clone.collisions)
         if (looked(path))
           warnings.push(
             `${source.id}: left out ${path}: macOS and Windows keep it in the same folder as ${kept}`,
           );
-      for (const { path, problem } of clone.refused)
-        if (looked(path))
-          warnings.push(
-            `${source.id}: left out ${path} on every system: its name ${problem}; rename it upstream`,
-          );
+      windowsNames(source, clone.refused, warnings);
       return {
         handle: await discover(clone.dir, source.skills).catch((error: unknown): SkillSource => {
           // Only the linked-folder pass can rescue this specific empty discovery result.
@@ -1308,15 +1364,83 @@ export async function syncVendored(
   if (source.kind !== "index") return fetchVendored(source, state, ctx);
   // `skills` downloads and unpacks an index's archives itself, with no limit on either.
   const refused: string[] = [];
-  const out = await withCappedFetch(() => fetchVendored(source, state, ctx), refused);
+  const mismatched = new Map<string, string>();
+  const out = await withCappedFetch(
+    () => withDigestCheck(() => fetchVendored(source, state, ctx, mismatched), mismatched),
+    refused,
+  );
   out.warnings.push(...refused.map((why) => `${source.id}: refused ${why}`));
   return out;
+}
+
+/** An index file of a well-known source, at either path `skills` reads. */
+const INDEX_FILE = /\/\.well-known\/(?:agent-skills|skills)\/index\.json$/;
+
+/**
+ * Runs `work` with every archive an index lists checked against the digest the index gives,
+ * before `skills` sees it. `skills` gives up on the whole index at the first mismatch; here a
+ * mismatched archive reads as a failed download instead, which drops only its skill, and its name
+ * goes into `mismatched` with the digest received.
+ */
+async function withDigestCheck<T>(work: () => Promise<T>, mismatched: Map<string, string>) {
+  const original = globalThis.fetch;
+  const expected = new Map<string, { name: string; digest: string }>();
+  globalThis.fetch = async (input, init) => {
+    const response = await original(input, init);
+    const url = input instanceof Request ? input.url : String(input);
+    const path = (() => {
+      try {
+        return new URL(url).pathname;
+      } catch {
+        return "";
+      }
+    })();
+    const listed = expected.get(url);
+    if (!response.ok || (!listed && !INDEX_FILE.test(path))) return response;
+    const body = new Uint8Array(await response.arrayBuffer());
+    if (listed) {
+      const digest = `sha256:${createHash("sha256").update(body).digest("hex")}`;
+      if (digest !== listed.digest) {
+        mismatched.set(listed.name, digest);
+        return new Response(null, { status: 502, statusText: "digest mismatch" });
+      }
+    } else
+      try {
+        const index: unknown = JSON.parse(new TextDecoder().decode(body));
+        const skills = isRecord(index) && Array.isArray(index.skills) ? index.skills : [];
+        for (const entry of skills)
+          if (
+            isRecord(entry) &&
+            typeof entry.name === "string" &&
+            typeof entry.url === "string" &&
+            typeof entry.digest === "string"
+          )
+            expected.set(new URL(entry.url, url).toString(), {
+              name: entry.name,
+              digest: entry.digest,
+            });
+      } catch {}
+    const copy = new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+    Object.defineProperty(copy, "url", { value: response.url });
+    return copy;
+  };
+  try {
+    return await work();
+  } finally {
+    globalThis.fetch = original;
+  }
 }
 
 async function fetchVendored(
   source: VendoredSource,
   state: SourceState,
   ctx: SourceContext,
+  /** Index skills whose archive did not match its digest, with the digest received. */
+  mismatched: ReadonlyMap<string, string> = new Map(),
 ): Promise<SourceResult> {
   const out = result(source, "unchanged");
   out.from = state.commit ?? state.version;
@@ -1397,8 +1521,20 @@ async function fetchVendored(
       const listed = await indexNames(source.index);
       const got = new Set(found.map((skill) => skill.name));
       for (const name of listed ?? [])
-        if (!got.has(name))
+        if (!got.has(name) && !mismatched.has(name))
           out.warnings.push(`${source.id}: rejected "${name}": its archive is invalid or unsafe`);
+    }
+    // A mismatched archive (a deploy in flight serving an old one) holds back only its skill.
+    const heldBack = new Set<string>();
+    for (const [name, digest] of mismatched) {
+      const kept =
+        state.skills[name] !== undefined &&
+        existsSync(storePaths(ctx.storeDir, name).live) &&
+        select(source, [{ name }], []).length > 0;
+      if (kept) heldBack.add(name);
+      out.warnings.push(
+        `${source.id}: the archive of "${name}" does not match the digest the index gives (received ${digest}), so ${kept ? "it keeps its last good copy" : "it is not installed"}; the index's other skills update as usual`,
+      );
     }
     if (nothingNew(source, state, ctx, opened.version, chosen)) {
       out.skills = chosen.map((skill) => ({
@@ -1505,7 +1641,12 @@ async function fetchVendored(
       if (sameTree(hashDir(from), seen)) continue;
       if (await opened.earlier(skill.path, live)) earlier.set(skill.name, seen);
     }
-    applyVendored(source, state, ctx, out, chosen, staged, { rebuilt, firstRun, earlier });
+    applyVendored(source, state, ctx, out, chosen, staged, {
+      rebuilt,
+      firstRun,
+      earlier,
+      heldBack,
+    });
     state.fetchedAt = ctx.now;
     if (source.kind === "npm") state.version = opened.version;
     else state.commit = opened.version;
@@ -1616,6 +1757,7 @@ function applyVendored(
     rebuilt,
     firstRun,
     earlier,
+    heldBack = new Set(),
   }: {
     /** Skills whose install record was rebuilt from the store this run. */
     rebuilt: readonly string[];
@@ -1625,6 +1767,8 @@ function applyVendored(
      * the copy's hashes then.
      */
     earlier: ReadonlyMap<string, Hashes>;
+    /** Skills upstream still has but whose download was refused: their copy stays as it is. */
+    heldBack?: ReadonlySet<string>;
   },
 ) {
   const write = !ctx.dryRun;
@@ -1750,6 +1894,9 @@ function applyVendored(
     out.updated.push(skill.name);
     out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
   }
+  // A skill held back keeps the update it was already waiting on.
+  for (const entry of out.pending)
+    if (heldBack.has(entry.skill) && !pending.has(entry.skill)) pending.set(entry.skill, entry);
   out.pending = [...pending.values()].sort((a, b) => (a.skill < b.skill ? -1 : 1));
   if (write)
     for (const name of Object.keys(state.pending))
@@ -1761,6 +1908,10 @@ function applyVendored(
   for (const name of Object.keys(state.skills)) {
     if (kept.has(name)) continue;
     const paths = storePaths(ctx.storeDir, name);
+    if (heldBack.has(name)) {
+      out.skills.push({ name, dir: paths.live, path: state.skills[name]?.path });
+      continue;
+    }
     if (edited.has(name) || review) {
       if (edited.has(name))
         out.warnings.push(

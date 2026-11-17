@@ -207,8 +207,10 @@ describe("names macOS and Windows fold together", () => {
   });
 
   // windows.test.ts runs this on Windows, where git refuses to write such a commit through an index.
+  // Linux and macOS keep such names, as git does in a working clone there (R7-12), and say Windows
+  // machines lack them.
   it.skipIf(process.platform === "win32")(
-    "W-NAME. names Windows can't write are left out on every system, with a warning each sync; the rest links",
+    "W-NAME. names Windows can't write are kept on Linux and macOS, with a warning each sync that Windows lacks them",
     async () => {
       const m = machine();
       const vendor = remote(m, "vendor", skills("skills/", "good"));
@@ -227,20 +229,28 @@ describe("names macOS and Windows fold together", () => {
       });
       const init = await m.run("init", manifest, "--no-timer");
       expect(init.code, init.stdout + init.stderr).toBe(0);
+      const lack = (path: string, why: string) =>
+        `vendor: Windows machines lack ${path}: its name ${why}; rename it upstream so every machine has it`;
       const warnings = [
-        "vendor: left out skills/aux on every system: its name is a device name on Windows; rename it upstream",
-        "vendor: left out skills/bad/aux.txt on every system: its name is a device name on Windows; rename it upstream",
-        "vendor: left out skills/bad/notes. on every system: its name ends with a dot or a space, which Windows drops; rename it upstream",
-        "vendor: left out skills/longna~1 on every system: its name looks like an 8.3 short name, which Windows can resolve to another folder; rename it upstream",
+        lack("skills/aux", "is a device name on Windows"),
+        lack("skills/bad/aux.txt", "is a device name on Windows"),
+        lack("skills/bad/notes.", "ends with a dot or a space, which Windows drops"),
+        lack(
+          "skills/longna~1",
+          "looks like an 8.3 short name, which Windows can resolve to another folder",
+        ),
       ];
       for (let run = 0; run < 2; run++) {
         const report = await m.json("sync");
         expect(report.ok, JSON.stringify(report.errors)).toBe(true);
-        expect(report.skills.names).toEqual(["bad", "good", "longname-skill"]);
+        // A skill named aux is still skipped: its name is a folder in every agent folder.
+        expect(report.skills.names).toEqual(["bad", "good", "longname-skill", "longna~1"]);
         expect(report.skills.added).toEqual([]);
-        expect([...report.warnings].sort()).toEqual(warnings);
+        expect(
+          [...report.warnings].filter((w) => w.includes("Windows machines lack")).sort(),
+        ).toEqual(warnings);
       }
-      expect(names(m.at(".claude/skills/bad"))).toEqual(["SKILL.md"]);
+      expect(names(m.at(".claude/skills/bad"))).toEqual(["SKILL.md", "aux.txt", "notes."]);
       expect(read(m.at(".claude/skills/longname-skill/SKILL.md"))).toBe(
         skillMd("longname-skill", "the real one"),
       );

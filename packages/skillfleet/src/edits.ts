@@ -12,7 +12,17 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
-import { copyDir, hashDir, inside, isErrno, isRecord, lstat, moveDir } from "./fs.ts";
+import {
+  changedFiles,
+  copyDir,
+  hashDir,
+  inside,
+  isErrno,
+  isRecord,
+  lstat,
+  moveDir,
+  sha256,
+} from "./fs.ts";
 import { fetchClone, gitUrl, repoKey } from "./gitcache.ts";
 import { globBase } from "./glob.ts";
 import {
@@ -185,6 +195,76 @@ async function forkUpstream(fork: { from: string; path: string }, ref?: string) 
   const dir = join(clone.dir, fork.path);
   confine(clone.dir, dir, `read it as the fork's upstream`);
   return { dir, commit: clone.commit };
+}
+
+/** A fork that changed upstream, as a sync reports it. */
+export interface ForkUpdate {
+  /** The source the fork came from. */
+  source: string;
+  skill: string;
+  files: string[];
+}
+
+/**
+ * Compares each fork's `base` with the skill's folder at the commit its git source has now, and
+ * records what it found in `state.forks`. Returns the forks whose upstream moved since the last
+ * sync that looked, so a sync says so once; `status` says it until the fork is merged. Only a
+ * fork of a git source has a base commit to compare. A fork whose source did not update this run
+ * keeps what was found before.
+ */
+export async function checkForks(
+  loaded: LoadedManifest,
+  results: readonly { id: string; status: string; to?: string }[],
+  state: State,
+  cacheDir: string,
+): Promise<{ updates: ForkUpdate[]; warnings: string[] }> {
+  const updates: ForkUpdate[] = [];
+  const warnings: string[] = [];
+  const forks = (state.forks ??= {});
+  for (const name of Object.keys(forks)) if (!(name in loaded.root.forks)) delete forks[name];
+  for (const [name, fork] of Object.entries(loaded.root.forks)) {
+    const source = loaded.sources.find(
+      (candidate) => candidate.kind === "git" && repoKey(candidate.git) === repoKey(fork.from),
+    );
+    const result = source && results.find((candidate) => candidate.id === source.id);
+    if (!source || source.kind !== "git" || !result?.to || result.status === "error") continue;
+    const known = forks[name];
+    if (known && known.base === fork.base && known.upstream === result.to) continue;
+    let files: string[] = [];
+    let tree = "";
+    if (!result.to.startsWith(fork.base.toLowerCase()))
+      try {
+        const now = await fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
+          offline: true,
+        });
+        const base = await forkUpstream(fork, fork.base);
+        const dir = join(now.dir, fork.path);
+        confine(now.dir, dir, "read it as the fork's upstream");
+        const upstream = hashDir(dir);
+        files = changedFiles(hashDir(base.dir), upstream);
+        tree = sha256(JSON.stringify(upstream));
+      } catch (error) {
+        warnings.push(
+          `could not tell whether ${name} changed upstream since you forked it: ${(error as Error).message}`,
+        );
+        continue;
+      }
+    forks[name] = { base: fork.base, upstream: result.to, tree, files };
+    // Said once for each new upstream version of the skill, not on every sync.
+    if (files.length > 0 && (known?.base !== fork.base || known.tree !== tree))
+      updates.push({ source: source.id, skill: name, files });
+  }
+  return { updates, warnings };
+}
+
+/** What `status` says of each fork that changed upstream since it was forked or last merged. */
+export function forkLines(state: State): string[] {
+  return Object.entries(state.forks ?? {})
+    .filter(([, fork]) => fork.files.length > 0)
+    .map(
+      ([name]) =>
+        `${name}: upstream changed since you forked it; \`skillfleet diff ${name}\` / \`skillfleet merge ${name}\``,
+    );
 }
 
 /** A vendored skill's pending update against the copy in use, or else its local edits. */

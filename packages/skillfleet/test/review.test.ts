@@ -2,6 +2,7 @@
 // bugs, each reproduced here first. Every run uses the fixture's temporary HOME, and every scheduler
 // call goes to the fixture's fake.
 import {
+  appendFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -18,6 +19,7 @@ import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { changedFiles, hashDir } from "../src/fs.ts";
+import { isRemoteGit, rewriteUrl } from "../src/manifest.ts";
 import { loadState, saveState, type State } from "../src/state.ts";
 import { type LockHolder, LockHeldError, takeLock } from "../src/sync.ts";
 import {
@@ -443,22 +445,95 @@ describe("CX7. names that are Object.prototype keys", () => {
 });
 
 describe("CX8. an extended manifest names only remote repositories", () => {
+  // An alias in the user's git config: `url.<to>.insteadOf <from>`, and the URL the team names.
+  const alias = (m: Machine, to: string, key = "insteadOf") => {
+    appendFileSync(
+      join(m.root, "gitconfig"),
+      `[url "${to.replace(/\\/g, "/")}"]\n\t${key} = https://mirror.skillfleet.test/private.git\n`,
+    );
+    return "https://mirror.skillfleet.test/private.git";
+  };
   it.each([
     { kind: "a path", spec: (url: string) => url },
+    { kind: "a relative path", spec: () => "../remotes/private.git" },
     { kind: "a file: URL", spec: (url: string) => pathToFileURL(url).href },
     { kind: "an ext:: command", spec: () => "ext::git %G" },
+    { kind: "an insteadOf alias of a path", spec: (url: string, m: Machine) => alias(m, url) },
+    {
+      kind: "an insteadOf alias of a file: URL",
+      spec: (url: string, m: Machine) => alias(m, pathToFileURL(url).href),
+    },
+    {
+      kind: "a pushInsteadOf alias of a path",
+      spec: (url: string, m: Machine) => alias(m, url, "pushInsteadOf"),
+    },
   ])("CX8. a team manifest's git source that is $kind is refused", async ({ spec }) => {
     const m = machine();
     const local = remote(m, "private", skills("skills/", "private"));
     const team = join(m.root, "team", "skills.json");
     writeFiles(join(m.root, "team"), {
-      "skills.json": JSON.stringify({ sources: [{ id: "team", git: spec(local.url) }] }),
+      "skills.json": JSON.stringify({ sources: [{ id: "team", git: spec(local.url, m) }] }),
     });
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
     const run = await init(m, manifest);
     expect(names(m.at(".claude/skills"))).not.toContain("private");
     expect(existsSync(join(m.stateDir, "store", "team"))).toBe(false);
     expect(run.warnings.join("\n")).toMatch(/team.*remote/);
+  });
+
+  it("R7-15. a team manifest's insteadOf alias of a remote repository is allowed", async () => {
+    const m = machine();
+    const vendor = remote(m, "private", skills("skills/", "private"));
+    const team = join(m.root, "team", "skills.json");
+    writeFiles(join(m.root, "team"), {
+      "skills.json": JSON.stringify({ sources: [{ id: "team", git: alias(m, vendor.served) }] }),
+    });
+    const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
+    const run = await init(m, manifest);
+    expect(run.warnings.join("\n")).not.toContain("ignored source");
+    expect(names(m.at(".claude/skills"))).toEqual(["private"]);
+  });
+
+  it("R7-15. each spelling of a repository is remote or not, after the user's rewrites", () => {
+    const remote = [
+      "owner/repo",
+      "github:owner/repo",
+      "gitlab:group/sub/repo",
+      "https://git.example.com/team/repo.git",
+      "http://gitea.local:3000/team/repo.git",
+      "git://git.example.com/repo.git",
+      "ssh://git@git.example.com:2222/repo.git",
+      "git+ssh://git.example.com/repo.git",
+      "git@github.com:owner/repo.git",
+      "gitea:team/repo.git",
+    ];
+    const local = [
+      "/srv/git/repo.git",
+      "./repo.git",
+      "../repo.git",
+      "repo.git",
+      "C:/git/repo.git",
+      "C:\\git\\repo.git",
+      "file:///srv/git/repo.git",
+      "ext::git %G",
+      "ext::sh -c touch% /tmp/pwned",
+      "fd::3",
+      "persistent-https::https://x/y.git",
+    ];
+    for (const spec of remote) expect(isRemoteGit(spec), spec).toBe(true);
+    for (const spec of local) expect(isRemoteGit(spec), spec).toBe(false);
+    const rules = [
+      { from: "https://mirror.example/", to: "/srv/mirror/", push: false },
+      { from: "https://push.example/", to: "file:///srv/push/", push: true },
+      { from: "gh:", to: "https://github.com/", push: false },
+      { from: "https://mirror.example/remote/", to: "https://git.example.com/", push: false },
+    ];
+    expect(isRemoteGit("https://mirror.example/team.git", rules)).toBe(false);
+    // The longest prefix wins, as in git.
+    expect(isRemoteGit("https://mirror.example/remote/team.git", rules)).toBe(true);
+    expect(isRemoteGit("https://push.example/team.git", rules)).toBe(false);
+    expect(isRemoteGit("gh:owner/repo", rules)).toBe(true);
+    expect(rewriteUrl("gh:owner/repo", rules)).toBe("https://github.com/owner/repo");
   });
 
   it("CX8. the root manifest still names a repository on this machine", async () => {

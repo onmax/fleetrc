@@ -433,7 +433,9 @@ console.log("pstack rebuilt");`,
       expect(names(m.at(".claude/skills"))).toEqual(["linked", "tool"]);
       const warnings = report.warnings.join("\n");
       expect(warnings).toMatch(/skills\/subskill is a git submodule that is not checked out/);
-      expect(warnings).toMatch(/skills\/outside links to a folder outside the source/);
+      expect(warnings).toMatch(
+        /skills\/outside links outside ~\/src\/vendor; add "followLinks": true to this source to use it/,
+      );
     },
   );
 });

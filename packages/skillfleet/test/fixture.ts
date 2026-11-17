@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { afterAll, afterEach } from "vite-plus/test";
@@ -235,8 +235,8 @@ export function machine({
       "[core]\n\tautocrlf = false\n\tsymlinks = true",
       '[protocol "file"]\n\tallow = always',
       "[advice]\n\tdetachedHead = false",
-      // Every remote's https URL (`Remote.https`) reaches its bare repository, as a manifest names one.
-      `[url "${root.replace(/\\/g, "/")}/remotes/"]\n\tinsteadOf = ${HTTPS_REMOTES}`,
+      // Every remote's https URL (`Remote.https`) reaches its bare repository over HTTP.
+      `[url "${GIT_SERVER}/${basename(root)}/remotes/"]\n\tinsteadOf = ${HTTPS_REMOTES}`,
     ].join("\n") + "\n",
   );
   const env: NodeJS.ProcessEnv = {
@@ -270,6 +270,7 @@ export function machine({
     SKILLFLEET_TEST_SCHEDULER_LOG: schedulerLog,
   };
   for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
+  gitRoots.set(basename(root), { root, env });
   const self: Machine = {
     root,
     home,
@@ -320,14 +321,91 @@ export function machine({
 /** The https URL prefix that each test machine's git config rewrites to its bare remotes. */
 const HTTPS_REMOTES = "https://git.skillfleet.test/";
 
+/**
+ * Machine roots by the first part of the URL path the git server below answers under: the folder
+ * name, which `mkdtemp` made unique.
+ */
+const gitRoots = new Map<string, { root: string; env: NodeJS.ProcessEnv }>();
+
+/**
+ * A git server over smart HTTP (`git http-backend`) for every machine's bare remotes, so a team
+ * manifest's https URL reaches them through a remote transport: a team manifest may not name a
+ * repository on this machine by any spelling, an `insteadOf` alias to a path included.
+ */
+async function gitServer(): Promise<string> {
+  const server = createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://x");
+    const [, token, ...rest] = url.pathname.split("/");
+    const machine = gitRoots.get(decodeURIComponent(token ?? ""));
+    if (!machine) {
+      res.writeHead(404).end("no such machine");
+      return;
+    }
+    const header = (name: string) => {
+      const value = req.headers[name];
+      return Array.isArray(value) ? value.join(", ") : (value ?? "");
+    };
+    const backend = spawn("git", ["http-backend"], {
+      env: {
+        ...machine.env,
+        GIT_PROJECT_ROOT: machine.root,
+        GIT_HTTP_EXPORT_ALL: "1",
+        PATH_INFO: `/${rest.map(decodeURIComponent).join("/")}`,
+        REQUEST_METHOD: req.method ?? "GET",
+        QUERY_STRING: url.search.slice(1),
+        CONTENT_TYPE: header("content-type"),
+        HTTP_CONTENT_ENCODING: header("content-encoding"),
+        HTTP_GIT_PROTOCOL: header("git-protocol"),
+        REMOTE_ADDR: "127.0.0.1",
+      },
+      windowsHide: true,
+    });
+    const out: Buffer[] = [];
+    backend.stdout.on("data", (chunk: Buffer) => out.push(chunk));
+    backend.stderr.resume();
+    backend.on("error", () => res.writeHead(500).end());
+    backend.on("close", () => {
+      const all = Buffer.concat(out);
+      let end = all.indexOf("\r\n\r\n");
+      let gap = 4;
+      if (end < 0) [end, gap] = [all.indexOf("\n\n"), 2];
+      if (end < 0) {
+        res.writeHead(500).end();
+        return;
+      }
+      const headers: Record<string, string> = {};
+      let status = 200;
+      for (const line of all.subarray(0, end).toString("latin1").split(/\r?\n/)) {
+        const colon = line.indexOf(":");
+        if (colon < 0) continue;
+        const [name, value] = [line.slice(0, colon).trim(), line.slice(colon + 1).trim()];
+        if (name.toLowerCase() === "status") status = Number.parseInt(value, 10);
+        else headers[name] = value;
+      }
+      res.writeHead(status, headers).end(all.subarray(end + gap));
+    });
+    req.pipe(backend.stdin);
+  });
+  servers.push(server);
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  server.unref();
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("no port");
+  return `http://127.0.0.1:${address.port}`;
+}
+
+const GIT_SERVER = await gitServer();
+
 export interface Remote {
   /** The bare repository: what sources point at. */
   url: string;
   /**
-   * The repository as an https URL, which the machine's git config rewrites to `url`: what a team
-   * manifest, which may not name a path on this machine, points at.
+   * The repository as an https URL, which the machine's git config rewrites to the test's git
+   * server: what a team manifest, which may not name a repository on this machine, points at.
    */
   https: string;
+  /** The repository's URL on the test's git server, which `https` is rewritten to. */
+  served: string;
   /** A clone where tests make upstream commits. */
   work: string;
   /** Writes files (null deletes), commits and pushes. Returns the new commit. */
@@ -351,6 +429,7 @@ export function remote(m: Machine, name: string, files: Files): Remote {
   const self: Remote = {
     url,
     https: `${HTTPS_REMOTES}${name}.git`,
+    served: `${GIT_SERVER}/${basename(m.root)}/remotes/${name}.git`,
     work,
     commit(changes, message = "change") {
       for (const [file, content] of Object.entries(changes)) {

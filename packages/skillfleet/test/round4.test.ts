@@ -143,7 +143,8 @@ describe("the user's journey", () => {
   });
 
   it("R7-6. a sync says when a forked skill changed upstream", async () => {
-    const m = machine();
+    // `status` reads the timer: a scheduler with none.
+    const m = machine({ scheduler: "empty" });
     const mine = remote(m, "mine", skills("skills/", "my-notes"));
     const team = remote(m, "team", skills("skills/", "team-style"));
     const manifest = m.manifest({
@@ -175,6 +176,23 @@ describe("the user's journey", () => {
       ...report.edited.map((entry) => entry.skill),
     ].join("\n");
     expect(said).toContain("team-style");
+    expect(report.pending).toEqual([
+      { source: "team", skill: "team-style", reason: "fork", files: ["SKILL.md"] },
+    ]);
+    // Said once: the next sync, with nothing new upstream, says nothing, and a fork you made on
+    // purpose is not reported as shadowed.
+    const again = await m.json("sync");
+    expect(again.pending).toEqual([]);
+    expect(again.shadowed).toEqual([]);
+    // status keeps saying it until the fork is merged.
+    const status = await m.run("status");
+    expect(status.stdout).toContain(
+      "team-style: upstream changed since you forked it; `skillfleet diff team-style` / `skillfleet merge team-style`",
+    );
+    const merged = await m.run("merge", "team-style");
+    expect(merged.code, merged.stdout + merged.stderr).toBe(0);
+    await m.json("sync");
+    expect((await m.run("status")).stdout).not.toContain("upstream changed since you forked it");
   });
 
   it("R7-7. remove of a skill or a source from an extended team manifest says what to do in your own manifest", async () => {
@@ -444,17 +462,45 @@ describe("discovery containment and refused names", () => {
       symlinkSync(m.at("onmax", "skills", "skills", "review"), join(dir, "skills", "review"));
       m.git(dir, "add", "-A");
       m.git(dir, "commit", "--quiet", "-m", "link skills");
-      const manifest = m.manifest({
-        agents: ["claude-code"],
-        sources: [{ id: "dotfiles", git: dotfiles.url, path: dir, skills: "skills/*" }],
-      });
+      const source = { id: "dotfiles", git: dotfiles.url, path: dir, skills: "skills/*" };
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [source] });
       const out = await m.json<{ sync: Report }>("init", manifest, "--no-timer");
-      // It links nothing and says only "dotfiles: No valid skills found. Skills require a SKILL.md
-      // with name and description.": not even the rule (links out of a working clone) that dropped them.
-      expect(out.sync.warnings.join("\n")).not.toContain("No valid skills found");
-      expect(out.sync.skills.names).toEqual(["drop", "review"]);
+      // It linked nothing and said only "dotfiles: No valid skills found. Skills require a SKILL.md
+      // with name and description.": not the rule (links out of a working clone) that dropped them.
+      // A cloned repository's links come from upstream, so they stay unfollowed until you opt in.
+      const said = out.sync.warnings.join("\n");
+      expect(said).not.toContain("No valid skills found");
+      expect(said).toContain(
+        'dotfiles: skills/drop links outside ~/dotfiles; add "followLinks": true to this source to use it',
+      );
+      expect(out.sync.skills.names).toEqual([]);
+      m.manifest({ agents: ["claude-code"], sources: [{ ...source, followLinks: true }] });
+      const report = await m.json("sync");
+      expect(report.warnings.join("\n")).not.toContain("links outside");
+      expect(report.skills.names).toEqual(["drop", "review"]);
+      expect(read(m.at(".claude", "skills", "drop", "SKILL.md"))).toBe(skillMd("drop"));
+      // The copy mode follows them too.
+      const copied = await m.json("sync", "--copy");
+      expect(copied.ok, JSON.stringify(copied.errors)).toBe(true);
+      expect(read(m.at(".claude", "skills", "review", "SKILL.md"))).toBe(skillMd("review"));
     },
   );
+
+  it("R7-11. a team manifest cannot make a source follow links out of a clone", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const team = remote(m, "team", {
+      "skills.json": JSON.stringify({
+        sources: [{ id: "vendor", git: vendor.https, followLinks: true }],
+      }),
+    });
+    const manifest = m.manifest({ agents: ["claude-code"], extends: [team.https], sources: [] });
+    const out = await m.json<{ sync: Report }>("init", manifest, "--no-timer");
+    expect(out.sync.warnings).toContain(
+      `extends ${team.https}: ignored "followLinks" of source "vendor"; only the root manifest can follow links out of a source`,
+    );
+    expect(out.sync.skills.names).toEqual(["tool"]);
+  });
 
   it.skipIf(isWindows)(
     "R7-12. on Linux and macOS a git source keeps notes~1.md and 'faq: part 1.md', as a working clone of the same repository does",
@@ -482,13 +528,13 @@ describe("discovery containment and refused names", () => {
 describe("the team manifest's transport allowlist", () => {
   it("R7-15. a team manifest may name a self-hosted http:// or git:// repository", async () => {
     const m = machine();
-    remote(m, "vendor", skills("skills/", "tool"));
-    remote(m, "other", skills("skills/", "lint"));
-    // The user's git config reaches the team's Gitea over plain http and a git daemon.
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const other = remote(m, "other", skills("skills/", "lint"));
+    // The team's Gitea over plain http and a git daemon, which the test's git server stands in for.
     appendFileSync(
       join(m.root, "gitconfig"),
-      `[url "${m.root.replace(/\\/g, "/")}/remotes/vendor.git"]\n\tinsteadOf = http://gitea.skillfleet.test/team/vendor.git\n` +
-        `[url "${m.root.replace(/\\/g, "/")}/remotes/other.git"]\n\tinsteadOf = git://git.skillfleet.test/other.git\n`,
+      `[url "${vendor.served}"]\n\tinsteadOf = http://gitea.skillfleet.test/team/vendor.git\n` +
+        `[url "${other.served}"]\n\tinsteadOf = git://git.skillfleet.test/other.git\n`,
     );
     const team = remote(m, "team", {
       "skills.json": JSON.stringify({

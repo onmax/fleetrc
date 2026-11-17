@@ -1,6 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
+import { git } from "./exec.ts";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
 import { dict, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
@@ -28,6 +29,11 @@ export interface CloneSource extends SourceCommon {
   ref?: string;
   path: string;
   adopt: boolean;
+  /**
+   * Follow links that lead out of the clone, for discovery and linking. Only the root manifest
+   * sets it: a clone's links come from whoever pushes to the repository.
+   */
+  followLinks: boolean;
 }
 
 /** A git repository skillfleet keeps a copy of. */
@@ -110,6 +116,7 @@ const SOURCE_KEYS = new Set([
   "exclude",
   "update",
   "adopt",
+  "followLinks",
 ]);
 const ROOT_KEYS = new Set([
   "$schema",
@@ -185,8 +192,9 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
   const update = raw.update ?? "auto";
   if (update !== "auto" && update !== "review")
     fail(file, `${at}.update`, 'must be "auto" or "review"');
-  if (raw.adopt !== undefined && typeof raw.adopt !== "boolean")
-    fail(file, `${at}.adopt`, "must be a boolean");
+  for (const key of ["adopt", "followLinks"])
+    if (raw[key] !== undefined && typeof raw[key] !== "boolean")
+      fail(file, `${at}.${key}`, "must be a boolean");
   const common: SourceCommon = {
     id,
     update,
@@ -214,12 +222,14 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
           ref,
           path: expandPath(path, base),
           adopt: raw.adopt === true,
+          followLinks: raw.followLinks === true,
         };
       onlyFor("adopt", "git sources with a path, and local");
+      onlyFor("followLinks", "git sources with a path");
       return { ...common, kind: "git", git: spec, ref };
     }
     case "index":
-      for (const key of ["ref", "path", "registry", "adopt"])
+      for (const key of ["ref", "path", "registry", "adopt", "followLinks"])
         onlyFor(key, key === "registry" ? "npm" : "git");
       // An index lists skills by name; there are no folders to glob.
       onlyFor("skills", "git, npm and local");
@@ -230,7 +240,7 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
       }
       return { ...common, kind: "index", index: spec };
     case "npm":
-      for (const key of ["ref", "path", "adopt"]) onlyFor(key, "git");
+      for (const key of ["ref", "path", "adopt", "followLinks"]) onlyFor(key, "git");
       return {
         ...common,
         kind: "npm",
@@ -239,7 +249,8 @@ function parseSource(file: string, at: string, raw: unknown, base: string): Sour
         sendToken: true,
       };
     case "local":
-      for (const key of ["ref", "path", "registry"])
+      // A folder of the user's own is followed wherever its links lead already.
+      for (const key of ["ref", "path", "registry", "followLinks"])
         onlyFor(key, key === "registry" ? "npm" : "git");
       return { ...common, kind: "local", local: expandPath(spec, base), adopt: raw.adopt === true };
     default: {
@@ -552,20 +563,83 @@ export async function locateManifest(
   return file;
 }
 
-/**
- * Whether a git source names a repository on another machine: an https or ssh URL, `user@host:path`,
- * or a GitHub or GitLab shorthand. Not a path, a file: URL or a transport such as ext::, which reach
- * this machine's files or run a command.
- */
-export function isRemoteGit(spec: string): boolean {
-  const url = gitUrl(spec);
-  return (
-    /^(?:https|ssh):\/\/(?:[^@/]+@)?[a-z0-9[]/i.test(url) ||
-    /^[a-z0-9_][\w.-]*@[a-z0-9][\w.-]*:/i.test(url)
-  );
+/** A URL git fetches over the network: http, https, git or ssh, or ssh's `[user@]host:path`. */
+const remoteTransport = (url: string) =>
+  /^(?:https?|git|ssh|git\+ssh|ssh\+git):\/\/(?:[^@/]+@)?[a-z0-9[]/i.test(url) ||
+  // A one-letter host would be a Windows drive (C:/repo), which is a path, and `<helper>::` runs
+  // a remote helper such as ext::, which runs a command.
+  /^(?:[a-z0-9_][\w.-]*@)?[a-z0-9][\w.-]+:(?!\/\/|:)/i.test(url);
+
+/** A URL rewrite from git config: `url.<to>.insteadOf <from>`. */
+export interface UrlRewrite {
+  from: string;
+  to: string;
+  push: boolean;
 }
 
-function readManifestFile(file: string): Manifest {
+/** The user's `url.<base>.insteadOf` and `pushInsteadOf` rules, from the global and system config. */
+export async function urlRewrites(): Promise<UrlRewrite[]> {
+  const rules: UrlRewrite[] = [];
+  for (const scope of ["--system", "--global"]) {
+    const run = await git(
+      [
+        "config",
+        scope,
+        "--includes",
+        "-z",
+        "--get-regexp",
+        "^url\\..*\\.(insteadof|pushinsteadof)$",
+      ],
+      { allowFail: true },
+    );
+    if (run.code !== 0) continue;
+    for (const entry of run.stdout.split("\0").filter(Boolean)) {
+      const newline = entry.indexOf("\n");
+      const key = entry.slice(0, newline);
+      const dot = key.lastIndexOf(".");
+      rules.push({
+        to: key.slice("url.".length, dot),
+        from: entry.slice(newline + 1),
+        push: key.slice(dot + 1).toLowerCase() === "pushinsteadof",
+      });
+    }
+  }
+  return rules;
+}
+
+/**
+ * `url` as git rewrites it with `rules` to fetch, or to push: the longest matching prefix wins, and
+ * a push URL that no `pushInsteadOf` matches is rewritten as a fetch URL, as in git.
+ */
+export function rewriteUrl(url: string, rules: readonly UrlRewrite[], push = false): string {
+  const longest = (pushRules: boolean) => {
+    let best: UrlRewrite | undefined;
+    for (const rule of rules)
+      if (
+        rule.push === pushRules &&
+        url.startsWith(rule.from) &&
+        rule.from.length > (best?.from.length ?? -1)
+      )
+        best = rule;
+    return best;
+  };
+  const best = (push ? longest(true) : undefined) ?? longest(false);
+  return best ? best.to + url.slice(best.from.length) : url;
+}
+
+/**
+ * Whether a git source names a repository on another machine: an http, https, git or ssh URL,
+ * `[user@]host:path`, or a GitHub or GitLab shorthand, after the user's `insteadOf` and
+ * `pushInsteadOf` rules rewrite it. Not a path, a file: URL or a transport such as ext::, which
+ * reach this machine's files or run a command, under any alias.
+ */
+export function isRemoteGit(spec: string, rules: readonly UrlRewrite[] = []): boolean {
+  const url = gitUrl(spec);
+  return remoteTransport(rewriteUrl(url, rules)) && remoteTransport(rewriteUrl(url, rules, true));
+}
+
+/** Reads and validates a manifest file; `prepare` may change its JSON first. */
+function readManifestFile(file: string, prepare?: (raw: unknown) => void): Manifest {
   if (!existsSync(file)) throw new ManifestError(`${file}: no such manifest`);
   let raw: unknown;
   try {
@@ -573,8 +647,12 @@ function readManifestFile(file: string): Manifest {
   } catch (error) {
     throw new ManifestError(`${file}: ${(error as Error).message}`);
   }
+  prepare?.(raw);
   return parseManifest(file, raw);
 }
+
+/** Fields a source may set only in the root manifest, which an extended one's sources lose. */
+const ROOT_ONLY_SOURCE_KEYS = ["followLinks"] as const;
 
 /**
  * Loads the root manifest and everything it extends. Extended manifests add sources only:
@@ -599,6 +677,7 @@ export async function loadManifest(
       source.kind === "npm" && source.registry ? [urlOrigin(source.registry)] : [],
     ),
   ]);
+  let rules: UrlRewrite[] | undefined;
   const visit = async (manifest: Manifest) => {
     for (const parent of manifest.extends) {
       let file: string;
@@ -613,7 +692,19 @@ export async function loadManifest(
       seen.add(file);
       let team: Manifest;
       try {
-        team = readManifestFile(file);
+        team = readManifestFile(file, (raw) => {
+          if (!isRecord(raw) || !Array.isArray(raw.sources)) return;
+          for (const [i, source] of raw.sources.entries()) {
+            if (!isRecord(source)) continue;
+            for (const key of ROOT_ONLY_SOURCE_KEYS) {
+              if (source[key] === undefined) continue;
+              delete source[key];
+              warnings.push(
+                `extends ${parent}: ignored "${key}" of source "${typeof source.id === "string" ? source.id : `sources[${i}]`}"; only the root manifest can follow links out of a source`,
+              );
+            }
+          }
+        });
       } catch (error) {
         warnings.push(`extends ${parent}: ${(error as Error).message}`);
         failed.push(parent);
@@ -636,11 +727,18 @@ export async function loadManifest(
           );
           continue;
         }
-        if (source.kind === "git" && !isRemoteGit(source.git)) {
-          warnings.push(
-            `extends ${parent}: ignored source "${source.id}"; a team manifest names only remote repositories (https, ssh or owner/repo), not ${source.git}`,
-          );
-          continue;
+        if (source.kind === "git") {
+          rules ??= await urlRewrites();
+          if (!isRemoteGit(source.git, rules)) {
+            const url = gitUrl(source.git);
+            const to = [rewriteUrl(url, rules), rewriteUrl(url, rules, true)].find(
+              (rewritten) => rewritten !== url,
+            );
+            warnings.push(
+              `extends ${parent}: ignored source "${source.id}"; a team manifest names only remote repositories (http, https, git, ssh or owner/repo), not ${source.git}${to ? `, which your git config rewrites to ${to}` : ""}`,
+            );
+            continue;
+          }
         }
         if (ids.has(nameKey(source.id))) {
           warnings.push(

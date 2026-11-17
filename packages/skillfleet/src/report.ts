@@ -32,7 +32,16 @@ export interface Report {
   renamed: { from: string; to: string }[];
   edited: { source: string; skill: string; files: string[] }[];
   held: { source: string; reason: string; files: string[] }[];
-  pending: { source: string; skill: string; reason: "review" | "edited"; files: string[] }[];
+  /**
+   * Updates not applied: held for review, held because the copy is edited, or made to a skill
+   * you forked (said by the sync that first sees them; `status` keeps saying it).
+   */
+  pending: {
+    source: string;
+    skill: string;
+    reason: "review" | "edited" | "fork";
+    files: string[];
+  }[];
   targets: TargetReport[];
   hooks: HookRun[];
   warnings: string[];
@@ -70,6 +79,11 @@ export function formatReport(report: Report): string {
     lines.push(
       `  review ${source}: updates for ${list(skills)}; see \`skillfleet diff <skill>\`, apply with \`skillfleet update ${source}\``,
     );
+  for (const pending of report.pending)
+    if (pending.reason === "fork")
+      lines.push(
+        `  fork ${pending.skill}: ${pending.source} changed it since you forked it (${list(pending.files)}); see \`skillfleet diff ${pending.skill}\`, merge with \`skillfleet merge ${pending.skill}\``,
+      );
   for (const edited of report.edited) {
     const behind = report.pending.some(
       (pending) => pending.skill === edited.skill && pending.reason === "edited",

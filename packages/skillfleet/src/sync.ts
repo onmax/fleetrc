@@ -16,6 +16,7 @@ import { hostname, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { agentTargets, formerTargets } from "./agents.ts";
 import { UserError } from "./errors.ts";
+import { checkForks } from "./edits.ts";
 import { exec, stopAll } from "./exec.ts";
 import {
   changedFiles,
@@ -794,6 +795,12 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
             );
       }
 
+    // Upstream changes to forks, said once; and a fork shadowing its source is what forking meant.
+    const forks =
+      dryRun || offline
+        ? { updates: [], warnings: [] }
+        : await checkForks(loaded, results, state, paths.cache());
+    const forked = new Set(Object.keys(loaded.root.forks).map(nameKey));
     const sourceWon = (result: SourceResult, skill: string) =>
       winners.get(skill)?.source === result.id;
     const report: Report = {
@@ -818,7 +825,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           ),
         ].sort(),
       },
-      shadowed,
+      shadowed: shadowed.filter((entry) => !forked.has(nameKey(entry.skill))),
       renamed: [...winners.keys()].flatMap((name) => {
         const from = renamedFrom(state, winners, name);
         return from === undefined ? [] : [{ from, to: name }];
@@ -829,13 +836,17 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       held: results.flatMap((result) =>
         result.held ? [{ source: result.id, ...result.held }] : [],
       ),
-      pending: results.flatMap((result) =>
-        result.pending.map((entry) => ({ source: result.id, ...entry })),
-      ),
+      pending: [
+        ...results.flatMap((result) =>
+          result.pending.map((entry) => ({ source: result.id, ...entry })),
+        ),
+        ...forks.updates.map((update) => ({ ...update, reason: "fork" as const })),
+      ],
       targets: targetReports,
       hooks: [],
       warnings: [
         ...warnings,
+        ...forks.warnings,
         ...loaded.warnings,
         ...results.flatMap((result) => result.warnings),
         ...(await unmatchedHooks(loaded, results)),

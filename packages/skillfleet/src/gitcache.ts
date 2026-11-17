@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { UserError } from "./errors.ts";
 import { git, GitError, gitOut } from "./exec.ts";
 import { isRecord, isRunning, readJsonOrNothing, sha256, writeJson } from "./fs.ts";
-import { checkoutProblem, nameKey } from "./names.ts";
+import { checkoutProblem, GIT_FOLDER, nameKey } from "./names.ts";
 
 /** `owner/repo` and `github:owner/repo` become GitHub HTTPS URLs; anything else is a git URL already. */
 export function gitUrl(spec: string): string {
@@ -34,9 +34,13 @@ export interface Collision {
   kept: string;
 }
 
-/** A path left out of a checkout on every system because Windows can't write it. */
+/**
+ * A path Windows can't write. Windows leaves it out of a checkout; Linux and macOS write it, as git
+ * does in a working clone, and warn that the fleet's Windows machines lack it. A name that is git's
+ * own folder somewhere (`.GIT`) is left out everywhere.
+ */
 export interface Refusal {
-  /** The path left out, up to the part Windows refuses. */
+  /** The path, up to the part Windows refuses. */
   path: string;
   /** Why, as `checkoutProblem` says it. */
   problem: string;
@@ -91,7 +95,7 @@ export function collisions(paths: readonly string[]): Collision[] {
 
 /**
  * Paths that Windows can't write, or that would write into another folder there (an 8.3 short
- * name). Every system leaves them out, so a fleet gets the same files everywhere.
+ * name). Only Windows leaves them out (see `Refusal`).
  */
 export function refusals(paths: readonly string[]): Refusal[] {
   const found = new Map<string, string>();
@@ -131,6 +135,15 @@ export async function fetchClone(
   };
   await recoverTree(cache, root, key);
   let written = readMarker(cache.marker, cache.tree);
+  if (written && written.skipsRefused !== SKIPS_REFUSED && written.refused.length > 0)
+    // Written when every system left out what Windows can't write: written again, which needs no
+    // network, so this system gets those files too.
+    try {
+      written = { commit: written.commit, ...(await writeTree(cache, written.commit)) };
+    } catch (error) {
+      if (!(error instanceof GitError)) throw error;
+      written = undefined;
+    }
   if (offline) {
     if (!written) throw new UserError(`${url} has never been fetched and --offline is set`);
     return { dir: cache.tree, ...written };
@@ -172,12 +185,17 @@ export async function fetchClone(
   }
 }
 
-function readMarker(marker: string, tree: string): Omit<CachedClone, "dir"> | undefined {
+/** Whether this system leaves out the paths Windows can't write (`Refusal`). */
+const SKIPS_REFUSED = process.platform === "win32";
+
+type Marker = Omit<CachedClone, "dir"> & { skipsRefused?: boolean };
+
+function readMarker(marker: string, tree: string): Marker | undefined {
   if (!existsSync(tree)) return undefined;
   return markedCommit(marker);
 }
 
-function markedCommit(marker: string): Omit<CachedClone, "dir"> | undefined {
+function markedCommit(marker: string): Marker | undefined {
   const raw = readJsonOrNothing(marker);
   if (!isRecord(raw) || typeof raw.commit !== "string" || !Array.isArray(raw.collisions))
     return undefined;
@@ -186,6 +204,8 @@ function markedCommit(marker: string): Omit<CachedClone, "dir"> | undefined {
     collisions: raw.collisions as Collision[],
     refused: Array.isArray(raw.refused) ? (raw.refused as Refusal[]) : [],
     submodules: Array.isArray(raw.submodules) ? (raw.submodules as string[]) : [],
+    // Trees written before the field left them out on every system.
+    skipsRefused: typeof raw.skipsRefused === "boolean" ? raw.skipsRefused : true,
   };
 }
 
@@ -280,8 +300,8 @@ interface CacheFiles {
 
 /**
  * Writes the files of `commit` to a new folder that then replaces `cache.tree`, leaving out the
- * paths that Windows can't write and those that would share a folder on macOS and Windows. Returns
- * those, and the submodules.
+ * paths that would share a folder on macOS and Windows, and on Windows those it can't write.
+ * Returns those, and the submodules.
  */
 async function writeTree(
   cache: CacheFiles,
@@ -297,7 +317,8 @@ async function writeTree(
   const refused = refusals(entries.map((entry) => entry.path));
   const within = (paths: readonly { path: string }[]) => (file: string) =>
     paths.some(({ path }) => file === path || file.startsWith(`${path}/`));
-  const writable = entries.filter((entry) => !within(refused)(entry.path));
+  const skipped = refused.filter(({ problem }) => SKIPS_REFUSED || problem === GIT_FOLDER);
+  const writable = entries.filter((entry) => !within(skipped)(entry.path));
   const left = collisions(writable.map((entry) => entry.path));
   const kept = writable.filter((entry) => !within(left)(entry.path));
   const submodules = entries.filter((entry) => entry.mode === "160000").map((entry) => entry.path);
@@ -322,7 +343,7 @@ async function writeTree(
       input: kept.map((entry) => `${entry.line}\0`).join(""),
     });
     await git([...at, "checkout-index", "--all", "--force"], { cwd: cache.repo });
-    const metadata = { commit, collisions: left, refused, submodules };
+    const metadata = { commit, collisions: left, refused, submodules, skipsRefused: SKIPS_REFUSED };
     writeJson(`${cache.tree}.${process.pid}.pending`, metadata);
     // Moved aside, not deleted, so a kill here leaves a whole tree for `recoverTree`.
     const replaced = existsSync(cache.tree);

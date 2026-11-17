@@ -23,6 +23,9 @@ export function segmentProblem(name: string): string | undefined {
   return undefined;
 }
 
+/** `checkoutProblem` of a name that is git's own folder on some system, which no system writes. */
+export const GIT_FOLDER = "is git's own folder";
+
 /**
  * Why Windows can't write a file or folder named `segment` where a repository has it, or where
  * writing it would open another one: a device name (`aux.txt`), a trailing dot or space, a
@@ -35,7 +38,7 @@ export function checkoutProblem(segment: string): string | undefined {
   if (/[. ]$/.test(segment)) return "ends with a dot or a space, which Windows drops";
   if (/^(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³]) *(\..*)?$/i.test(segment))
     return "is a device name on Windows";
-  if (nameKey(segment) === ".git") return "is git's own folder";
+  if (nameKey(segment) === ".git") return GIT_FOLDER;
   const dot = segment.lastIndexOf(".");
   const [stem, extension] =
     dot > 0 ? [segment.slice(0, dot), segment.slice(dot + 1)] : [segment, ""];

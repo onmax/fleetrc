@@ -43,6 +43,7 @@ const sourceSamples: Record<string, unknown> = {
   ref: "main",
   path: "/tmp/x",
   adopt: true,
+  followLinks: true,
   index: "https://example.com",
   npm: "pkg",
   registry: "https://registry.example",
@@ -109,14 +110,16 @@ describe("schema.json", () => {
       expect(schemaTakes(id), id).toBe(parserTakes(id));
   });
 
-  it("asks for path wherever the parser does: adopt on a git source", () => {
+  it("asks for path wherever the parser does: adopt and followLinks on a git source", () => {
     const git = schema.$defs.source.oneOf.find((variant) => variant.required[0] === "git")!;
-    expect(git.dependentRequired).toEqual({ adopt: ["path"] });
-    expect(() => parseManifest("m.json", { sources: [{ git: "a/b", adopt: true }] })).toThrow(
-      "adopt only applies to git sources with a path",
-    );
-    expect(() =>
-      parseManifest("m.json", { sources: [{ git: "a/b", path: "/tmp/x", adopt: true }] }),
-    ).not.toThrow();
+    expect(git.dependentRequired).toEqual({ adopt: ["path"], followLinks: ["path"] });
+    for (const key of ["adopt", "followLinks"]) {
+      expect(() => parseManifest("m.json", { sources: [{ git: "a/b", [key]: true }] })).toThrow(
+        `${key} only applies to git sources with a path`,
+      );
+      expect(() =>
+        parseManifest("m.json", { sources: [{ git: "a/b", path: "/tmp/x", [key]: true }] }),
+      ).not.toThrow();
+    }
   });
 });

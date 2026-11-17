@@ -36,10 +36,23 @@ export interface SkillRecord {
   changedAt: string;
 }
 
+/** What the last sync found upstream of a fork (the manifest's `forks`). */
+export interface ForkState {
+  /** The fork's `base` when it was checked. */
+  base: string;
+  /** The upstream commit checked. */
+  upstream: string;
+  /** A hash of the skill's folder at `upstream`, so a new version is told apart from the last one. */
+  tree: string;
+  /** Files of the skill that changed upstream between `base` and `upstream`; none when it did not move. */
+  files: string[];
+}
+
 export interface State {
   version: 1;
   sources: Record<string, SourceState>;
   skills: Record<string, SkillRecord>;
+  forks?: Record<string, ForkState>;
   /** Last time any linked skill was added, removed or changed. */
   lastChange?: string;
 }
@@ -78,6 +91,7 @@ export function loadState(warnings?: string[]): State {
     version: 1,
     sources: records(raw.sources, sourceRecord),
     skills: records(raw.skills, skillRecord),
+    ...(isRecord(raw.forks) ? { forks: records(raw.forks, forkRecord) } : {}),
     ...(typeof raw.lastChange === "string" ? { lastChange: raw.lastChange } : {}),
   };
 }
@@ -130,6 +144,19 @@ function pendingUpdate(record: unknown): PendingUpdate | undefined {
   if (!isRecord(record) || (record.reason !== "review" && record.reason !== "edited"))
     return undefined;
   return { reason: record.reason, since: text(record.since) ?? new Date(0).toISOString() };
+}
+
+function forkRecord(record: unknown): ForkState | undefined {
+  if (!isRecord(record) || !text(record.base) || !text(record.upstream)) return undefined;
+  const files = Array.isArray(record.files)
+    ? record.files.filter((file): file is string => typeof file === "string")
+    : [];
+  return {
+    base: record.base as string,
+    upstream: record.upstream as string,
+    tree: text(record.tree) ?? "",
+    files,
+  };
 }
 
 function skillRecord(record: unknown): SkillRecord | undefined {
