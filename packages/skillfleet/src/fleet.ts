@@ -18,6 +18,8 @@ export interface HostResult {
     errors: string[];
     sources: Record<string, string | undefined>;
   };
+  /** `fleet upgrade`: the version the host ran before, when known, and the one it runs now. */
+  upgrade?: { from?: string; to: string };
   error?: string;
   behind: string[];
 }
@@ -40,6 +42,8 @@ const HOST_NOTES = {
  * answered.
  */
 const ANSWERED = `echo "${NOTE} answered" >&2`;
+/** The version the installed launcher runs, told to stderr before `fleet upgrade` replaces it. */
+const WAS = `if [ -x "$l" ]; then echo "${NOTE} was $("$l" --version </dev/null 2>/dev/null)" >&2; fi`;
 
 /**
  * Runs `command`, a simple command, so that it stops when the connection drops. Without a tty sshd
@@ -78,7 +82,7 @@ export function remoteScript(
       return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then ${watched(`"$f" sync --json${dryRun ? " --dry-run" : ""}`)}; else ${MISSING}; fi`;
     case "upgrade":
       // npx next to the launcher's node, with that node first on PATH for npx's own `#!/usr/bin/env node`.
-      return `${ANSWERED}; ${LAUNCHER_NODE}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
+      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
     default: {
       const exhaustive: never = action;
       return exhaustive;
@@ -231,6 +235,9 @@ async function runOnHost(
       checked: false,
     };
   const answered = new RegExp(`^${NOTE} answered\r?$`, "m").test(run.stderr);
+  const was = run.stderr.match(
+    new RegExp(`^${NOTE} was (\\d+\\.\\d+\\.\\d+[\\w.+-]*)\r?$`, "m"),
+  )?.[1];
   const stderr = run.stderr.replace(new RegExp(`^${NOTE} .*\r?\n?`, "gm"), "");
   if (run.timedOut) {
     const after = `${Math.round(timeoutMs / 1000)} s`;
@@ -245,7 +252,7 @@ async function runOnHost(
     return { note: note as keyof typeof HOST_NOTES };
   // sync --json prints the report last, and exits 1 when a source failed; status prints the file.
   const report = parseReport(run.stdout);
-  if (report !== undefined) return { report };
+  if (report !== undefined) return { report, was };
   if (run.code !== 0)
     return {
       error: (stderr || run.stdout).trim().split("\n").slice(-3).join(" ") || `exit ${run.code}`,
@@ -299,8 +306,13 @@ export async function fleet(
       }
       const run = "report" in answer ? summarize(answer.report) : undefined;
       if (run) {
+        const before = cache[host]?.skillfleet;
         if (!dryRun) cache[host] = run;
-        return { host, reachable: true, checked: true, lastRun: run, behind: [] };
+        const upgrade =
+          action === "upgrade" && run.skillfleet
+            ? { upgrade: { from: answer.was || before || undefined, to: run.skillfleet } }
+            : {};
+        return { host, reachable: true, checked: true, lastRun: run, ...upgrade, behind: [] };
       }
       return {
         host,
@@ -363,9 +375,14 @@ export function formatFleet(results: readonly HostResult[]): string {
           : result.error
             ? `${result.error}; ${last}`
             : last;
-      return `${result.host}: ${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
+      return `${result.host}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
     })
     .join("\n");
+}
+
+function upgraded({ from, to }: NonNullable<HostResult["upgrade"]>): string {
+  if (!from) return `now on ${to}`;
+  return from === to ? `already on ${to}` : `${from} → ${to}`;
 }
 
 export interface TailscalePeer {

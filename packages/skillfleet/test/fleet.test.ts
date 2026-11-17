@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { remoteScript } from "../src/fleet.ts";
+import { fleet, formatFleet, remoteScript } from "../src/fleet.ts";
 import { launchers } from "../src/selfinstall.ts";
 import { isWindows, machine, type Machine, pathWith, remote, skills } from "./fixture.ts";
 
@@ -230,6 +230,50 @@ describe("fleet", () => {
       }
     },
   );
+
+  it.skipIf(isWindows)("R7-18. fleet upgrade prints each host's version change", async () => {
+    const m = machine();
+    sshShim(m);
+    const state = join(m.root, "state");
+    const dir = join(state, "skillfleet");
+    // The installed skillfleet: its version is in a file that the fake npx's self-install rewrites.
+    mkdirSync(join(dir, "bin"), { recursive: true });
+    writeFileSync(join(dir, "version"), "0.0.1\n");
+    writeFileSync(
+      join(dir, "bin", "skillfleet"),
+      `#!/bin/sh
+v=$(cat "${dir}/version")
+case "$1" in
+  --version) echo "$v" ;;
+  sync) printf '{"finishedAt":"%s","ok":true,"skillfleet":"%s","skills":{"total":1}}\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$v" ;;
+esac
+`,
+    );
+    chmodSync(join(dir, "bin", "skillfleet"), 0o755);
+    const npx = join(m.root, "npx-bin");
+    mkdirSync(npx);
+    writeFileSync(join(npx, "npx"), `#!/bin/sh\necho 0.0.2 > "${dir}/version"\n`);
+    chmodSync(join(npx, "npx"), 0o755);
+    const saved = {
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+      SKILLFLEET_SSH: process.env.SKILLFLEET_SSH,
+      PATH: process.env.PATH,
+    };
+    process.env.XDG_STATE_HOME = state;
+    process.env.SKILLFLEET_SSH = join(m.root, "bin", "ssh.mjs");
+    process.env.PATH = pathWith(npx, process.env);
+    try {
+      const results = await fleet(["localhost"], "upgrade", "0.0.2", 60_000);
+      expect(formatFleet(results)).toMatch(
+        /^localhost: 0\.0\.1 → 0\.0\.2; last run \d+s ago, 1 skills$/,
+      );
+      expect(results[0]!.upgrade).toEqual({ from: "0.0.1", to: "0.0.2" });
+    } finally {
+      for (const [key, value] of Object.entries(saved))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+    }
+  });
 });
 
 function alive(pid: number): boolean {
