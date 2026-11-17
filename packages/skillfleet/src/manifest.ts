@@ -453,7 +453,8 @@ export interface WebPage {
 /**
  * A repository page on GitHub or GitLab, as a browser shows it: the repository, or a `blob` link
  * to a file or a `tree` link to a folder on a branch. A line anchor (`#L3`) or a query
- * (`?plain=1`) copied with the link is ignored.
+ * (`?plain=1`, `?tab=readme-ov-file`) copied with the link is ignored, and the path and branch are
+ * decoded.
  */
 export function webPage(spec: string): WebPage | undefined {
   const page =
@@ -464,12 +465,21 @@ export function webPage(spec: string): WebPage | undefined {
       /^(https?:\/\/gitlab\.com\/(?:[^/?#]+\/)+?[^/?#]+?)(?:\.git)?(?:\/-\/(blob|tree)\/([^/?#]+)(?:\/([^?#]*?))?)?\/?(?:[?#].*)?$/,
     );
   if (!page) return undefined;
-  const [, repo, kind, ref, path] = page;
+  // The address bar shows `my skills`, but a copied link holds `my%20skills`.
+  const [, repo, kind, ref, path] = page.map((part) => part && decoded(part));
   return {
     repo: repo!.replace(/^http:/, "https:").replace("://www.", "://"),
     ...(kind ? { kind: kind as "blob" | "tree", ref } : {}),
     ...(path ? { path } : {}),
   };
+}
+
+function decoded(part: string): string {
+  try {
+    return decodeURIComponent(part);
+  } catch {
+    return part;
+  }
 }
 
 /** A `blob` link names a manifest file, a `tree` link a folder holding `skills.json`. */

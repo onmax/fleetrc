@@ -586,7 +586,7 @@ function sourceFromSpec(spec: string): Record<string, unknown> {
   if (spec.startsWith("npm:")) return { npm: spec.slice(4) };
   // A GitHub or GitLab page: git clones the repository, not the page of a folder or file in it.
   const page = webPage(spec);
-  if (page?.kind) {
+  if (page) {
     const folder =
       page.kind === "blob"
         ? page.path?.includes("/")
@@ -607,7 +607,7 @@ function sourceFromSpec(spec: string): Record<string, unknown> {
     spec.startsWith("github:") ||
     spec.startsWith("gitlab:")
   )
-    return { git: spec };
+    return { git: spec.replace(/[\\/]+$/, "") };
   if (
     spec.startsWith(".") ||
     spec.startsWith("/") ||
@@ -622,7 +622,7 @@ function sourceFromSpec(spec: string): Record<string, unknown> {
     !/^https?:\/\/(github\.com|gitlab\.com)\//.test(spec)
   )
     return { index: spec };
-  return { git: spec };
+  return { git: spec.replace(/[\\/]+$/, "") };
 }
 
 /**
