@@ -19,7 +19,9 @@ export function globToRegExp(glob: string): RegExp {
   return new RegExp(`^${source}$`);
 }
 
-export const matchesGlob = (path: string, glob: string) => globToRegExp(glob).test(path);
+/** Paths and globs compare in Unicode NFC: macOS lists names in NFD, keyboards type NFC. */
+export const matchesGlob = (path: string, glob: string) =>
+  globToRegExp(glob.normalize("NFC")).test(path.normalize("NFC"));
 
 /** The folder part of a glob before its first wildcard: `skills/*` gives `skills`. */
 export function globBase(glob: string): string {

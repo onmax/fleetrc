@@ -1,7 +1,8 @@
-import { lstatSync, writeFileSync } from "node:fs";
+import { appendFileSync, lstatSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import {
+  AGENT_DIRS,
   clone,
   isLink,
   isWindows,
@@ -88,16 +89,96 @@ describe("links on each OS", () => {
     const report = await m.json("sync", "--copy");
     expect(read(m.at(".claude/skills/copied/SKILL.md"))).toBe(skillMd("copied", "v2"));
     expect(read(m.at(".cursor/skills/copied/SKILL.md"))).toBe(skillMd("copied", "v2"));
-    expect(read(m.at(".cursor/skills/other/SKILL.md"))).toBe(skillMd("other", "edited copy"));
-    expect(read(m.at(".claude/skills/other/SKILL.md"))).toBe(skillMd("other", "v2"));
-    expect(report.targets.flatMap((target) => target.warnings).join("\n")).toContain(
-      "is a copy with local edits",
-    );
+    // The edit in one agent's copy is an edit of the skill, so every agent shows it (R3-2).
+    for (const dir of [".claude/skills", ".cursor/skills"])
+      expect(read(m.at(dir, "other/SKILL.md"))).toBe(skillMd("other", "edited copy"));
+    expect(report.edited).toEqual([{ source: "vendor", skill: "other", files: ["SKILL.md"] }]);
+    expect(report.pending).toEqual([
+      { source: "vendor", skill: "other", reason: "edited", files: ["SKILL.md"] },
+    ]);
 
-    // Dropping the skill removes the unedited copy and keeps the edited one.
+    // Dropping the skill keeps it, edited, for every agent.
     vendor.commit({ "skills/other": null });
-    await m.run("sync", "--copy");
-    expect(names(m.at(".claude/skills"))).toEqual(["copied"]);
+    const dropped = await m.json("sync", "--copy");
+    expect(dropped.warnings).toContain(
+      "vendor: other is gone upstream but has local edits, so it stays",
+    );
+    expect(names(m.at(".claude/skills"))).toEqual(["copied", "other"]);
     expect(names(m.at(".cursor/skills"))).toEqual(["copied", "other"]);
+  });
+
+  it("R3-2. an edited copy is an edit of its skill: status lists it, diff and merge find it, and agents agree after --no-copy", async () => {
+    const m = machine({ scheduler: "empty" });
+    const beta = (...body: string[]) =>
+      `---\nname: beta\ndescription: The beta skill\n---\n${body.join("\n")}\n`;
+    const vendor = remote(m, "vendor", {
+      ...skills("skills/", "alpha"),
+      "skills/beta/SKILL.md": beta("one", "two", "three", "four"),
+    });
+    const manifest = m.manifest({
+      agents: ["claude-code", "codex"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    const init = await m.run("init", manifest, "--no-timer", "--copy");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    appendFileSync(m.at(".claude/skills/beta/SKILL.md"), "mine\n");
+    const edited = beta("one", "two", "three", "four", "mine");
+
+    const relinked = await m.json("sync", "--no-copy");
+    expect(relinked.ok, JSON.stringify(relinked.errors)).toBe(true);
+    expect(relinked.edited).toEqual([{ source: "vendor", skill: "beta", files: ["SKILL.md"] }]);
+    for (const dir of AGENT_DIRS) {
+      expect(isLink(m.at(dir, "beta")), dir).toBe(true);
+      expect(read(m.at(dir, "beta/SKILL.md")), dir).toBe(edited);
+    }
+
+    vendor.commit({ "skills/beta/SKILL.md": beta("ONE", "two", "three", "four") });
+    const held = await m.json("sync");
+    expect(held.edited).toEqual([{ source: "vendor", skill: "beta", files: ["SKILL.md"] }]);
+    expect(held.pending).toEqual([
+      { source: "vendor", skill: "beta", reason: "edited", files: ["SKILL.md"] },
+    ]);
+    for (const dir of AGENT_DIRS) expect(read(m.at(dir, "beta/SKILL.md")), dir).toBe(edited);
+    const status = await m.run("status");
+    expect(status.stdout).toContain(
+      "edited beta (vendor): SKILL.md; upstream changed too, see `skillfleet diff beta`",
+    );
+    const doctor = await m.json<{ name: string; ok: boolean; detail: string }[]>("doctor");
+    expect(doctor.find((check) => check.name === "agents agree")).toMatchObject({ ok: true });
+
+    const diff = await m.run("diff", "beta");
+    expect(diff.code, diff.stderr).toBe(0);
+    expect(diff.stdout).toContain("+ONE");
+    expect(diff.stdout).toContain("-mine");
+    const merge = await m.run("merge", "beta");
+    expect(merge.code, merge.stdout + merge.stderr).toBe(0);
+    expect(merge.stdout).toContain("merged: SKILL.md");
+    for (const dir of AGENT_DIRS)
+      expect(read(m.at(dir, "beta/SKILL.md")), dir).toBe(
+        beta("ONE", "two", "three", "four", "mine"),
+      );
+  });
+
+  it("R3-2. in --copy mode an edit in one agent's copy reaches every agent's copy", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "alpha", "beta"));
+    const manifest = m.manifest({
+      agents: ["claude-code", "codex"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    expect((await m.run("init", manifest, "--no-timer", "--copy")).code).toBe(0);
+    appendFileSync(m.at(".agents/skills/beta/SKILL.md"), "mine\n");
+    const report = await m.json("sync");
+    expect(report.ok, JSON.stringify(report.errors)).toBe(true);
+    expect(report.edited).toEqual([{ source: "vendor", skill: "beta", files: ["SKILL.md"] }]);
+    for (const dir of AGENT_DIRS) {
+      expect(isLink(m.at(dir, "beta")), dir).toBe(false);
+      expect(read(m.at(dir, "beta/SKILL.md")), dir).toBe(`${skillMd("beta")}mine\n`);
+    }
+    expect(report.targets.flatMap((target) => target.warnings)).toEqual([]);
+    // Settled: the next sync changes nothing.
+    const again = await m.json("sync");
+    expect(again.warnings).toEqual([]);
+    expect(again.targets.flatMap((target) => [...target.created, ...target.removed])).toEqual([]);
   });
 });

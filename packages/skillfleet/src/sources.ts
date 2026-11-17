@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   realpathSync,
+  rmdirSync,
   rmSync,
   statSync,
 } from "node:fs";
@@ -13,8 +14,16 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "skills";
 import { git, GitError, gitOut } from "./exec.ts";
-import { changedFiles, copyDir, hashDir, isRecord, listFiles, sameTree } from "./fs.ts";
-import { fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
+import {
+  changedFiles,
+  copyDir,
+  hashDir,
+  isRecord,
+  listFiles,
+  renameFolder,
+  sameTree,
+} from "./fs.ts";
+import { collisions, fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
 import type { CloneSource, InPlaceSource, Source, VendoredSource } from "./manifest.ts";
 import { assertSegment, nameKey, segmentProblem } from "./names.ts";
@@ -141,14 +150,20 @@ export function select(source: Source, found: readonly Found[], warnings: string
   let chosen = found.filter(
     (skill) => !glob || (skill.path !== undefined && matchesGlob(skill.path, glob)),
   );
+  // A name in the manifest finds its skill in any case or Unicode form, as a CLI argument does.
+  const names = (list: readonly string[]) => new Set(list.map(nameKey));
   if (source.include) {
-    const names = new Set(chosen.map((skill) => skill.name));
+    const have = names(chosen.map((skill) => skill.name));
     for (const name of source.include)
-      if (!names.has(name))
+      if (!have.has(nameKey(name)))
         warnings.push(`${source.id}: include names "${name}", which the source does not have`);
-    chosen = chosen.filter((skill) => source.include!.includes(skill.name));
+    const included = names(source.include);
+    chosen = chosen.filter((skill) => included.has(nameKey(skill.name)));
   }
-  if (source.exclude) chosen = chosen.filter((skill) => !source.exclude!.includes(skill.name));
+  if (source.exclude) {
+    const excluded = names(source.exclude);
+    chosen = chosen.filter((skill) => !excluded.has(nameKey(skill.name)));
+  }
   return chosen;
 }
 
@@ -287,6 +302,7 @@ export async function syncClone(
     try {
       if (existsSync(dir)) throw new Error(`${dir} exists and is not a git repository`);
       await cloneAt(source, dir);
+      await nameClashes(source, dir, out.warnings, true);
       out.status = "installed";
       out.to = await gitOut(["rev-parse", "HEAD"], dir);
       out.changed = (await gitOut(["ls-files", "-z"], dir)).split("\0").filter(Boolean);
@@ -302,8 +318,9 @@ export async function syncClone(
       out.to = before;
       if (!state.commit)
         out.changed = (await gitOut(["ls-files", "-z"], dir)).split("\0").filter(Boolean);
+      const clashes = await nameClashes(source, dir, out.warnings, !ctx.dryRun);
       if (ctx.offline) out.status = "offline";
-      else await updateClone(source, dir, before, ctx, out);
+      else await updateClone(source, dir, before, ctx, out, clashes);
     } catch (error) {
       // The clone is still on disk (git may be missing or broken): keep linking what it has.
       out.status = "error";
@@ -379,6 +396,7 @@ async function updatePinned(
   before: string,
   ctx: SourceContext,
   out: SourceResult,
+  clashes: Clashes,
 ) {
   if (before.startsWith(ref.toLowerCase())) return;
   if (ctx.dryRun) {
@@ -403,11 +421,7 @@ async function updatePinned(
     out.pending = [{ skill: "*", reason: "review", files: incoming }];
     return;
   }
-  const dirty = new Set(
-    parsePorcelain(
-      (await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: dir })).stdout,
-    ),
-  );
+  const dirty = await localEdits(dir, clashes);
   const overlap = incoming.filter((file) => dirty.has(file));
   if (overlap.length > 0) {
     out.status = "held";
@@ -417,10 +431,9 @@ async function updatePinned(
     };
     return;
   }
-  const moved = await git(["checkout", "--quiet", "--detach", commit], {
-    cwd: dir,
-    allowFail: true,
-  });
+  let moved = await git(["checkout", "--quiet", "--detach", commit], { cwd: dir, allowFail: true });
+  if (moved.code !== 0 && incoming.some((file) => clashes.has(file)))
+    moved = await moveAroundClashes(dir, commit, incoming, clashes);
   if (moved.code !== 0) {
     out.status = "held";
     out.held = { reason: moved.stderr.trim() || "git checkout failed", files: [] };
@@ -437,10 +450,11 @@ async function updateClone(
   before: string,
   ctx: SourceContext,
   out: SourceResult,
+  clashes: Clashes,
 ) {
   if (source.ref && isCommitRef(source.ref)) {
     const branch = await git(["symbolic-ref", "--quiet", "HEAD"], { cwd: dir, allowFail: true });
-    if (branch.code !== 0) return updatePinned(source, source.ref, dir, before, ctx, out);
+    if (branch.code !== 0) return updatePinned(source, source.ref, dir, before, ctx, out, clashes);
   }
   const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], {
     cwd: dir,
@@ -508,21 +522,22 @@ async function updateClone(
     out.pending = [{ skill: "*", reason: "review", files: incoming }];
     return;
   }
-  const dirty = new Set(
-    parsePorcelain(
-      (await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: dir })).stdout,
-    ),
-  );
+  const dirty = await localEdits(dir, clashes);
   const overlap = incoming.filter((file) => dirty.has(file));
   if (overlap.length > 0) {
     out.status = "held";
     out.held = { reason: "local edits touch files that changed upstream", files: overlap };
     return;
   }
-  const merged = await git(["merge", "--ff-only", "--quiet", "@{u}"], {
-    cwd: dir,
-    allowFail: true,
-  });
+  let merged = await git(["merge", "--ff-only", "--quiet", "@{u}"], { cwd: dir, allowFail: true });
+  // git refuses to overwrite a file it sees as changed, and it sees a name clash that way.
+  if (merged.code !== 0 && incoming.some((file) => clashes.has(file)))
+    merged = await moveAroundClashes(
+      dir,
+      await gitOut(["rev-parse", "@{u}"], dir),
+      incoming,
+      clashes,
+    );
   if (merged.code !== 0) {
     out.status = "held";
     out.held = { reason: merged.stderr.trim() || "git merge --ff-only failed", files: [] };
@@ -538,6 +553,118 @@ async function updateClone(
         .filter(Boolean),
     ]),
   ];
+}
+
+/** A `/`-separated path as macOS and Windows compare it. */
+const pathKey = (path: string) => path.split("/").map(nameKey).join("/");
+
+/** Files with uncommitted changes in a working clone, untracked ones too, but not `clashes`. */
+async function localEdits(dir: string, clashes: Clashes): Promise<Set<string>> {
+  const status = await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+    cwd: dir,
+  });
+  return new Set(parsePorcelain(status.stdout).filter((file) => !clashes.has(file)));
+}
+
+/** Tracked files that share one file on macOS and Windows, each mapped to the one kept there. */
+type Clashes = ReadonlyMap<string, string>;
+
+/**
+ * Files of a working clone whose paths differ only in case or Unicode form (skills/Foo/SKILL.md
+ * and skills/foo/SKILL.md), when what is on disk is one of their committed versions. macOS and
+ * Windows check such paths out into one file, so git sees all but one of them as changed; that is
+ * not a local edit, and must not hold the rest of the clone back. Warns once for each clash. With
+ * `write`, the shared file is made to hold the path first in byte order, the one the git cache and
+ * every other system link.
+ */
+async function nameClashes(
+  source: CloneSource,
+  dir: string,
+  warnings: string[],
+  write: boolean,
+): Promise<Clashes> {
+  const entries = (await gitOut(["ls-files", "--stage", "-z"], dir))
+    .split("\0")
+    .filter(Boolean)
+    .map((line) => {
+      const [meta, path] = line.split("\t") as [string, string];
+      return { blob: meta.split(" ")[1]!, path };
+    });
+  const found = collisions(entries.map((entry) => entry.path));
+  for (const { path, kept } of found)
+    warnings.push(
+      `${source.id}: ${kept} and ${path} differ only in case or Unicode form, so macOS and Windows check them out as one folder; skillfleet uses ${kept} there, and git's view of the other is not a local edit. Rename one of them upstream`,
+    );
+  const clashes = new Map<string, string>();
+  if (found.length === 0) return clashes;
+  const groups = new Map<string, typeof entries>();
+  for (const entry of entries) {
+    const key = pathKey(entry.path);
+    groups.set(key, [...(groups.get(key) ?? []), entry]);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    group.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
+    const blobs = new Set(group.map((entry) => entry.blob));
+    let explained = true;
+    let keptOnDisk = true;
+    for (const entry of group) {
+      const file = join(dir, entry.path);
+      const onDisk = lstatSync(file, { throwIfNoEntry: false })?.isFile()
+        ? await gitOut(["hash-object", "--", entry.path], dir)
+        : undefined;
+      if (onDisk === undefined || !blobs.has(onDisk)) explained = false;
+      if (entry === group[0] && onDisk !== entry.blob) keptOnDisk = false;
+    }
+    if (!explained) continue;
+    for (const entry of group) clashes.set(entry.path, group[0]!.path);
+    if (write && !keptOnDisk)
+      await git(["checkout-index", "--force", "-z", "--stdin"], {
+        cwd: dir,
+        input: `${group[0]!.path}\0`,
+      });
+  }
+  return clashes;
+}
+
+/**
+ * Moves a working clone to `commit` and writes the `incoming` files, when some of them clash by
+ * name: git's own merge and checkout refuse, since they see the clash as a local edit. The caller
+ * checked that no other local edit touches an incoming file. The kept path of each clash is
+ * written last, so on macOS and Windows the file they share holds it.
+ */
+async function moveAroundClashes(
+  dir: string,
+  commit: string,
+  incoming: readonly string[],
+  clashes: Clashes,
+) {
+  const reset = await git(["reset", "--quiet", "--mixed", commit], { cwd: dir, allowFail: true });
+  if (reset.code !== 0) return reset;
+  const tracked = new Set((await gitOut(["ls-files", "-z"], dir)).split("\0").filter(Boolean));
+  const trackedKeys = new Set([...tracked].map(pathKey));
+  for (const file of incoming)
+    // A removed path that shares its file with a tracked one on this disk stays.
+    if (!trackedKeys.has(pathKey(file))) {
+      rmSync(join(dir, file), { force: true });
+      // Like git, leave no folder a removal emptied.
+      for (let parent = dirname(file); parent !== "."; parent = dirname(parent))
+        try {
+          rmdirSync(join(dir, parent));
+        } catch {
+          break;
+        }
+    }
+  const kept = new Set(incoming.flatMap((file) => clashes.get(file) ?? []));
+  const write = [
+    ...incoming.filter((file) => tracked.has(file) && !kept.has(file)),
+    ...[...kept].filter((file) => tracked.has(file)),
+  ];
+  return git(["checkout-index", "--force", "-z", "--stdin"], {
+    cwd: dir,
+    allowFail: true,
+    input: write.map((file) => `${file}\0`).join(""),
+  });
 }
 
 /** Local commits that `tracking` once had and lost: upstream rewrote its history under them. */
@@ -755,6 +882,7 @@ export async function syncVendored(
         out.warnings.push(`${source.id}: ${failure.skill}: ${failure.message}`);
       if (opened.root) linkedSkillMds(source, opened.root, chosen, staged, out.warnings);
     }
+    carryRenames(state, ctx, out, chosen, staged);
     applyVendored(source, state, ctx, out, chosen, staged, firstRun);
     state.fetchedAt = ctx.now;
     if (source.kind === "npm") state.version = opened.version;
@@ -803,6 +931,47 @@ function linkedSkillMds(
         `${source.id}: skipped the skill "${skill.name}": its SKILL.md links to ${real ? "a file outside the source" : "nothing"}`,
       );
     }
+  }
+}
+
+/**
+ * A skill whose name changed upstream only in case or Unicode form (alpha to Alpha) is the same
+ * skill: its install record, a pending update, local edits and its store folders move to the new
+ * name. macOS and Windows keep both names in one folder, so it is renamed through a third name.
+ */
+function carryRenames(
+  state: SourceState,
+  ctx: SourceContext,
+  out: SourceResult,
+  chosen: readonly Found[],
+  staged: ReadonlyMap<string, string>,
+) {
+  const upstream = chosen.filter((skill) => staged.has(skill.name));
+  const now = new Set(upstream.map((skill) => skill.name));
+  for (const skill of upstream) {
+    if (state.skills[skill.name]) continue;
+    const old = Object.keys(state.skills).find(
+      (name) => !now.has(name) && nameKey(name) === nameKey(skill.name),
+    );
+    if (old === undefined) continue;
+    if (!ctx.dryRun) {
+      const from = storePaths(ctx.storeDir, old);
+      const to = storePaths(ctx.storeDir, skill.name);
+      for (const kind of ["live", "base", "upstream"] as const)
+        if (!renameFolder(from[kind], to[kind]) && existsSync(from[kind])) {
+          // A folder under the new name with no record of its own is left over: the record wins.
+          rmSync(to[kind], { recursive: true, force: true });
+          renameFolder(from[kind], to[kind]);
+        }
+    }
+    state.skills[skill.name] = { ...state.skills[old]!, path: skill.path };
+    delete state.skills[old];
+    if (state.pending[old]) {
+      state.pending[skill.name] = state.pending[old];
+      delete state.pending[old];
+    }
+    for (const entry of [...out.edited, ...out.pending])
+      if (entry.skill === old) entry.skill = skill.name;
   }
 }
 

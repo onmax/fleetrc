@@ -39,6 +39,18 @@ export const nameKey = (name: string) =>
     .replace(/[. ]+$/, "");
 
 /**
+ * The one of `names` that `typed` means: itself, else the one with the same `nameKey`. Skill names
+ * are unique by `nameKey` (sync keeps the first of two that macOS and Windows fold together), so a
+ * name typed in another case or Unicode form, as a macOS keyboard types NFC, finds one skill.
+ */
+export function findName(names: Iterable<string>, typed: string): string | undefined {
+  const list = [...names];
+  if (list.includes(typed)) return typed;
+  const key = nameKey(typed);
+  return list.find((name) => nameKey(name) === key);
+}
+
+/**
  * Why a source id cannot name its store folder. The manifest's pattern already limits the
  * characters; a trailing dot is allowed and compared away by `nameKey`.
  */

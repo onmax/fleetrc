@@ -172,6 +172,7 @@ export interface Report {
     held?: { reason: string; files: string[] };
   }[];
   shadowed: { skill: string; winner: string; loser: string }[];
+  renamed: { from: string; to: string }[];
   edited: { source: string; skill: string; files: string[] }[];
   held: { source: string; reason: string; files: string[] }[];
   pending: { source: string; skill: string; reason: string; files: string[] }[];

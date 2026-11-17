@@ -37,6 +37,7 @@ import {
   readConfig,
   updateConfig,
 } from "./manifest.ts";
+import { findName } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import { formatReport, type Report } from "./report.ts";
 import { commandOnPath, findOnPath, installedCli, selfInstall, stableNode } from "./selfinstall.ts";
@@ -599,29 +600,32 @@ async function remove() {
       { removed: name },
     );
   }
-  const owner = loadState().skills[name]?.source;
+  const linked = loadState().skills;
+  // The skill as skillfleet keeps it, typed in any case or Unicode form.
+  const skill = findName(Object.keys(linked), name);
+  const owner = skill === undefined ? undefined : linked[skill]!.source;
   const source = loaded.sources.find((candidate) => candidate.id === owner);
-  if (!source) throw new UserError(`no source or linked skill named "${name}"`);
+  if (!skill || !source) throw new UserError(`no source or linked skill named "${name}"`);
   if (source.origin !== loaded.root.file)
     throw new UserError(
-      `${name} comes from ${source.id} in ${tildify(source.origin)}; exclude it there`,
+      `${skill} comes from ${source.id} in ${tildify(source.origin)}; exclude it there`,
     );
   const target = manifestToEdit(
     loaded,
     manifest,
-    `Add "${name}" to "exclude" of the source "${source.id}"`,
+    `Add "${skill}" to "exclude" of the source "${source.id}"`,
   );
   return changeManifest(
-    `exclude ${name} from ${source.id}`,
+    `exclude ${skill} from ${source.id}`,
     target,
     (raw) => {
       for (const entry of Array.isArray(raw.sources) ? raw.sources : [])
         if (isRecord(entry) && (entry.id ?? defaultSourceId(entry)) === source.id)
           entry.exclude = [
-            ...new Set([...(Array.isArray(entry.exclude) ? entry.exclude : []), name]),
+            ...new Set([...(Array.isArray(entry.exclude) ? entry.exclude : []), skill]),
           ];
     },
-    { excluded: name, source: source.id },
+    { excluded: skill, source: source.id },
   );
 }
 

@@ -28,6 +28,8 @@ export interface Report {
     updated: string[];
   };
   shadowed: { skill: string; winner: string; loser: string }[];
+  /** Skills whose name changed upstream only in case or Unicode form: the same skill, renamed. */
+  renamed: { from: string; to: string }[];
   edited: { source: string; skill: string; files: string[] }[];
   held: { source: string; reason: string; files: string[] }[];
   pending: { source: string; skill: string; reason: "review" | "edited"; files: string[] }[];
@@ -50,6 +52,7 @@ export function formatReport(report: Report): string {
   if (report.skills.added.length) lines.push(`  + added: ${list(report.skills.added)}`);
   if (report.skills.updated.length) lines.push(`  ~ updated: ${list(report.skills.updated)}`);
   if (report.skills.removed.length) lines.push(`  - removed: ${list(report.skills.removed)}`);
+  for (const renamed of report.renamed) lines.push(`  renamed ${renamed.from} -> ${renamed.to}`);
   for (const source of report.sources) {
     if (source.status === "updated" && source.from && source.to && source.from !== source.to)
       lines.push(`  ${source.id}: ${source.from.slice(0, 7)} -> ${source.to.slice(0, 7)}`);

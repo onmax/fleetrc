@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import {
+  copyFileSync,
   existsSync,
   linkSync,
   mkdirSync,
@@ -24,6 +25,7 @@ import {
   lstat,
   moveDir,
   readJsonOrNothing,
+  sameTree,
   writeJson,
 } from "./fs.ts";
 import { matchesGlob } from "./glob.ts";
@@ -331,6 +333,21 @@ async function runHooks(
   return runs;
 }
 
+/** The skill of the same source that `name` renames, when the two differ only in case or Unicode form. */
+function renamedFrom(
+  state: State,
+  winners: ReadonlyMap<string, DesiredLink>,
+  name: string,
+): string | undefined {
+  if (state.skills[name]) return undefined;
+  return Object.keys(state.skills).find(
+    (old) =>
+      !winners.has(old) &&
+      nameKey(old) === nameKey(name) &&
+      state.skills[old]!.source === winners.get(name)?.source,
+  );
+}
+
 function recordSkills(
   state: State,
   winners: Map<string, DesiredLink>,
@@ -354,7 +371,10 @@ function recordSkills(
   for (const [name, link] of winners) {
     const record = state.skills[name];
     if (!record) {
-      state.skills[name] = { source: link.source, dir: link.target, addedAt: now, changedAt: now };
+      // Renamed only in case or Unicode form: the same skill, so it keeps when it arrived.
+      const old = renamedFrom(state, winners, name);
+      const addedAt = old === undefined ? now : state.skills[old]!.addedAt;
+      state.skills[name] = { source: link.source, dir: link.target, addedAt, changedAt: now };
       changed = true;
     } else if (
       record.dir !== link.target ||
@@ -404,6 +424,14 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
     const state = loadState(dryRun ? undefined : warnings);
+    const targets = await agentTargets(loaded.root.agents);
+    // Before the sources look for local edits, so they find the ones made in a copy.
+    warnings.push(
+      ...adoptCopyEdits(
+        targets.map((target) => target.dir),
+        dryRun,
+      ),
+    );
     // Skills linked last time, by source: what a source that fails, or can't be read, keeps.
     const lastLinked = (id: string) =>
       Object.entries(state.skills)
@@ -476,7 +504,6 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         byKey.set(nameKey(link.name), link);
       }
 
-    const targets = await agentTargets(loaded.root.agents);
     if (targets.length === 0)
       warnings.push(
         loaded.root.agents === "all"
@@ -566,6 +593,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         ].sort(),
       },
       shadowed,
+      renamed: [...winners.keys()].flatMap((name) => {
+        const from = renamedFrom(state, winners, name);
+        return from === undefined ? [] : [{ from, to: name }];
+      }),
       edited: results.flatMap((result) =>
         result.edited.map((entry) => ({ source: result.id, ...entry })),
       ),
@@ -622,6 +653,60 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     lock.release();
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
+}
+
+/**
+ * An edited copy in an agent folder (`--copy`) is an edit of its skill: the files it changed go
+ * into the folder it was copied from, the store or the folder linked in place, so every agent
+ * shows the edit, sync holds upstream changes for it, and `status`, `diff` and `merge` find it.
+ * When that folder changed too since the copy was made, both stay as they are and the link step
+ * warns. Returns what to tell the user.
+ */
+function adoptCopyEdits(dirs: readonly string[], dryRun: boolean): string[] {
+  const said: string[] = [];
+  for (const dir of dirs) {
+    if (!existsSync(join(dir, MANIFEST_FILE))) continue;
+    const manifest = readTargetManifest(dir);
+    let changed = false;
+    for (const [name, record] of Object.entries(manifest.links)) {
+      if (record.kind !== "copy" || !record.hashes) continue;
+      const copy = join(dir, name);
+      try {
+        if (!lstat(copy)?.isDirectory() || !lstat(record.target)?.isDirectory()) continue;
+        const now = hashDir(copy);
+        const files = changedFiles(record.hashes, now);
+        if (files.length === 0) continue;
+        if (!sameTree(hashDir(record.target, { skillMdAsFile: true }), record.hashes)) continue;
+        // A link moves as the file it points to, and a linked SKILL.md in place stays a link.
+        const linked = (path: string) => lstat(path)?.isSymbolicLink();
+        if (files.some((file) => linked(join(copy, file)) || linked(join(record.target, file))))
+          continue;
+        if (dryRun) {
+          said.push(
+            `would move the edits in ${tildify(copy)} (${files.join(", ")}) into ${tildify(record.target)}, which every agent shows`,
+          );
+          continue;
+        }
+        for (const file of files) {
+          const to = join(record.target, file);
+          if (now[file] === undefined) rmSync(to, { force: true });
+          else {
+            mkdirSync(dirname(to), { recursive: true });
+            copyFileSync(join(copy, file), to);
+          }
+        }
+        record.hashes = now;
+        changed = true;
+        said.push(
+          `${tildify(copy)} had local edits (${files.join(", ")}); they are now edits of ${name} in ${tildify(record.target)}, which every agent shows`,
+        );
+      } catch (error) {
+        said.push(`${tildify(copy)} has local edits that could not be moved: ${errorText(error)}`);
+      }
+    }
+    if (changed) writeJson(join(dir, MANIFEST_FILE), manifest);
+  }
+  return said;
 }
 
 /**

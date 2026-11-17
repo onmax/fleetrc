@@ -124,6 +124,24 @@ export function moveDir(from: string, to: string) {
   }
 }
 
+/**
+ * Renames `from` to `to`, names that may differ only in case or Unicode form: macOS and Windows
+ * see one entry there, so it goes through a third name. Returns false, changing nothing, when
+ * `from` is missing or `to` is another entry.
+ */
+export function renameFolder(from: string, to: string): boolean {
+  if (from === to) return true;
+  if (!lstat(from)) return false;
+  const temp = `${from}.${process.pid}.rename`;
+  renameSync(from, temp);
+  if (lstat(to)) {
+    renameSync(temp, from);
+    return false;
+  }
+  renameSync(temp, to);
+  return true;
+}
+
 export function isErrno(error: unknown, ...codes: string[]): boolean {
   return error instanceof Error && "code" in error && codes.includes(String(error.code));
 }

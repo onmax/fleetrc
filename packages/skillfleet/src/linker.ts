@@ -21,6 +21,7 @@ import {
   lstat,
   materializeSkillMd,
   readJson,
+  renameFolder,
   sameTree,
   writeJson,
 } from "./fs.ts";
@@ -205,6 +206,22 @@ export function linkTargetDir(
     (replacing ? report.replaced : report.created).push(name);
   };
 
+  // A skill renamed only in case or Unicode form (alpha to Alpha) keeps its entry here, renamed.
+  for (const link of wanted.values()) {
+    if (manifest.links[link.name]) continue;
+    const old = Object.keys(manifest.links).find(
+      (name) => !wanted.has(name) && nameKey(name) === nameKey(link.name),
+    );
+    if (old === undefined) continue;
+    try {
+      if (!dryRun && lstat(join(dir, old)) && !renameFolder(join(dir, old), join(dir, link.name)))
+        continue;
+      manifest.links[link.name] = manifest.links[old]!;
+      delete manifest.links[old];
+    } catch (error) {
+      failed(old, error);
+    }
+  }
   for (const link of wanted.values()) {
     try {
       linkOne(link);
@@ -244,7 +261,9 @@ export function linkTargetDir(
     if (current.isDirectory() && record?.kind === "copy") {
       const now = hashDir(path);
       if (record.hashes && !sameTree(now, record.hashes)) {
-        report.warnings.push(`${tildify(path)} is a copy with local edits, so it is not refreshed`);
+        report.warnings.push(
+          `${tildify(path)} is a copy with local edits, and ${link.name} changed too since it was copied, so it is not refreshed and other agents show ${link.name} without these edits; copy them into ${tildify(link.target)} and delete this copy to make the agents agree`,
+        );
         return;
       }
       const fresh = hashDir(link.target, { skillMdAsFile: true });

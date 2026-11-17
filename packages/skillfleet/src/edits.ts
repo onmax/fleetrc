@@ -17,6 +17,7 @@ import {
   remoteManifest,
   type Source,
 } from "./manifest.ts";
+import { findName } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import { storePaths } from "./sources.ts";
 import { loadState, saveState, type State } from "./state.ts";
@@ -55,20 +56,33 @@ export function manifestToEdit(
 interface Located {
   loaded: LoadedManifest;
   state: State;
+  /** The skill's name as skillfleet keeps it, which may differ from the typed one in case or Unicode form. */
   name: string;
   source: Source;
+  /** The skill's entry under "forks", by the key the manifest gives it. */
+  fork?: { key: string; fork: Fork };
 }
 
-async function locate(spec: string, name: string): Promise<Located> {
+async function locate(spec: string, typed: string): Promise<Located> {
   const loaded = await loadManifest(spec, { offline: true });
   const state = loadState();
   // A linked skill, or one a review-mode source is holding back.
+  const name =
+    findName(
+      [
+        ...Object.keys(state.skills),
+        ...Object.values(state.sources).flatMap((source) => Object.keys(source.pending)),
+      ],
+      typed,
+    ) ?? typed;
   const owner =
     state.skills[name]?.source ??
     Object.entries(state.sources).find(([, source]) => source.pending[name])?.[0];
   const source = loaded.sources.find((candidate) => candidate.id === owner);
-  if (!source) throw new UserError(`no skill "${name}" is linked; run \`skillfleet list\``);
-  return { loaded, state, name, source };
+  if (!source) throw new UserError(`no skill "${typed}" is linked; run \`skillfleet list\``);
+  const key = findName(Object.keys(loaded.root.forks), name);
+  const fork = key === undefined ? undefined : { key, fork: loaded.root.forks[key]! };
+  return { loaded, state, name, source, fork };
 }
 
 /** The source that `fork` and `adopt` move skills into: the first in-place source marked `adopt`, else the first clone. */
@@ -147,11 +161,10 @@ function diffVendored(state: State, source: Source, name: string): Promise<strin
 }
 
 /** `skillfleet diff <skill>`: local edits against upstream, or a pending update against what is installed. */
-export async function diffSkill(spec: string, name: string): Promise<string> {
-  const { loaded, state, source } = await locate(spec, name);
-  const fork = loaded.root.forks[name];
+export async function diffSkill(spec: string, typed: string): Promise<string> {
+  const { state, source, name, fork } = await locate(spec, typed);
   if (fork) {
-    const upstream = await forkUpstream(fork);
+    const upstream = await forkUpstream(fork.fork);
     const local = state.skills[name]!.dir;
     return diffDirs(name, { dir: upstream.dir, label: "upstream" }, { dir: local, label: "local" });
   }
@@ -268,26 +281,25 @@ async function mergeTrees(
 /** `skillfleet merge <skill>`: brings upstream changes into an edited copy or a fork. */
 export async function mergeSkill(
   spec: string,
-  name: string,
+  typed: string,
   { dryRun = false } = {},
 ): Promise<MergeResult & { into: string; manifest?: ManifestTarget }> {
-  const { loaded, state, source } = await locate(spec, name);
-  const fork = loaded.root.forks[name];
+  const { loaded, state, source, name, fork } = await locate(spec, typed);
   if (fork) {
-    const head = await forkUpstream(fork);
-    const base = await forkUpstream(fork, fork.base);
+    const head = await forkUpstream(fork.fork);
+    const base = await forkUpstream(fork.fork, fork.fork.base);
     const live = state.skills[name]!.dir;
     // Where the new base is recorded, checked before the merge touches a file.
     const manifest = manifestToEdit(
       loaded,
       spec,
-      `Set "base" of "forks"."${name}" to "${head.commit}"`,
+      `Set "base" of "forks"."${fork.key}" to "${head.commit}"`,
     );
     const result = await mergeTrees(live, base.dir, head.dir, dryRun);
     editManifest(
       manifest.file,
       (raw) => {
-        const entry = isRecord(raw.forks) ? raw.forks[name] : undefined;
+        const entry = isRecord(raw.forks) ? raw.forks[fork.key] : undefined;
         if (isRecord(entry)) entry.base = head.commit;
       },
       { dryRun },
@@ -325,10 +337,10 @@ export interface Forked {
 /** `skillfleet fork <skill>`: moves a vendored skill into the personal repository and records where it came from. */
 export async function forkSkill(
   spec: string,
-  name: string,
+  typed: string,
   { dryRun = false } = {},
 ): Promise<Forked> {
-  const { loaded, state, source } = await locate(spec, name);
+  const { loaded, state, source, name } = await locate(spec, typed);
   if (!isVendored(source)) throw new UserError(`${name} already lives in ${source.id}`);
   const personal = personalSource(loaded.sources);
   if (!personal)

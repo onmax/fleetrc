@@ -169,6 +169,248 @@ describe("names macOS and Windows fold together", () => {
       { path: "skills/foo", kept: "skills/Foo" },
     ]);
   });
+
+  it("R3-3. a working clone with Foo and foo keeps updating, warns once a sync, and links Foo", async () => {
+    const m = machine();
+    const personal = remote(m, "personal", skills("skills/", "delta"));
+    const files = {
+      ...skills("skills/", "delta"),
+      "skills/Foo/SKILL.md": skillMd("Foo"),
+      "skills/foo/SKILL.md": skillMd("foo"),
+    };
+    commitRaw(m, personal, files);
+    // On macOS and Windows git checks both out into one folder and then sees skills/Foo as changed.
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+    const init = await m.run("init", manifest, "--no-timer");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const clash =
+      "personal: skills/Foo and skills/foo differ only in case or Unicode form, so macOS and Windows check them out as one folder";
+    const clashWarnings = (report: { warnings: string[] }) =>
+      report.warnings.filter((warning) => warning.startsWith(clash));
+
+    // An upstream change to another skill arrives; nothing is held for the clash.
+    let head = commitRaw(m, personal, {
+      ...files,
+      "skills/delta/SKILL.md": skillMd("delta", "v2"),
+    });
+    const first = await m.json("sync");
+    expect(first.ok, JSON.stringify(first.errors)).toBe(true);
+    expect(first.held).toEqual([]);
+    expect(first.sources[0]).toMatchObject({ status: "updated", to: head });
+    expect(clashWarnings(first)).toHaveLength(1);
+    expect(read(join(work, "skills/delta/SKILL.md"))).toBe(skillMd("delta", "v2"));
+    expect(read(m.at(".claude/skills/delta/SKILL.md"))).toBe(skillMd("delta", "v2"));
+    // The folder every system shares holds Foo, the name the git cache keeps too.
+    expect(read(join(work, "skills/Foo/SKILL.md"))).toBe(skillMd("Foo"));
+    expect(read(m.at(".claude/skills/Foo/SKILL.md"))).toBe(skillMd("Foo"));
+
+    // An upstream change to foo, the name left out, does not hold the clone either.
+    head = commitRaw(m, personal, {
+      ...files,
+      "skills/delta/SKILL.md": skillMd("delta", "v3"),
+      "skills/foo/SKILL.md": skillMd("foo", "v2"),
+    });
+    const second = await m.json("sync");
+    expect(second.held).toEqual([]);
+    expect(second.sources[0]).toMatchObject({ status: "updated", to: head });
+    expect(clashWarnings(second)).toHaveLength(1);
+    expect(read(join(work, "skills/delta/SKILL.md"))).toBe(skillMd("delta", "v3"));
+    expect(read(join(work, "skills/Foo/SKILL.md"))).toBe(skillMd("Foo"));
+
+    // A real local edit to a file that changes upstream still holds it.
+    writeFileSync(join(work, "skills/delta/SKILL.md"), skillMd("delta", "mine"));
+    commitRaw(m, personal, {
+      ...files,
+      "skills/delta/SKILL.md": skillMd("delta", "v4"),
+      "skills/foo/SKILL.md": skillMd("foo", "v2"),
+    });
+    const held = await m.json("sync");
+    expect(held.held).toEqual([
+      {
+        source: "personal",
+        reason: "local edits touch files that changed upstream",
+        files: ["skills/delta/SKILL.md"],
+      },
+    ]);
+  });
+
+  /** alpha's SKILL.md, whose name is all that changes in the rename. */
+  const alphaMd = (name: string) =>
+    `---\nname: ${name}\ndescription: The alpha skill\n---\none\ntwo\nthree\n`;
+
+  /** A vendored source with alpha and other, linked for Claude Code and Codex. */
+  async function caseRename() {
+    const m = machine();
+    const files = { ...skills("skills/", "other"), "skills/alpha/SKILL.md": alphaMd("alpha") };
+    const vendor = remote(m, "vendor", files);
+    const manifest = m.manifest({
+      agents: ["claude-code", "codex"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    const init = await m.run("init", manifest, "--no-timer");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    // Upstream renames skills/alpha to skills/Alpha, and its name with it.
+    const rename = () =>
+      commitRaw(m, vendor, {
+        ...skills("skills/", "other"),
+        "skills/Alpha/SKILL.md": alphaMd("Alpha"),
+      });
+    return { m, rename };
+  }
+  const allWarnings = (report: { warnings: string[]; targets: { warnings: string[] }[] }) => [
+    ...report.warnings,
+    ...report.targets.flatMap((target) => target.warnings),
+  ];
+
+  it("R3-4. a skill renamed upstream only in case is renamed here, quietly", async () => {
+    const { m, rename } = await caseRename();
+    rename();
+    const report = await m.json("sync");
+    expect(report.ok, JSON.stringify(report.errors)).toBe(true);
+    expect(report.renamed).toEqual([{ from: "alpha", to: "Alpha" }]);
+    expect(report.skills.names).toEqual(["Alpha", "other"]);
+    expect(report.skills.updated).toEqual(["Alpha"]);
+    expect(report.skills.added).toEqual([]);
+    expect(report.skills.removed).toEqual([]);
+    expect(report.edited).toEqual([]);
+    expect(allWarnings(report)).toEqual([]);
+    for (const dir of [".claude/skills", ".agents/skills"]) {
+      expect(names(m.at(dir))).toEqual(["Alpha", "other"]);
+      expect(read(m.at(dir, "Alpha/SKILL.md"))).toBe(alphaMd("Alpha"));
+    }
+    expect((await m.run("sync")).stdout).not.toContain("renamed");
+    const again = await m.json("sync");
+    expect(allWarnings(again)).toEqual([]);
+    expect(again.skills.updated).toEqual([]);
+  });
+
+  it("R3-4. an edited skill renamed upstream only in case keeps its edit under the new name", async () => {
+    const { m, rename } = await caseRename();
+    appendFileSync(m.at(".claude/skills/alpha/SKILL.md"), "mine\n");
+    rename();
+    const sync = await m.run("sync");
+    expect(sync.stdout).toContain("renamed alpha -> Alpha");
+    for (let run = 0; run < 2; run++) {
+      const report = await m.json("sync");
+      expect(report.ok, JSON.stringify(report.errors)).toBe(true);
+      expect(report.skills.names).toEqual(["Alpha", "other"]);
+      expect(report.edited).toEqual([{ source: "vendor", skill: "Alpha", files: ["SKILL.md"] }]);
+      expect(report.pending).toEqual([
+        { source: "vendor", skill: "Alpha", reason: "edited", files: ["SKILL.md"] },
+      ]);
+      expect(allWarnings(report)).toEqual([]);
+      for (const dir of [".claude/skills", ".agents/skills"]) {
+        expect(names(m.at(dir))).toEqual(["Alpha", "other"]);
+        expect(read(m.at(dir, "Alpha/SKILL.md"))).toBe(`${alphaMd("alpha")}mine\n`);
+      }
+    }
+    // Either spelling finds it.
+    for (const typed of ["Alpha", "alpha"]) {
+      const diff = await m.run("diff", typed);
+      expect(diff.code, diff.stderr).toBe(0);
+      expect(diff.stdout).toContain("+name: Alpha");
+    }
+    const merge = await m.run("merge", "alpha");
+    expect(merge.code, merge.stdout + merge.stderr).toBe(0);
+    expect(merge.stdout).toContain("merged: SKILL.md");
+    expect(read(m.at(".claude/skills/Alpha/SKILL.md"))).toBe(`${alphaMd("Alpha")}mine\n`);
+    const after = await m.json("sync");
+    expect(after.pending).toEqual([]);
+    expect(allWarnings(after)).toEqual([]);
+  });
+
+  /** A vendored source with plain and an NFD café, and a personal source to fork into. */
+  async function nfdSkill(body: string[] = ["one", "two", "three"]) {
+    const m = machine();
+    const personal = remote(m, "personal", skills("skills/", "mine"));
+    const work = clone(m, personal, "code/skills");
+    const vendor = remote(m, "vendor", skills("skills/", "plain"));
+    const nfd = "cafe\u0301";
+    const cafe = (...lines: string[]) =>
+      `---\nname: ${nfd}\ndescription: The café skill\n---\n${lines.join("\n")}\n`;
+    const files = { ...skills("skills/", "plain"), [`skills/${nfd}/SKILL.md`]: cafe(...body) };
+    commitRaw(m, vendor, files);
+    const source = { id: "vendor", git: vendor.url };
+    const write = (vendorSource: object, extra: object = {}) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+          { ...source, ...vendorSource },
+        ],
+        ...extra,
+      });
+    const manifest = write({});
+    const init = await m.run("init", manifest, "--no-timer");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    return { m, work, vendor, nfd, cafe, files, write };
+  }
+  // What a macOS keyboard types.
+  const typed = "caf\u00e9";
+
+  it("R3-5. diff, merge and fork find a skill named in NFD when its name is typed in NFC", async () => {
+    const { m, work, vendor, nfd, cafe, files } = await nfdSkill();
+    const unchanged = await m.run("diff", typed);
+    expect(unchanged.code, unchanged.stderr).toBe(0);
+    expect(unchanged.stdout).toBe("no differences\n");
+    // Case too, on every system, as sync treats names that differ in case as one skill.
+    expect((await m.run("diff", "PLAIN")).code).toBe(0);
+
+    const linked = names(m.at(".claude/skills")).find((name) => name.normalize("NFC") === typed)!;
+    appendFileSync(m.at(".claude/skills", linked, "SKILL.md"), "mine\n");
+    commitRaw(m, vendor, { ...files, [`skills/${nfd}/SKILL.md`]: cafe("ONE", "two", "three") });
+    await m.run("sync");
+    const merge = await m.run("merge", typed);
+    expect(merge.code, merge.stdout + merge.stderr).toBe(0);
+    expect(merge.stdout).toContain("merged: SKILL.md");
+    expect(read(m.at(".claude/skills", linked, "SKILL.md"))).toBe(
+      `${cafe("ONE", "two", "three")}mine\n`,
+    );
+
+    const fork = await m.run("fork", typed);
+    expect(fork.code, fork.stdout + fork.stderr).toBe(0);
+    expect(read(join(work, "skills", nfd, "SKILL.md"))).toBe(
+      `${cafe("ONE", "two", "three")}mine\n`,
+    );
+    const recorded = JSON.parse(read(join(m.root, "manifest", "skills.json"))) as {
+      forks: Record<string, unknown>;
+      sources: { exclude?: string[] }[];
+    };
+    expect(Object.keys(recorded.forks)).toEqual([nfd]);
+    expect(recorded.sources[1]!.exclude).toEqual([nfd]);
+  });
+
+  it("R3-5. remove, include, exclude and hooks find a skill named in NFD by its NFC name", async () => {
+    const { m, vendor, nfd, cafe, files, write } = await nfdSkill();
+    const removed = await m.run("remove", typed);
+    expect(removed.code, removed.stdout + removed.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["mine", "plain"]);
+    const manifest = JSON.parse(read(join(m.root, "manifest", "skills.json"))) as {
+      sources: { exclude?: string[] }[];
+    };
+    expect(manifest.sources[1]!.exclude).toEqual([nfd]);
+
+    write({ exclude: [typed] });
+    const excluded = await m.json("sync");
+    expect(excluded.skills.names).toEqual(["mine", "plain"]);
+
+    const hook = changedLog(m);
+    write(
+      { include: [typed] },
+      { hooks: [{ name: "cafe", on: [`vendor:skills/${typed}/**`], run: hook.run }] },
+    );
+    const included = await m.json("sync");
+    expect(nfc(included.skills.names)).toEqual([typed, "mine"]);
+    expect(included.warnings.filter((warning) => warning.includes("include names"))).toEqual([]);
+    expect(included.warnings.filter((warning) => warning.startsWith("hook "))).toEqual([]);
+    commitRaw(m, vendor, { ...files, [`skills/${nfd}/SKILL.md`]: cafe("v2") });
+    const changed = await m.json("sync");
+    expect(changed.hooks.map((run) => run.name)).toEqual(["cafe"]);
+  });
 });
 
 describe("refs that name a commit", () => {

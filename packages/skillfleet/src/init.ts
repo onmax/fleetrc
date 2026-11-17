@@ -17,6 +17,7 @@ import {
   remoteManifest,
   writeConfig,
 } from "./manifest.ts";
+import { findName } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { sync } from "./sync.ts";
@@ -113,7 +114,7 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
   for (const entry of lockEntries) {
     const local = personal ? join(personalSkillsDir(personal), entry.name) : undefined;
     if (local && existsSync(join(local, "SKILL.md"))) {
-      if (!loaded.root.forks[entry.name])
+      if (findName(Object.keys(loaded.root.forks), entry.name) === undefined)
         imports.forks[entry.name] = {
           from: entry.source,
           path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
