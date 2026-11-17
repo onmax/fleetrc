@@ -15,6 +15,8 @@ export interface ExecOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   input?: string;
+  /** Writes `input` and keeps stdin open until the command exits, so it can tell when we are gone. */
+  holdStdin?: boolean;
   timeoutMs?: number;
   shell?: boolean;
   /** Characters of stdout and of stderr to keep, from the end. Defaults to 1 MiB each. */
@@ -121,6 +123,7 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
       clearTimeout(timer);
       if (child.pid !== undefined && groups.delete(child.pid) && groups.size === 0)
         for (const name of FORWARDED) process.removeListener(name, forward);
+      child.stdin?.destroy();
       child.stdout?.destroy();
       child.stderr?.destroy();
       const err = stderr.toString();
@@ -148,7 +151,8 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
       if (timedOut) finish(code);
     });
     child.stdin?.on("error", () => {});
-    child.stdin?.end(options.input ?? "");
+    if (options.holdStdin) child.stdin?.write(options.input ?? "");
+    else child.stdin?.end(options.input ?? "");
   });
 }
 

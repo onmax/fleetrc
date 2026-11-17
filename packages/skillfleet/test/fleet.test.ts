@@ -61,8 +61,8 @@ describe("fleet", () => {
     expect(hosts[1]).toMatchObject({
       host: "gone.example",
       reachable: false,
-      error: "timed out after 3s",
-      behind: ["never ran"],
+      error: "no answer within 3 s",
+      behind: [],
     });
 
     // Once a host has answered, its last run is cached and shown with its age while it is unreachable.
@@ -72,7 +72,7 @@ describe("fleet", () => {
     const text = await m.runWith({ env }, "fleet", "status", "--timeout", "2");
     expect(text.stdout).toMatch(/^localhost: last run \d+s ago, 1 skills$/m);
     expect(text.stdout).toContain(
-      "gone.example: unreachable (timed out after 2s); last run 5h ago, 1 skills; behind: last run 5h ago",
+      "gone.example: unreachable (no answer within 2 s); last run 5h ago, 1 skills; behind: last run 5h ago",
     );
 
     // fleet sync runs the sync on the host and reads back its report.
@@ -161,4 +161,82 @@ describe("fleet", () => {
       expect(status.code).toBe(0);
     },
   );
+
+  it("R7-16. fleet without ssh says ssh is not installed, and calls no host unreachable or never run", async () => {
+    const m = machine();
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [],
+      fleet: ["laptop", "homelab"],
+    });
+    const empty = join(m.root, "no-ssh");
+    mkdirSync(empty);
+    const status = await m.runWith(
+      { env: { PATH: empty, Path: isWindows ? empty : undefined } },
+      "fleet",
+      "status",
+      "--manifest",
+      manifest,
+    );
+    expect(status.code).toBe(1);
+    expect(status.stdout.replace(/\r/g, "")).toBe(
+      "laptop: not checked (ssh is not installed, or not on PATH); no run recorded\n" +
+        "homelab: not checked (ssh is not installed, or not on PATH); no run recorded\n",
+    );
+  });
+
+  it.skipIf(isWindows)(
+    "R7-16. a host that answers but is slow times out as slow, not unreachable, and its sync is stopped",
+    async () => {
+      const m = machine();
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [],
+        fleet: ["localhost", "gone.example"],
+      });
+      // The host's sync starts and never ends.
+      const pidFile = join(m.root, "sync.pid");
+      const launcher = join(m.stateDir, "bin", "skillfleet");
+      mkdirSync(join(launcher, ".."), { recursive: true });
+      writeFileSync(launcher, `#!/bin/sh\necho $$ > "${pidFile}"\nexec sleep 300\n`);
+      chmodSync(launcher, 0o755);
+      const env = sshShim(m);
+      let pid: number | undefined;
+      try {
+        // Long enough for the host to answer on a loaded machine; the sync never finishes.
+        const sync = await m.runWith(
+          { env },
+          "fleet",
+          "sync",
+          "--manifest",
+          manifest,
+          "--timeout",
+          "10",
+        );
+        expect(sync.code).toBe(1);
+        expect(sync.stdout).toContain(
+          "localhost: timed out after 10 s (the host answered, but its run did not finish, so it was stopped); no run recorded\n",
+        );
+        expect(sync.stdout).toContain(
+          "gone.example: unreachable (no answer within 10 s); no run recorded\n",
+        );
+        pid = Number(readFileSync(pidFile, "utf8"));
+        // The fake ssh is gone and its stdin closed, as when ssh's connection drops: the sync is stopped.
+        const deadline = Date.now() + 30_000;
+        while (alive(pid) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+        expect(alive(pid)).toBe(false);
+      } finally {
+        if (pid !== undefined && alive(pid)) process.kill(pid, "SIGKILL");
+      }
+    },
+  );
 });
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

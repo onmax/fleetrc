@@ -7,7 +7,10 @@ export type FleetAction = "status" | "sync" | "upgrade";
 
 export interface HostResult {
   host: string;
+  /** The host answered over ssh. */
   reachable: boolean;
+  /** False when skillfleet could not try the host: ssh is not installed, or the name is not one ssh takes. */
+  checked: boolean;
   /** The host's last run, fresh or from the local cache when unreachable. */
   lastRun?: Pick<Report, "finishedAt" | "ok" | "skillfleet" | "host"> & {
     skills: number;
@@ -32,6 +35,23 @@ const HOST_NOTES = {
     "skillfleet is not installed there, and node is not on the PATH ssh commands get; install Node.js 22.12 or newer, then run `npx skillfleet init <manifest>` on it",
 } as const;
 
+/**
+ * Told to stderr first, so a timeout can tell a host that answered and was slow from one that never
+ * answered.
+ */
+const ANSWERED = `echo "${NOTE} answered" >&2`;
+
+/**
+ * Runs `command`, a simple command, so that it stops when the connection drops. Without a tty sshd
+ * sends no SIGHUP, and a sync prints nothing until it ends, so it would run on, holding the sync
+ * lock, after fleet's timeout killed ssh. fleet writes a line to stdin and holds it open; sshd closes
+ * it when the connection goes, and the watcher then kills the command. A stdin that ends before any
+ * line, as with `ssh -n`, leaves the command alone. A background list reads /dev/null unless told
+ * otherwise, hence fd 3.
+ */
+const watched = (command: string) =>
+  `{ exec 3<&0; ${command} </dev/null 3<&- & p=$!; { read -r _ && { while read -r _; do :; done; kill $p; }; } <&3 >/dev/null 2>&1 & w=$!; exec 3<&-; wait $p; s=$?; kill $w 2>/dev/null; exit $s; }`;
+
 /** Finds skillfleet on the host: the installed launcher, else a `skillfleet` on PATH. */
 const FIND = `f=${STATE}/bin/skillfleet; [ -x "$f" ] || f=$(command -v skillfleet) || f=`;
 /**
@@ -53,12 +73,12 @@ export function remoteScript(
 ): string {
   switch (action) {
     case "status":
-      return `r=${STATE}/last-run.json; if [ -f "$r" ]; then cat "$r"; else ${FIND}; if [ -n "$f" ]; then echo "${NOTE} never-synced"; else ${MISSING}; fi; fi`;
+      return `${ANSWERED}; r=${STATE}/last-run.json; if [ -f "$r" ]; then cat "$r"; else ${FIND}; if [ -n "$f" ]; then echo "${NOTE} never-synced"; else ${MISSING}; fi; fi`;
     case "sync":
-      return `${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then "$f" sync --json${dryRun ? " --dry-run" : ""}; else ${MISSING}; fi`;
+      return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then ${watched(`"$f" sync --json${dryRun ? " --dry-run" : ""}`)}; else ${MISSING}; fi`;
     case "upgrade":
       // npx next to the launcher's node, with that node first on PATH for npx's own `#!/usr/bin/env node`.
-      return `${LAUNCHER_NODE}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install && "$l" sync --json; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
+      return `${ANSWERED}; ${LAUNCHER_NODE}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
     default: {
       const exhaustive: never = action;
       return exhaustive;
@@ -181,7 +201,7 @@ async function runOnHost(
   dryRun: boolean,
 ) {
   const problem = hostProblem(host);
-  if (problem) return { error: problem };
+  if (problem) return { error: problem, reached: false, checked: false };
   const { command, prefix } = sshCommand();
   const args = [
     ...prefix,
@@ -194,9 +214,32 @@ async function runOnHost(
     host,
     `sh -c ${quote(remoteScript(action, version, { dryRun }))}`,
   ];
-  // The report is parsed whole, so it is not cut to the default tail.
-  const run = await exec(command, args, { timeoutMs, maxOutput: 64 * 1024 * 1024 });
-  if (run.timedOut) return { error: `timed out after ${Math.round(timeoutMs / 1000)}s` };
+  // The report is parsed whole, so it is not cut to the default tail. stdin stays open for `watched`.
+  const run = await exec(command, args, {
+    timeoutMs,
+    maxOutput: 64 * 1024 * 1024,
+    input: "fleet\n",
+    holdStdin: true,
+  });
+  if (run.spawnError === "ENOENT")
+    return {
+      error:
+        command === "ssh"
+          ? "ssh is not installed, or not on PATH"
+          : `${command}, which SKILLFLEET_SSH names, is not installed or not on PATH`,
+      reached: false,
+      checked: false,
+    };
+  const answered = new RegExp(`^${NOTE} answered\r?$`, "m").test(run.stderr);
+  const stderr = run.stderr.replace(new RegExp(`^${NOTE} .*\r?\n?`, "gm"), "");
+  if (run.timedOut) {
+    const after = `${Math.round(timeoutMs / 1000)} s`;
+    if (!answered) return { error: `no answer within ${after}`, reached: false };
+    // ssh is gone, so the host's `watched` sync stops.
+    const tail =
+      action === "status" ? "but sent no report" : "but its run did not finish, so it was stopped";
+    return { error: `timed out after ${after} (the host answered, ${tail})`, reached: true };
+  }
   const note = run.stdout.match(new RegExp(`^${NOTE} ([\\w-]+)$`, "m"))?.[1];
   if (note !== undefined && Object.hasOwn(HOST_NOTES, note))
     return { note: note as keyof typeof HOST_NOTES };
@@ -205,10 +248,13 @@ async function runOnHost(
   if (report !== undefined) return { report };
   if (run.code !== 0)
     return {
-      error:
-        (run.stderr || run.stdout).trim().split("\n").slice(-3).join(" ") || `exit ${run.code}`,
+      error: (stderr || run.stdout).trim().split("\n").slice(-3).join(" ") || `exit ${run.code}`,
+      reached: answered,
     };
-  return { error: "the host answered with something that is not a skillfleet report" };
+  return {
+    error: "the host answered with something that is not a skillfleet report",
+    reached: true,
+  };
 }
 
 /** The skillfleet report a host printed, or undefined when its output holds none. */
@@ -245,6 +291,7 @@ export async function fleet(
         return {
           host,
           reachable: true,
+          checked: true,
           lastRun: cache[host],
           ...(error ? { error } : {}),
           behind: [],
@@ -253,11 +300,12 @@ export async function fleet(
       const run = "report" in answer ? summarize(answer.report) : undefined;
       if (run) {
         if (!dryRun) cache[host] = run;
-        return { host, reachable: true, lastRun: run, behind: [] };
+        return { host, reachable: true, checked: true, lastRun: run, behind: [] };
       }
       return {
         host,
-        reachable: false,
+        reachable: answer.reached ?? false,
+        checked: answer.checked ?? true,
         lastRun: cache[host],
         error: answer.error ?? "no report",
         behind: [],
@@ -269,7 +317,10 @@ export async function fleet(
   return results;
 }
 
-/** A host is behind when its last run is over two hours old or a source sits at another commit than on the freshest host. */
+/**
+ * A host is behind when its last run is over two hours old or a source sits at another commit than
+ * on the freshest host. Only a host that answered can be said to have never run.
+ */
 export function markBehind(results: HostResult[], now = Date.now()) {
   const freshest = results
     .filter((result) => result.lastRun)
@@ -277,7 +328,7 @@ export function markBehind(results: HostResult[], now = Date.now()) {
   for (const result of results) {
     const run = result.lastRun;
     if (!run) {
-      result.behind.push("never ran");
+      if (result.reachable && result.error === undefined) result.behind.push("never ran");
       continue;
     }
     if (now - new Date(run.finishedAt).getTime() > 2 * 60 * 60 * 1000)
@@ -305,11 +356,13 @@ export function formatFleet(results: readonly HostResult[]): string {
       const last = run
         ? `last run ${age(run.finishedAt)} ago, ${run.skills} skills${run.ok ? "" : ", with errors"}`
         : "no run recorded";
-      const state = !result.reachable
-        ? `unreachable (${result.error}); ${last}`
-        : result.error
-          ? `${result.error}; ${last}`
-          : last;
+      const state = !result.checked
+        ? `not checked (${result.error}); ${last}`
+        : !result.reachable
+          ? `unreachable (${result.error}); ${last}`
+          : result.error
+            ? `${result.error}; ${last}`
+            : last;
       return `${result.host}: ${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
     })
     .join("\n");
