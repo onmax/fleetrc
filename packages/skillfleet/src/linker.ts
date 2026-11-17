@@ -12,16 +12,18 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
-  copyDir,
+  copyResolved,
+  type DroppedLink,
   type Hashes,
   hashDir,
   isErrno,
   isRecord,
   JsonFileError,
   lstat,
-  materializeSkillMd,
   readJson,
+  recoverRenames,
   renameFolder,
+  resolvedHashes,
   sameTree,
   writeJson,
 } from "./fs.ts";
@@ -38,6 +40,8 @@ export interface LinkRecord {
   source: string;
   /** For copies: the files as written, to tell an edited copy from a stale one. */
   hashes?: Hashes;
+  /** For copies: the folder links in the skill were followed into (see `DesiredLink`). */
+  root?: string;
 }
 
 export interface TargetManifest {
@@ -49,6 +53,8 @@ export interface DesiredLink {
   name: string;
   target: string;
   source: string;
+  /** The folder a copy follows links in the skill into: a working clone. Without it, anywhere. */
+  root?: string;
 }
 
 export interface TargetReport {
@@ -94,6 +100,7 @@ export function readTargetManifest(dir: string, warnings: string[] = []): Target
       target: record.target,
       kind,
       source: record.source,
+      ...(typeof record.root === "string" ? { root: record.root } : {}),
       ...(isRecord(record.hashes)
         ? {
             hashes: Object.fromEntries(
@@ -128,21 +135,32 @@ export function removeLink(path: string) {
   }
 }
 
-/** Links `path` to the `target` folder: a symlink, a junction on Windows, or a copy. */
-export function makeLink(target: string, path: string, copy: boolean): LinkKind {
+/**
+ * Links `path` to the `link.target` folder: a symlink, a junction on Windows, or a copy that holds
+ * no links (see `copyResolved`), since Codex and Cursor skip a skill whose SKILL.md is a link.
+ */
+export function makeLink(
+  link: Pick<DesiredLink, "target" | "root">,
+  path: string,
+  copy: boolean,
+): { kind: LinkKind; dropped: DroppedLink[] } {
   mkdirSync(dirname(path), { recursive: true });
   if (!copy) {
     try {
-      symlinkSync(target, path, process.platform === "win32" ? "junction" : "dir");
-      return process.platform === "win32" ? "junction" : "symlink";
+      symlinkSync(link.target, path, process.platform === "win32" ? "junction" : "dir");
+      return { kind: process.platform === "win32" ? "junction" : "symlink", dropped: [] };
     } catch (error) {
       if (process.platform !== "win32") throw error;
     }
   }
-  copyDir(target, path);
-  materializeSkillMd(path, target);
-  return "copy";
+  return { kind: "copy", dropped: copyResolved(link.target, path, link.root) };
 }
+
+const DROPPED = {
+  outside: "to a place outside the source",
+  nothing: "to nothing",
+  loop: "to a folder that holds it",
+} as const;
 
 /**
  * Makes each folder hold exactly one link per desired skill. Only links recorded in the folder's
@@ -179,6 +197,11 @@ export function linkTargetDir(
     return report;
   }
   const manifest = readTargetManifest(dir, report.warnings);
+  try {
+    if (stat && !dryRun) recoverRenames(dir, new Set(Object.keys(manifest.links)));
+  } catch (error) {
+    report.warnings.push(`${tildify(dir)}: ${errorText(error)}`);
+  }
   const failed = (name: string, error: unknown) =>
     report.errors.push(`${tildify(join(dir, name))}: ${errorText(error)}`);
   const wanted = new Map<string, DesiredLink>();
@@ -195,12 +218,18 @@ export function linkTargetDir(
         if (existing?.isSymbolicLink()) removeLink(path);
         else rmSync(path, { recursive: true, force: true });
       }
-      const kind = makeLink(link.target, path, copy);
+      const { kind, dropped } = makeLink(link, path, copy);
+      for (const left of dropped)
+        report.warnings.push(
+          `${tildify(join(link.target, left.path))} links ${DROPPED[left.reason]}, so the copy in ${tildify(path)} leaves it out`,
+        );
       manifest.links[name] = {
         target: link.target,
         kind,
         source: link.source,
-        ...(kind === "copy" ? { hashes: hashDir(path) } : {}),
+        ...(kind === "copy"
+          ? { hashes: hashDir(path), ...(link.root ? { root: link.root } : {}) }
+          : {}),
       };
     }
     (replacing ? report.replaced : report.created).push(name);
@@ -266,8 +295,13 @@ export function linkTargetDir(
         );
         return;
       }
-      const fresh = hashDir(link.target, { skillMdAsFile: true });
-      if (!copy || !sameTree(now, fresh) || !samePath(record.target, link.target))
+      const fresh = resolvedHashes(link.target, link.root);
+      if (
+        !copy ||
+        !sameTree(now, fresh) ||
+        !samePath(record.target, link.target) ||
+        record.root !== link.root
+      )
         write(link.name, link, true);
       return;
     }

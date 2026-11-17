@@ -9,43 +9,39 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmSync,
   type Stats,
   statSync,
   symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 export type Hashes = Record<string, string>;
 
 export const lstat = (path: string): Stats | undefined =>
   lstatSync(path, { throwIfNoEntry: false });
 
-/**
- * sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target
- * text; with `skillMdAsFile`, a top-level SKILL.md link hashes as the file it points to, as
- * `materializeSkillMd` leaves it.
- */
-export function hashDir(dir: string, { skillMdAsFile = false } = {}): Hashes {
+/** sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target text. */
+export function hashDir(dir: string): Hashes {
   const hashes: Hashes = {};
   const walk = (current: string) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
       const key = relative(dir, path).split(sep).join("/");
       if (entry.isDirectory()) walk(path);
-      else if (entry.isSymbolicLink())
-        hashes[key] =
-          (skillMdAsFile && key === SKILL_MD && linkedFile(path)) ||
-          sha256(`link:${readlinkSync(path)}`);
+      else if (entry.isSymbolicLink()) hashes[key] = sha256(`link:${readlinkSync(path)}`);
       else if (entry.isFile()) hashes[key] = sha256(readFileSync(path));
     }
   };
   if (existsSync(dir)) walk(dir);
-  return Object.fromEntries(Object.entries(hashes).sort(([a], [b]) => (a < b ? -1 : 1)));
+  return sorted(hashes);
 }
+
+const sorted = (hashes: Hashes): Hashes =>
+  Object.fromEntries(Object.entries(hashes).sort(([a], [b]) => (a < b ? -1 : 1)));
 
 /** Every file and link under `dir`, as `/`-separated relative paths. */
 export function listFiles(dir: string): string[] {
@@ -62,28 +58,78 @@ export function listFiles(dir: string): string[] {
 export const sha256 = (data: string | Uint8Array) =>
   createHash("sha256").update(data).digest("hex");
 
-const SKILL_MD = "SKILL.md";
+/** Whether `path` is `root` or inside it. */
+export const inside = (root: string, path: string) => {
+  const rel = relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
 
-/** sha256 of the file a link points to, or undefined when it points to no file. */
-function linkedFile(path: string): string | undefined {
-  try {
-    return statSync(path).isFile() ? sha256(readFileSync(path)) : undefined;
-  } catch {
-    return undefined;
-  }
+/** A link an agent's copy of a skill leaves out, `/`-separated from the skill folder, and why. */
+export interface DroppedLink {
+  path: string;
+  reason: "outside" | "nothing" | "loop";
+}
+
+interface ResolvedEntry {
+  /** `/`-separated, from the skill folder. */
+  rel: string;
+  real: string;
+  dir: boolean;
 }
 
 /**
- * In `copy`, a copy of the skill folder `original`, replaces a SKILL.md that is a link with the
- * file it points to from `original`, where a relative link resolves. Codex and Cursor skip a
- * skill whose SKILL.md is a link. A link to no file stays.
+ * The tree of the skill folder `dir` as an agent's copy holds it: the folder and every link in it
+ * are followed to what they resolve to. Copied, a relative link would point at nothing, and a link
+ * into the source would no longer lead into it. A link that leaves `within` (when given), leads to
+ * nothing, or leads to a folder that holds it is left out and named in `dropped`.
  */
-export function materializeSkillMd(copy: string, original: string) {
-  const file = join(copy, SKILL_MD);
-  const from = join(original, SKILL_MD);
-  if (!lstat(file)?.isSymbolicLink() || !linkedFile(from)) return;
-  unlinkSync(file);
-  writeFileSync(file, readFileSync(from));
+function resolvedTree(dir: string, within: string | undefined, dropped: DroppedLink[]) {
+  const bound = within === undefined ? undefined : realpathSync(within);
+  const entries: ResolvedEntry[] = [];
+  const walk = (real: string, rel: string, open: readonly string[]) => {
+    for (const name of readdirSync(real)) {
+      const path = join(real, name);
+      const childRel = rel ? `${rel}/${name}` : name;
+      let target = path;
+      let stat = lstatSync(path);
+      if (stat.isSymbolicLink()) {
+        try {
+          target = realpathSync(path);
+          stat = statSync(target);
+        } catch {
+          dropped.push({ path: childRel, reason: "nothing" });
+          continue;
+        }
+        if (bound !== undefined && !inside(bound, target)) {
+          dropped.push({ path: childRel, reason: "outside" });
+          continue;
+        }
+      }
+      if (stat.isDirectory()) {
+        if (open.some((folder) => inside(target, folder))) {
+          dropped.push({ path: childRel, reason: "loop" });
+          continue;
+        }
+        entries.push({ rel: childRel, real: target, dir: true });
+        walk(target, childRel, [...open, target]);
+      } else if (stat.isFile()) entries.push({ rel: childRel, real: target, dir: false });
+    }
+  };
+  const root = realpathSync(dir);
+  walk(root, "", [root]);
+  return entries;
+}
+
+/**
+ * Hashes of the copy `copyResolved(dir, within)` makes, without making it: what `hashDir` of a
+ * fresh copy reads.
+ */
+export function resolvedHashes(dir: string, within?: string): Hashes {
+  const hashes: Hashes = {};
+  if (!existsSync(dir)) return hashes;
+  for (const entry of resolvedTree(dir, within, []))
+    if (!entry.dir) hashes[entry.rel] = sha256(readFileSync(entry.real));
+  return sorted(hashes);
 }
 
 /** Files whose hash differs between two trees, including added and removed ones. */
@@ -127,6 +173,26 @@ export function copyDir(from: string, to: string) {
   copyTree(from, to);
 }
 
+/**
+ * Replaces `to` with a copy of the skill folder `from` that holds no links: each is copied as what
+ * it resolves to (see `resolvedTree`). Returns the links it left out.
+ */
+export function copyResolved(from: string, to: string, within?: string): DroppedLink[] {
+  const dropped: DroppedLink[] = [];
+  const entries = resolvedTree(from, within, dropped);
+  rmSync(to, { recursive: true, force: true });
+  mkdirSync(to, { recursive: true });
+  for (const entry of entries) {
+    const path = join(to, entry.rel);
+    if (entry.dir) mkdirSync(path, { recursive: true });
+    else {
+      copyFileSync(entry.real, path, constants.COPYFILE_FICLONE);
+      copiedFiles++;
+    }
+  }
+  return dropped;
+}
+
 const REPLACING = /^\.(.+)\.(\d+)\.(new|old)$/;
 
 /**
@@ -150,12 +216,13 @@ export function replaceDir(from: string, to: string, { move = false } = {}) {
 }
 
 /**
- * Finishes what a killed `replaceDir` left in `dir`: a new tree that was never renamed into place
- * is deleted, and an old tree whose replacement never arrived goes back. Folders of a process
- * still running are left alone.
+ * Finishes what a killed `replaceDir` or `renameFolder` left in `dir`: a new tree that was never
+ * renamed into place is deleted, and an old tree whose replacement never arrived, or a folder left
+ * under its third name, goes back. Folders of a process still running are left alone.
  */
 export function recoverReplaced(dir: string) {
   if (!existsSync(dir)) return;
+  recoverRenames(dir);
   for (const name of readdirSync(dir)) {
     const match = REPLACING.exec(name);
     if (!match || isRunning(Number(match[2]))) continue;
@@ -191,10 +258,12 @@ export function moveDir(from: string, to: string) {
   }
 }
 
+const RENAMING = /^(.+)\.(\d+)\.rename$/;
+
 /**
  * Renames `from` to `to`, names that may differ only in case or Unicode form: macOS and Windows
- * see one entry there, so it goes through a third name. Returns false, changing nothing, when
- * `from` is missing or `to` is another entry.
+ * see one entry there, so it goes through a third name, which `recoverRenames` puts back after a
+ * kill. Returns false, changing nothing, when `from` is missing or `to` is another entry.
  */
 export function renameFolder(from: string, to: string): boolean {
   if (from === to) return true;
@@ -207,6 +276,19 @@ export function renameFolder(from: string, to: string): boolean {
   }
   renameSync(temp, to);
   return true;
+}
+
+/**
+ * Puts each entry a killed `renameFolder` left in `dir` under its third name back under the name it
+ * had, where nothing took that name. With `names`, only entries that had one of them.
+ */
+export function recoverRenames(dir: string, names?: ReadonlySet<string>) {
+  for (const name of readdirSync(dir)) {
+    const match = RENAMING.exec(name);
+    if (!match || isRunning(Number(match[2])) || (names && !names.has(match[1]!))) continue;
+    const original = join(dir, match[1]!);
+    if (lstat(original) === undefined) renameSync(join(dir, name), original);
+  }
 }
 
 export function isErrno(error: unknown, ...codes: string[]): boolean {

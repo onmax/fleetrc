@@ -25,6 +25,7 @@ import {
   lstat,
   moveDir,
   readJsonOrNothing,
+  resolvedHashes,
   sameTree,
   writeJson,
 } from "./fs.ts";
@@ -533,7 +534,12 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
             shadowed.push({ skill: skill.name, winner: winner.source, loser: result.id });
           continue;
         }
-        const link = { name: skill.name, target: skill.dir, source: result.id };
+        const link: DesiredLink = {
+          name: skill.name,
+          target: skill.dir,
+          source: result.id,
+          ...(skill.root ? { root: skill.root } : {}),
+        };
         winners.set(skill.name, link);
         byKey.set(nameKey(skill.name), link);
       }
@@ -718,7 +724,7 @@ function adoptCopyEdits(dirs: readonly string[], dryRun: boolean, errors: string
           const now = hashDir(copy);
           const files = changedFiles(record.hashes, now);
           if (files.length === 0) continue;
-          if (!sameTree(hashDir(record.target, { skillMdAsFile: true }), record.hashes)) continue;
+          if (!sameTree(resolvedHashes(record.target, record.root), record.hashes)) continue;
           // A link moves as the file it points to, and a linked SKILL.md in place stays a link.
           const linked = (path: string) => lstat(path)?.isSymbolicLink();
           if (files.some((file) => linked(join(copy, file)) || linked(join(record.target, file))))

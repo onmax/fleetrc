@@ -19,6 +19,7 @@ import {
   changedFiles,
   countCopies,
   hashDir,
+  inside,
   isRecord,
   isRunning,
   listFiles,
@@ -40,6 +41,8 @@ export interface SkillEntry {
   dir: string;
   /** Folder inside the source, `/`-separated. */
   path?: string;
+  /** A working clone's folder, which links in the skill may lead into when it is copied. */
+  root?: string;
 }
 
 export type SourceStatus =
@@ -170,11 +173,6 @@ export function select(source: Source, found: readonly Found[], warnings: string
   }
   return chosen;
 }
-
-const inside = (root: string, path: string) => {
-  const rel = relative(root, path);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
-};
 
 /**
  * The folder a `skills` glob starts from, which must stay inside the source. A fetched source
@@ -387,6 +385,8 @@ async function discoverInPlace(
       name: skill.name,
       path: skill.path,
       dir: skill.path && skill.path !== "." ? join(root, skill.path) : root,
+      // A folder of the user's own may link anywhere, as in `linkedFolders`.
+      ...(source.kind === "clone" ? { root } : {}),
     }));
   } finally {
     await handle?.dispose();
