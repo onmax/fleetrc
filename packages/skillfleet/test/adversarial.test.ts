@@ -24,6 +24,7 @@ import {
   isWindows,
   machine,
   type Machine,
+  named,
   names,
   read,
   remote,
@@ -454,20 +455,19 @@ describe("hostile npm registries and tarballs", () => {
   it("A3. NPM_TOKEN is not sent to a registry an extended team manifest names", async () => {
     const m = machine();
     const registry = await recorder();
+    // A name for the server, which a team manifest may name; CX18 refuses a loopback address.
+    const url = named(registry.url, "registry");
     const archive = tarball(pkgFiles("pkg", { "skills/x/SKILL.md": skillMd("x") }));
     registry.routes.set("/pkg.tgz", { body: archive, type: "application/octet-stream" });
     servePackument(
       registry,
       "pkg",
-      { "1.0.0": { tarball: `${registry.url}/pkg.tgz`, integrity: sha512(archive) } },
+      { "1.0.0": { tarball: `${url}/pkg.tgz`, integrity: sha512(archive) } },
       "1.0.0",
     );
     const team = join(m.root, "team", "skills.json");
     mkdirSync(join(m.root, "team"), { recursive: true });
-    writeFileSync(
-      team,
-      JSON.stringify({ sources: [{ id: "n", npm: "pkg", registry: registry.url }] }),
-    );
+    writeFileSync(team, JSON.stringify({ sources: [{ id: "n", npm: "pkg", registry: url }] }));
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
     await m.runWith({ env: { NPM_TOKEN: "npm_secret" } }, "init", manifest, "--no-timer");
     expect(registry.hits.length).toBeGreaterThan(0);

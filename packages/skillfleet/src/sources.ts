@@ -43,10 +43,11 @@ import {
   type InPlaceSource,
   type Source,
   teamGitProblem,
+  teamUrlProblem,
   type VendoredSource,
 } from "./manifest.ts";
 import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
-import { type FetchBudget, fetchNpm, parseNpmSpec, withCappedFetch } from "./npm.ts";
+import { type FetchBudget, fetchNpm, guardedFetch, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
 import { tarEntries } from "./tar.ts";
 import type { SourceState } from "./state.ts";
@@ -1117,6 +1118,10 @@ async function openVendored(
     case "npm": {
       const pkg = await fetchNpm(source.npm, source.registry, join(ctx.cacheDir, "npm"), {
         sendToken: source.sendToken,
+        // A registry a team manifest names, and where it sends the tarball, are on another machine.
+        ...(source.via !== undefined && source.registry !== undefined
+          ? { fetch: guardedFetch(teamUrlProblem) }
+          : {}),
       });
       return {
         handle: await discover(pkg.dir, source.skills),
@@ -1420,17 +1425,35 @@ export async function syncVendored(
   const refused: string[] = [];
   const mismatched = new Map<string, string>();
   const budget = indexBudget();
-  const out = await withCappedFetch(
-    () =>
-      withDigestCheck(
-        () => fetchVendored(source, state, ctx, mismatched, refused, budget.skipped),
-        mismatched,
-      ),
-    refused,
-    budget,
+  const out = await withTeamHosts(source, () =>
+    withCappedFetch(
+      () =>
+        withDigestCheck(
+          () => fetchVendored(source, state, ctx, mismatched, refused, budget.skipped),
+          mismatched,
+        ),
+      refused,
+      budget,
+    ),
   );
   out.warnings.push(...refused.map((why) => `${source.id}: refused ${why}`));
   return out;
+}
+
+/**
+ * Runs `work` with every fetch held to `teamUrlProblem` when a team manifest declared `source`:
+ * the index, each download it lists, and every redirect. It is the fetch closest to the network,
+ * so a refused URL is never requested and its download fails like any other.
+ */
+async function withTeamHosts<T>(source: VendoredSource, work: () => Promise<T>): Promise<T> {
+  if (source.via === undefined) return work();
+  const original = globalThis.fetch;
+  globalThis.fetch = guardedFetch(teamUrlProblem, original);
+  try {
+    return await work();
+  } finally {
+    globalThis.fetch = original;
+  }
 }
 
 /** An index file of a well-known source, at either path `skills` reads. */

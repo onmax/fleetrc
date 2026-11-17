@@ -710,7 +710,11 @@ function ownHosts(): Set<string> {
  */
 export function isLocalHost(url: string): boolean {
   const raw = gitHost(url);
-  const host = raw === undefined ? undefined : canonicalHost(raw);
+  return localHost(raw === undefined ? undefined : canonicalHost(raw));
+}
+
+/** Whether `host`, as `canonicalHost` writes it, is this machine (see `isLocalHost`). */
+function localHost(host: string | undefined): boolean {
   if (!host) return true;
   if (host === "localhost" || host.endsWith(".localhost")) return true;
   if (ownHosts().has(host)) return true;
@@ -814,6 +818,40 @@ export async function teamGitProblem(spec: string, cwd = tmpdir()): Promise<stri
   if (urls.some((each) => isLocalHost(each!)))
     return `a team manifest names only repositories on another machine, not ${spec}${rewrite}, which is this machine`;
   return undefined;
+}
+
+/**
+ * Why a team manifest's source may not fetch `url`, or undefined when it may: an http or https
+ * URL on another machine, by the rule `isLocalHost` applies to git. This holds for an index or an
+ * npm registry a team manifest names, for every download either sends skillfleet to, and for
+ * each redirect on the way.
+ */
+export function teamUrlProblem(url: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    parsed = new URL("invalid:");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    return `a team manifest fetches only http or https URLs, not ${url}`;
+  // The host as fetch reads it, which a backslash or `user@` in the URL cannot disguise.
+  if (localHost(canonicalHost(parsed.hostname)))
+    return `a team manifest fetches only from another machine, not ${url}, which is this machine`;
+  return undefined;
+}
+
+/** Why a team manifest may not declare this source, or undefined when it may. */
+async function teamSourceProblem(source: VendoredSource): Promise<string | undefined> {
+  switch (source.kind) {
+    case "git":
+      return teamGitProblem(source.git);
+    case "index":
+      return teamUrlProblem(source.index);
+    case "npm":
+      // Without a registry, the package comes from the registry the user configured.
+      return source.registry === undefined ? undefined : teamUrlProblem(source.registry);
+  }
 }
 
 /** Reads and validates a manifest file; `prepare` may change its JSON first. */
@@ -928,12 +966,10 @@ export async function loadManifest(
           );
           continue;
         }
-        if (source.kind === "git") {
-          const problem = await teamGitProblem(source.git);
-          if (problem) {
-            warnings.push(`extends ${parent}: ignored source "${source.id}"; ${problem}`);
-            continue;
-          }
+        const problem = await teamSourceProblem(source);
+        if (problem) {
+          warnings.push(`extends ${parent}: ignored source "${source.id}"; ${problem}`);
+          continue;
         }
         if (ids.has(nameKey(source.id))) {
           warnings.push(

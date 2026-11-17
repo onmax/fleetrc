@@ -130,7 +130,7 @@ describe("well-known index", () => {
 });
 
 /** An index server like `http()` that never answers a request for a path in `stall`. */
-async function stallingHttp(): Promise<Http & { stall: Set<string> }> {
+async function stallingHttp(): Promise<Omit<Http, "named" | "redirects"> & { stall: Set<string> }> {
   const routes: Http["routes"] = new Map();
   const stall = new Set<string>();
   const server = createServer((req, res) => {

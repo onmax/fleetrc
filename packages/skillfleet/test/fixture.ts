@@ -266,7 +266,10 @@ export function machine({
     DO_NOT_TRACK: "1",
     NO_COLOR: "1",
     // Every Node process the test starts, skillfleet and what it runs, loads the scheduler guard.
-    NODE_OPTIONS: `--import=${pathToFileURL(join(guardDir, "scheduler-guard.mjs")).href}`,
+    // Every Node process also resolves *.skillfleet.test to 127.0.0.1 (test-hosts.mjs).
+    NODE_OPTIONS: ["scheduler-guard.mjs", "test-hosts.mjs"]
+      .map((file) => `--import=${pathToFileURL(join(guardDir, file)).href}`)
+      .join(" "),
     SKILLFLEET_TEST_ROOT: root,
     SKILLFLEET_TEST_SCHEDULER: scheduler,
     SKILLFLEET_TEST_SCHEDULER_LOG: schedulerLog,
@@ -397,10 +400,13 @@ async function gitServer(): Promise<string> {
 }
 
 /**
- * The git server's host name. A team manifest may not name this machine, a loopback address
- * included, so the server goes by a name that git's `http.curloptResolve` maps to 127.0.0.1.
+ * The domain test servers go by. A team manifest may not name this machine, a loopback address
+ * included, so a server a team manifest names goes by a name under it, which git's
+ * `http.curloptResolve` and Node's test-hosts.mjs send to 127.0.0.1.
  */
-const GIT_SERVER_NAME = "git-server.skillfleet.test";
+const TEST_DOMAIN = "skillfleet.test";
+/** The git server's host name. */
+const GIT_SERVER_NAME = `git-server.${TEST_DOMAIN}`;
 
 const GIT_SERVER = await gitServer();
 
@@ -502,19 +508,30 @@ export const sha256 = (data: Uint8Array) => createHash("sha256").update(data).di
 // HTTP: a well-known skills index and an npm registry.
 
 export interface Http {
+  /** The server on 127.0.0.1, a loopback address. */
   url: string;
+  /** The server as `<name>.skillfleet.test`, which is no loopback name and reaches 127.0.0.1. */
+  named(name: string): string;
   routes: Map<string, { body: Uint8Array | string; type: string }>;
+  /** Paths the server redirects (302) to another URL. */
+  redirects: Map<string, string>;
   /** Runs before each request is answered, which waits for it. */
   before?: (path: string) => void | Promise<void>;
   close(): Promise<void>;
 }
 
 export async function http(): Promise<Http> {
-  const routes = new Map<string, { body: Uint8Array | string; type: string }>();
+  const routes: Http["routes"] = new Map();
+  const redirects = new Map<string, string>();
   const server = createServer((req, res) => {
     const path = new URL(req.url ?? "/", "http://x").pathname;
     void (async () => {
       await self.before?.(path);
+      const location = redirects.get(path);
+      if (location !== undefined) {
+        res.writeHead(302, { location }).end();
+        return;
+      }
       const route = routes.get(path);
       if (!route) {
         res.writeHead(404).end("not found");
@@ -529,11 +546,20 @@ export async function http(): Promise<Http> {
   if (!address || typeof address === "string") throw new Error("no port");
   const self: Http = {
     url: `http://127.0.0.1:${address.port}`,
+    named: (name) => named(`http://127.0.0.1:${address.port}`, name),
     routes,
+    redirects,
     close: () => new Promise((done) => server.close(() => done())),
   };
   return self;
 }
+
+/**
+ * A test server's URL on 127.0.0.1 under the name `<name>.skillfleet.test`, which is no loopback
+ * name, so a team manifest may name it.
+ */
+export const named = (url: string, name: string) =>
+  url.replace("//127.0.0.1:", `//${name}.${TEST_DOMAIN}:`);
 
 export interface IndexSkill {
   name: string;
@@ -543,7 +569,7 @@ export interface IndexSkill {
 }
 
 /** A v0.2.0 index of archive skills at `/.well-known/agent-skills/`, the way vite-hub/skills serves them. */
-export function serveIndexV2(server: Http, list: IndexSkill[]) {
+export function serveIndexV2(server: Pick<Http, "routes">, list: IndexSkill[]) {
   const entries = list.map((skill) => {
     const archive = tgz(skill.files);
     const path = `/.well-known/agent-skills/${skill.name}.tar.gz`;
@@ -572,7 +598,7 @@ export function serveIndexV2(server: Http, list: IndexSkill[]) {
 
 /** A v0.1 index (file lists, no digests) at `/.well-known/skills/`. */
 export function serveIndexV1(
-  server: Http,
+  server: Pick<Http, "routes">,
   list: { name: string; files: Record<string, string> }[],
 ) {
   for (const skill of list)
@@ -593,12 +619,16 @@ export function serveIndexV1(
   });
 }
 
-/** Publishes `name@version` with these files (under `package/`) to a fake registry. */
+/**
+ * Publishes `name@version` with these files (under `package/`) to a fake registry, its tarballs
+ * named under `base`.
+ */
 export function publishNpm(
   server: Http,
   name: string,
   versions: Record<string, Files>,
   latest: string,
+  base = server.url,
 ) {
   const packument = { name, "dist-tags": { latest }, versions: {} as Record<string, unknown> };
   for (const [version, files] of Object.entries(versions)) {
@@ -615,7 +645,7 @@ export function publishNpm(
       name,
       version,
       dist: {
-        tarball: `${server.url}${path}`,
+        tarball: `${base}${path}`,
         integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
       },
     };

@@ -206,6 +206,45 @@ function verify(bytes: Uint8Array, dist: Record<string, unknown>, label: string)
   throw new Error(`${label}: the registry gave no integrity hash`);
 }
 
+const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+const MAX_REDIRECTS = 20;
+
+/**
+ * `fetch`, with each URL it would request checked by `problem` first: the one asked for and every
+ * redirect, which it follows itself, as fetch does. A URL with a problem is never requested.
+ */
+export function guardedFetch(
+  problem: (url: string) => string | undefined,
+  base: typeof fetch = globalThis.fetch,
+): typeof fetch {
+  return async (input, init) => {
+    let url = input instanceof Request ? input.url : String(input);
+    const first = problem(url);
+    if (first) throw new Error(first);
+    if (init?.redirect === "manual" || init?.redirect === "error") return base(input, init);
+    let options: RequestInit =
+      input instanceof Request
+        ? { method: input.method, headers: input.headers, signal: input.signal, ...init }
+        : { ...init };
+    for (let hops = 0; ; hops++) {
+      const response = await base(url, { ...options, redirect: "manual" });
+      const location = response.headers.get("location");
+      if (!REDIRECTS.has(response.status) || location === null) return response;
+      await response.body?.cancel();
+      if (hops === MAX_REDIRECTS) throw new Error(`${url}: more than ${MAX_REDIRECTS} redirects`);
+      const to = new URL(location, url).toString();
+      const why = problem(to);
+      if (why) throw new Error(`${url} redirects to ${to}; ${why}`);
+      // As fetch does: a token stays with its origin, and a 303 is followed with a GET.
+      const headers = new Headers(options.headers);
+      if (urlOrigin(to) !== urlOrigin(url)) headers.delete("authorization");
+      options = { ...options, headers };
+      if (response.status === 303) options = { ...options, method: "GET", body: undefined };
+      url = to;
+    }
+  };
+}
+
 /**
  * Downloads an npm package into `cacheRoot/<name>@<version>` and returns that folder.
  * `skills` has no npm source type; it discovers skills in the unpacked folder like any local path.
@@ -214,7 +253,14 @@ export async function fetchNpm(
   spec: string,
   registry: string | undefined,
   cacheRoot: string,
-  { sendToken = true }: { sendToken?: boolean } = {},
+  {
+    sendToken = true,
+    fetch = globalThis.fetch,
+  }: {
+    sendToken?: boolean;
+    /** What fetches the packument and the tarball. */
+    fetch?: typeof globalThis.fetch;
+  } = {},
 ) {
   const { name, want } = parseNpmSpec(spec);
   if (!PACKAGE_NAME.test(name)) throw new Error(`npm "${name}" is not a package name`);

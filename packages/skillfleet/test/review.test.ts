@@ -1,6 +1,7 @@
 // Regression cases for an independent review of main at a05dd0d (CX1–CX9), and a second one of
-// fix/round3 at 11cd125 (CX10–CX17): security and data-loss bugs, each reproduced here first. Every run uses the fixture's temporary HOME, and every scheduler
-// call goes to the fixture's fake.
+// fix/round3 at 11cd125 (CX10–CX17) and ab042b4 (CX18): security and data-loss bugs, each
+// reproduced here first. Every run uses the fixture's temporary HOME, and every scheduler call
+// goes to the fixture's fake.
 import {
   appendFileSync,
   existsSync,
@@ -19,7 +20,7 @@ import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { changedFiles, hashDir } from "../src/fs.ts";
-import { isRemoteGit, rewriteUrl } from "../src/manifest.ts";
+import { isRemoteGit, rewriteUrl, teamUrlProblem } from "../src/manifest.ts";
 import { loadState, saveState, type State } from "../src/state.ts";
 import { type LockHolder, LockHeldError, takeLock } from "../src/sync.ts";
 import {
@@ -29,6 +30,7 @@ import {
   machine,
   type Machine,
   names,
+  publishNpm,
   read,
   remote,
   serveIndexV1,
@@ -997,5 +999,155 @@ describe("CX17. a team manifest's extends follows the team source rules", () => 
     const run = await init(m, manifest);
     expect(names(m.at(".claude/skills"))).not.toContain("leak");
     expect(run.warnings.join("\n")).toMatch(/extends/);
+  });
+});
+
+describe("CX18. a team index or npm registry on this machine is refused, redirects included", () => {
+  const inside = { name: "inside", files: { "SKILL.md": skillMd("inside") } };
+
+  it("CX18. a team index served over loopback is refused, and the root manifest may use it", async () => {
+    const m = machine();
+    const site = await http();
+    serveIndexV2(site, [inside]);
+    const run = await init(m, teamOf(m, { sources: [{ id: "site", index: site.url }] }));
+    expect(names(m.at(".claude/skills"))).not.toContain("inside");
+    expect(run.warnings.join("\n")).toMatch(/ignored source "site".*this machine/);
+    const own = m.manifest({ agents: ["claude-code"], sources: [{ id: "mine", index: site.url }] });
+    expect((await m.run("init", own, "--no-timer")).code).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["inside"]);
+  });
+
+  it("CX18. a team index on another machine is fetched", async () => {
+    const m = machine();
+    const site = await http();
+    serveIndexV2(site, [inside]);
+    const run = await init(m, teamOf(m, { sources: [{ id: "site", index: site.named("index") }] }));
+    expect(run.warnings.join("\n")).not.toContain("this machine");
+    expect(names(m.at(".claude/skills"))).toEqual(["inside"]);
+  });
+
+  it.each([
+    { to: "127.0.0.1", target: (local: string) => local },
+    { to: "169.254.169.254", target: () => "http://169.254.169.254" },
+  ])("CX18. a team index whose index file redirects to $to is refused", async ({ target }) => {
+    const m = machine();
+    const local = await http();
+    serveIndexV2(local, [inside]);
+    const site = await http();
+    for (const path of [".well-known/agent-skills/index.json", ".well-known/skills/index.json"])
+      site.redirects.set(`/${path}`, `${target(local.url)}/${path}`);
+    let reached = false;
+    local.before = () => {
+      reached = true;
+    };
+    const run = await init(m, teamOf(m, { sources: [{ id: "site", index: site.named("index") }] }));
+    expect(names(m.at(".claude/skills"))).not.toContain("inside");
+    expect(reached).toBe(false);
+    expect([...run.errors, ...run.warnings].join("\n")).toMatch(/this machine/);
+  });
+
+  it("CX18. a team index whose archive is listed or redirected on loopback is refused", async () => {
+    const m = machine();
+    const local = await http();
+    serveIndexV2(local, [inside, { name: "moved", files: { "SKILL.md": skillMd("moved") } }]);
+    const site = await http();
+    serveIndexV2(site, [inside, { name: "moved", files: { "SKILL.md": skillMd("moved") } }]);
+    // The index names one archive on loopback, and the site redirects the other there.
+    const index = JSON.parse(
+      String(site.routes.get("/.well-known/agent-skills/index.json")!.body),
+    ) as { skills: { name: string; url: string }[] };
+    index.skills[0]!.url = `${local.url}/.well-known/agent-skills/inside.tar.gz`;
+    site.routes.set("/.well-known/agent-skills/index.json", {
+      body: JSON.stringify(index),
+      type: "application/json",
+    });
+    site.redirects.set(
+      "/.well-known/agent-skills/moved.tar.gz",
+      `${local.url}/.well-known/agent-skills/moved.tar.gz`,
+    );
+    let reached = false;
+    local.before = () => {
+      reached = true;
+    };
+    const run = await init(m, teamOf(m, { sources: [{ id: "site", index: site.named("index") }] }));
+    expect(names(m.at(".claude/skills"))).toEqual([]);
+    expect(reached).toBe(false);
+    expect([...run.errors, ...run.warnings].join("\n")).toMatch(/this machine/);
+  });
+
+  const files = { "1.0.0": { "skills/from-npm/SKILL.md": skillMd("from-npm") } };
+
+  it("CX18. a team npm registry on loopback is refused, and the root manifest may use it", async () => {
+    const m = machine();
+    const registry = await http();
+    publishNpm(registry, "@acme/skills", files, "1.0.0");
+    const source = { id: "pkg", npm: "@acme/skills", registry: registry.url };
+    const run = await init(m, teamOf(m, { sources: [source] }));
+    expect(names(m.at(".claude/skills"))).not.toContain("from-npm");
+    expect(run.warnings.join("\n")).toMatch(/ignored source "pkg".*this machine/);
+    const own = m.manifest({ agents: ["claude-code"], sources: [source] });
+    expect((await m.run("init", own, "--no-timer")).code).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["from-npm"]);
+  });
+
+  it("CX18. a team npm registry on another machine is fetched", async () => {
+    const m = machine();
+    const registry = await http();
+    publishNpm(registry, "@acme/skills", files, "1.0.0", registry.named("registry"));
+    const source = { id: "pkg", npm: "@acme/skills", registry: registry.named("registry") };
+    const run = await init(m, teamOf(m, { sources: [source] }));
+    expect(run.warnings.join("\n")).not.toContain("this machine");
+    expect(names(m.at(".claude/skills"))).toEqual(["from-npm"]);
+  });
+
+  it.each([
+    { what: "its tarball on loopback", redirect: false },
+    { what: "a redirect of its packument to loopback", redirect: true },
+  ])("CX18. a team npm registry that gives $what is refused", async ({ redirect }) => {
+    const m = machine();
+    const local = await http();
+    publishNpm(local, "@acme/skills", files, "1.0.0");
+    const registry = await http();
+    if (redirect) registry.redirects.set("/@acme%2fskills", `${local.url}/@acme%2fskills`);
+    // Without the redirect, the packument names its tarball on loopback.
+    else publishNpm(registry, "@acme/skills", files, "1.0.0", local.url);
+    let reached = false;
+    local.before = () => {
+      reached = true;
+    };
+    const source = { id: "pkg", npm: "@acme/skills", registry: registry.named("registry") };
+    const run = await init(m, teamOf(m, { sources: [source] }));
+    expect(names(m.at(".claude/skills"))).not.toContain("from-npm");
+    expect(reached).toBe(false);
+    expect([...run.errors, ...run.warnings].join("\n")).toMatch(/this machine/);
+  });
+
+  it("CX18. each URL a team manifest may fetch is on another machine, over http or https", () => {
+    const local = [
+      "http://127.0.0.1:8080",
+      "http://localhost/",
+      "https://LOCALHOST./skills",
+      "http://169.254.169.254/latest/meta-data",
+      "http://[::1]:4873",
+      "http://[::ffff:7f00:1]/",
+      "http://0x7f000001/",
+      "http://2130706433/",
+      "http://0.0.0.0:3000",
+      "http://[fe80::1]/",
+      // A URL parser reads the backslash as a slash, so the host is 127.0.0.1.
+      "http://127.0.0.1\\@skills.example.com/",
+      `http://${hostname()}:8080/`,
+    ];
+    const refused = ["file:///etc/skills", "ftp://skills.example.com/", "data:,{}", "not a url"];
+    const remote = [
+      "https://skills.example.com",
+      "http://user@skills.example.com:8080/",
+      "http://10.0.0.5:4873",
+      "https://192.168.1.20/",
+      "https://registry.npmjs.org",
+    ];
+    for (const url of local) expect(teamUrlProblem(url), url).toMatch(/this machine/);
+    for (const url of refused) expect(teamUrlProblem(url), url).toMatch(/http or https/);
+    for (const url of remote) expect(teamUrlProblem(url), url).toBeUndefined();
   });
 });
