@@ -1,9 +1,9 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join, sep } from "node:path";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { exec, git } from "./exec.ts";
-import { lstat } from "./fs.ts";
+import { isErrno, lstat } from "./fs.ts";
 import { gitUrl } from "./gitcache.ts";
 import { linkTarget } from "./linker.ts";
 import { loadManifest, readConfig, remoteManifest, type Source } from "./manifest.ts";
@@ -289,9 +289,16 @@ export async function doctor(manifest?: string): Promise<Check[]> {
   // Agent folders should agree on where each name points.
   const targets = await agentTargets(loaded.root.agents);
   const pointsTo = new Map<string, Set<string>>();
+  // A folder that links to another agent folder is merged into it by `agentTargets`; any other
+  // link is skipped by sync, so that agent shows none of the skills.
+  const skipped: string[] = [];
   for (const target of targets) {
     const stat = lstat(target.dir);
-    if (!stat || stat.isSymbolicLink()) continue;
+    if (stat?.isSymbolicLink()) {
+      skipped.push(`${tildify(target.dir)} is ${linkShape(target.dir)}`);
+      continue;
+    }
+    if (!stat) continue;
     for (const name of skillNames(target.dir)) {
       const path = join(target.dir, name);
       const resolved = lstat(path)?.isSymbolicLink() ? linkTarget(path) : path;
@@ -299,15 +306,36 @@ export async function doctor(manifest?: string): Promise<Check[]> {
     }
   }
   const split = [...pointsTo].filter(([, dirs]) => dirs.size > 1).map(([name]) => name);
+  const problems = [
+    ...(split.length > 0 ? [`different copies of ${split.join(", ")} across agent folders`] : []),
+    ...(skipped.length > 0
+      ? [
+          `${skipped.join("; ")}, so sync links no skill there; run \`skillfleet init\` to make it a folder of one link per skill`,
+        ]
+      : []),
+  ];
   checks.push({
     name: "agents agree",
-    ok: split.length === 0,
+    ok: problems.length === 0,
     detail:
-      split.length === 0
+      problems.length === 0
         ? `${targets.length} agent folders show the same skills`
-        : `different copies of ${split.join(", ")} across agent folders`,
+        : problems.join("; "),
   });
   return checks;
+}
+
+/** What the agent folder `dir`, a link, leads to. */
+function linkShape(dir: string): string {
+  const to = tildify(linkTarget(dir));
+  try {
+    realpathSync(dir);
+    return `a link to ${to}`;
+  } catch (error) {
+    return isErrno(error, "ELOOP")
+      ? `a link to ${to} that leads back to itself`
+      : `a link to ${to}, which does not exist`;
+  }
 }
 
 export const formatChecks = (checks: readonly Check[]) =>
