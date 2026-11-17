@@ -324,7 +324,7 @@ describe("init", () => {
       expect(dry.code, dry.stdout + dry.stderr).toBe(0);
       const clone = dry.stdout.indexOf("clone ");
       const adopt = dry.stdout.indexOf(
-        "adopt ~/.claude/skills/handmade into ~/code/mine/skills/handmade",
+        `adopt ${join("~", ".claude", "skills", "handmade")} into ${join("~", "code", "mine", "skills", "handmade")}`,
       );
       expect(clone).toBeGreaterThan(-1);
       expect(adopt).toBeGreaterThan(clone);
@@ -340,9 +340,9 @@ describe("init", () => {
       const m = machine();
       const team = newMachine(m, { reachable: false });
       const init = await m.run("init", team.url, "--no-timer");
-      expect(init.stdout + init.stderr).toMatch(
-        /could not clone mine into ~\/code\/mine .*nothing is adopted/,
-      );
+      const said = init.stdout + init.stderr;
+      expect(said).toContain(`could not clone mine into ${join("~", "code", "mine")} (`);
+      expect(said).toContain("so nothing is adopted");
       expect(read(m.at(".claude/skills/handmade/SKILL.md"))).toBe(skillMd("handmade"));
       expect(isLink(m.at(".claude/skills/handmade"))).toBe(false);
       expect(existsSync(m.at("code/mine"))).toBe(false);
@@ -359,7 +359,9 @@ describe("init", () => {
       }>("init", team.url, "--dry-run", "--no-timer");
       expect(dry.migrations.map((migration) => migration.kind)).toEqual([]);
       expect(dry.lost).toEqual([]);
-      expect(dry.warnings.join("\n")).toContain("~/code/mine exists and is not a git repository");
+      expect(dry.warnings.join("\n")).toContain(
+        `${join("~", "code", "mine")} exists and is not a git repository`,
+      );
       await m.run("init", team.url, "--no-timer");
       expect(read(m.at(".claude/skills/handmade/SKILL.md"))).toBe(skillMd("handmade"));
       expect(existsSync(m.at("code/mine/skills"))).toBe(false);

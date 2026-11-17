@@ -288,7 +288,13 @@ async function usable(repo: string): Promise<boolean> {
   const run = await git(["rev-parse", "--absolute-git-dir"], { cwd: repo, allowFail: true });
   if (run.code === null && !run.timedOut) throw new GitError(["rev-parse"], run);
   const gitDir = run.code === 0 ? run.stdout.trim() : undefined;
-  return gitDir !== undefined && realpathSync(gitDir) === realpathSync(repo);
+  if (gitDir === undefined) return false;
+  // The native realpath expands Windows 8.3 names (RUNNER~1), which git prints in full.
+  const real = (path: string) => {
+    const resolved = realpathSync.native(path);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  return real(gitDir) === real(repo);
 }
 
 /** Splits `<repo>//<path>` (as in `github:org/repo//skills.json`) into the repository and the file. */

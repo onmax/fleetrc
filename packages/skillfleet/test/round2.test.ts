@@ -403,7 +403,7 @@ describe("what users paste", () => {
     const m = machine();
     const run = await m.run("agents", "--manifest", m.at("nope/skills.json"));
     expect(run.code).not.toBe(0);
-    expect(run.stderr).toContain("nope/skills.json");
+    expect(run.stderr).toContain(join("nope", "skills.json"));
   });
 
   it("R2-17. PATH advice for csh and nushell users is in their shell's syntax and file", () => {
