@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { applyPlan, type InitPlan } from "../src/init.ts";
 import { timerNode } from "../src/timer.ts";
 import {
   clone,
@@ -93,6 +94,34 @@ describe("linked skill folders", () => {
       // Linked, Claude Code reads the guide through the clone; copied, the link must still lead to it.
       expect(read(join(work, "skills/tool/refs/guide.md"))).toBe("the guide\n");
       expect(read(m.at(".claude/skills/tool/refs/guide.md"))).toBe("the guide\n");
+      // What the copy holds is what the next copy would hold, so it is not copied again.
+      const again = await m.json("sync", "--copy");
+      expect(again.targets.flatMap((target) => target.created)).toEqual([]);
+      expect(again.targets.flatMap((target) => target.warnings)).toEqual([]);
+    },
+  );
+
+  it.skipIf(isWindows)(
+    "R5-2. copy mode leaves out, with a warning, a link in a working clone's skill that leads out of the clone",
+    async () => {
+      const m = machine();
+      const r = remote(m, "personal", skills("skills/", "tool"));
+      mkdirSync(m.at("private"), { recursive: true });
+      writeFileSync(m.at("private/notes.md"), "not for the copy\n");
+      commitLink(m, r.work, "skills/tool/notes", m.at("private"));
+      const work = clone(m, r, "code/skills");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "personal", git: r.url, path: work, skills: "skills/*" }],
+      });
+      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      const copied = await m.json("sync", "--copy");
+      expect(copied.errors).toEqual([]);
+      expect(copied.targets.flatMap((target) => target.warnings).join("\n")).toMatch(
+        /notes links to a place outside the source, so the copy in ~\/\.claude\/skills\/tool leaves it out/,
+      );
+      expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+      expect(existsSync(m.at(".claude/skills/tool/notes"))).toBe(false);
     },
   );
 
@@ -161,6 +190,18 @@ describe("the crash-safe store", () => {
     expect(read(m.at(".claude/skills", linked!, "SKILL.md"))).toBe(skillMd("tool", "my edit"));
     expect(readdirSync(live).filter((name) => name.includes(".rename"))).toEqual([]);
   });
+
+  it("R5-6. an agent folder's link a sync killed mid-rename left under its temporary name goes back", async () => {
+    const m = machine();
+    const { vendor } = await vendored(m);
+    vendor.commit({ "skills/tool": null, ...skills("skills/", "Tool") });
+    const agent = m.at(".claude/skills");
+    // Killed after the link step moved tool to its third name, before it named it Tool.
+    renameSync(join(agent, "tool"), join(agent, "tool.2147483.rename"));
+    const report = await m.json("sync");
+    expect(report.errors).toEqual([]);
+    expect(names(agent)).toEqual(["Tool"]);
+  });
 });
 
 describe("agent folders that link to one another", () => {
@@ -223,6 +264,10 @@ describe("links pasted from a browser", () => {
       id: "r",
       git: "https://gitlab.com/g/r",
     });
+    expect(await added("https://git.example.com/team/r.git/")).toEqual({
+      id: "r",
+      git: "https://git.example.com/team/r.git",
+    });
   });
 
   it("R5-9. add decodes a folder link's percent-encoded path, as the browser's address bar shows it", async () => {
@@ -281,24 +326,30 @@ describe("the timer's own record of its node", () => {
 });
 
 describe("a state.json of another shape", () => {
-  it("R5-11. a source record without pending (or with hashes that are no object) never unlinks the skill", async () => {
-    const m = machine();
-    const { vendor } = await vendored(m);
-    // Top-level shape as this version writes it; the source record is one an older build wrote.
-    writeFileSync(
-      join(m.stateDir, "state.json"),
-      JSON.stringify({
-        version: 1,
-        sources: { vendor: { kind: "git", skills: { tool: { hashes: {} } } } },
-        skills: {},
-      }),
-    );
-    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
-    const report = await m.json("sync");
-    expect(report.errors).toEqual([]);
-    expect(report.skills.removed).toEqual([]);
-    expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
-  });
+  for (const [shape, record] of [
+    ["without pending", { kind: "git", skills: { tool: { hashes: {} } } }],
+    [
+      "with hashes that are no object",
+      { kind: "git", skills: { tool: { hashes: "x" } }, pending: {} },
+    ],
+    ["with a pending update of another shape", { kind: "git", skills: {}, pending: { tool: 1 } }],
+  ] as const)
+    it(`R5-11. a source record ${shape} never unlinks the skill`, async () => {
+      const m = machine();
+      const { vendor } = await vendored(m);
+      // Top-level shape as this version writes it; the source record is one an older build wrote.
+      writeFileSync(
+        join(m.stateDir, "state.json"),
+        JSON.stringify({ version: 1, sources: { vendor: record }, skills: {} }),
+      );
+      vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
+      const report = await m.json("sync");
+      expect(report.errors).toEqual([]);
+      expect(report.skills.removed).toEqual([]);
+      // A record of no files would make every file an edit; one that can't be read is rebuilt.
+      if (shape !== "without pending") expect(report.edited).toEqual([]);
+      expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+    });
 });
 
 describe("init clones an adopt source before adopting", () => {
@@ -329,6 +380,28 @@ describe("init clones an adopt source before adopting", () => {
       ? JSON.stringify(readdirSync(backup, { recursive: true }))
       : "";
     expect(kept === skillMd("tool", "hand-made") || backedUp.includes("tool"), all).toBe(true);
+  });
+
+  it("R5-12. init moves nothing when one of its moves would fail", () => {
+    const root = mkdtempSync(join(tmpdir(), "skillfleet-r5-12-"));
+    try {
+      const at = (...parts: string[]) => join(root, ...parts);
+      for (const name of ["a", "b"]) mkdirSync(at("agent", name), { recursive: true });
+      // b's name was taken after init planned to adopt it.
+      mkdirSync(at("clone", "b"), { recursive: true });
+      writeFileSync(at("clone", "b", "SKILL.md"), skillMd("b"));
+      const plan = {
+        migrations: [
+          { kind: "adopt", path: at("agent", "a"), to: at("clone", "a") },
+          { kind: "adopt", path: at("agent", "b"), to: at("clone", "b") },
+        ],
+      } as unknown as InitPlan;
+      expect(() => applyPlan(plan)).toThrow(/init changed nothing: .*clone\/b exists/);
+      expect(readdirSync(at("agent")).sort()).toEqual(["a", "b"]);
+      expect(readdirSync(at("clone"))).toEqual(["b"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
