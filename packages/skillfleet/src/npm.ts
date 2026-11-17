@@ -84,7 +84,20 @@ export const FETCH_LIMITS = {
   idleMs: waitMs,
   totalMs: 5 * 60_000,
   sourceMs: 15 * 60_000,
+  /** Downloads of one source at a time: `skills` starts every file of a skill at once. */
+  concurrent: 8,
 };
+
+/**
+ * What a source's downloads may hold: `withCappedFetch` refuses a download it gives a reason for.
+ * The budget reports its own refusals; they do not go into `refused`.
+ */
+export interface FetchBudget {
+  /** Why `url` is not downloaded at all. */
+  before(url: string): string | undefined;
+  /** Why the body of `url` is refused; `unpacked` is a gzip body, unpacked. */
+  after(url: string, body: Uint8Array, unpacked: Buffer | undefined): string | undefined;
+}
 
 /**
  * Runs `work` with every fetch it makes read whole under the tarball limit, and a gzip body
@@ -92,15 +105,36 @@ export const FETCH_LIMITS = {
  * server takes longer than `FETCH_LIMITS` allows, and so is every fetch once `work` has spent
  * `sourceMs`. The `skills` package downloads and unpacks index archives without a limit or a
  * timeout, and drops the skill when its fetch fails, so why a download was refused goes into
- * `refused`.
+ * `refused`. At most `FETCH_LIMITS.concurrent` downloads run at once, and `budget` may refuse one
+ * before it starts or once its body is in.
  */
-export async function withCappedFetch<T>(work: () => Promise<T>, refused: string[]): Promise<T> {
+export async function withCappedFetch<T>(
+  work: () => Promise<T>,
+  refused: string[],
+  budget?: FetchBudget,
+): Promise<T> {
   const original = globalThis.fetch;
   const source = AbortSignal.timeout(FETCH_LIMITS.sourceMs);
+  let running = 0;
+  const waiting: (() => void)[] = [];
+  const slot = async () => {
+    if (running < FETCH_LIMITS.concurrent) running++;
+    else await new Promise<void>((done) => waiting.push(done));
+  };
+  // A finished download hands its slot to the next one waiting.
+  const release = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else running--;
+  };
   globalThis.fetch = async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
+    const early = budget?.before(url);
+    if (early) throw new Error(`${url} ${early}`);
+    await slot();
     const stop = new AbortController();
     let why = "";
+    let over: string | undefined;
     const after = (ms: number, what: string) =>
       setTimeout(() => {
         why = what;
@@ -121,9 +155,12 @@ export async function withCappedFetch<T>(work: () => Promise<T>, refused: string
           clearTimeout(idle);
           idle = after(FETCH_LIMITS.idleMs, `sent nothing for ${FETCH_LIMITS.idleMs / 1000} s`);
         });
-        if (body[0] === 0x1f && body[1] === 0x8b) gunzipCapped(body);
+        const unpacked = body[0] === 0x1f && body[1] === 0x8b ? gunzipCapped(body) : undefined;
+        over = response.ok ? budget?.after(url, body, unpacked) : undefined;
+        if (over) throw new Error(`${url} ${over}`);
       }
     } catch (error) {
+      if (over) throw error;
       const message = why
         ? why
         : source.aborted
@@ -134,6 +171,7 @@ export async function withCappedFetch<T>(work: () => Promise<T>, refused: string
     } finally {
       clearTimeout(total);
       clearTimeout(idle);
+      release();
     }
     const capped = new Response(body as Uint8Array<ArrayBuffer> | null, {
       status: response.status,

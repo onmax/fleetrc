@@ -1,5 +1,5 @@
-// Regression cases for an independent review of main at a05dd0d (CX1–CX9): security and data-loss
-// bugs, each reproduced here first. Every run uses the fixture's temporary HOME, and every scheduler
+// Regression cases for an independent review of main at a05dd0d (CX1–CX9), and a second one of
+// fix/round3 at 11cd125 (CX10–CX17): security and data-loss bugs, each reproduced here first. Every run uses the fixture's temporary HOME, and every scheduler
 // call goes to the fixture's fake.
 import {
   appendFileSync,
@@ -13,7 +13,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { gzipSync } from "node:zlib";
@@ -31,6 +31,8 @@ import {
   names,
   read,
   remote,
+  serveIndexV1,
+  serveIndexV2,
   type Files,
   type Report,
   sha256,
@@ -603,4 +605,397 @@ describe("CX9. index archives are capped before `skills` reads them", () => {
     expect(names(m.at(".claude/skills"))).not.toContain("bomb");
     expect([...run.errors, ...run.warnings].join("\n")).toMatch(/100 MB/);
   }, 60_000);
+});
+
+// A second review, of fix/round3 at 11cd125 (CX10–CX17).
+
+describe("CX10. edits in a copy are adopted only into the source folder itself", () => {
+  /** A working clone whose skill holds `payload`, a link to `target`, synced as copies. */
+  async function copiedWithLink(target: (m: Machine) => string) {
+    const m = machine();
+    const personal = remote(m, "personal", skills("skills/", "tool"));
+    const to = target(m);
+    commitLink(m, personal.work, "skills/tool/payload", to);
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+    const run = await m.run("init", manifest, "--no-timer", "--copy");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    return { m, work, copy: m.at(".claude/skills/tool") };
+  }
+
+  it.skipIf(isWindows)(
+    "CX10. a file added under a link out of the clone, which the copy left out, is not written outside",
+    async () => {
+      const { m, copy } = await copiedWithLink((m) => {
+        const outside = join(m.root, "outside");
+        writeFiles(outside, { config: "keep\n" });
+        return outside;
+      });
+      expect(existsSync(join(copy, "payload"))).toBe(false);
+      writeFiles(copy, { "payload/config": "overwritten\n" });
+      const report = await m.json("sync");
+      expect(read(join(m.root, "outside", "config"))).toBe("keep\n");
+      expect(report.warnings.join("\n")).toContain("could not be moved");
+    },
+  );
+
+  it.skipIf(isWindows)(
+    "CX10. a file under a link inside the clone is not written through the link",
+    async () => {
+      const { m, work, copy } = await copiedWithLink(() => "../../docs");
+      writeFiles(work, { "docs/notes.md": "keep\n" });
+      await m.run("sync");
+      expect(read(join(copy, "payload", "notes.md"))).toBe("keep\n");
+      writeFileSync(join(copy, "payload", "notes.md"), "overwritten\n");
+      await m.run("sync");
+      expect(read(join(work, "docs", "notes.md"))).toBe("keep\n");
+    },
+  );
+});
+
+/** An HTTP server for an index whose answers the test can hold or act on. */
+async function indexSite() {
+  const site = await http();
+  const serve = (list: Record<string, Files>) =>
+    serveIndexV2(
+      site,
+      Object.entries(list).map(([name, files]) => ({ name, files })),
+    );
+  return { site, serve };
+}
+
+describe("CX11. an upstream removal keeps an edit saved during the fetch", () => {
+  it("CX11. a skill gone upstream, edited while the sync downloads, is not deleted", async () => {
+    const m = machine();
+    const { site, serve } = await indexSite();
+    serve({ alpha: { "SKILL.md": skillMd("alpha") }, beta: { "SKILL.md": skillMd("beta") } });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "site", index: site.url }],
+    });
+    await init(m, manifest);
+    const alpha = m.at(".claude/skills/alpha/SKILL.md");
+    expect(read(alpha)).toBe(skillMd("alpha"));
+    site.routes.clear();
+    serve({ beta: { "SKILL.md": skillMd("beta", "v2") } });
+    site.before = (path) => {
+      if (path.endsWith("/beta.tar.gz")) appendFileSync(alpha, "my edit\n");
+    };
+    const report = await m.json("sync");
+    expect(containing("my edit", m.home)).not.toEqual([]);
+    expect(report.skills.removed).not.toContain("alpha");
+    expect(report.warnings.join("\n")).toContain("alpha");
+  });
+});
+
+describe("CX12. links to files count toward the copy limits", () => {
+  it.skipIf(isWindows).each([
+    { what: "files", links: 10_001, size: 1, limit: /more than 10000 files/ },
+    { what: "bytes", links: 201, size: 1024 * 1024, limit: /more than 200 MB/ },
+  ])(
+    "CX12. a skill past the $what limit through links to one file is not copied",
+    async ({ links, size, limit }) => {
+      const m = machine();
+      const vendor = remote(m, "vendor", {
+        ...skills("skills/", "tool"),
+        "skills/tool/data.bin": Buffer.alloc(size, 7),
+      });
+      for (let i = 0; i < links; i++)
+        symlinkSync("data.bin", join(vendor.work, "skills/tool", `l${i}`));
+      m.git(vendor.work, "add", "-A");
+      m.git(vendor.work, "commit", "--quiet", "-m", "links");
+      m.git(vendor.work, "push", "--quiet", "origin", "main");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      });
+      const run = await init(m, manifest);
+      expect(names(m.at(".claude/skills"))).not.toContain("tool");
+      expect(existsSync(join(m.stateDir, "store", "vendor", "live", "tool"))).toBe(false);
+      expect(run.warnings.join("\n")).toMatch(limit);
+    },
+    120_000,
+  );
+});
+
+describe("CX13. index sources are held to the copy limits and download a few files at once", () => {
+  it("CX13. a legacy index skill past the file limit is refused before its files are fetched", async () => {
+    const m = machine();
+    const site = await http();
+    const files: Record<string, string> = { "SKILL.md": skillMd("big") };
+    for (let i = 0; i <= 10_000; i++) files[`f${i}.txt`] = "x\n";
+    serveIndexV1(site, [
+      { name: "big", files },
+      { name: "small", files: { "SKILL.md": skillMd("small") } },
+    ]);
+    let fetched = 0;
+    site.before = (path) => {
+      if (path.startsWith("/.well-known/skills/big/f")) fetched++;
+    };
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "site", index: site.url }],
+    });
+    const run = await init(m, manifest);
+    expect(names(m.at(".claude/skills"))).toEqual(["small"]);
+    expect(fetched).toBe(0);
+    expect([...run.warnings, ...run.errors].join("\n")).toMatch(/more than 10000 files/);
+  }, 120_000);
+
+  it("CX13. a legacy index skill's files download at most 8 at a time", async () => {
+    const m = machine();
+    const site = await http();
+    const files: Record<string, string> = { "SKILL.md": skillMd("many") };
+    for (let i = 0; i < 40; i++) files[`f${i}.txt`] = `${i}\n`;
+    serveIndexV1(site, [{ name: "many", files }]);
+    let open = 0;
+    let most = 0;
+    site.before = async () => {
+      most = Math.max(most, ++open);
+      await new Promise((done) => setTimeout(done, 20));
+      open--;
+    };
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "site", index: site.url }],
+    });
+    await init(m, manifest);
+    expect(names(m.at(".claude/skills"))).toEqual(["many"]);
+    expect(readdirSync(m.at(".claude/skills/many"))).toHaveLength(41);
+    expect(most).toBeGreaterThan(1);
+    expect(most).toBeLessThanOrEqual(8);
+  });
+
+  it("CX13. an index archive past the file limit is refused", async () => {
+    const m = machine();
+    const { site, serve } = await indexSite();
+    const files: Files = { "SKILL.md": skillMd("wide") };
+    for (let i = 0; i <= 10_000; i++) files[`f${i}`] = "";
+    serve({ wide: files, small: { "SKILL.md": skillMd("small") } });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "site", index: site.url }],
+    });
+    const run = await init(m, manifest);
+    expect(names(m.at(".claude/skills"))).toEqual(["small"]);
+    expect([...run.warnings, ...run.errors].join("\n")).toMatch(/more than 10000 files/);
+  }, 120_000);
+});
+
+describe("CX14. discovery in a working clone stays inside it", () => {
+  const malformed = (name: string) =>
+    `---\nname: ${name}\ndescription: [unclosed\n---\nPRIVATE ${name} body\n`;
+
+  it.skipIf(isWindows)(
+    "CX14. a SKILL.md that `skills` rejects, reached through a link out of the clone, is not linked",
+    async () => {
+      const m = machine();
+      const outside = join(m.root, "private");
+      writeFiles(outside, { "secret/SKILL.md": malformed("secret") });
+      const personal = remote(m, "personal", skills("skills/", "mine"));
+      commitLink(m, personal.work, ".agents/skills", outside);
+      const work = clone(m, personal, "code/skills");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "personal", git: personal.url, path: work }],
+      });
+      const run = await init(m, manifest);
+      expect(names(m.at(".claude/skills"))).toEqual(["mine"]);
+      expect(run.warnings.join("\n")).toContain(".agents/skills");
+    },
+  );
+
+  it.skipIf(isWindows)(
+    "CX14. a skill in the clone whose SKILL.md links out of it is not linked",
+    async () => {
+      const m = machine();
+      const outside = privateFolder(m);
+      const personal = remote(m, "personal", skills("skills/", "mine"));
+      commitLink(m, personal.work, "skills/tool/SKILL.md", join(outside, "secret", "SKILL.md"));
+      const work = clone(m, personal, "code/skills");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+      });
+      const run = await init(m, manifest);
+      expect(names(m.at(".claude/skills"))).toEqual(["mine"]);
+      expect(run.warnings.join("\n")).toContain("skills/tool");
+    },
+  );
+
+  it.skipIf(isWindows)(
+    "CX14. with followLinks, the clone's links out of it are still followed",
+    async () => {
+      const m = machine();
+      const outside = join(m.root, "private");
+      writeFiles(outside, { "secret/SKILL.md": malformed("secret") });
+      const personal = remote(m, "personal", skills("skills/", "mine"));
+      commitLink(m, personal.work, ".agents/skills", outside);
+      const work = clone(m, personal, "code/skills");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "personal", git: personal.url, path: work, followLinks: true }],
+      });
+      await init(m, manifest);
+      expect(names(m.at(".claude/skills"))).toEqual(["mine", "secret"]);
+    },
+  );
+});
+
+/** Runs init with --json under `env`: its sync report, with the plan's warnings added. */
+async function initWith(m: Machine, env: NodeJS.ProcessEnv, manifest: string): Promise<Report> {
+  const result = await m.runWith({ env }, "init", manifest, "--no-timer", "--json");
+  const out = JSON.parse(result.stdout) as { plan: { warnings?: string[] }; sync: Report };
+  return { ...out.sync, warnings: [...out.sync.warnings, ...(out.plan.warnings ?? [])] };
+}
+
+/** A team manifest outside the root manifest that declares `source`, and a root that extends it. */
+function teamOf(m: Machine, team: object) {
+  writeFiles(join(m.root, "team"), { "skills.json": JSON.stringify(team) });
+  return m.manifest({
+    agents: ["claude-code"],
+    extends: [join(m.root, "team", "skills.json")],
+    sources: [],
+  });
+}
+
+describe("CX15. a team source is checked with the git config git itself uses", () => {
+  const team = "https://mirror.skillfleet.test/private.git";
+  it.each([
+    {
+      via: "GIT_CONFIG_COUNT",
+      env: (to: string): NodeJS.ProcessEnv => ({
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: `url.${to}.insteadOf`,
+        GIT_CONFIG_VALUE_0: team,
+      }),
+    },
+    {
+      via: "GIT_CONFIG_PARAMETERS",
+      env: (to: string): NodeJS.ProcessEnv => ({
+        GIT_CONFIG_PARAMETERS: `'url.${to}.insteadof'='${team}'`,
+      }),
+    },
+  ])("CX15. an insteadOf rewrite to a path from $via is refused", async ({ env }) => {
+    const m = machine();
+    const local = remote(m, "private", skills("skills/", "private"));
+    const manifest = teamOf(m, { sources: [{ id: "team", git: team }] });
+    const run = await initWith(m, env(local.url.replace(/\\/g, "/")), manifest);
+    expect(names(m.at(".claude/skills"))).not.toContain("private");
+    expect(existsSync(join(m.stateDir, "store", "team"))).toBe(false);
+    expect(run.warnings.join("\n")).toMatch(/team.*remote/);
+  });
+});
+
+describe("CX16. a team source on this machine's own network address is refused", () => {
+  it("CX16. a team source served over loopback is refused, and the root manifest may use it", async () => {
+    const m = machine();
+    const local = remote(m, "private", skills("skills/", "private"));
+    const loopback = local.served.replace(/^http:\/\/[^/:]+/, "http://localhost");
+    const manifest = teamOf(m, { sources: [{ id: "team", git: loopback }] });
+    const run = await init(m, manifest);
+    expect(names(m.at(".claude/skills"))).not.toContain("private");
+    expect(run.warnings.join("\n")).toMatch(/team.*this machine/);
+    const own = m.manifest({ agents: ["claude-code"], sources: [{ id: "mine", git: loopback }] });
+    expect((await m.run("init", own, "--no-timer")).code).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["private"]);
+  });
+
+  it("CX16. each loopback or local spelling of a host is local", () => {
+    const local = [
+      "git://localhost/repo.git",
+      "http://LOCALHOST./repo.git",
+      "https://git.localhost/repo.git",
+      "ssh://127.0.0.1/repo.git",
+      "ssh://git@127.0.0.2:22/repo.git",
+      "https://127.1/repo.git",
+      "https://2130706433/repo.git",
+      "https://0x7f000001/repo.git",
+      "ssh://[::1]/repo.git",
+      "ssh://[0:0:0:0:0:0:0:1]/repo.git",
+      "https://[::ffff:127.0.0.1]/repo.git",
+      "git://0.0.0.0/repo.git",
+      "git://[::]/repo.git",
+      "http://169.254.169.254/repo.git",
+      "http://[fe80::1]/repo.git",
+      "LOCALHOST:/repo.git",
+      "git@localhost:repo.git",
+      "git@127.0.0.1:repo.git",
+      `${hostname()}:repo.git`,
+      `https://${hostname()}/repo.git`,
+    ];
+    const remote = [
+      "https://github.com/owner/repo.git",
+      "ssh://git@10.213.47.9/repo.git",
+      "https://192.168.213.47/team/repo.git",
+      "git@git.example.com:owner/repo.git",
+      "https://localhost.example.com/repo.git",
+    ];
+    for (const spec of local) expect(isRemoteGit(spec), spec).toBe(false);
+    for (const spec of remote) expect(isRemoteGit(spec), spec).toBe(true);
+  });
+});
+
+describe("CX17. a team manifest's extends follows the team source rules", () => {
+  /** A private repository holding a manifest whose source would install `leak`. */
+  function privateManifest(m: Machine) {
+    const vendor = remote(m, "vendor", skills("skills/", "leak"));
+    return remote(m, "private", {
+      "skills.json": JSON.stringify({ sources: [{ id: "leak", git: vendor.https }] }),
+    });
+  }
+
+  it.each([
+    { kind: "a file: URL", spec: (repo: string) => `${pathToFileURL(repo).href}//skills.json` },
+    { kind: "a path to a repository", spec: (repo: string) => `${repo}//skills.json` },
+    { kind: "a bare repository", spec: (repo: string) => repo },
+    {
+      kind: "a manifest file on this machine",
+      spec: (repo: string) => join(repo, "..", "..", "private", "skills.json"),
+    },
+    { kind: "a relative path out of the team folder", spec: () => "../private/skills.json" },
+  ])("CX17. a nested extends that is $kind is refused", async ({ spec }) => {
+    const m = machine();
+    const priv = privateManifest(m);
+    writeFiles(join(m.root, "private"), { "skills.json": read(join(priv.work, "skills.json")) });
+    const manifest = teamOf(m, { extends: [spec(priv.url)], sources: [] });
+    const run = await init(m, manifest);
+    expect(names(m.at(".claude/skills"))).not.toContain("leak");
+    expect(existsSync(join(m.stateDir, "cache", "manifests"))).toBe(false);
+    expect(run.warnings.join("\n")).toMatch(/extends/);
+  });
+
+  it("CX17. a team repository's manifest may extend another file in it, and a remote one", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const other = remote(m, "other", skills("skills/", "extra"));
+    const otherTeam = remote(m, "otherteam", {
+      "skills.json": JSON.stringify({ sources: [{ id: "other", git: other.https }] }),
+    });
+    const team = remote(m, "team", {
+      "skills.json": JSON.stringify({ extends: ["./more.json", otherTeam.https], sources: [] }),
+      "more.json": JSON.stringify({ sources: [{ id: "vendor", git: vendor.https }] }),
+    });
+    const manifest = m.manifest({ agents: ["claude-code"], extends: [team.https], sources: [] });
+    const run = await init(m, manifest);
+    expect(run.warnings.join("\n")).not.toContain("extends");
+    expect(names(m.at(".claude/skills"))).toEqual(["extra", "tool"]);
+  });
+
+  it("CX17. a team repository's manifest may not extend a file outside the repository through a link", async () => {
+    const m = machine();
+    const priv = privateManifest(m);
+    writeFiles(join(m.root, "private"), { "skills.json": read(join(priv.work, "skills.json")) });
+    const team = remote(m, "team", {
+      "skills.json": JSON.stringify({ extends: ["./more.json"], sources: [] }),
+    });
+    if (!isWindows) commitLink(m, team.work, "more.json", join(m.root, "private", "skills.json"));
+    const manifest = m.manifest({ agents: ["claude-code"], extends: [team.https], sources: [] });
+    const run = await init(m, manifest);
+    expect(names(m.at(".claude/skills"))).not.toContain("leak");
+    expect(run.warnings.join("\n")).toMatch(/extends/);
+  });
 });

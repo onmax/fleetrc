@@ -75,6 +75,18 @@ export const inside = (root: string, path: string) => {
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 };
 
+/** Whether the `/`-separated `rel` under `root` is a link or sits in a folder that is one. */
+export function linkOnPath(root: string, rel: string): boolean {
+  let at = root;
+  for (const part of rel.split("/")) {
+    at = join(at, part);
+    const stat = lstat(at);
+    if (stat === undefined) return false;
+    if (stat.isSymbolicLink()) return true;
+  }
+  return false;
+}
+
 /** A link an agent's copy of a skill leaves out, `/`-separated from the skill folder, and why. */
 export interface DroppedLink {
   path: string;
@@ -315,6 +327,24 @@ export function replaceUnchanged(from: string, to: string, expected: Hashes): st
   }
   rmSync(temp, { recursive: true, force: true });
   rmSync(old, { recursive: true, force: true });
+  return edited;
+}
+
+/**
+ * Deletes the folder `dir` only while it still hashes to `expected`, and returns the files that
+ * differ when it does not, keeping it. As in `replaceUnchanged`, an edit saved after the caller
+ * last looked is caught: the folder is checked, renamed aside in one step, and checked again.
+ */
+export function removeUnchanged(dir: string, expected: Hashes): string[] {
+  if (lstat(dir) === undefined) return [];
+  let edited = changedFiles(expected, hashDir(dir));
+  if (edited.length > 0) return edited;
+  const old = join(dirname(dir), `.${basename(dir)}.${process.pid}.old`);
+  rmSync(old, { recursive: true, force: true });
+  renameSync(dir, old);
+  edited = changedFiles(expected, hashDir(old));
+  if (edited.length > 0) renameSync(old, dir);
+  else rmSync(old, { recursive: true, force: true });
   return edited;
 }
 

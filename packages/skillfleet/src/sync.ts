@@ -21,10 +21,12 @@ import { exec, stopAll } from "./exec.ts";
 import {
   changedFiles,
   hashDir,
+  inside,
   isErrno,
   isRecord,
   isRunning,
   jsonTempWriter,
+  linkOnPath,
   lstat,
   moveDir,
   readJsonOrNothing,
@@ -965,9 +967,21 @@ function adoptCopyEdits(dirs: readonly string[], dryRun: boolean, errors: string
           if (files.length === 0) continue;
           if (!sameTree(resolvedHashes(record.target, record.root), record.hashes)) continue;
           // A link moves as the file it points to, and a linked SKILL.md in place stays a link.
-          const linked = (path: string) => lstat(path)?.isSymbolicLink();
-          if (files.some((file) => linked(join(copy, file)) || linked(join(record.target, file))))
+          if (files.some((file) => lstat(join(record.target, file))?.isSymbolicLink())) continue;
+          // An edit goes into the source folder itself, never through a link on the way to it:
+          // a link the copy left out may lead out of the source.
+          const through = files.find(
+            (file) => linkOnPath(copy, file) || linkOnPath(record.target, file),
+          );
+          const outside =
+            record.root !== undefined &&
+            !inside(realpathSync(record.root), realpathSync(record.target));
+          if (through !== undefined || outside) {
+            said.push(
+              `${tildify(copy)} has local edits that could not be moved: ${outside ? `${tildify(record.target)} is outside ${tildify(record.root!)}` : `${through} is behind a link in ${tildify(record.target)}`}`,
+            );
             continue;
+          }
           if (dryRun) {
             said.push(
               `would move the edits in ${tildify(copy)} (${files.join(", ")}) into ${tildify(record.target)}, which every agent shows`,

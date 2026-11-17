@@ -27,19 +27,28 @@ import {
   isRecord,
   listFiles,
   recoverReplaced,
+  removeUnchanged,
   renameFolder,
   replaceDir,
   replaceUnchanged,
   sameTree,
+  SKILL_LIMITS,
   skillBudget,
   SkillTooLargeError,
 } from "./fs.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
-import type { CloneSource, InPlaceSource, Source, VendoredSource } from "./manifest.ts";
+import {
+  type CloneSource,
+  type InPlaceSource,
+  type Source,
+  teamGitProblem,
+  type VendoredSource,
+} from "./manifest.ts";
 import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
-import { fetchNpm, parseNpmSpec, withCappedFetch } from "./npm.ts";
+import { type FetchBudget, fetchNpm, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
+import { tarEntries } from "./tar.ts";
 import type { SourceState } from "./state.ts";
 
 export interface SkillEntry {
@@ -497,12 +506,28 @@ async function discoverInPlace(
         name: skill.name,
         path: withBase(source.skills, skill.path),
       }));
+    // Without followLinks, a skill folder and its SKILL.md stay in the clone, links followed:
+    // `escapingSkills` judges only the folders `skills` accepted.
+    const realRoot = realpathSync(root);
+    const leaves = (path: string, rel: string) => {
+      if (follow || source.kind !== "clone") return false;
+      let real: string;
+      try {
+        real = realpathSync(path);
+      } catch {
+        return false; // A link to nothing: nothing to read through it.
+      }
+      if (inside(realRoot, real)) return false;
+      warnings.push(linksOutOfClone(source, rel));
+      return true;
+    };
     // Agents read a SKILL.md that `skills` rejects (Claude Code parses frontmatter leniently),
     // so a folder in place is linked anyway rather than dropped.
     for (const file of skipped) {
       const dir = dirname(file);
       const path = relative(root, dir).split(sep).join("/");
       if (path.startsWith("..") || isAbsolute(path)) continue;
+      if (leaves(dir, path || ".")) continue;
       const name = lenientName(file) ?? basename(dir);
       if (found.some((skill) => skill.name === name)) continue;
       found.push({ name, path: path || "." });
@@ -511,9 +536,14 @@ async function discoverInPlace(
       );
     }
     found.push(...linkedFolders(source, root, found, warnings, follow));
+    const contained = found.filter((skill) => {
+      const path = skill.path && skill.path !== "." ? skill.path : "";
+      const dir = path ? join(root, path) : root;
+      return !leaves(join(dir, "SKILL.md"), path ? `${path}/SKILL.md` : "SKILL.md");
+    });
     if (source.kind === "clone")
-      unfetchedSubmodules(source, root, found, await cloneSubmodules(root), warnings);
-    return select(source, plainNames(source, found, warnings), warnings).map((skill) => ({
+      unfetchedSubmodules(source, root, contained, await cloneSubmodules(root), warnings);
+    return select(source, plainNames(source, contained, warnings), warnings).map((skill) => ({
       name: skill.name,
       path: skill.path,
       dir: skill.path && skill.path !== "." ? join(root, skill.path) : root,
@@ -1041,7 +1071,10 @@ async function openVendored(
 ) {
   switch (source.kind) {
     case "git": {
-      const clone = await fetchClone(gitUrl(source.git), source.ref, join(ctx.cacheDir, "git"));
+      const clone = await fetchClone(gitUrl(source.git), source.ref, join(ctx.cacheDir, "git"), {
+        // A team manifest's repository is checked again with the config of the fetch itself.
+        check: source.via === undefined ? undefined : teamGitProblem,
+      });
       const looked = lookedAt(source);
       for (const { path, kept } of clone.collisions)
         if (looked(path))
@@ -1161,9 +1194,19 @@ function copyableSkill(
       one.depth(childRel);
       if (entry.isDirectory()) walk(path, childRel);
       else if (entry.isSymbolicLink()) {
+        let target;
         try {
-          if (statSync(path).isDirectory()) folderLinks = true;
-        } catch {}
+          target = statSync(path);
+        } catch {
+          continue;
+        }
+        if (target.isDirectory()) folderLinks = true;
+        // `skills` copies a link to a file as that file, so each link counts as one.
+        else if (target.isFile()) {
+          one.file(target.size);
+          files++;
+          bytes += target.size;
+        }
       } else if (entry.isFile()) {
         const size = lstatSync(path).size;
         one.file(size);
@@ -1376,9 +1419,15 @@ export async function syncVendored(
   // `skills` downloads and unpacks an index's archives itself, with no limit on either.
   const refused: string[] = [];
   const mismatched = new Map<string, string>();
+  const budget = indexBudget();
   const out = await withCappedFetch(
-    () => withDigestCheck(() => fetchVendored(source, state, ctx, mismatched, refused), mismatched),
+    () =>
+      withDigestCheck(
+        () => fetchVendored(source, state, ctx, mismatched, refused, budget.skipped),
+        mismatched,
+      ),
     refused,
+    budget,
   );
   out.warnings.push(...refused.map((why) => `${source.id}: refused ${why}`));
   return out;
@@ -1386,6 +1435,116 @@ export async function syncVendored(
 
 /** An index file of a well-known source, at either path `skills` reads. */
 const INDEX_FILE = /\/\.well-known\/(?:agent-skills|skills)\/index\.json$/;
+
+/**
+ * The copy limits for an index source's downloads, which `skills` makes itself: `SKILL_LIMITS` for
+ * each skill and `SOURCE_LIMITS` for all of them. A legacy index lists each skill's files, so a
+ * skill that lists too many or too deep is refused before any is fetched; an archive is measured
+ * unpacked. A refused skill's name goes into `skipped`, with why.
+ */
+function indexBudget(): FetchBudget & { skipped: Map<string, string> } {
+  const skipped = new Map<string, string>();
+  /** Archive URLs, and the folder URLs a legacy index's files sit under, to skill names. */
+  const archives = new Map<string, string>();
+  const folders = new Map<string, string>();
+  const total = { files: 0, bytes: 0 };
+  const bytes = new Map<string, number>();
+  const skillOf = (url: string) => {
+    const archive = archives.get(url);
+    if (archive !== undefined) return archive;
+    for (const [folder, name] of folders) if (url.startsWith(folder)) return name;
+    return undefined;
+  };
+  const skip = (name: string, why: string) => {
+    if (!skipped.has(name)) skipped.set(name, why);
+    return `was refused: ${why}`;
+  };
+  /** Counts `files` and `size` toward the skill `name` and the source. */
+  const count = (name: string, files: number, size: number) => {
+    const held = (bytes.get(name) ?? 0) + size;
+    bytes.set(name, held);
+    total.files += files;
+    total.bytes += size;
+    if (held > SKILL_LIMITS.bytes) return `it holds more than ${SKILL_LIMITS.bytes / 1024 ** 2} MB`;
+    if (total.files > SOURCE_LIMITS.files)
+      return `the source's skills hold more than ${SOURCE_LIMITS.files} files together`;
+    if (total.bytes > SOURCE_LIMITS.bytes)
+      return `the source's skills hold more than ${SOURCE_LIMITS.bytes / 1024 ** 3} GB together`;
+    return undefined;
+  };
+  const tooDeep = (path: string) => path.split("/").length > SKILL_LIMITS.depth;
+  const learn = (url: string, body: Uint8Array) => {
+    let index: unknown;
+    try {
+      index = JSON.parse(new TextDecoder().decode(body));
+    } catch {
+      return;
+    }
+    if (!isRecord(index) || !Array.isArray(index.skills)) return;
+    for (const entry of index.skills) {
+      if (!isRecord(entry) || typeof entry.name !== "string") continue;
+      const name = entry.name;
+      if (typeof entry.url === "string")
+        try {
+          archives.set(new URL(entry.url, url).toString(), name);
+        } catch {}
+      if (!Array.isArray(entry.files)) continue;
+      folders.set(new URL(`${encodeURIComponent(name)}/`, url).toString(), name);
+      folders.set(new URL(`${name}/`, url).toString(), name);
+      const files = entry.files.filter((file): file is string => typeof file === "string");
+      if (files.length > SKILL_LIMITS.files)
+        skip(name, `it lists more than ${SKILL_LIMITS.files} files`);
+      const deep = files.find(tooDeep);
+      if (deep) skip(name, `it nests folders more than ${SKILL_LIMITS.depth} deep (${deep})`);
+    }
+  };
+  return {
+    skipped,
+    before(url) {
+      const name = skillOf(url);
+      if (name === undefined) return undefined;
+      const why = skipped.get(name);
+      return why === undefined ? undefined : `was refused: ${why}`;
+    },
+    after(url, body, unpacked) {
+      let path = "";
+      try {
+        path = new URL(url).pathname;
+      } catch {}
+      if (INDEX_FILE.test(path)) {
+        learn(url, body);
+        return undefined;
+      }
+      const name = skillOf(url);
+      if (name === undefined) return undefined;
+      if (skipped.has(name)) return `was refused: ${skipped.get(name)!}`;
+      if (!archives.has(url)) {
+        const over = count(name, 1, body.byteLength);
+        return over === undefined ? undefined : skip(name, over);
+      }
+      let files = 0;
+      let size = 0;
+      try {
+        for (const entry of tarEntries(unpacked ?? body)) {
+          if (entry.type !== "0" && entry.type !== "\0") continue;
+          if (tooDeep(entry.name.replace(/^\.\//, "")))
+            return skip(
+              name,
+              `it nests folders more than ${SKILL_LIMITS.depth} deep (${entry.name})`,
+            );
+          files++;
+          size += entry.body.byteLength;
+        }
+      } catch (error) {
+        return skip(name, (error as Error).message);
+      }
+      if (files > SKILL_LIMITS.files)
+        return skip(name, `it holds more than ${SKILL_LIMITS.files} files`);
+      const over = count(name, files, size);
+      return over === undefined ? undefined : skip(name, over);
+    },
+  };
+}
 
 /**
  * Runs `work` with every archive an index lists checked against the digest the index gives,
@@ -1457,6 +1616,8 @@ async function fetchVendored(
   mismatched: ReadonlyMap<string, string> = new Map(),
   /** Index downloads that were stopped, as `<url>: <why>`. */
   refused: readonly string[] = [],
+  /** Index skills refused for the copy limits, with why. */
+  skipped: ReadonlyMap<string, string> = new Map(),
 ): Promise<SourceResult> {
   const out = result(source, "unchanged");
   out.from = state.commit ?? state.version;
@@ -1649,6 +1810,7 @@ async function fetchVendored(
         staged,
         mismatched,
         refused,
+        skipped,
         installFailures,
         heldBack,
       });
@@ -1704,6 +1866,7 @@ function heldBackFromIndex(
     staged,
     mismatched,
     refused,
+    skipped,
     installFailures,
     heldBack,
   }: {
@@ -1711,6 +1874,7 @@ function heldBackFromIndex(
     staged: ReadonlyMap<string, string>;
     mismatched: ReadonlyMap<string, string>;
     refused: readonly string[];
+    skipped: ReadonlyMap<string, string>;
     installFailures: ReadonlyMap<string, string>;
     heldBack: Set<string>;
   },
@@ -1738,7 +1902,10 @@ function heldBackFromIndex(
       continue;
     const refusal = refused.find((why) => why.startsWith(at));
     const failure = installFailures.get(name);
-    if (refusal) errors.push(`"${name}" did not download (${refusal}), so ${keep(name)}`);
+    const tooLarge = skipped.get(name);
+    if (tooLarge !== undefined)
+      out.warnings.push(`${source.id}: skipped the skill "${name}": ${tooLarge}, so ${keep(name)}`);
+    else if (refusal) errors.push(`"${name}" did not download (${refusal}), so ${keep(name)}`);
     else if (failure) errors.push(`"${name}" did not install (${failure}), so ${keep(name)}`);
     else
       out.warnings.push(
@@ -2008,6 +2175,16 @@ function applyVendored(
       continue;
     }
     if (write) {
+      // Edits were looked for before the fetch; one saved since then keeps the skill.
+      const late = removeUnchanged(paths.live, state.skills[name]!.hashes);
+      if (late.length > 0) {
+        out.edited.push({ skill: name, files: late });
+        out.warnings.push(
+          `${source.id}: ${name} is gone upstream but has local edits, so it stays`,
+        );
+        out.skills.push({ name, dir: paths.live, path: state.skills[name]?.path });
+        continue;
+      }
       for (const dir of Object.values(paths)) rmSync(dir, { recursive: true, force: true });
       delete state.skills[name];
       delete state.pending[name];

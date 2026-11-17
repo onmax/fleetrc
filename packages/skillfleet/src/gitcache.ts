@@ -125,7 +125,14 @@ export async function fetchClone(
   url: string,
   ref: string | undefined,
   root: string,
-  { offline = false }: { offline?: boolean } = {},
+  {
+    offline = false,
+    check,
+  }: {
+    offline?: boolean;
+    /** Why `url` may not be fetched, asked in the cache's own repository right before each fetch. */
+    check?: (url: string, cwd: string) => Promise<string | undefined>;
+  } = {},
 ): Promise<CachedClone> {
   const key = sha256(`${url}#${ref ?? ""}`).slice(0, 16);
   const cache = {
@@ -161,6 +168,8 @@ export async function fetchClone(
     }
     let commit: string;
     try {
+      const problem = await check?.(url, cache.repo);
+      if (problem) throw new UserError(problem);
       commit = await fetchCommit(url, ref, cache.repo);
     } catch (error) {
       // The network or the remote: a cache with a commit stays for --offline and later runs.

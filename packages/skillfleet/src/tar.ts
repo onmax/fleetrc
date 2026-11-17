@@ -38,10 +38,10 @@ export function gunzipCapped(gz: Uint8Array): Buffer {
   }
 }
 
-/** Regular files in a .tgz, keyed by path. Throws on links, on paths that leave the archive, and past the size limits. */
-export function readTgz(gz: Uint8Array): Map<string, Uint8Array> {
-  const tar = gunzipCapped(gz);
-  const files = new Map<string, Uint8Array>();
+/** Each entry of an unpacked tar, long names (pax `path`, GNU `L`) applied. Throws past the entry limit. */
+export function* tarEntries(
+  tar: Uint8Array,
+): Generator<{ name: string; type: string; body: Uint8Array }> {
   let offset = 0;
   let longName: string | undefined;
   let entries = 0;
@@ -68,6 +68,14 @@ export function readTgz(gz: Uint8Array): Map<string, Uint8Array> {
       longName = text(body, 0, body.length);
       continue;
     }
+    yield { name, type, body };
+  }
+}
+
+/** Regular files in a .tgz, keyed by path. Throws on links, on paths that leave the archive, and past the size limits. */
+export function readTgz(gz: Uint8Array): Map<string, Uint8Array> {
+  const files = new Map<string, Uint8Array>();
+  for (const { name, type, body } of tarEntries(gunzipCapped(gz))) {
     if (type === "1" || type === "2") throw new Error(`archive entry ${name} is a link`);
     if (type !== "0" && type !== "\0") continue;
     const path = safeRelativePath(name);

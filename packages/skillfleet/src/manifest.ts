@@ -1,10 +1,19 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { isIPv4 } from "node:net";
+import { hostname, networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
-import { dict, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
+import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
 import { registryUrl, urlOrigin } from "./npm.ts";
@@ -577,27 +586,64 @@ export function canonicalManifestSpec(spec: string): string {
   return remote ? `${remote.repo}//${remote.path}` : expandPath(spec);
 }
 
+interface LocateOptions {
+  offline?: boolean;
+  cacheRoot?: string;
+  base?: string;
+}
+
 /** Where a manifest spec lives on disk, fetching it when it is in a remote repository. */
-export async function locateManifest(
+export async function locateManifest(spec: string, options: LocateOptions = {}) {
+  return (await locate(spec, options)).file;
+}
+
+/**
+ * A manifest file and the folder it came in: the repository's checkout, or the file's own folder.
+ * With `team`, the spec comes from an extended manifest, which names only a remote repository on
+ * another machine or a file inside `team.within`, the folder that manifest came in.
+ */
+async function locate(
   spec: string,
-  { offline = false, cacheRoot = join(paths.cache(), "manifests"), base = process.cwd() } = {},
-) {
+  {
+    offline = false,
+    cacheRoot = join(paths.cache(), "manifests"),
+    base = process.cwd(),
+    team,
+  }: LocateOptions & { team?: { within: string } } = {},
+): Promise<{ file: string; root: string }> {
   const remote = remoteManifest(spec, base);
   if (!remote) {
     // A folder, such as a clone of the manifest's repository, means its skills.json.
     const path = expandPath(spec, base);
-    return statSync(path, { throwIfNoEntry: false })?.isDirectory()
+    const file = statSync(path, { throwIfNoEntry: false })?.isDirectory()
       ? join(path, DEFAULT_MANIFEST)
       : path;
+    if (team) within(team.within, file, spec);
+    return { file, root: team?.within ?? dirname(file) };
   }
   const url = gitUrl(remote.repo);
-  const clone = await fetchClone(url, remote.ref, cacheRoot, { offline });
+  const check = team ? teamGitProblem : undefined;
+  if (check) {
+    const problem = await check(remote.repo);
+    if (problem) throw new ManifestError(problem);
+  }
+  const clone = await fetchClone(url, remote.ref, cacheRoot, { offline, check });
   const file = join(clone.dir, remote.path);
   if (!existsSync(file))
     throw new ManifestError(
       `${url} has no ${remote.path}; name the manifest file as ${remote.repo}//<file>`,
     );
-  return file;
+  if (team) within(clone.dir, file, spec);
+  return { file, root: clone.dir };
+}
+
+/** Throws unless `file`, links followed, is inside `root`. */
+function within(root: string, file: string, spec: string) {
+  if (!existsSync(file)) return;
+  if (!inside(realpathSync(root), realpathSync(file)))
+    throw new ManifestError(
+      `a team manifest names only manifests in its own repository or in a remote repository, not ${spec}, which is outside it`,
+    );
 }
 
 /** A URL git fetches over the network: http, https, git or ssh, or ssh's `[user@]host:path`. */
@@ -607,6 +653,81 @@ const remoteTransport = (url: string) =>
   // a remote helper such as ext::, which runs a command.
   /^(?:[a-z0-9_][\w.-]*@)?[a-z0-9][\w.-]+:(?!\/\/|:)/i.test(url);
 
+/** The host a git URL names: `scheme://[user@]host[:port]/…` or ssh's `[user@]host:path`. */
+function gitHost(url: string): string | undefined {
+  const match =
+    url.match(/^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?(\[[^\]/]*\]|[^/:?#]*)/i) ??
+    url.match(/^(?:[^@/:]+@)?(\[[^\]/]*\]|[^/:]+):/);
+  return match?.[1];
+}
+
+/** A host as a URL parser reads it: lowercase, IP addresses in one spelling (127.1 is 127.0.0.1). */
+function canonicalHost(host: string): string | undefined {
+  try {
+    return new URL(`http://${host}/`).hostname.replace(/\.+$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
+/** The 8 groups of an IPv6 address as `URL` writes it (no dotted quad), or undefined. */
+function ipv6Groups(ip: string): number[] | undefined {
+  const [head = "", tail] = ip.split("::");
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const zeros = tail === undefined ? 0 : 8 - left.length - right.length;
+  const groups = [...left, ...Array<string>(Math.max(zeros, 0)).fill("0"), ...right].map((group) =>
+    Number.parseInt(group, 16),
+  );
+  return groups.length === 8 && groups.every((group) => group >= 0 && group <= 0xffff)
+    ? groups
+    : undefined;
+}
+
+/** 0.0.0.0/8, 127.0.0.0/8 and the link-local 169.254.0.0/16 reach this machine or its link. */
+function localIPv4(ip: string): boolean {
+  const [a, b] = ip.split(".").map(Number);
+  return a === 0 || a === 127 || (a === 169 && b === 254);
+}
+
+/** This machine's names and addresses, as `canonicalHost` writes them. */
+function ownHosts(): Set<string> {
+  const name = hostname().toLowerCase();
+  const short = name.split(".")[0]!;
+  const own = new Set([name, short, `${short}.local`]);
+  for (const addresses of Object.values(networkInterfaces()))
+    for (const { address, family } of addresses ?? []) {
+      const host = canonicalHost(family === "IPv6" ? `[${address.replace(/%.*$/, "")}]` : address);
+      if (host) own.add(host);
+    }
+  return own;
+}
+
+/**
+ * Whether a git URL's host is this machine: localhost and *.localhost, a loopback, unspecified
+ * or link-local address in any spelling, or one of the machine's own names and addresses. Private
+ * ranges (10/8, 192.168/16, fc00::/7) are other machines: a team's own git server lives there.
+ */
+export function isLocalHost(url: string): boolean {
+  const raw = gitHost(url);
+  const host = raw === undefined ? undefined : canonicalHost(raw);
+  if (!host) return true;
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (ownHosts().has(host)) return true;
+  if (isIPv4(host)) return localIPv4(host);
+  if (!host.startsWith("[")) return false;
+  const groups = ipv6Groups(host.slice(1, -1));
+  if (!groups) return true;
+  // fe80::/10 is link-local.
+  if ((groups[0]! & 0xffc0) === 0xfe80) return true;
+  if (groups.slice(0, 5).some(Boolean)) return false;
+  // ::, ::1 and the IPv4-compatible ::/96; ::ffff:0:0/96 maps an IPv4 address.
+  if (groups[5] === 0) return true;
+  if (groups[5] !== 0xffff) return false;
+  const [hi, lo] = [groups[6]!, groups[7]!];
+  return localIPv4(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
+}
+
 /** A URL rewrite from git config: `url.<to>.insteadOf <from>`. */
 export interface UrlRewrite {
   from: string;
@@ -614,34 +735,29 @@ export interface UrlRewrite {
   push: boolean;
 }
 
-/** The user's `url.<base>.insteadOf` and `pushInsteadOf` rules, from the global and system config. */
-export async function urlRewrites(): Promise<UrlRewrite[]> {
-  const rules: UrlRewrite[] = [];
-  for (const scope of ["--system", "--global"]) {
-    const run = await git(
-      [
-        "config",
-        scope,
-        "--includes",
-        "-z",
-        "--get-regexp",
-        "^url\\..*\\.(insteadof|pushinsteadof)$",
-      ],
-      { allowFail: true },
-    );
-    if (run.code !== 0) continue;
-    for (const entry of run.stdout.split("\0").filter(Boolean)) {
+/**
+ * The `url.<base>.insteadOf` and `pushInsteadOf` rules git reads in `cwd`: from the system,
+ * global and repository config, and from the environment (GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS).
+ */
+export async function urlRewrites(cwd = tmpdir()): Promise<UrlRewrite[]> {
+  const run = await git(
+    ["config", "--includes", "-z", "--get-regexp", "^url\\..*\\.(insteadof|pushinsteadof)$"],
+    { cwd, allowFail: true },
+  );
+  if (run.code !== 0) return [];
+  return run.stdout
+    .split("\0")
+    .filter(Boolean)
+    .map((entry) => {
       const newline = entry.indexOf("\n");
       const key = entry.slice(0, newline);
       const dot = key.lastIndexOf(".");
-      rules.push({
+      return {
         to: key.slice("url.".length, dot),
         from: entry.slice(newline + 1),
         push: key.slice(dot + 1).toLowerCase() === "pushinsteadof",
-      });
-    }
-  }
-  return rules;
+      };
+    });
 }
 
 /**
@@ -672,7 +788,32 @@ export function rewriteUrl(url: string, rules: readonly UrlRewrite[], push = fal
  */
 export function isRemoteGit(spec: string, rules: readonly UrlRewrite[] = []): boolean {
   const url = gitUrl(spec);
-  return remoteTransport(rewriteUrl(url, rules)) && remoteTransport(rewriteUrl(url, rules, true));
+  return [rewriteUrl(url, rules), rewriteUrl(url, rules, true)].every(otherMachine);
+}
+
+/** A URL git fetches over the network from another machine. */
+const otherMachine = (url: string) => remoteTransport(url) && !isLocalHost(url);
+
+/**
+ * Why a team manifest may not name the repository `spec`, or undefined when it names one on
+ * another machine. Git is asked in `cwd` which URL it fetches, so every rewrite it would apply
+ * counts, wherever it is configured; `pushInsteadOf` rules count too.
+ */
+export async function teamGitProblem(spec: string, cwd = tmpdir()): Promise<string | undefined> {
+  const url = gitUrl(spec);
+  const asked = url.startsWith("-")
+    ? undefined
+    : await git(["ls-remote", "--get-url", "--", url], { cwd, allowFail: true });
+  const fetched = asked?.code === 0 ? asked.stdout.trim() : undefined;
+  const pushed = rewriteUrl(url, await urlRewrites(cwd), true);
+  const to = [fetched, pushed].find((rewritten) => rewritten !== url);
+  const rewrite = to ? `, which your git config rewrites to ${to}` : "";
+  const urls = [url, fetched, pushed];
+  if (urls.some((each) => each === undefined || !remoteTransport(each)))
+    return `a team manifest names only remote repositories (http, https, git, ssh or owner/repo), not ${spec}${rewrite}`;
+  if (urls.some((each) => isLocalHost(each!)))
+    return `a team manifest names only repositories on another machine, not ${spec}${rewrite}, which is this machine`;
+  return undefined;
 }
 
 /** Reads and validates a manifest file; `prepare` may change its JSON first. */
@@ -714,14 +855,14 @@ export async function loadManifest(
       source.kind === "npm" && source.registry ? [urlOrigin(source.registry)] : [],
     ),
   ]);
-  let rules: UrlRewrite[] | undefined;
   /** What the root's `extends` entry a manifest came through leaves out. */
   interface Through {
     via: number;
     exclude: string[];
     excludeSources: Set<string>;
   }
-  const visit = async (manifest: Manifest, through?: Through) => {
+  /** `within` is the folder an extended manifest came in, which its own `extends` stays in. */
+  const visit = async (manifest: Manifest, through?: Through, within?: string) => {
     for (const [i, entry] of manifest.extends.entries()) {
       const parent = entry.manifest;
       // Exclusions apply in the root manifest only, to everything its entry brings in.
@@ -731,8 +872,14 @@ export async function loadManifest(
         excludeSources: new Set(entry.excludeSources.map(nameKey)),
       };
       let file: string;
+      let root: string;
       try {
-        file = await locateManifest(parent, { ...options, base: dirname(manifest.file) });
+        ({ file, root } = await locate(parent, {
+          ...options,
+          base: dirname(manifest.file),
+          // An extended manifest's own `extends` follows the rules of its sources.
+          ...(within === undefined ? {} : { team: { within } }),
+        }));
       } catch (error) {
         warnings.push(`extends ${parent}: ${(error as Error).message}`);
         failed.push(parent);
@@ -782,15 +929,9 @@ export async function loadManifest(
           continue;
         }
         if (source.kind === "git") {
-          rules ??= await urlRewrites();
-          if (!isRemoteGit(source.git, rules)) {
-            const url = gitUrl(source.git);
-            const to = [rewriteUrl(url, rules), rewriteUrl(url, rules, true)].find(
-              (rewritten) => rewritten !== url,
-            );
-            warnings.push(
-              `extends ${parent}: ignored source "${source.id}"; a team manifest names only remote repositories (http, https, git, ssh or owner/repo), not ${source.git}${to ? `, which your git config rewrites to ${to}` : ""}`,
-            );
+          const problem = await teamGitProblem(source.git);
+          if (problem) {
+            warnings.push(`extends ${parent}: ignored source "${source.id}"; ${problem}`);
             continue;
           }
         }
@@ -805,7 +946,7 @@ export async function loadManifest(
           source.sendToken = !source.registry || tokenOrigins.has(urlOrigin(source.registry));
         sources.push(source);
       }
-      await visit(team, filter);
+      await visit(team, filter, root);
     }
   };
   await visit(root);

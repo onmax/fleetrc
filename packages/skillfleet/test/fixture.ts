@@ -237,6 +237,8 @@ export function machine({
       "[advice]\n\tdetachedHead = false",
       // Every remote's https URL (`Remote.https`) reaches its bare repository over HTTP.
       `[url "${GIT_SERVER}/${basename(root)}/remotes/"]\n\tinsteadOf = ${HTTPS_REMOTES}`,
+      // The git server's name, which is no loopback name, reaches it on 127.0.0.1.
+      `[http]\n\tcurloptResolve = ${new URL(GIT_SERVER).host}:127.0.0.1`,
     ].join("\n") + "\n",
   );
   const env: NodeJS.ProcessEnv = {
@@ -391,8 +393,14 @@ async function gitServer(): Promise<string> {
   server.unref();
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("no port");
-  return `http://127.0.0.1:${address.port}`;
+  return `http://${GIT_SERVER_NAME}:${address.port}`;
 }
+
+/**
+ * The git server's host name. A team manifest may not name this machine, a loopback address
+ * included, so the server goes by a name that git's `http.curloptResolve` maps to 127.0.0.1.
+ */
+const GIT_SERVER_NAME = "git-server.skillfleet.test";
 
 const GIT_SERVER = await gitServer();
 
@@ -496,28 +504,35 @@ export const sha256 = (data: Uint8Array) => createHash("sha256").update(data).di
 export interface Http {
   url: string;
   routes: Map<string, { body: Uint8Array | string; type: string }>;
+  /** Runs before each request is answered, which waits for it. */
+  before?: (path: string) => void | Promise<void>;
   close(): Promise<void>;
 }
 
 export async function http(): Promise<Http> {
   const routes = new Map<string, { body: Uint8Array | string; type: string }>();
   const server = createServer((req, res) => {
-    const route = routes.get(new URL(req.url ?? "/", "http://x").pathname);
-    if (!route) {
-      res.writeHead(404).end("not found");
-      return;
-    }
-    res.writeHead(200, { "content-type": route.type }).end(route.body);
+    const path = new URL(req.url ?? "/", "http://x").pathname;
+    void (async () => {
+      await self.before?.(path);
+      const route = routes.get(path);
+      if (!route) {
+        res.writeHead(404).end("not found");
+        return;
+      }
+      res.writeHead(200, { "content-type": route.type }).end(route.body);
+    })();
   });
   servers.push(server);
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("no port");
-  return {
+  const self: Http = {
     url: `http://127.0.0.1:${address.port}`,
     routes,
     close: () => new Promise((done) => server.close(() => done())),
   };
+  return self;
 }
 
 export interface IndexSkill {
