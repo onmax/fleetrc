@@ -66,13 +66,22 @@ async function readCapped(
 const NO_BODY = new Set([101, 103, 204, 205, 304]);
 
 /**
+ * How long a download waits for the server to answer, or for its next bytes.
+ * SKILLFLEET_FETCH_WAIT_MS shortens it, for tests.
+ */
+const waitMs = (() => {
+  const set = Number(process.env.SKILLFLEET_FETCH_WAIT_MS);
+  return set > 0 && set < 30_000 ? set : 30_000;
+})();
+
+/**
  * How long a download may wait: for the server to answer, for its next bytes, in all, and for all
  * the downloads of one source. A server that stops answering would otherwise hold the sync, and
  * its lock, forever.
  */
 export const FETCH_LIMITS = {
-  answerMs: 30_000,
-  idleMs: 30_000,
+  answerMs: waitMs,
+  idleMs: waitMs,
   totalMs: 5 * 60_000,
   sourceMs: 15 * 60_000,
 };

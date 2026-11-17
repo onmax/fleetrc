@@ -1274,29 +1274,28 @@ function earlierPackages(cache: string, spec: string, current: string): string[]
     .filter((dir) => dir !== current);
 }
 
-/** The names in a well-known index, read directly so skills it rejected can be reported. */
-async function indexNames(url: string): Promise<string[] | undefined> {
+/**
+ * The skills a well-known index lists, read directly so skills it rejected or failed to download
+ * can be reported, each with the URL its downloads start with: its archive (v0.2) or its folder
+ * (v0.1).
+ */
+async function indexEntries(url: string): Promise<{ name: string; at: string }[] | undefined> {
   const base = url.replace(/\/$/, "");
   for (const path of [".well-known/agent-skills/index.json", ".well-known/skills/index.json"]) {
     try {
-      const response = await fetch(`${base}/${path}`, { signal: AbortSignal.timeout(15_000) });
+      const file = `${base}/${path}`;
+      const response = await fetch(file, { signal: AbortSignal.timeout(15_000) });
       if (!response.ok) continue;
       const index: unknown = await response.json();
-      if (
-        typeof index !== "object" ||
-        index === null ||
-        !("skills" in index) ||
-        !Array.isArray(index.skills)
-      )
-        continue;
-      return index.skills.flatMap((entry: unknown) =>
-        typeof entry === "object" &&
-        entry !== null &&
-        "name" in entry &&
-        typeof entry.name === "string"
-          ? [entry.name]
-          : [],
-      );
+      if (!isRecord(index) || !Array.isArray(index.skills)) continue;
+      return index.skills.flatMap((entry: unknown) => {
+        if (!isRecord(entry) || typeof entry.name !== "string") return [];
+        let at = `${base}/${posix.dirname(path)}/${entry.name}/`;
+        try {
+          if (typeof entry.url === "string") at = new URL(entry.url, file).toString();
+        } catch {}
+        return [{ name: entry.name, at }];
+      });
     } catch {
       continue;
     }
@@ -1378,7 +1377,7 @@ export async function syncVendored(
   const refused: string[] = [];
   const mismatched = new Map<string, string>();
   const out = await withCappedFetch(
-    () => withDigestCheck(() => fetchVendored(source, state, ctx, mismatched), mismatched),
+    () => withDigestCheck(() => fetchVendored(source, state, ctx, mismatched, refused), mismatched),
     refused,
   );
   out.warnings.push(...refused.map((why) => `${source.id}: refused ${why}`));
@@ -1456,6 +1455,8 @@ async function fetchVendored(
   ctx: SourceContext,
   /** Index skills whose archive did not match its digest, with the digest received. */
   mismatched: ReadonlyMap<string, string> = new Map(),
+  /** Index downloads that were stopped, as `<url>: <why>`. */
+  refused: readonly string[] = [],
 ): Promise<SourceResult> {
   const out = result(source, "unchanged");
   out.from = state.commit ?? state.version;
@@ -1536,13 +1537,7 @@ async function fetchVendored(
     if (opened.root)
       unfetchedSubmodules(source, opened.root, found, opened.submodules, out.warnings);
     const chosen = select(source, plainNames(source, found, out.warnings), out.warnings);
-    if (source.kind === "index") {
-      const listed = await indexNames(source.index);
-      const got = new Set(found.map((skill) => skill.name));
-      for (const name of listed ?? [])
-        if (!got.has(name) && !mismatched.has(name))
-          out.warnings.push(`${source.id}: rejected "${name}": its archive is invalid or unsafe`);
-    }
+    const listed = source.kind === "index" ? await indexEntries(source.index) : undefined;
     // A mismatched archive (a deploy in flight serving an old one) holds back only its skill.
     const heldBack = new Set<string>();
     for (const [name, digest] of mismatched) {
@@ -1573,6 +1568,7 @@ async function fetchVendored(
       mkdirSync(staging, { recursive: true });
     }
     const staged = new Map<string, string>();
+    const installFailures = new Map<string, string>();
     const install = async (handle: SkillSource, names: string[], cwd: string) => {
       const installed = await installSkills(handle, {
         cwd,
@@ -1583,8 +1579,10 @@ async function fetchVendored(
         telemetry: false,
         skills: names,
       });
-      for (const failure of installed.failed)
+      for (const failure of installed.failed) {
+        installFailures.set(failure.skill, failure.message);
         out.warnings.push(`${source.id}: ${failure.skill}: ${failure.message}`);
+      }
       return installed.installed;
     };
     // Each skill's folder is measured before `skills` copies it, which follows folder links.
@@ -1645,6 +1643,15 @@ async function fetchVendored(
         await handle.dispose();
       }
     }
+    if (source.kind === "index")
+      heldBackFromIndex(source, state, ctx, out, {
+        listed,
+        staged,
+        mismatched,
+        refused,
+        installFailures,
+        heldBack,
+      });
     countCopies([...staged.values()].reduce((sum, dir) => sum + listFiles(dir).length, 0));
     if (opened.root) linkedSkillMds(source, opened.root, chosen, staged, out.warnings);
     carryRenames(state, ctx, out, chosen, staged);
@@ -1679,6 +1686,66 @@ async function fetchVendored(
     if (staging) rmSync(staging, { recursive: true, force: true });
   }
   return out;
+}
+
+/**
+ * A skill the index still lists that did not come through, because its download stalled or failed
+ * or `skills` refused its archive, is no deletion: its last good copy stays, in `heldBack`, and a
+ * failed download is an error naming it. When the index could not be read again to tell, every
+ * skill that did not come through stays.
+ */
+function heldBackFromIndex(
+  source: VendoredSource,
+  state: SourceState,
+  ctx: SourceContext,
+  out: SourceResult,
+  {
+    listed,
+    staged,
+    mismatched,
+    refused,
+    installFailures,
+    heldBack,
+  }: {
+    listed: { name: string; at: string }[] | undefined;
+    staged: ReadonlyMap<string, string>;
+    mismatched: ReadonlyMap<string, string>;
+    refused: readonly string[];
+    installFailures: ReadonlyMap<string, string>;
+    heldBack: Set<string>;
+  },
+) {
+  const keep = (name: string) => {
+    const kept =
+      state.skills[name] !== undefined && existsSync(storePaths(ctx.storeDir, name).live);
+    if (kept) heldBack.add(name);
+    return kept ? "it keeps its last good copy" : "it is not installed";
+  };
+  if (!listed) {
+    const lost = Object.keys(state.skills).filter(
+      (name) => !staged.has(name) && !mismatched.has(name),
+    );
+    for (const name of lost) keep(name);
+    if (lost.length > 0)
+      out.warnings.push(
+        `${source.id}: the index could not be read again to tell whether it still lists ${lost.join(", ")}, so they keep their last good copies`,
+      );
+    return;
+  }
+  const errors: string[] = [];
+  for (const { name, at } of listed) {
+    if (staged.has(name) || mismatched.has(name) || select(source, [{ name }], []).length === 0)
+      continue;
+    const refusal = refused.find((why) => why.startsWith(at));
+    const failure = installFailures.get(name);
+    if (refusal) errors.push(`"${name}" did not download (${refusal}), so ${keep(name)}`);
+    else if (failure) errors.push(`"${name}" did not install (${failure}), so ${keep(name)}`);
+    else
+      out.warnings.push(
+        `${source.id}: rejected "${name}": its archive is invalid or unsafe, so ${keep(name)}`,
+      );
+  }
+  if (errors.length > 0) out.error = [out.error, ...errors].filter(Boolean).join("; ");
 }
 
 /**

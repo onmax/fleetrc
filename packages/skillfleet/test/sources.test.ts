@@ -1,8 +1,10 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import {
   http,
+  type Http,
   isLink,
   linkOf,
   machine,
@@ -125,6 +127,98 @@ describe("well-known index", () => {
     expect(offline.sources[0]!.status).toBe("offline");
     expect(names(m.at(".claude/skills"))).toEqual(["cached"]);
   });
+});
+
+/** An index server like `http()` that never answers a request for a path in `stall`. */
+async function stallingHttp(): Promise<Http & { stall: Set<string> }> {
+  const routes: Http["routes"] = new Map();
+  const stall = new Set<string>();
+  const server = createServer((req, res) => {
+    const path = new URL(req.url ?? "/", "http://x").pathname;
+    if (stall.has(path)) return;
+    const route = routes.get(path);
+    if (route) res.writeHead(200, { "content-type": route.type }).end(route.body);
+    else res.writeHead(404).end("not found");
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("no port");
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    routes,
+    stall,
+    close: () =>
+      new Promise((done) => {
+        server.closeAllConnections();
+        server.close(() => done());
+      }),
+  };
+}
+
+describe("an index server that stalls on one skill", () => {
+  // `skills` loads every skill of an index at once, so when one file besides a SKILL.md does not
+  // download, no skill of the index comes through, and all keep their copies.
+  const cases = [
+    { label: "v0.2 archive", v1: false, stalls: "/.well-known/agent-skills/flaky.tar.gz" },
+    { label: "v0.1 SKILL.md", v1: true, stalls: "/.well-known/skills/flaky/SKILL.md" },
+    { label: "v0.1 extra file", v1: true, stalls: "/.well-known/skills/flaky/extra.md", all: true },
+  ];
+  for (const { label, v1, stalls, all } of cases)
+    it(`6e. keeps the last good copy of that skill and reports it (${label})`, async () => {
+      const m = machine();
+      const site = await stallingHttp();
+      const serve = (tag?: string) => {
+        const list = ["good", "flaky"].map((name) => ({
+          name,
+          files: { "SKILL.md": skillMd(name, tag), "extra.md": `extra ${tag ?? "v1"}\n` },
+        }));
+        if (v1) serveIndexV1(site, list);
+        else serveIndexV2(site, list);
+      };
+      serve();
+      try {
+        const manifest = m.manifest({
+          agents: ["claude-code"],
+          sources: [{ id: "site", index: site.url }],
+        });
+        const init = await m.run("init", manifest, "--no-timer");
+        expect(init.code, init.stdout + init.stderr).toBe(0);
+        const flaky = m.at(".claude", "skills", "flaky", "SKILL.md");
+        expect(read(flaky)).toBe(skillMd("flaky"));
+
+        serve("v2");
+        site.stall.add(stalls);
+        const run = await m.runWith(
+          { env: { SKILLFLEET_FETCH_WAIT_MS: "1000" } },
+          "sync",
+          "--json",
+        );
+        const report = JSON.parse(run.stdout) as {
+          errors: string[];
+          skills: { removed: string[] };
+        };
+        expect(run.code).toBe(1);
+        expect(report.errors.join("\n")).toContain(
+          all ? 'for skill "flaky"' : '"flaky" did not download',
+        );
+        expect(report.skills.removed).toEqual([]);
+        expect(read(m.at(".claude", "skills", "good", "SKILL.md"))).toBe(
+          all ? skillMd("good") : skillMd("good", "v2"),
+        );
+        expect(read(flaky)).toBe(skillMd("flaky"));
+        expect(existsSync(join(m.stateDir, "store", "site", "live", "flaky", "SKILL.md"))).toBe(
+          true,
+        );
+
+        // Still recorded: the next sync with the server well updates it like any other.
+        site.stall.clear();
+        const healed = await m.run("sync");
+        expect(healed.code, healed.stdout + healed.stderr).toBe(0);
+        expect(read(flaky)).toBe(skillMd("flaky", "v2"));
+      } finally {
+        await site.close();
+      }
+    }, 60_000);
 });
 
 describe("npm and local sources", () => {
