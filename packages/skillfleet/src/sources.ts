@@ -4,6 +4,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmdirSync,
@@ -11,16 +12,19 @@ import {
   statSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative, sep } from "node:path";
 import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "skills";
 import { git, GitError, gitOut } from "./exec.ts";
 import {
   changedFiles,
-  copyDir,
+  countCopies,
   hashDir,
   isRecord,
+  isRunning,
   listFiles,
+  recoverReplaced,
   renameFolder,
+  replaceDir,
   sameTree,
 } from "./fs.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
@@ -207,6 +211,126 @@ async function discover(
   });
 }
 
+/** Folders discovery does not look in: as in the `skills` package. */
+const SKIP_DIRS = new Set([".git", "node_modules"]);
+
+interface LinkedFolder extends Found {
+  path: string;
+  /** The folder the link resolves to. */
+  real: string;
+}
+
+/**
+ * Where a skill folder that discovery could not see (a link, a submodule) may sit: what the
+ * `skills` glob matches, or, without one, a folder beside a skill discovery found.
+ */
+function skillPlace(source: Source, found: readonly Found[]): (path: string) => boolean {
+  const glob = source.kind === "index" ? undefined : source.skills;
+  if (glob) return (path) => matchesGlob(path, glob);
+  const parents = new Set(
+    found.flatMap((skill) =>
+      skill.path === undefined || skill.path === "." ? [] : [posix.dirname(skill.path)],
+    ),
+  );
+  return (path) => parents.has(posix.dirname(path));
+}
+
+/**
+ * Skill folders that are links, which discovery does not follow. A link that resolves inside the
+ * source is a skill; one that leaves it is not read (unless `outside`, for a folder of the user's
+ * own) and is named in a warning. Links inside a skill are copied or dropped by `skills`.
+ */
+function linkedFolders(
+  source: Source,
+  root: string,
+  found: readonly Found[],
+  warnings: string[],
+  outside = false,
+): LinkedFolder[] {
+  const glob = source.kind === "index" ? undefined : source.skills;
+  const place = skillPlace(source, found);
+  const realRoot = realpathSync(root);
+  const linked: LinkedFolder[] = [];
+  const look = (dir: string, depth: number) => {
+    if (depth > 5 || existsSync(join(dir, "SKILL.md"))) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (glob && !SKIP_DIRS.has(entry.name)) look(path, depth + 1);
+        continue;
+      }
+      const rel = relative(root, path).split(sep).join("/");
+      if (!entry.isSymbolicLink() || !place(rel)) continue;
+      let real: string;
+      try {
+        real = realpathSync(path);
+        if (!statSync(real).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      if (!outside && !inside(realRoot, real)) {
+        warnings.push(
+          `${source.id}: ${rel} links to a folder outside the source, so it is not read`,
+        );
+        continue;
+      }
+      // A link to a folder that holds it would make the skill contain itself.
+      if (inside(real, realpathSync(dir))) continue;
+      const file = join(real, "SKILL.md");
+      if (existsSync(file))
+        linked.push({ name: lenientName(file) ?? basename(path), path: rel, real });
+    }
+  };
+  if (glob) look(globRoot(root, glob, outside), 0);
+  else {
+    const dirs = new Set(
+      found.flatMap((skill) =>
+        skill.path === undefined || skill.path === "." ? [] : [posix.dirname(skill.path)],
+      ),
+    );
+    for (const dir of dirs) look(join(root, dir), 5);
+  }
+  return linked.filter((link) => !found.some((skill) => skill.name === link.name));
+}
+
+/** The submodules of a working clone. */
+async function cloneSubmodules(dir: string): Promise<string[]> {
+  const listed = await git(["ls-files", "--stage", "-z"], { cwd: dir, allowFail: true });
+  if (listed.code !== 0) return [];
+  return listed.stdout
+    .split("\0")
+    .filter((entry) => entry.startsWith("160000 "))
+    .map((entry) => entry.slice(entry.indexOf("\t") + 1));
+}
+
+/**
+ * A warning for each submodule where the `skills` glob looks and no skill is checked out: a
+ * fetched source never has them, and a working clone has them after `git submodule update --init`.
+ */
+function unfetchedSubmodules(
+  source: Source,
+  root: string,
+  found: readonly Found[],
+  submodules: readonly string[],
+  warnings: string[],
+) {
+  const place = skillPlace(source, found);
+  for (const path of submodules) {
+    if (!place(path) || existsSync(join(root, path, "SKILL.md"))) continue;
+    warnings.push(
+      source.kind === "clone"
+        ? `${source.id}: ${path} is a git submodule that is not checked out, so its skills are not linked; run \`git submodule update --init\` in ${source.path}`
+        : `${source.id}: ${path} is a git submodule, which skillfleet does not fetch, so its skills are not linked`,
+    );
+  }
+}
+
 /** The `name:` of a SKILL.md whose frontmatter is not valid YAML, read line by line. */
 function lenientName(file: string): string | undefined {
   const frontmatter = readFileSync(file, "utf8").match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1];
@@ -253,6 +377,9 @@ async function discoverInPlace(
         `${source.id}: ${path}/SKILL.md frontmatter is not valid YAML; linked anyway, but tools that parse it strictly skip ${name}`,
       );
     }
+    found.push(...linkedFolders(source, root, found, warnings, source.kind === "local"));
+    if (source.kind === "clone")
+      unfetchedSubmodules(source, root, found, await cloneSubmodules(root), warnings);
     return select(source, plainNames(source, found, warnings), warnings).map((skill) => ({
       name: skill.name,
       path: skill.path,
@@ -736,6 +863,7 @@ async function openVendored(
         version: clone.commit,
         glob: source.skills,
         root: clone.dir,
+        submodules: clone.submodules,
       };
     }
     case "npm": {
@@ -747,6 +875,7 @@ async function openVendored(
         version: pkg.version,
         glob: source.skills,
         root: pkg.dir,
+        submodules: [],
       };
     }
     case "index":
@@ -755,6 +884,7 @@ async function openVendored(
         version: state.commit,
         glob: undefined,
         root: undefined,
+        submodules: [],
       };
     default: {
       const exhaustive: never = source;
@@ -800,6 +930,65 @@ function keptSkills(state: SourceState, storeDir: string): SkillEntry[] {
     .map(([name, copy]) => ({ name, dir: storePaths(storeDir, name).live, path: copy.path }));
 }
 
+/** Where a sync stages what it fetched: in the store, so a staged folder is renamed into place. */
+const STAGE = /^\.stage-(\d+)$/;
+
+/**
+ * Cleans up after a sync that was killed: its staging folder goes, and a folder it was replacing
+ * is finished or put back (see `replaceDir`).
+ */
+function recoverStore(storeDir: string) {
+  if (!existsSync(storeDir)) return;
+  for (const name of readdirSync(storeDir)) {
+    const match = STAGE.exec(name);
+    if (match && !isRunning(Number(match[1])))
+      rmSync(join(storeDir, name), { recursive: true, force: true });
+  }
+  for (const part of ["live", "base", "upstream"]) recoverReplaced(join(storeDir, part));
+}
+
+/**
+ * Install records for skills in the store that state.json does not have (it was lost, or a sync
+ * was killed before it wrote one): the base the store keeps is what was installed. Returns their
+ * names.
+ */
+function rebuildRecords(state: SourceState, storeDir: string): string[] {
+  const live = join(storeDir, "live");
+  if (!existsSync(live)) return [];
+  const rebuilt: string[] = [];
+  for (const name of readdirSync(live)) {
+    if (state.skills[name] || segmentProblem(name)) continue;
+    const base = storePaths(storeDir, name).base;
+    if (!existsSync(base)) continue;
+    state.skills[name] = { hashes: hashDir(base) };
+    rebuilt.push(name);
+  }
+  return rebuilt.sort();
+}
+
+/**
+ * Whether a fetch brought nothing to apply: the same commit or version as last time, the same
+ * skills, every one still in the store, and nothing waiting. Then nothing is staged or copied.
+ */
+function nothingNew(
+  source: VendoredSource,
+  state: SourceState,
+  ctx: SourceContext,
+  version: string | undefined,
+  chosen: readonly Found[],
+): boolean {
+  // A well-known index has no version to compare.
+  if (source.kind === "index" || version === undefined) return false;
+  if (version !== (source.kind === "npm" ? state.version : state.commit)) return false;
+  if (Object.keys(state.pending).length > 0) return false;
+  if (chosen.length !== Object.keys(state.skills).length) return false;
+  return chosen.every(
+    (skill) =>
+      state.skills[skill.name]?.path === skill.path &&
+      existsSync(storePaths(ctx.storeDir, skill.name).live),
+  );
+}
+
 export async function syncVendored(
   source: VendoredSource,
   state: SourceState,
@@ -816,6 +1005,12 @@ export async function syncVendored(
         `${source.id}: forgot the skill "${name}": its name ${segmentProblem(name)}`,
       );
     }
+  if (!ctx.dryRun) recoverStore(ctx.storeDir);
+  const rebuilt = rebuildRecords(state, ctx.storeDir);
+  if (rebuilt.length > 0)
+    out.warnings.push(
+      `${source.id}: state.json had no install record of ${rebuilt.join(", ")}, so skillfleet rebuilt it from the copy it kept in the store`,
+    );
   const firstRun = Object.keys(state.skills).length === 0;
   // Local edits are checked on every run, online or not.
   for (const [name, copy] of Object.entries(state.skills)) {
@@ -852,12 +1047,16 @@ export async function syncVendored(
       );
     return out;
   }
-  const staging = mkdtempSync(join(tmpdir(), "skillfleet-stage-"));
+  let staging: string | undefined;
   try {
-    const found = opened.handle.skills.map((skill) => ({
+    const found: Found[] = opened.handle.skills.map((skill) => ({
       name: skill.name,
       path: withBase(opened.glob, skill.path),
     }));
+    const linked = opened.root ? linkedFolders(source, opened.root, found, out.warnings) : [];
+    found.push(...linked);
+    if (opened.root)
+      unfetchedSubmodules(source, opened.root, found, opened.submodules, out.warnings);
     const chosen = select(source, plainNames(source, found, out.warnings), out.warnings);
     if (source.kind === "index") {
       const listed = await indexNames(source.index);
@@ -866,24 +1065,68 @@ export async function syncVendored(
         if (!got.has(name))
           out.warnings.push(`${source.id}: rejected "${name}": its archive is invalid or unsafe`);
     }
+    if (nothingNew(source, state, ctx, opened.version, chosen)) {
+      out.skills = chosen.map((skill) => ({
+        name: skill.name,
+        dir: storePaths(ctx.storeDir, skill.name).live,
+        path: skill.path,
+      }));
+      state.fetchedAt = ctx.now;
+      out.to = opened.version;
+      return out;
+    }
+    // In the store, on its file system, so what is staged is renamed into place, not copied.
+    if (ctx.dryRun) staging = mkdtempSync(join(tmpdir(), "skillfleet-stage-"));
+    else {
+      staging = join(ctx.storeDir, `.stage-${process.pid}`);
+      rmSync(staging, { recursive: true, force: true });
+      mkdirSync(staging, { recursive: true });
+    }
     const staged = new Map<string, string>();
-    if (chosen.length > 0) {
-      const installed = await installSkills(opened.handle, {
-        cwd: staging,
+    const install = async (handle: SkillSource, names: string[], cwd: string) => {
+      const installed = await installSkills(handle, {
+        cwd,
         scope: "project",
         agents: ["universal"],
         mode: "copy",
         lockfile: false,
         telemetry: false,
-        skills: chosen.map((skill) => skill.name),
+        skills: names,
       });
-      for (const target of installed.installed) staged.set(target.skill, target.path);
       for (const failure of installed.failed)
         out.warnings.push(`${source.id}: ${failure.skill}: ${failure.message}`);
-      if (opened.root) linkedSkillMds(source, opened.root, chosen, staged, out.warnings);
+      return installed.installed;
+    };
+    const fromHandle = chosen.filter((skill) => !linked.includes(skill as LinkedFolder));
+    if (fromHandle.length > 0)
+      for (const target of await install(
+        opened.handle,
+        fromHandle.map((skill) => skill.name),
+        staging,
+      ))
+        staged.set(target.skill, target.path);
+    for (const [i, link] of linked.entries()) {
+      if (!chosen.includes(link)) continue;
+      // Each from its own folder, which `skills` reads as a source of one skill.
+      const handle = await discover(link.real, undefined);
+      try {
+        const name = handle.skills[0]?.name;
+        if (handle.skills.length !== 1 || name !== link.name) {
+          out.warnings.push(
+            `${source.id}: skipped the skill "${link.name}" that ${link.path} links to: its SKILL.md names ${name ?? "no skill"}`,
+          );
+          continue;
+        }
+        for (const target of await install(handle, [name], join(staging, `link-${i}`)))
+          staged.set(link.name, target.path);
+      } finally {
+        await handle.dispose();
+      }
     }
+    countCopies([...staged.values()].reduce((sum, dir) => sum + listFiles(dir).length, 0));
+    if (opened.root) linkedSkillMds(source, opened.root, chosen, staged, out.warnings);
     carryRenames(state, ctx, out, chosen, staged);
-    applyVendored(source, state, ctx, out, chosen, staged, firstRun);
+    applyVendored(source, state, ctx, out, chosen, staged, { rebuilt, firstRun });
     state.fetchedAt = ctx.now;
     if (source.kind === "npm") state.version = opened.version;
     else state.commit = opened.version;
@@ -894,7 +1137,7 @@ export async function syncVendored(
     out.skills = keptSkills(state, ctx.storeDir);
   } finally {
     await opened.handle.dispose();
-    rmSync(staging, { recursive: true, force: true });
+    if (staging) rmSync(staging, { recursive: true, force: true });
   }
   return out;
 }
@@ -990,7 +1233,14 @@ function applyVendored(
   out: SourceResult,
   chosen: Found[],
   staged: Map<string, string>,
-  firstRun: boolean,
+  {
+    rebuilt,
+    firstRun,
+  }: {
+    /** Skills whose install record was rebuilt from the store this run. */
+    rebuilt: readonly string[];
+    firstRun: boolean;
+  },
 ) {
   const write = !ctx.dryRun;
   const edited = new Map(out.edited.map((entry) => [entry.skill, entry.files]));
@@ -1007,12 +1257,17 @@ function applyVendored(
     const upstreamChanged =
       !existsSync(paths.upstream) || !sameTree(hashDir(paths.upstream), incoming);
     if (write && upstreamChanged) {
-      if (from) copyDir(from, paths.upstream);
+      if (from) replaceDir(from, paths.upstream);
       else rmSync(paths.upstream, { recursive: true, force: true });
     }
     const since = upstreamChanged ? ctx.now : (state.pending[name]?.since ?? ctx.now);
     if (write) state.pending[name] = { reason, since };
     pending.set(name, { skill: name, reason, files });
+  };
+  // The base first: a kill between the two leaves a copy that matches its record or the update.
+  const install = (from: string, paths: ReturnType<typeof storePaths>) => {
+    replaceDir(from, paths.base);
+    replaceDir(from, paths.live, { move: true });
   };
   for (const skill of chosen) {
     const from = staged.get(skill.name);
@@ -1025,7 +1280,7 @@ function applyVendored(
       // copy that differs from it counts as edited, so it is never overwritten.
       const files = changedFiles(incoming, hashDir(paths.live));
       if (write) {
-        copyDir(from, paths.base);
+        replaceDir(from, paths.base);
         state.skills[skill.name] = { hashes: incoming, path: skill.path };
       }
       out.skills.push({ name: skill.name, dir: paths.live, path: skill.path });
@@ -1047,8 +1302,7 @@ function applyVendored(
     out.skills.push({ name: skill.name, dir: paths.live, path: skill.path });
     if (!record || !existsSync(paths.live)) {
       if (write) {
-        copyDir(from, paths.live);
-        copyDir(from, paths.base);
+        install(from, paths);
         state.skills[skill.name] = { hashes: incoming, path: skill.path };
       }
       out.added.push(skill.name);
@@ -1059,6 +1313,29 @@ function applyVendored(
     if (files.length === 0) {
       if (write) rmSync(paths.upstream, { recursive: true, force: true });
       delete state.pending[skill.name];
+      if (write) record.path = skill.path;
+      if (rebuilt.includes(skill.name)) {
+        // New to the records (a killed sync may have copied it), so hooks hear about it again.
+        out.added.push(skill.name);
+        out.changed.push(
+          ...Object.keys(incoming).map((file) => `${filesAt(source, skill)}${file}`),
+        );
+      }
+      continue;
+    }
+    if (edited.has(skill.name) && sameTree(hashDir(paths.live), incoming)) {
+      // The copy is already this update: a sync killed after it replaced the copy and before it
+      // saved state.json. It is no edit; the record and the base catch up.
+      if (write) {
+        replaceDir(from, paths.base);
+        rmSync(paths.upstream, { recursive: true, force: true });
+        state.skills[skill.name] = { hashes: incoming, path: skill.path };
+        delete state.pending[skill.name];
+      }
+      edited.delete(skill.name);
+      out.edited = out.edited.filter((entry) => entry.skill !== skill.name);
+      out.updated.push(skill.name);
+      out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
       continue;
     }
     const editedFiles = edited.get(skill.name);
@@ -1067,8 +1344,7 @@ function applyVendored(
       continue;
     }
     if (write) {
-      copyDir(from, paths.live);
-      copyDir(from, paths.base);
+      install(from, paths);
       rmSync(paths.upstream, { recursive: true, force: true });
       state.skills[skill.name] = { hashes: incoming, path: skill.path };
       delete state.pending[skill.name];

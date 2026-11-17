@@ -12,7 +12,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { osScheduleErrors } from "@vite-hub/schedule/os";
 import { describe, expect, it } from "vite-plus/test";
 import { remoteManifest } from "../src/manifest.ts";
@@ -128,31 +128,57 @@ describe("a sync killed or left without its records", () => {
     const files: Record<string, string> = { "skills/tool/SKILL.md": skillMd("tool", "v2") };
     for (let k = 0; k < 8000; k++) files[`skills/tool/refs/f${k}.md`] = `f${k}`;
     vendor.commit(files);
-    const refs = join(live, "tool", "refs");
+    const store = dirname(live);
+    // The most files in any refs folder the sync is writing in the store, or -1 before there is one.
+    const copying = () => {
+      let most = -1;
+      const walk = (dir: string, depth: number) => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const path = join(dir, entry.name);
+          if (entry.name === "refs") {
+            const count = readdirSync(path).length;
+            if (count < 8000) most = Math.max(most, count);
+          } else if (depth < 6) walk(path, depth + 1);
+        }
+      };
+      try {
+        walk(store, 0);
+      } catch {
+        // A folder renamed or removed while it was read.
+      }
+      return most;
+    };
     const child = spawn(process.execPath, [cli, "sync"], {
       cwd: m.home,
       env: m.env,
       stdio: "ignore",
     });
-    const exited = new Promise((done) => child.on("exit", done));
+    let exited = false;
+    const exit = new Promise((done) => child.on("exit", done)).then(() => (exited = true));
     let copied = -1;
-    for (let i = 0; i < 30_000; i++) {
-      copied = existsSync(refs) ? readdirSync(refs).length : -1;
-      // Power lost, or the timer's unit stopped at logout, halfway through the copy.
-      if (copied > 0 && copied < 8000) {
+    while (!exited) {
+      copied = copying();
+      // Power lost, or the timer's unit stopped at logout, halfway through a copy.
+      if (copied > 0) {
         child.kill("SIGKILL");
         break;
       }
       await new Promise((done) => setTimeout(done, 2));
     }
-    await exited;
+    await exit;
     expect(copied).toBeGreaterThan(0);
-    expect(copied).toBeLessThan(8000);
+    // What agents see is the old copy or the new one, never half of one.
+    expect(readdirSync(join(live, "tool"))).not.toContain("refs");
 
     const report = await m.json("sync");
     expect(report.edited).toEqual([]);
     expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool", "v2"));
     expect(readdirSync(m.at(".claude/skills/tool/refs"))).toHaveLength(8000);
+    // Nothing the killed sync was writing is left behind.
+    expect(readdirSync(store).filter((name) => name.startsWith("."))).toEqual([]);
+    for (const part of ["live", "base"])
+      expect(readdirSync(join(store, part)).filter((name) => name.startsWith("."))).toEqual([]);
   }, 120_000);
 
   it("R2-4. after state.json is lost, a vendored skill nobody edited still takes upstream's update", async () => {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import {
@@ -373,4 +373,67 @@ console.log("pstack rebuilt");`,
     expect(names(m.at(".agents/skills"))).toEqual(["one"]);
     expect(readdirSync(m.at(".claude/skills"))).toContain(".skillfleet-manifest.json");
   });
+
+  it("a sync that finds nothing new upstream copies no file", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool", "other"));
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    const log = join(m.root, "copies.log");
+    // The number of files the sync copied, which it writes to SKILLFLEET_DEBUG_COPIES at exit.
+    const copies = async () => {
+      rmSync(log, { force: true });
+      const run = await m.runWith({ env: { SKILLFLEET_DEBUG_COPIES: log } }, "sync");
+      expect(run.code, run.stdout + run.stderr).toBe(0);
+      return Number(read(log).trim());
+    };
+    expect(await copies()).toBe(0);
+    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
+    expect(await copies()).toBeGreaterThan(0);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool", "v2"));
+    expect(await copies()).toBe(0);
+  });
+
+  it.skipIf(isWindows)(
+    "a working clone links a skill folder that is a link inside it, and names a submodule it does not have",
+    async () => {
+      const m = machine();
+      const sub = remote(m, "sub", { "SKILL.md": skillMd("subskill") });
+      const vendor = remote(m, "vendor", {
+        ...skills("skills/", "tool"),
+        "shared/linked/SKILL.md": skillMd("linked"),
+      });
+      m.git(
+        vendor.work,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "--quiet",
+        sub.url,
+        "skills/subskill",
+      );
+      symlinkSync("../shared/linked", join(vendor.work, "skills", "linked"));
+      // A link that leaves the repository is never followed.
+      mkdirSync(join(m.root, "secret", "outside"), { recursive: true });
+      writeFileSync(join(m.root, "secret", "outside", "SKILL.md"), skillMd("outside"));
+      symlinkSync(join(m.root, "secret", "outside"), join(vendor.work, "skills", "outside"));
+      m.git(vendor.work, "add", "-A");
+      m.git(vendor.work, "commit", "--quiet", "-m", "a submodule and linked skills");
+      m.git(vendor.work, "push", "--quiet", "origin", "main");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, skills: "skills/*", path: "~/src/vendor" }],
+      });
+      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      const report = await m.json<{ warnings: string[] }>("sync");
+      expect(names(m.at(".claude/skills"))).toEqual(["linked", "tool"]);
+      const warnings = report.warnings.join("\n");
+      expect(warnings).toMatch(/skills\/subskill is a git submodule that is not checked out/);
+      expect(warnings).toMatch(/skills\/outside links to a folder outside the source/);
+    },
+  );
 });
