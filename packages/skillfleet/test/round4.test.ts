@@ -564,7 +564,8 @@ describe("hooks", () => {
       hooks: [{ name: "build", on: ["loc:**"], run: `echo ran >> "${marker}"` }],
     });
     await init(m, manifest);
-    expect(read(marker)).toBe("ran\n");
+    // cmd's echo writes "ran \r\n".
+    expect(read(marker).trim()).toBe("ran");
     writeFiles(folder, { "tool/SKILL.md": skillMd("tool", "v2") });
     const report = await m.json("sync");
     // `changed` of a local source is filled only when it has never been fetched.
