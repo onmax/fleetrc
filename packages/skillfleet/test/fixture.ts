@@ -207,17 +207,22 @@ function spawnAsync(
   });
 }
 
-/** A fresh temporary machine. `agents: false` leaves out the agent folders. */
+/**
+ * A fresh temporary machine. `agents: false` leaves out the agent folders. `home` names the HOME
+ * folder inside the machine's root, and `base` is where the root is made (the temp folder).
+ */
 export function machine({
   agents = true,
   scheduler = "forbid",
-}: { agents?: boolean; scheduler?: Scheduler } = {}): Machine {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "skillfleet-e2e-")));
+  home: homeName = "home",
+  base = tmpdir(),
+}: { agents?: boolean; scheduler?: Scheduler; home?: string; base?: string } = {}): Machine {
+  const root = realpathSync(mkdtempSync(join(base, "skillfleet-e2e-")));
   made.push(root);
   const schedulerLog = join(root, "scheduler-calls.jsonl");
   appendFileSync(schedulerLog, "");
   const path = [schedulerShims(root), process.env.PATH ?? process.env.Path ?? ""].join(delimiter);
-  const home = join(root, "home");
+  const home = join(root, homeName);
   mkdirSync(home, { recursive: true });
   if (agents) for (const dir of AGENT_HOMES) mkdirSync(join(home, dir), { recursive: true });
   const gitConfig = join(root, "gitconfig");

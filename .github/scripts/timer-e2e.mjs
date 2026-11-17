@@ -6,6 +6,10 @@
 //   pnpm --filter skillfleet build
 //   (cd packages/skillfleet && pnpm pack --out ../../skillfleet.tgz)
 //   node .github/scripts/timer-e2e.mjs skillfleet.tgz
+//   node .github/scripts/timer-e2e.mjs skillfleet.tgz --home-name "O'Brien & Zoë"
+//
+// --home-name names the throwaway HOME folder, so the timer's files, its command line and its
+// environment carry that name (the windows-break job passes cmd and PowerShell metacharacters).
 //
 // Everything skillfleet writes lives under a throwaway HOME, but the timer itself goes into the
 // OS scheduler of the user that runs this. It always removes it again, and it refuses to run
@@ -21,7 +25,7 @@ import { parseArgs } from "node:util";
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
-  options: { yes: { type: "boolean" } },
+  options: { yes: { type: "boolean" }, "home-name": { type: "string", default: "home" } },
 });
 const tarball = positionals[0] && resolve(positionals[0]);
 assert.ok(tarball && existsSync(tarball), "pass the path of the packed skillfleet tarball");
@@ -40,7 +44,7 @@ const platform = process.platform;
 const realHome = homedir();
 
 const root = mkdtempSync(join(tmpdir(), "skillfleet-timer-e2e-"));
-const home = join(root, "home");
+const home = join(root, values["home-name"]);
 const prefix = join(root, "prefix");
 const bare = join(root, "remotes", "vendor.git");
 const work = join(root, "upstream", "vendor");
