@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { personalSkillsDir, personalSource } from "./edits.ts";
+import { UserError } from "./errors.ts";
 import { isRecord, lstat, moveDir, readJsonFile } from "./fs.ts";
 import { linkTarget, MANIFEST_FILE, removeLink } from "./linker.ts";
 import {
@@ -18,7 +19,7 @@ import {
   remoteManifest,
   writeConfig,
 } from "./manifest.ts";
-import { findName } from "./names.ts";
+import { nameKey } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { GitError } from "./exec.ts";
@@ -123,7 +124,7 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
   for (const entry of lockEntries) {
     const local = personal ? join(personalSkillsDir(personal), entry.name) : undefined;
     if (local && existsSync(join(local, "SKILL.md"))) {
-      if (findName(Object.keys(loaded.root.forks), entry.name) === undefined)
+      if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name)))
         imports.forks[entry.name] = {
           from: entry.source,
           path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
@@ -432,8 +433,34 @@ export async function cloneBeforeAdopt(plan: InitPlan): Promise<string[]> {
   }
 }
 
+/**
+ * Throws, before anything moves, when a move in the plan would fail: a folder to move that is gone,
+ * or an adoption into a name that something else holds now, or that another adoption takes.
+ * Moved one by one, a failure halfway would leave some skills adopted and others not.
+ */
+function checkMoves(migrations: readonly Migration[]) {
+  const problems: string[] = [];
+  const taken = new Set<string>();
+  for (const migration of migrations) {
+    if (migration.kind !== "adopt" && migration.kind !== "backup") continue;
+    if (!lstat(migration.path)) problems.push(`${tildify(migration.path)} is gone`);
+    if (migration.kind !== "adopt") continue;
+    const key = nameKey(migration.to);
+    if (lstat(migration.to) || taken.has(key))
+      problems.push(
+        `${tildify(migration.to)} exists, so ${tildify(migration.path)} can't move there`,
+      );
+    taken.add(key);
+  }
+  if (problems.length > 0)
+    throw new UserError(
+      `init changed nothing: ${problems.join("; ")}; run \`skillfleet init\` again`,
+    );
+}
+
 /** Carries out a plan: back up, adopt, unfold folder links, write config and imports. Sync runs after. */
 export function applyPlan(plan: InitPlan): string[] {
+  checkMoves(plan.migrations);
   const done: string[] = [];
   const backupRoot = join(paths.backup(), new Date().toISOString().replace(/[:.]/g, "-"));
   const unfold: Extract<Migration, { kind: "unfold" }>[] = [];
