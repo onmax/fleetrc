@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
 import {
@@ -285,9 +285,16 @@ export function forkLines(state: State): string[] {
  * The files of a merge's conflicts that are not resolved yet: they still hold git's markers, or
  * upstream's side still sits beside them as `<file>.upstream`.
  */
-export function unresolvedFiles(conflict: { dir: string; files: readonly string[] }): string[] {
+export function unresolvedFiles(conflict: {
+  dir: string;
+  files: readonly string[];
+  markers?: Record<string, string>;
+}): string[] {
   return conflict.files.filter((file) => {
     const path = join(conflict.dir, file);
+    // A conflict git's markers can't show is open while the file merge put beside it is there.
+    const marker = conflict.markers?.[file];
+    if (marker !== undefined) return lstat(join(conflict.dir, marker)) !== undefined;
     if (lstat(`${path}.upstream`)) return true;
     try {
       if (!lstat(path)?.isFile()) return false;
@@ -370,6 +377,8 @@ export async function diffPending(spec: string): Promise<string> {
 interface MergeResult {
   merged: string[];
   conflicts: string[];
+  /** For each conflict git's markers can't show, the file merge wrote beside it, relative to the copy. */
+  markers?: Record<string, string>;
   /** The conflicts an earlier merge left were resolved, and this merge recorded that. */
   resolved?: boolean;
 }
@@ -394,6 +403,9 @@ function linkedFolder(dir: string, file: string): string | undefined {
   return undefined;
 }
 
+/** Whether git takes `data` for binary: a NUL byte in its first 8000 bytes. */
+const binary = (data: Buffer) => data.subarray(0, 8000).includes(0);
+
 /** `file` in the tree `dir`, read without following a link; one inside a linked folder reads as that link. */
 function readContent(dir: string, file: string): Content | undefined {
   const folder = linkedFolder(dir, file);
@@ -408,9 +420,9 @@ function readContent(dir: string, file: string): Content | undefined {
  * Writes upstream's side of a conflict beside the local file, at `<file>.upstream`, or
  * `<file>.upstream.<n>` when that is taken: created, never overwritten, and never through a link.
  */
-function writeSidecar(target: string, content: Buffer): string {
+function writeSidecar(target: string, content: Buffer, suffix = ".upstream"): string {
   for (let n = 0; ; n++) {
-    const path = n === 0 ? `${target}.upstream` : `${target}.upstream.${n}`;
+    const path = n === 0 ? `${target}${suffix}` : `${target}${suffix}.${n}`;
     try {
       writeFileSync(path, content, { flag: "wx" });
       return path;
@@ -438,6 +450,43 @@ async function mergeTrees(
     ...Object.keys(hashDir(upstream)),
   ]);
   const result: MergeResult = { merged: [], conflicts: [] };
+  const markers: Record<string, string> = {};
+  /**
+   * A conflict git's markers can't show: upstream's side goes beside the local file, as
+   * `<file>.upstream` (a link's as a note of its target), or a note that upstream deleted it. A file
+   * in a linked folder gets its note beside that folder, since merge never writes through a link.
+   */
+  const conflict = (file: string, upstream: Content | undefined) => {
+    result.conflicts.push(file);
+    if (dryRun) return;
+    const folder = linkedFolder(live, file);
+    const at = join(live, folder ?? file);
+    mkdirSync(dirname(at), { recursive: true });
+    const written =
+      folder !== undefined
+        ? writeSidecar(
+            at,
+            Buffer.from(
+              `upstream changed ${file}, which is inside ${folder}, a link here; skillfleet does not write through links. Bring in upstream's change by hand, then delete this file and run \`skillfleet merge\` again.\n`,
+            ),
+            ".upstream-conflict",
+          )
+        : upstream === undefined
+          ? writeSidecar(
+              at,
+              Buffer.from(
+                `upstream deleted ${file}, which you changed. Keep your copy or delete it, then delete this file and run \`skillfleet merge\` again.\n`,
+              ),
+              ".upstream-deleted",
+            )
+          : writeSidecar(
+              at,
+              Buffer.isBuffer(upstream)
+                ? upstream
+                : Buffer.from(`upstream has a link here, to ${upstream.link}\n`),
+            );
+    markers[file] = relative(live, written).split(sep).join("/");
+  };
   for (const file of [...files].sort()) {
     const b = readContent(base, file);
     const l = readContent(live, file);
@@ -447,7 +496,7 @@ async function mergeTrees(
     const plain = (content: Content | undefined) =>
       content === undefined || Buffer.isBuffer(content);
     if (!plain(b) || !plain(l) || !plain(u)) {
-      result.conflicts.push(file);
+      conflict(file, u);
       continue;
     }
     const [lb, bb, ub] = [l, b, u] as (Buffer | undefined)[];
@@ -461,9 +510,14 @@ async function mergeTrees(
       continue;
     }
     if (lb === undefined || ub === undefined || bb === undefined) {
-      // Added or deleted on one side and changed on the other: keep the local file, put upstream's beside it.
-      if (ub !== undefined && !dryRun) writeSidecar(target, ub);
-      result.conflicts.push(file);
+      // Added or deleted on one side and changed on the other: keep the local file, put upstream's
+      // beside it, or a note that upstream deleted it.
+      conflict(file, ub);
+      continue;
+    }
+    // git merges text only; a binary file keeps the local side, with upstream's beside it.
+    if ([lb, bb, ub].some(binary)) {
+      conflict(file, ub);
       continue;
     }
     const scratch = mkdtempSync(join(tmpdir(), "skillfleet-merge-"));
@@ -490,12 +544,18 @@ async function mergeTrees(
         },
       );
       if (merge.code === 0) result.merged.push(file);
-      else if (merge.code !== null && merge.code > 0) result.conflicts.push(file);
+      else if (merge.code !== null && merge.code > 0 && merge.code < 128) {
+        // Each conflict is a hunk with git's markers in the file.
+        if (dryRun || unresolvedFiles({ dir: live, files: [file] }).length > 0)
+          result.conflicts.push(file);
+        else conflict(file, ub);
+      } else if (merge.code !== null && merge.code >= 128) conflict(file, ub);
       else throw new UserError(`git merge-file ${file}: ${merge.stderr.trim()}`);
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
   }
+  if (Object.keys(markers).length > 0) result.markers = markers;
   return result;
 }
 
@@ -524,7 +584,11 @@ export async function mergeSkill(
   /** Records the conflicts a merge left in `into`, which status, doctor and sync report. */
   const record = (result: MergeResult, into: string): MergeResult & { into: string } => {
     if (!dryRun && result.conflicts.length > 0) {
-      (state.conflicts ??= {})[name] = { dir: into, files: result.conflicts };
+      (state.conflicts ??= {})[name] = {
+        dir: into,
+        files: result.conflicts,
+        ...(result.markers ? { markers: result.markers } : {}),
+      };
       saveState(state);
     }
     return { ...result, ...(resolved ? { resolved } : {}), into };

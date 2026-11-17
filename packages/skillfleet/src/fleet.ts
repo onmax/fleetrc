@@ -44,6 +44,8 @@ const HOST_NOTES = {
 const ANSWERED = `echo "${NOTE} answered" >&2`;
 /** The version the installed launcher runs, told to stderr before `fleet upgrade` replaces it. */
 const WAS = `if [ -x "$l" ]; then echo "${NOTE} was $("$l" --version </dev/null 2>/dev/null)" >&2; fi`;
+/** The version the launcher runs once `fleet upgrade` installed it, told before the sync that follows, which may fail. */
+const NOW = `echo "${NOTE} now $("$l" --version </dev/null 2>/dev/null)" >&2`;
 
 /**
  * Runs `command`, a simple command, so that it stops when the connection drops. Without a tty sshd
@@ -82,7 +84,7 @@ export function remoteScript(
       return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then ${watched(`"$f" sync --json${dryRun ? " --dry-run" : ""}`)}; else ${MISSING}; fi`;
     case "upgrade":
       // npx next to the launcher's node, with that node first on PATH for npx's own `#!/usr/bin/env node`.
-      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
+      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${NOW} && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
     default: {
       const exhaustive: never = action;
       return exhaustive;
@@ -235,9 +237,10 @@ async function runOnHost(
       checked: false,
     };
   const answered = new RegExp(`^${NOTE} answered\r?$`, "m").test(run.stderr);
-  const was = run.stderr.match(
-    new RegExp(`^${NOTE} was (\\d+\\.\\d+\\.\\d+[\\w.+-]*)\r?$`, "m"),
-  )?.[1];
+  const told = (what: "was" | "now") =>
+    run.stderr.match(new RegExp(`^${NOTE} ${what} (\\d+\\.\\d+\\.\\d+[\\w.+-]*)\r?$`, "m"))?.[1];
+  const was = told("was");
+  const now = told("now");
   const stderr = run.stderr.replace(new RegExp(`^${NOTE} .*\r?\n?`, "gm"), "");
   if (run.timedOut) {
     const after = `${Math.round(timeoutMs / 1000)} s`;
@@ -245,18 +248,25 @@ async function runOnHost(
     // ssh is gone, so the host's `watched` sync stops.
     const tail =
       action === "status" ? "but sent no report" : "but its run did not finish, so it was stopped";
-    return { error: `timed out after ${after} (the host answered, ${tail})`, reached: true };
+    return {
+      error: `timed out after ${after} (the host answered, ${tail})`,
+      reached: true,
+      was,
+      now,
+    };
   }
   const note = run.stdout.match(new RegExp(`^${NOTE} ([\\w-]+)$`, "m"))?.[1];
   if (note !== undefined && Object.hasOwn(HOST_NOTES, note))
     return { note: note as keyof typeof HOST_NOTES };
   // sync --json prints the report last, and exits 1 when a source failed; status prints the file.
   const report = parseReport(run.stdout);
-  if (report !== undefined) return { report, was };
+  if (report !== undefined) return { report, was, now };
   if (run.code !== 0)
     return {
       error: (stderr || run.stdout).trim().split("\n").slice(-3).join(" ") || `exit ${run.code}`,
       reached: answered,
+      was,
+      now,
     };
   return {
     error: "the host answered with something that is not a skillfleet report",
@@ -305,13 +315,20 @@ export async function fleet(
         };
       }
       const run = "report" in answer ? summarize(answer.report) : undefined;
+      const before = cache[host]?.skillfleet;
+      // What the host runs once the upgrade went in, told before its sync, which may still fail.
+      const to = ("now" in answer ? answer.now : undefined) || run?.skillfleet;
+      const upgrade =
+        action === "upgrade" && to
+          ? {
+              upgrade: {
+                from: ("was" in answer ? answer.was : undefined) || before || undefined,
+                to,
+              },
+            }
+          : {};
       if (run) {
-        const before = cache[host]?.skillfleet;
         if (!dryRun) cache[host] = run;
-        const upgrade =
-          action === "upgrade" && run.skillfleet
-            ? { upgrade: { from: answer.was || before || undefined, to: run.skillfleet } }
-            : {};
         return { host, reachable: true, checked: true, lastRun: run, ...upgrade, behind: [] };
       }
       return {
@@ -319,6 +336,7 @@ export async function fleet(
         reachable: answer.reached ?? false,
         checked: answer.checked ?? true,
         lastRun: cache[host],
+        ...upgrade,
         error: answer.error ?? "no report",
         behind: [],
       };

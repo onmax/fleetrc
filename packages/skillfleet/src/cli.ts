@@ -41,7 +41,7 @@ import {
   updateConfig,
   webPage,
 } from "./manifest.ts";
-import { findName } from "./names.ts";
+import { findName, nameKey } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import { formatReport, type Report } from "./report.ts";
 import {
@@ -54,7 +54,7 @@ import {
 } from "./selfinstall.ts";
 import { promptHook, staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
-import { LockHeldError, manifestSpec, sync } from "./sync.ts";
+import { LockHeldError, manifestSpec, sync, withSyncLock } from "./sync.ts";
 import {
   foreignTimer,
   foreignTimerResource,
@@ -67,6 +67,7 @@ import {
   recordTimer,
   removeTimer,
   sameAsInstalled,
+  scheduleDrift,
   systemdMissing,
   TIMER_NAME,
   TimerError,
@@ -532,12 +533,24 @@ function lastRun(): Report | undefined {
   return isRecord(raw) && raw.version === 1 ? (raw as unknown as Report) : undefined;
 }
 
+/** The installed timer's schedule, when the manifest now names another; see `scheduleDrift`. */
+async function timerScheduleDrift(): Promise<string | undefined> {
+  try {
+    const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
+    return scheduleDrift(loaded.root.timer);
+  } catch {
+    // A manifest that does not load is doctor's to report.
+    return undefined;
+  }
+}
+
 async function status() {
   const report = lastRun();
   const state = loadState();
   const stale = await staleSessions(state);
   const config = readConfig();
   const timerState = await readTimer();
+  const drift = await timerScheduleDrift();
   if (json) {
     emit({
       manifest: config?.manifest,
@@ -546,6 +559,7 @@ async function status() {
       forks: state.forks ?? {},
       staleSessions: stale,
       timer: timerState instanceof TimerError ? { error: timerState.message } : timerState,
+      ...(drift ? { timerSchedule: drift } : {}),
     });
     return 0;
   }
@@ -566,6 +580,7 @@ async function status() {
           : await missingTimer(timerState, declined)
     }`,
   );
+  if (drift) say(`timer: ${drift}`);
   for (const proc of stale)
     say(
       `restart: ${proc.agent} (pid ${proc.pid}) started ${proc.startedAt.toISOString()}, before the last skill change at ${state.lastChange}`,
@@ -736,34 +751,39 @@ async function remove() {
   const name = one("source or skill");
   const manifest = manifestSpec(values.manifest);
   const loaded = await loadManifest(manifest, { offline: true });
-  const declared = loaded.sources.find((source) => source.id === name);
+  // Source ids are one in any case, as everywhere else.
+  const declared = loaded.sources.find((source) => nameKey(source.id) === nameKey(name));
   if (declared && declared.via === undefined) {
-    const target = manifestToEdit(loaded, manifest, `Remove the source "${name}" from "sources"`);
+    const id = declared.id;
+    const target = manifestToEdit(loaded, manifest, `Remove the source "${id}" from "sources"`);
     return changeManifest(
-      `remove source ${name}`,
+      `remove source ${id}`,
       target,
       (raw) => {
         raw.sources = (Array.isArray(raw.sources) ? raw.sources : []).filter(
-          (source: unknown) => !isRecord(source) || (source.id ?? defaultSourceId(source)) !== name,
+          (source: unknown) =>
+            !isRecord(source) ||
+            nameKey(typeof source.id === "string" ? source.id : defaultSourceId(source)) !==
+              nameKey(id),
         );
       },
-      { removed: name },
+      { removed: id },
     );
   }
   if (declared?.via !== undefined) {
     // A team manifest's source: the team's file is not yours, so your manifest leaves it out.
-    const via = declared.via;
+    const { via, id } = declared;
     const parent = loaded.root.extends[via]!.manifest;
     const target = manifestToEdit(
       loaded,
       manifest,
-      `Add "${name}" to "excludeSources" of the "extends" entry ${JSON.stringify(parent)}`,
+      `Add "${id}" to "excludeSources" of the "extends" entry ${JSON.stringify(parent)}`,
     );
     return changeManifest(
-      `leave out source ${name} of ${parent}`,
+      `leave out source ${id} of ${parent}`,
       target,
-      (raw) => excludeInExtends(raw, via, "excludeSources", name),
-      { removed: name, extends: parent },
+      (raw) => excludeInExtends(raw, via, "excludeSources", id),
+      { removed: id, extends: parent },
     );
   }
   const linked = loadState().skills;
@@ -928,6 +948,62 @@ async function fleetCommand(action: string | undefined) {
   return results.some(failed) ? 1 : 0;
 }
 
+/**
+ * Runs a command that changes state.json, the store or the manifest under the sync lock, so it
+ * never runs while a sync does; a dry run changes nothing and takes no lock.
+ */
+const locked = (command: string, work: () => Promise<number>) =>
+  dryRun ? work() : withSyncLock(command, work);
+
+async function adopt() {
+  const result = await adoptSkill(manifestSpec(values.manifest), resolve(one("path")), {
+    dryRun,
+  });
+  if (dryRun) {
+    say(`would move ${result.name} to ${tildify(result.to)}`);
+    if (json) emit({ ...result, dryRun });
+    return 0;
+  }
+  say(`moved ${result.name} to ${tildify(result.to)}; commit it there`);
+  return syncAfter({ ...result, dryRun });
+}
+
+async function fork() {
+  const result = await forkSkill(manifestSpec(values.manifest), one("skill"), { dryRun });
+  const where = tildify(result.manifest.file);
+  const push = result.manifest.push ? `, then commit and push ${where}` : "";
+  const details = { ...result, dryRun };
+  if (dryRun) {
+    say(
+      `would copy ${tildify(result.from)} to ${tildify(result.to)}, record the fork in ${where}, and remove skillfleet's copy`,
+    );
+    if (json) emit(details);
+    return 0;
+  }
+  say(`forked into ${tildify(result.to)}; commit it there${push}`);
+  if (result.manifest.push) {
+    if (json) emit(details);
+    return 0;
+  }
+  return syncAfter(details);
+}
+
+async function merge() {
+  const result = await mergeSkill(manifestSpec(values.manifest), one("skill"), { dryRun });
+  const would = dryRun ? "would merge" : "merged";
+  if (result.merged.length) say(`${would}: ${result.merged.join(", ")}`);
+  if (result.conflicts.length)
+    say(
+      `${dryRun ? "would conflict" : "conflicts"}: ${result.conflicts.join(", ")} in ${tildify(result.into)}${dryRun ? "" : "; resolve the markers by hand"}`,
+    );
+  if (!result.merged.length && !result.conflicts.length)
+    say(result.resolved ? "merged; nothing left to do" : "nothing to merge");
+  if (result.manifest?.push && !dryRun)
+    say(`recorded the new base in ${tildify(result.manifest.file)}; commit and push it`);
+  if (json) emit({ ...result, dryRun });
+  return result.conflicts.length && !dryRun ? 1 : 0;
+}
+
 async function main(): Promise<number> {
   if (values.version) {
     console.log(version);
@@ -980,40 +1056,13 @@ async function main(): Promise<number> {
       return checks.every((check) => check.ok) ? 0 : 1;
     }
     case "add":
-      return add();
+      return locked("add", add);
     case "remove":
-      return remove();
-    case "adopt": {
-      const result = await adoptSkill(manifestSpec(values.manifest), resolve(one("path")), {
-        dryRun,
-      });
-      if (dryRun) {
-        say(`would move ${result.name} to ${tildify(result.to)}`);
-        if (json) emit({ ...result, dryRun });
-        return 0;
-      }
-      say(`moved ${result.name} to ${tildify(result.to)}; commit it there`);
-      return syncAfter({ ...result, dryRun });
-    }
-    case "fork": {
-      const result = await forkSkill(manifestSpec(values.manifest), one("skill"), { dryRun });
-      const where = tildify(result.manifest.file);
-      const push = result.manifest.push ? `, then commit and push ${where}` : "";
-      const details = { ...result, dryRun };
-      if (dryRun) {
-        say(
-          `would copy ${tildify(result.from)} to ${tildify(result.to)}, record the fork in ${where}, and remove skillfleet's copy`,
-        );
-        if (json) emit(details);
-        return 0;
-      }
-      say(`forked into ${tildify(result.to)}; commit it there${push}`);
-      if (result.manifest.push) {
-        if (json) emit(details);
-        return 0;
-      }
-      return syncAfter(details);
-    }
+      return locked("remove", remove);
+    case "adopt":
+      return locked("adopt", adopt);
+    case "fork":
+      return locked("fork", fork);
     case "diff": {
       if (rest.length > 1) usage("diff takes at most one skill");
       const spec = manifestSpec(values.manifest);
@@ -1023,21 +1072,8 @@ async function main(): Promise<number> {
       );
       return 0;
     }
-    case "merge": {
-      const result = await mergeSkill(manifestSpec(values.manifest), one("skill"), { dryRun });
-      const would = dryRun ? "would merge" : "merged";
-      if (result.merged.length) say(`${would}: ${result.merged.join(", ")}`);
-      if (result.conflicts.length)
-        say(
-          `${dryRun ? "would conflict" : "conflicts"}: ${result.conflicts.join(", ")} in ${tildify(result.into)}${dryRun ? "" : "; resolve the markers by hand"}`,
-        );
-      if (!result.merged.length && !result.conflicts.length)
-        say(result.resolved ? "merged; nothing left to do" : "nothing to merge");
-      if (result.manifest?.push && !dryRun)
-        say(`recorded the new base in ${tildify(result.manifest.file)}; commit and push it`);
-      if (json) emit({ ...result, dryRun });
-      return result.conflicts.length && !dryRun ? 1 : 0;
-    }
+    case "merge":
+      return locked("merge", merge);
     case "timer":
       return timer(rest[0]);
     case "fleet":

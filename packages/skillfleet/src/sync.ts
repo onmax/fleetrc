@@ -65,8 +65,8 @@ import {
 } from "./process.ts";
 import type { HookRun, Report } from "./report.ts";
 import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sources.ts";
-import { loadState, saveState, sourceState, type State } from "./state.ts";
-import { installedSchedule } from "./timer.ts";
+import { loadState, sourceState, type State, StateFile } from "./state.ts";
+import { scheduleDrift } from "./timer.ts";
 import { version } from "./version.ts";
 
 export interface SyncOptions {
@@ -88,21 +88,18 @@ export interface SyncOptions {
 /**
  * A note, once for each new schedule, when the manifest's `timer` differs from the one the installed
  * timer runs on. The sync does not install it again: it may be the timer's own run, and launchd
- * stops a job's running process when the job is replaced.
+ * stops a job's running process when the job is replaced. `doctor` and `status` say it every time.
  */
 function timerDrift(timer: { cron: string; timeZone?: string }, state: State): string | undefined {
-  const installed = installedSchedule();
-  const want = { cron: timer.cron, timeZone: timer.timeZone ?? "local" };
-  if (!installed || (installed.cron === want.cron && installed.timeZone === want.timeZone)) {
+  const drift = scheduleDrift(timer);
+  if (!drift) {
     delete state.timerNotice;
     return undefined;
   }
-  const key = `${want.cron} ${want.timeZone}`;
+  const key = `${timer.cron} ${timer.timeZone ?? "local"}`;
   if (state.timerNotice === key) return undefined;
   state.timerNotice = key;
-  const zone = (spec: { timeZone: string }) =>
-    spec.timeZone === "local" ? "" : ` (${spec.timeZone})`;
-  return `the manifest's timer is now "${want.cron}"${zone(want)}, but the installed timer runs on "${installed.cron}"${zone(installed)}; run \`skillfleet timer install\` to apply it`;
+  return drift;
 }
 
 export function manifestSpec(override?: string): string {
@@ -130,6 +127,8 @@ const START_SLACK_MS = 10_000;
 
 export interface LockHolder {
   pid: number;
+  /** The command that holds it: `sync`, or one that changes state.json, such as `merge`. */
+  command?: string;
   /** When the holder started, by its own clock, to tell it from a later process with its pid. */
   started?: number;
   at: number;
@@ -168,6 +167,7 @@ function readLock(file: string): { text: string; holder: LockHolder } | undefine
       text,
       holder: {
         pid: raw.pid,
+        command: optional(raw, "command", "string"),
         started: optional(raw, "started", "number"),
         at: optional(raw, "at", "number") ?? mtime,
         host: optional(raw, "host", "string"),
@@ -181,11 +181,12 @@ function readLock(file: string): { text: string; holder: LockHolder } | undefine
 }
 
 /** What this process writes into the sync lock: who it is, and where. */
-export function lockText(): string {
+export function lockText(command = "sync"): string {
   const here = whereabouts();
   const ticks = processStartTicks();
   return JSON.stringify({
     pid: process.pid,
+    command,
     started: Math.floor(performance.timeOrigin),
     at: Date.now(),
     ...here,
@@ -259,17 +260,19 @@ function staleBecause(holder: LockHolder): string | undefined {
   return undefined;
 }
 
-/** Another sync holds the lock and is still running. */
+/** Another sync, or a command that changes state.json, holds the lock and is still running. */
 export class LockHeldError extends UserError {
   readonly pid: number;
-  constructor(pid: number, where?: string) {
-    super(`another skillfleet sync is running (pid ${pid}${where ? ` ${where}` : ""})`);
+  constructor(pid: number, where?: string, command = "sync", hint = "") {
+    super(
+      `${command === "sync" ? "another skillfleet sync" : `skillfleet ${command}`} is running (pid ${pid}${where ? ` ${where}` : ""})${hint}`,
+    );
     this.pid = pid;
   }
 }
 
 const heldError = (holder: LockHolder) =>
-  new LockHeldError(holder.pid, elsewhere(holder, whereabouts()));
+  new LockHeldError(holder.pid, elsewhere(holder, whereabouts()), holder.command);
 
 /** How `takeLock` judges a lock and, in tests, lets other contenders in between its steps. */
 export interface LockOptions {
@@ -279,15 +282,58 @@ export interface LockOptions {
   step?: () => void;
 }
 
-/** Takes the sync lock atomically; a stale lock is moved aside first. Returns the release and a note. */
-function acquireLock(): { release: () => void; note?: string } {
+/** Whether this process holds the sync lock for a command, which the sync it runs then shares. */
+let heldByCommand = false;
+
+/**
+ * Takes the sync lock atomically; a stale lock is moved aside first. Returns the release and a
+ * note. A sync that a command holding the lock runs (`merge`, `fork`, `remove`) runs under it.
+ */
+function acquireLock(command = "sync"): { release: () => void; note?: string } {
+  if (heldByCommand) return { release: () => {} };
   const file = paths.lock();
   mkdirSync(dirname(file), { recursive: true });
-  const mine = lockText();
+  const mine = lockText(command);
   const release = () => {
     if (readLock(file)?.text === mine) rmSync(file, { force: true });
   };
   return { release, note: takeLock(file, mine) };
+}
+
+/** How long a command waits for a running sync to let go of the lock; SKILLFLEET_LOCK_WAIT_MS sets it, for tests. */
+function lockWaitMs(): number {
+  const set = Number(process.env.SKILLFLEET_LOCK_WAIT_MS);
+  return set >= 0 && process.env.SKILLFLEET_LOCK_WAIT_MS ? set : 10_000;
+}
+
+/**
+ * Runs `work`, a command that changes state.json or the store (`merge`, `fork`, `adopt`, `remove`),
+ * under the sync lock, so a sync never writes back a state.json it read before the command changed
+ * it. A running sync is waited for a few seconds; after that the command stops and says to try again.
+ */
+export async function withSyncLock<T>(command: string, work: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + lockWaitMs();
+  let lock: ReturnType<typeof acquireLock>;
+  for (;;) {
+    try {
+      lock = acquireLock(command);
+      break;
+    } catch (error) {
+      if (!(error instanceof LockHeldError) || Date.now() >= deadline) {
+        if (error instanceof LockHeldError)
+          throw new UserError(`${error.message}; try again when it finishes`);
+        throw error;
+      }
+      await new Promise((done) => setTimeout(done, 250));
+    }
+  }
+  heldByCommand = true;
+  try {
+    return await work();
+  } finally {
+    heldByCommand = false;
+    lock.release();
+  }
 }
 
 /**
@@ -660,7 +706,8 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       }));
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
-    const state = loadState(dryRun ? undefined : warnings);
+    const stateFile = new StateFile(loadState(dryRun ? undefined : warnings));
+    const state = stateFile.state;
     if (!dryRun && !options.skipTimerCheck) {
       const drift = timerDrift(loaded.root.timer, state);
       if (drift) warnings.push(drift);
@@ -710,6 +757,9 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       } catch (error) {
         results.push({ ...failedResult(source, errorText(error)), skills: lastLinked(source.id) });
       }
+      // Saved as each source is done: a sync stopped later (its time limit, a kill) leaves no copy
+      // in the store at a version state.json does not record.
+      if (!dryRun) stateFile.save();
     }
 
     // Sources in the state that the manifest no longer declares.
@@ -912,7 +962,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       for (const hook of report.hooks)
         if (hook.code !== 0) report.errors.push(`hook ${hook.name} exited with ${hook.code}`);
       if (recordSkills(state, winners, results, startedAt)) state.lastChange = startedAt;
-      saveState(state);
+      stateFile.save();
     }
     report.ok = report.errors.length === 0;
     report.finishedAt = new Date().toISOString();

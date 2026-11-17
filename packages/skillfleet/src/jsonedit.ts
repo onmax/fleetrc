@@ -15,6 +15,8 @@ interface Node {
 class Scanner {
   i = 0;
   readonly text: string;
+  /** Keys an object holds twice, which JSON.parse reads as the last one alone. */
+  readonly duplicates: string[] = [];
   constructor(text: string) {
     this.text = text;
   }
@@ -56,6 +58,7 @@ class Scanner {
           this.ws();
           this.expect(":");
           const value = this.value();
+          if (members.some((member) => member.key === key)) this.duplicates.push(key);
           members.push({ key, keyStart, value });
           this.ws();
           if (this.text[this.i] === ",") {
@@ -111,9 +114,15 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
 /**
  * Edits `text`, which parses to `before`, so it parses to `after`. Returns undefined when it can't
- * (the text is not plain JSON); the caller then writes the whole file.
+ * (the text is not plain JSON, or an object repeats a key, which `notes` then names); the caller
+ * then writes the whole file.
  */
-export function editJsonText(text: string, before: unknown, after: unknown): string | undefined {
+export function editJsonText(
+  text: string,
+  before: unknown,
+  after: unknown,
+  notes: string[] = [],
+): string | undefined {
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const unit = text.match(/\n([ \t]+)\S/)?.[1] ?? "  ";
   let root: Node;
@@ -123,6 +132,13 @@ export function editJsonText(text: string, before: unknown, after: unknown): str
     root = scanner.value();
     scanner.ws();
     if (scanner.i !== text.length) return undefined;
+    // JSON.parse keeps the last of a repeated key, which the text's first one does not match.
+    if (scanner.duplicates.length > 0) {
+      notes.push(
+        `it repeats the key${scanner.duplicates.length > 1 ? "s" : ""} ${[...new Set(scanner.duplicates)].map((key) => JSON.stringify(key)).join(", ")}, so it was written out whole with the last of each`,
+      );
+      return undefined;
+    }
   } catch {
     return undefined;
   }
@@ -230,7 +246,8 @@ export function editJsonText(text: string, before: unknown, after: unknown): str
           return true;
         }
       }
-      if (to.length === from.length) return from.every((item, i) => walk(items[i]!, item, to[i]));
+      if (to.length === from.length && items.length === from.length)
+        return from.every((item, i) => walk(items[i]!, item, to[i]));
       replace(node, to);
       return true;
     }
@@ -245,6 +262,19 @@ export function editJsonText(text: string, before: unknown, after: unknown): str
       const order = Object.keys(to);
       if (added.some((key, i) => order.indexOf(key) !== order.length - added.length + i))
         return false;
+      if (drop.length > 0 && drop.length === members.length && added.length > 0) {
+        // Every member replaced: one edit, laid out like the first member was.
+        const first = members[0]!;
+        const lineBreak = multiline(node) && startsLine(first.keyStart);
+        edits.push({
+          start: spans[0]!.start,
+          end: spans.at(-1)!.end,
+          text: added
+            .map((key) => `${JSON.stringify(key)}: ${layout(to[key], first.value, node)}`)
+            .join(lineBreak ? `,${eol}${indentAt(first.keyStart)}` : ", "),
+        });
+        return true;
+      }
       if (drop.length > 0) removeEntries(node, spans, drop);
       const last = members.filter((_, i) => !drop.includes(i)).at(-1);
       return addAfter(

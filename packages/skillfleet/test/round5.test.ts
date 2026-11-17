@@ -7,10 +7,12 @@ import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -108,65 +110,124 @@ describe("a sync stopped before it saved state.json", () => {
 });
 
 describe("merge while a sync runs", () => {
+  /** A hook script that passes while `pass` exists, else says it started and waits for `release`. */
+  function slowHook(m: Machine) {
+    const pass = join(m.root, "hook.pass");
+    const started = join(m.root, "hook.started");
+    const release = join(m.root, "hook.release");
+    const script = join(m.root, "slow.mjs");
+    writeFileSync(
+      script,
+      [
+        `import { existsSync, writeFileSync } from "node:fs";`,
+        `if (existsSync(${JSON.stringify(pass)})) process.exit(0);`,
+        `writeFileSync(${JSON.stringify(started)}, "");`,
+        `setInterval(() => existsSync(${JSON.stringify(release)}) && process.exit(0), 100);`,
+      ].join("\n"),
+    );
+    writeFileSync(pass, "");
+    return { pass, started, release, run: `"${process.execPath}" "${script}"` };
+  }
+
+  async function waitFor(file: string) {
+    const deadline = Date.now() + 60_000;
+    while (!existsSync(file) && Date.now() < deadline)
+      await new Promise((done) => setTimeout(done, 100));
+    expect(existsSync(file), `${file} never appeared`).toBe(true);
+  }
+
   it.skipIf(isWindows)(
-    "R8-4. a merge's conflicts stay recorded when a sync that started before it saves state.json after it",
+    "R8-4. merge waits for a running sync and then says to try again, and the conflicts it records once the sync is done stay recorded",
     async () => {
       const m = machine();
       const vendor = remote(m, "vendor", skills("skills/", "tool", "other"));
-      const pass = join(m.root, "hook.pass");
-      const started = join(m.root, "hook.started");
-      const release = join(m.root, "hook.release");
-      const script = join(m.root, "slow.mjs");
-      // A slow step of the timer's sync (a fetch, a hook): it waits for `release` unless `pass` exists.
-      writeFileSync(
-        script,
-        [
-          `import { existsSync, writeFileSync } from "node:fs";`,
-          `if (existsSync(${JSON.stringify(pass)})) process.exit(0);`,
-          `writeFileSync(${JSON.stringify(started)}, "");`,
-          `setInterval(() => existsSync(${JSON.stringify(release)}) && process.exit(0), 100);`,
-        ].join("\n"),
-      );
-      writeFileSync(pass, "");
+      const hook = slowHook(m);
       const manifest = m.manifest({
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
-        hooks: [{ name: "slow", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
+        hooks: [{ name: "slow", run: hook.run, on: ["vendor:**"] }],
       });
       await init(m, manifest);
+      const copy = m.at(".claude", "skills", "tool", "SKILL.md");
       // A local edit and an upstream change to the same line: the update waits for `merge`.
-      writeFileSync(m.at(".claude", "skills", "tool", "SKILL.md"), skillMd("tool", "mine"));
+      writeFileSync(copy, skillMd("tool", "mine"));
       vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "theirs") });
       const held = await m.json("sync");
       expect(held.pending.map((entry) => entry.skill)).toEqual(["tool"]);
       try {
         // The timer's sync starts and is still running when the user merges.
-        rmSync(pass);
+        rmSync(hook.pass);
         vendor.commit({ "skills/other/SKILL.md": skillMd("other", "v2") });
         const timer = m.run("sync");
-        const deadline = Date.now() + 60_000;
-        while (!existsSync(started) && Date.now() < deadline)
-          await new Promise((done) => setTimeout(done, 100));
-        expect(existsSync(started), "the sync never reached its hook").toBe(true);
-        const merge = await m.run("merge", "tool");
-        expect(merge.stdout).toContain("conflicts: SKILL.md");
-        writeFileSync(release, "");
-        await timer;
-        writeFileSync(pass, "");
-        // The sync wrote back the state.json it read before the merge: the conflict record is
-        // gone, so the copy agents read, conflict markers and all, is no longer reported as held,
-        // and the update it merged is pending again.
+        await waitFor(hook.started);
+        // It used to merge and record the conflicts, and the sync then wrote back the state.json
+        // it read before, losing them. Now it waits, and gives up without touching the copy.
+        const merge = await m.runWith(
+          { env: { ...m.env, SKILLFLEET_LOCK_WAIT_MS: "500" } },
+          "merge",
+          "tool",
+        );
+        expect(merge.code).not.toBe(0);
+        expect(merge.stderr).toMatch(
+          /another skillfleet sync is running \(pid \d+\); try again when it finishes/,
+        );
+        expect(read(copy)).not.toContain("<<<<<<<");
+        writeFileSync(hook.release, "");
+        expect((await timer).code).toBe(0);
+        writeFileSync(hook.pass, "");
+        const again = await m.run("merge", "tool");
+        expect(again.stdout).toContain("conflicts: SKILL.md");
         const after = await m.json("sync");
-        expect(read(m.at(".claude", "skills", "tool", "SKILL.md"))).toContain("<<<<<<<");
+        expect(read(copy)).toContain("<<<<<<<");
         expect(after.held.map((entry) => entry.reason).join("\n")).toContain(
           "tool has unresolved merge conflicts",
         );
         expect(after.pending).toEqual([]);
       } finally {
-        writeFileSync(release, "");
+        writeFileSync(hook.release, "");
       }
     },
     180_000,
+  );
+
+  it.skipIf(isWindows)(
+    "R8-4. a sync that another writer's change to state.json lands under keeps that change when it saves",
+    async () => {
+      const m = machine();
+      const vendor = remote(m, "vendor", skills("skills/", "tool"));
+      // A hook that writes state.json while the sync runs, as a writer that took no lock would: it
+      // records a conflict in tool, with the file it is waiting on.
+      const script = join(m.root, "writer.mjs");
+      const state = join(m.stateDir, "state.json");
+      writeFileSync(
+        script,
+        [
+          `import { readFileSync, writeFileSync } from "node:fs";`,
+          `import { join } from "node:path";`,
+          `const state = JSON.parse(readFileSync(${JSON.stringify(state)}, "utf8"));`,
+          // init's sync, which records the skill only as it ends, has no copy to point at yet.
+          `if (!state.skills.tool) process.exit(0);`,
+          `const dir = state.skills.tool.dir;`,
+          `writeFileSync(join(dir, "notes.md.upstream"), "theirs\\n");`,
+          `state.conflicts = { tool: { dir, files: ["notes.md"], markers: { "notes.md": "notes.md.upstream" } } };`,
+          `writeFileSync(${JSON.stringify(state)}, JSON.stringify(state));`,
+        ].join("\n"),
+      );
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+        hooks: [{ name: "writer", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
+      });
+      await init(m, manifest);
+      vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
+      const report = await m.json("sync");
+      expect(report.hooks.map((hook) => hook.code)).toEqual([0]);
+      const saved = JSON.parse(read(state)) as { conflicts?: Record<string, unknown> };
+      expect(Object.keys(saved.conflicts ?? {})).toEqual(["tool"]);
+      const next = await m.json("sync");
+      expect(next.held.flatMap((entry) => entry.files)).toContain("notes.md");
+    },
+    120_000,
   );
 });
 
@@ -310,11 +371,25 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
     for (const url of [
       "http://127.0.0.1:9418?@github.com/x.git",
       "http://127.0.0.1#@github.com/x.git",
+      "https://127.0.0.1/?@github.com/x.git",
+      "http://127.0.0.1;@github.com/x.git",
+      "http://127.0.0.1\\@github.com/x.git",
+      "http://user\\@127.0.0.1\\@github.com/x.git",
+      "git://localhost?x@github.com/x.git",
     ])
       it(`R8-5. refuses ${url}, which reaches this machine`, async () => {
         expect.soft(isRemoteGit(url)).toBe(false);
         expect.soft(await teamGitProblem(url)).toMatch(/this machine|remote repositories/);
       });
+  });
+
+  it("R8-5. still takes user info and a query on a host elsewhere", async () => {
+    for (const url of [
+      "https://user:token@github.com/x.git",
+      "https://github.com/x.git?ref=main",
+      "ssh://git@github.com/x.git",
+    ])
+      expect.soft(isRemoteGit(url), url).toBe(true);
   });
 
   describe("extends objects", () => {
@@ -336,6 +411,26 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       expect(loaded.sources[0]!.exclude).toEqual(["old"]);
     });
 
+    it("R8-6. keeps exclusions of every level, with the member's own on top", async () => {
+      write("r5-levels/base.json", {
+        sources: [
+          { id: "a", index: "https://a.example.com" },
+          { id: "b", index: "https://b.example.com" },
+          { id: "c", index: "https://c.example.com" },
+        ],
+      });
+      write("r5-levels/team.json", {
+        extends: [{ manifest: "./base.json", excludeSources: ["a"], exclude: ["x"] }],
+      });
+      const file = write("r5-levels/me.json", {
+        extends: [{ manifest: "./team.json", excludeSources: ["b"], exclude: ["y"] }],
+      });
+      const loaded = await loadManifest(file, { offline: true });
+      expect(loaded.sources.map((source) => source.id)).toEqual(["c"]);
+      expect(loaded.sources[0]!.exclude).toEqual(["y", "x"]);
+      expect(loaded.sources[0]!.via).toBe(0);
+    });
+
     it("R8-7. applies an entry's exclusions to a manifest another entry already brought in", async () => {
       // The sub-team extends the base too. Its entry comes first, so the base is loaded through it,
       // unfiltered, and the user's own entry for the base, which leaves "legacy" out, is skipped as
@@ -353,6 +448,31 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       const loaded = await loadManifest(file, { offline: true });
       expect(loaded.sources.map((source) => source.id)).toEqual(["keep"]);
     });
+
+    it("R8-7. a skill excluded on one path to a manifest is excluded, whichever path came first", async () => {
+      write("r5-union/base.json", { sources: [{ id: "keep", index: "https://keep.example.com" }] });
+      write("r5-union/sub.json", { extends: [{ manifest: "./base.json", exclude: ["one"] }] });
+      const file = write("r5-union/me.json", {
+        extends: ["./sub.json", { manifest: "./base.json", exclude: ["two"] }],
+      });
+      const loaded = await loadManifest(file, { offline: true });
+      expect(loaded.sources.map((source) => source.id)).toEqual(["keep"]);
+      expect(loaded.sources[0]!.exclude?.sort()).toEqual(["one", "two"]);
+    });
+
+    it("R8-7. a manifest that extends itself through another ends the loop", async () => {
+      write("r5-loop/a.json", {
+        extends: ["./b.json"],
+        sources: [{ id: "a", index: "https://a.example.com" }],
+      });
+      write("r5-loop/b.json", {
+        extends: [{ manifest: "./a.json", excludeSources: ["a"] }],
+        sources: [{ id: "b", index: "https://b.example.com" }],
+      });
+      const file = write("r5-loop/me.json", { extends: ["./a.json"] });
+      const loaded = await loadManifest(file, { offline: true });
+      expect(loaded.sources.map((source) => source.id).sort()).toEqual(["a", "b"]);
+    });
   });
 
   describe("editing a manifest in place", () => {
@@ -369,6 +489,14 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       expect(after.sources[1]!.exclude).toEqual(["x"]);
     });
 
+    it("R8-8. says which key a manifest repeats when it writes the file out whole", () => {
+      const text = `{\n  "agents": ["codex"],\n  "agents": ["claude-code"]\n}\n`;
+      const notes: string[] = [];
+      const before = JSON.parse(text) as Record<string, unknown>;
+      expect(editJsonText(text, before, { ...before, fleet: ["box"] }, notes)).toBeUndefined();
+      expect(notes.join("\n")).toContain('"agents"');
+    });
+
     it("R8-9. keeps the layout when every member of an object is replaced", () => {
       // Dropping every member and adding one makes two edits of the same span: the second lands on
       // text the first already shortened, the result fails its own check, and the whole file is
@@ -379,6 +507,19 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       const out = editJsonText(text, before, after);
       expect(out).toBeDefined();
       expect(out).toContain('\r\n\t"agents": ["codex"],\r\n');
+      expect(out).toContain(
+        '\t"forks": {\r\n\t\t"b": { "from": "x/y", "path": "b", "base": "2" }\r\n\t}',
+      );
+      expect(JSON.parse(out!)).toEqual(after);
+    });
+
+    it("R8-9. keeps the layout when every member of a one-line object is replaced", () => {
+      const text = `{\n\t"forks": { "a": 1, "b": 2 },\n\t"agents": ["codex"]\n}\n`;
+      const before = JSON.parse(text) as Record<string, unknown>;
+      const after = { ...before, forks: { c: 3 } };
+      expect(editJsonText(text, before, after)).toBe(
+        `{\n\t"forks": { "c": 3 },\n\t"agents": ["codex"]\n}\n`,
+      );
     });
   });
 });
@@ -521,6 +662,47 @@ describe("index sources", () => {
   });
 });
 
+describe("index archives past the copy limits", () => {
+  it("R8-11. refuses a zip whose central directory says it unpacks past a skill's limit", async () => {
+    const m = machine();
+    const archive = zip({ "SKILL.md": longSkillMd("huge") });
+    // The central directory's unpacked size of SKILL.md: 300 MB, past the 200 MB a skill may hold.
+    const central = archive.lastIndexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    archive.writeUInt32LE(300 * 1024 * 1024, central + 24);
+    const site = await server((_req, res, path) => {
+      if (path === "/.well-known/agent-skills/index.json")
+        res.writeHead(200, { "content-type": "application/json" }).end(
+          JSON.stringify({
+            $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+            skills: [
+              {
+                name: "huge",
+                type: "archive",
+                description: "The huge skill",
+                url: "huge.zip",
+                digest: `sha256:${sha256(archive)}`,
+              },
+            ],
+          }),
+        );
+      else if (path === "/.well-known/agent-skills/huge.zip")
+        res.writeHead(200, { "content-type": "application/zip" }).end(archive);
+      else res.writeHead(404).end();
+    });
+    try {
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "site", index: site.url }],
+      });
+      const run = await m.run("init", manifest, "--no-timer");
+      expect(names(m.at(".claude", "skills"))).not.toContain("huge");
+      expect(run.stdout + run.stderr).toContain("more than 200 MB");
+    } finally {
+      await site.close();
+    }
+  });
+});
+
 describe("merge conflicts", () => {
   it("R8-12. a binary file merge reports as a conflict stays an unresolved conflict for doctor and sync until merge runs again", async () => {
     const m = machine({ scheduler: "empty" });
@@ -548,5 +730,80 @@ describe("merge conflicts", () => {
     expect(conflicts?.ok, conflicts?.detail).toBe(false);
     const report = await m.json<Report>("sync");
     expect(report.held.map((held) => held.files).flat()).toContain("logo.bin");
+    // Upstream's bytes are beside it; once the user deletes them, merge records the conflict resolved.
+    const sidecar = m.at(".claude/skills/tool/logo.bin.upstream");
+    expect(readFileSync(sidecar).equals(Buffer.from([0, 7, 7, 0]))).toBe(true);
+    rmSync(sidecar);
+    const again = await m.run("merge", "tool");
+    expect(again.code, again.stdout + again.stderr).toBe(0);
+    const fixed = await m.json<{ name: string; ok: boolean }[]>("doctor");
+    expect(fixed.find((check) => check.name === "merge conflicts")?.ok).toBe(true);
+  });
+
+  it("R8-12. a file deleted upstream that was edited here stays an unresolved conflict until its note is deleted", async () => {
+    const m = machine({ scheduler: "empty" });
+    const vendor = remote(m, "vendor", {
+      "skills/tool/SKILL.md": skillMd("tool"),
+      "skills/tool/notes.md": "notes\n",
+    });
+    await init(m, m.manifest({ agents: ["claude-code"], sources: [{ id: "v", git: vendor.url }] }));
+    writeFileSync(m.at(".claude/skills/tool/notes.md"), "my notes\n");
+    vendor.commit({ "skills/tool/notes.md": null });
+    await m.run("sync");
+    const merge = await m.run("merge", "tool");
+    expect(merge.code, merge.stdout + merge.stderr).toBe(1);
+    expect(merge.stdout).toContain("conflicts: notes.md");
+    expect(read(m.at(".claude/skills/tool/notes.md"))).toBe("my notes\n");
+    const note = m.at(".claude/skills/tool/notes.md.upstream-deleted");
+    expect(read(note)).toContain("upstream deleted notes.md");
+    const report = await m.json<Report>("sync");
+    expect(report.held.map((held) => held.files).flat()).toContain("notes.md");
+    rmSync(note);
+    const after = await m.json<Report>("sync");
+    expect(after.held).toEqual([]);
+  });
+
+  it.skipIf(isWindows)(
+    "R8-12. a link that changed upstream stays an unresolved conflict, with a note of upstream's target beside it",
+    async () => {
+      const m = machine({ scheduler: "empty" });
+      const vendor = remote(m, "vendor", {
+        "skills/tool/SKILL.md": skillMd("tool"),
+        "skills/tool/doc.md": "doc\n",
+      });
+      await init(
+        m,
+        m.manifest({ agents: ["claude-code"], sources: [{ id: "v", git: vendor.url }] }),
+      );
+      // The user made doc.md a link; upstream changed the file.
+      const doc = m.at(".claude/skills/tool/doc.md");
+      rmSync(doc);
+      symlinkSync("SKILL.md", doc);
+      vendor.commit({ "skills/tool/doc.md": "doc v2\n" });
+      await m.run("sync");
+      const merge = await m.run("merge", "tool");
+      expect(merge.code, merge.stdout + merge.stderr).toBe(1);
+      expect(merge.stdout).toContain("conflicts: doc.md");
+      expect(lstatSync(doc).isSymbolicLink()).toBe(true);
+      expect(read(`${doc}.upstream`)).toBe("doc v2\n");
+      const checks = await m.json<{ name: string; ok: boolean }[]>("doctor");
+      expect(checks.find((check) => check.name === "merge conflicts")?.ok).toBe(false);
+    },
+  );
+});
+
+describe("remove", () => {
+  it("finds a source by its id in any case, as every other command does", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    await init(m, manifest);
+    const run = await m.run("remove", "VENDOR");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect((JSON.parse(read(manifest)) as { sources: unknown[] }).sources).toEqual([]);
+    expect(names(m.at(".claude", "skills"))).not.toContain("tool");
   });
 });

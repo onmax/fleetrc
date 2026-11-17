@@ -49,7 +49,7 @@ import {
 import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
 import { type FetchBudget, fetchNpm, guardedFetch, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
-import { tarEntries } from "./tar.ts";
+import { tarEntries, zipEntries } from "./tar.ts";
 import type { SourceState } from "./state.ts";
 
 export interface SkillEntry {
@@ -1548,15 +1548,14 @@ function indexBudget(): FetchBudget & { skipped: Map<string, string> } {
       let files = 0;
       let size = 0;
       try {
-        for (const entry of tarEntries(unpacked ?? body)) {
-          if (entry.type !== "0" && entry.type !== "\0") continue;
+        for (const entry of archiveFiles(url, body, unpacked)) {
           if (tooDeep(entry.name.replace(/^\.\//, "")))
             return skip(
               name,
               `it nests folders more than ${SKILL_LIMITS.depth} deep (${entry.name})`,
             );
           files++;
-          size += entry.body.byteLength;
+          size += entry.size;
         }
       } catch (error) {
         return skip(name, (error as Error).message);
@@ -1567,6 +1566,34 @@ function indexBudget(): FetchBudget & { skipped: Map<string, string> } {
       return over === undefined ? undefined : skip(name, over);
     },
   };
+}
+
+/**
+ * The files a download an index lists unpacks to, as `skills` reads it: a gzipped tar, a tar, a zip
+ * (by its central directory, whose sizes `skills` holds each file to), or else one file, such as the
+ * SKILL.md of a `skill-md` entry.
+ */
+function* archiveFiles(
+  url: string,
+  body: Uint8Array,
+  unpacked: Buffer | undefined,
+): Generator<{ name: string; size: number }> {
+  const ustar = body.length >= 262 && new TextDecoder().decode(body.subarray(257, 262)) === "ustar";
+  if (unpacked || ustar) {
+    for (const entry of tarEntries(unpacked ?? body))
+      if (entry.type === "0" || entry.type === "\0")
+        yield { name: entry.name, size: entry.body.byteLength };
+    return;
+  }
+  let path = "";
+  try {
+    path = new URL(url).pathname;
+  } catch {}
+  if ((body[0] === 0x50 && body[1] === 0x4b) || path.toLowerCase().endsWith(".zip")) {
+    for (const entry of zipEntries(body)) if (!entry.directory) yield entry;
+    return;
+  }
+  yield { name: posix.basename(path) || "SKILL.md", size: body.byteLength };
 }
 
 /**
@@ -1662,10 +1689,19 @@ async function fetchVendored(
   const firstRun = Object.keys(state.skills).length === 0;
   // Local edits are checked on every run, online or not.
   for (const [name, copy] of Object.entries(state.skills)) {
-    const live = storePaths(ctx.storeDir, name).live;
+    const { live, base } = storePaths(ctx.storeDir, name);
     if (!existsSync(live)) continue;
-    const files = changedFiles(copy.hashes, hashDir(live));
-    if (files.length > 0) out.edited.push({ skill: name, files });
+    const now = hashDir(live);
+    const files = changedFiles(copy.hashes, now);
+    if (files.length === 0) continue;
+    // A sync stopped after it put an update in place (the base first, then the copy) and before it
+    // saved state.json leaves both at the update and the record behind: the copy is that update,
+    // unedited, and the record takes its hashes.
+    if (existsSync(base) && sameTree(hashDir(base), now)) {
+      copy.hashes = now;
+      continue;
+    }
+    out.edited.push({ skill: name, files });
   }
   for (const [skill, pending] of Object.entries(state.pending)) {
     const upstream = storePaths(ctx.storeDir, skill).upstream;
@@ -1687,11 +1723,13 @@ async function fetchVendored(
     opened = await openVendored(source, state, ctx, out.warnings);
   } catch (error) {
     out.status = "error";
-    // Every archive was refused for its digest, which leaves `skills` with nothing to read.
-    out.error =
-      mismatched.size > 0
-        ? [...mismatched].map(([name, digest]) => mismatchText(name, digest)).join("; ")
-        : message(error);
+    // Every archive was refused, for its digest or the copy limits, which leaves `skills` with
+    // nothing to read, and it says only that a download failed.
+    const refusals = [
+      ...[...mismatched].map(([name, digest]) => mismatchText(name, digest)),
+      ...[...skipped].map(([name, why]) => `skipped the skill "${name}": ${why}`),
+    ];
+    out.error = refusals.length > 0 ? refusals.join("; ") : message(error);
     out.skills = keptSkills(state, ctx.storeDir);
     if (out.skills.length > 0)
       out.warnings.push(

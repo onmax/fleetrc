@@ -16,6 +16,7 @@ import {
   formatTimerStatus,
   machineTimeZone,
   missingTimer,
+  scheduleDrift,
   systemdMissing,
   TimerError,
   type TimerStatus,
@@ -258,6 +259,9 @@ export async function doctor(manifest?: string): Promise<Check[]> {
   });
   const drift = timerDeclined() ? undefined : timeZoneDrift(loaded.root.timer.timeZone);
   if (drift) checks.push({ name: "timer time zone", ok: true, warn: true, detail: drift });
+  // A sync says this once, often in the timer's own log; doctor says it until it is applied.
+  const schedule = scheduleDrift(loaded.root.timer);
+  if (schedule) checks.push({ name: "timer schedule", ok: true, warn: true, detail: schedule });
   // Without git, the git check above already says so once.
   const reachable = gitVersion.code === 0 ? loaded.sources : [];
   await Promise.all(

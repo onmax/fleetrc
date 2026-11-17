@@ -17,7 +17,7 @@ import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
 import { registryUrl, urlOrigin } from "./npm.ts";
-import { expandPath, paths } from "./paths.ts";
+import { expandPath, paths, tildify } from "./paths.ts";
 import { cronProblem, timeZoneProblem } from "./timer.ts";
 
 export type UpdateMode = "auto" | "review";
@@ -648,17 +648,28 @@ function within(root: string, file: string, spec: string) {
 
 /** A URL git fetches over the network: http, https, git or ssh, or ssh's `[user@]host:path`. */
 const remoteTransport = (url: string) =>
-  /^(?:https?|git|ssh|git\+ssh|ssh\+git):\/\/(?:[^@/]+@)?[a-z0-9[]/i.test(url) ||
+  /^(?:https?|git|ssh|git\+ssh|ssh\+git):\/\/(?:[^@/?#\\]*@)?[a-z0-9[]/i.test(url) ||
   // A one-letter host would be a Windows drive (C:/repo), which is a path, and `<helper>::` runs
   // a remote helper such as ext::, which runs a command.
   /^(?:[a-z0-9_][\w.-]*@)?[a-z0-9][\w.-]+:(?!\/\/|:)/i.test(url);
 
-/** The host a git URL names: `scheme://[user@]host[:port]/…` or ssh's `[user@]host:path`. */
+/**
+ * The host a git URL names: `scheme://[user@]host[:port]/…` or ssh's `[user@]host:path`. The
+ * authority ends at the first `/`, `?`, `#` or `\`, as curl and the WHATWG URL parser end it, and
+ * the user info at its last `@`. Undefined when parsers could read another host: an `@` after the
+ * authority's end and before the path, or a `;` or `\` in the user info.
+ */
 function gitHost(url: string): string | undefined {
-  const match =
-    url.match(/^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]*@)?(\[[^\]/]*\]|[^/:?#]*)/i) ??
-    url.match(/^(?:[^@/:]+@)?(\[[^\]/]*\]|[^/:]+):/);
-  return match?.[1];
+  const scheme = url.match(/^[a-z][a-z0-9+.-]*:\/\/([^/]*)/i);
+  if (scheme) {
+    const upToPath = scheme[1]!;
+    const authority = upToPath.match(/^[^?#\\]*/)![0];
+    if (upToPath.slice(authority.length).includes("@")) return undefined;
+    const at = authority.lastIndexOf("@");
+    if (/[;\\]/.test(authority.slice(0, Math.max(at, 0)))) return undefined;
+    return authority.slice(at + 1).match(/^(\[[^\]]*\]|[^:]*)/)![1];
+  }
+  return url.match(/^(?:[^@/:]+@)?(\[[^\]/]*\]|[^/:]+):/)?.[1];
 }
 
 /** A host as a URL parser reads it: lowercase, IP addresses in one spelling (127.1 is 127.0.0.1). */
@@ -884,7 +895,6 @@ export async function loadManifest(
   const warnings: string[] = [];
   const failed: string[] = [];
   const sources = [...root.sources];
-  const seen = new Set([rootFile]);
   const ids = new Set(sources.map((source) => nameKey(source.id)));
   // NPM_TOKEN goes to the registry the user configured and to registries the root manifest names.
   const tokenOrigins = new Set([
@@ -893,99 +903,137 @@ export async function loadManifest(
       source.kind === "npm" && source.registry ? [urlOrigin(source.registry)] : [],
     ),
   ]);
-  /** What the root's `extends` entry a manifest came through leaves out. */
+  /**
+   * What the `extends` entries on one path from the root to a manifest leave out: every entry's
+   * `exclude` and `excludeSources` on the path count, and `via` is the root's entry it starts at.
+   */
   interface Through {
     via: number;
     exclude: string[];
     excludeSources: Set<string>;
   }
-  /** `within` is the folder an extended manifest came in, which its own `extends` stays in. */
-  const visit = async (manifest: Manifest, through?: Through, within?: string) => {
+  /** Each manifest extended, once, with every path it was reached by, in the order first reached. */
+  const extended = new Map<string, { manifest: Manifest; parent: string; paths: Through[] }>();
+  /** Where each `extends` entry led, by the manifest that has it and its index; null when it failed. */
+  const located = new Map<string, { file: string; root: string } | null>();
+  const unreadable = new Set<string>();
+  const sameThrough = (a: Through, b: Through) =>
+    a.via === b.via &&
+    a.exclude.join("\0") === b.exclude.join("\0") &&
+    [...a.excludeSources].join("\0") === [...b.excludeSources].join("\0");
+  /**
+   * `within` is the folder an extended manifest came in, which its own `extends` stays in; `path`
+   * is the manifests on the way to it, so a cycle ends.
+   */
+  const visit = async (
+    manifest: Manifest,
+    through: Through | undefined,
+    within: string | undefined,
+    path: readonly string[],
+  ) => {
     for (const [i, entry] of manifest.extends.entries()) {
       const parent = entry.manifest;
-      // Exclusions apply in the root manifest only, to everything its entry brings in.
-      const filter: Through = through ?? {
-        via: i,
-        exclude: entry.exclude,
-        excludeSources: new Set(entry.excludeSources.map(nameKey)),
+      const filter: Through = {
+        via: through?.via ?? i,
+        exclude: [...new Set([...(through?.exclude ?? []), ...entry.exclude])],
+        excludeSources: new Set([
+          ...(through?.excludeSources ?? []),
+          ...entry.excludeSources.map(nameKey),
+        ]),
       };
-      let file: string;
-      let root: string;
-      try {
-        ({ file, root } = await locate(parent, {
-          ...options,
-          base: dirname(manifest.file),
-          // An extended manifest's own `extends` follows the rules of its sources.
-          ...(within === undefined ? {} : { team: { within } }),
-        }));
-      } catch (error) {
-        warnings.push(`extends ${parent}: ${(error as Error).message}`);
-        failed.push(parent);
-        continue;
+      const key = `${manifest.file}\0${i}`;
+      let at = located.get(key);
+      if (at === undefined) {
+        try {
+          at = await locate(parent, {
+            ...options,
+            base: dirname(manifest.file),
+            // An extended manifest's own `extends` follows the rules of its sources.
+            ...(within === undefined ? {} : { team: { within } }),
+          });
+        } catch (error) {
+          warnings.push(`extends ${parent}: ${(error as Error).message}`);
+          failed.push(parent);
+          at = null;
+        }
+        located.set(key, at);
       }
-      if (seen.has(file)) continue;
-      seen.add(file);
-      let team: Manifest;
-      try {
-        team = readManifestFile(file, (raw) => {
-          if (!isRecord(raw) || !Array.isArray(raw.sources)) return;
-          for (const [i, source] of raw.sources.entries()) {
-            if (!isRecord(source)) continue;
-            for (const key of ROOT_ONLY_SOURCE_KEYS) {
-              if (source[key] === undefined) continue;
-              delete source[key];
-              warnings.push(
-                `extends ${parent}: ignored "${key}" of source "${typeof source.id === "string" ? source.id : `sources[${i}]`}"; only the root manifest can follow links out of a source`,
-              );
+      if (!at || at.file === rootFile || path.includes(at.file) || unreadable.has(at.file))
+        continue;
+      let known = extended.get(at.file);
+      if (!known) {
+        let team: Manifest;
+        try {
+          team = readManifestFile(at.file, (raw) => {
+            if (!isRecord(raw) || !Array.isArray(raw.sources)) return;
+            for (const [i, source] of raw.sources.entries()) {
+              if (!isRecord(source)) continue;
+              for (const key of ROOT_ONLY_SOURCE_KEYS) {
+                if (source[key] === undefined) continue;
+                delete source[key];
+                warnings.push(
+                  `extends ${parent}: ignored "${key}" of source "${typeof source.id === "string" ? source.id : `sources[${i}]`}"; only the root manifest can follow links out of a source`,
+                );
+              }
             }
-          }
-        });
-      } catch (error) {
-        warnings.push(`extends ${parent}: ${(error as Error).message}`);
-        failed.push(parent);
-        continue;
-      }
-      const ignored = [
-        team.hooks.length > 0 && "hooks",
-        team.fleet.length > 0 && "fleet",
-        team.hub && "hub",
-        team.report && "report",
-      ].filter(Boolean);
-      if (ignored.length > 0)
-        warnings.push(
-          `extends ${parent}: ignored ${ignored.join(", ")}; only the root manifest can run commands or name machines`,
-        );
-      for (const source of team.sources) {
-        if (filter.excludeSources.has(nameKey(source.id))) continue;
-        source.via = filter.via;
-        if (filter.exclude.length > 0)
-          source.exclude = [...new Set([...(source.exclude ?? []), ...filter.exclude])];
-        if (source.kind === "clone" || source.kind === "local") {
+          });
+        } catch (error) {
+          warnings.push(`extends ${parent}: ${(error as Error).message}`);
+          failed.push(parent);
+          unreadable.add(at.file);
+          continue;
+        }
+        const ignored = [
+          team.hooks.length > 0 && "hooks",
+          team.fleet.length > 0 && "fleet",
+          team.hub && "hub",
+          team.report && "report",
+        ].filter(Boolean);
+        if (ignored.length > 0)
           warnings.push(
-            `extends ${parent}: ignored source "${source.id}"; only the root manifest can name a folder on this machine (${source.kind === "clone" ? "path" : "local"})`,
+            `extends ${parent}: ignored ${ignored.join(", ")}; only the root manifest can run commands or name machines`,
           );
-          continue;
-        }
-        const problem = await teamSourceProblem(source);
-        if (problem) {
-          warnings.push(`extends ${parent}: ignored source "${source.id}"; ${problem}`);
-          continue;
-        }
-        if (ids.has(nameKey(source.id))) {
-          warnings.push(
-            `extends ${parent}: source "${source.id}" is already declared; the first one is used`,
-          );
-          continue;
-        }
-        ids.add(nameKey(source.id));
-        if (source.kind === "npm")
-          source.sendToken = !source.registry || tokenOrigins.has(urlOrigin(source.registry));
-        sources.push(source);
+        known = { manifest: team, parent, paths: [] };
+        extended.set(at.file, known);
       }
-      await visit(team, filter, root);
+      if (known.paths.some((seen) => sameThrough(seen, filter))) continue;
+      known.paths.push(filter);
+      await visit(known.manifest, filter, at.root, [...path, at.file]);
     }
   };
-  await visit(root);
+  await visit(root, undefined, undefined, []);
+  // A manifest reached by several paths gets what any of them leaves out: a source one path
+  // excludes is left out, and a skill's exclusions are those of every path.
+  for (const { manifest: team, parent, paths: through } of extended.values()) {
+    for (const source of team.sources) {
+      if (through.some((filter) => filter.excludeSources.has(nameKey(source.id)))) continue;
+      source.via = through[0]!.via;
+      const exclude = through.flatMap((filter) => filter.exclude);
+      if (exclude.length > 0)
+        source.exclude = [...new Set([...(source.exclude ?? []), ...exclude])];
+      if (source.kind === "clone" || source.kind === "local") {
+        warnings.push(
+          `extends ${parent}: ignored source "${source.id}"; only the root manifest can name a folder on this machine (${source.kind === "clone" ? "path" : "local"})`,
+        );
+        continue;
+      }
+      const problem = await teamSourceProblem(source);
+      if (problem) {
+        warnings.push(`extends ${parent}: ignored source "${source.id}"; ${problem}`);
+        continue;
+      }
+      if (ids.has(nameKey(source.id))) {
+        warnings.push(
+          `extends ${parent}: source "${source.id}" is already declared; the first one is used`,
+        );
+        continue;
+      }
+      ids.add(nameKey(source.id));
+      if (source.kind === "npm")
+        source.sendToken = !source.registry || tokenOrigins.has(urlOrigin(source.registry));
+      sources.push(source);
+    }
+  }
   return { root, sources, warnings, failed };
 }
 
@@ -1006,7 +1054,9 @@ export function editManifest(
   change(raw);
   parseManifest(file, raw);
   if (dryRun) return;
-  const edited = editJsonText(readFileSync(file, "utf8"), before, raw);
+  const notes: string[] = [];
+  const edited = editJsonText(readFileSync(file, "utf8"), before, raw, notes);
+  for (const note of notes) process.stderr.write(`skillfleet: ${tildify(file)}: ${note}\n`);
   if (edited === undefined) {
     writeJson(file, raw);
     return;

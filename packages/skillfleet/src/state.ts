@@ -67,6 +67,11 @@ export interface MergeConflict {
   dir: string;
   /** Files with conflicts, `/`-separated, relative to `dir`. */
   files: string[];
+  /**
+   * For a conflict git's markers can't show (a binary file, a link, a file deleted upstream), the
+   * file merge wrote beside it, relative to `dir`: unresolved until it is deleted.
+   */
+  markers?: Record<string, string>;
 }
 
 export const emptyState = (): State => ({ version: 1, sources: dict(), skills: dict() });
@@ -175,9 +180,15 @@ function forkRecord(record: unknown): ForkState | undefined {
 
 function conflictRecord(record: unknown): MergeConflict | undefined {
   if (!isRecord(record) || !text(record.dir) || !Array.isArray(record.files)) return undefined;
+  const markers = isRecord(record.markers)
+    ? Object.entries(record.markers).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      )
+    : [];
   return {
     dir: record.dir as string,
     files: record.files.filter((file): file is string => typeof file === "string"),
+    ...(markers.length > 0 ? { markers: dict(markers) } : {}),
   };
 }
 
@@ -202,6 +213,77 @@ function backUp(problem: string, warnings: string[]) {
 }
 
 export const saveState = (state: State) => writeJson(paths.state(), state);
+
+/** JSON with every object's keys sorted, to compare two values whatever order their keys came in. */
+function canonical(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, inner: unknown) =>
+    isRecord(inner)
+      ? Object.fromEntries(Object.entries(inner).sort(([a], [b]) => (a < b ? -1 : 1)))
+      : inner,
+  );
+}
+
+const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
+
+/**
+ * Three-way merge of `mine` and `theirs`, two changes of `base`: a part only one side changed takes
+ * that side's change, and where both changed it, `mine` wins. Objects are merged key by key down to
+ * `depth` levels; deeper, a value is one whole.
+ */
+function merged(base: unknown, mine: unknown, theirs: unknown, depth: number): unknown {
+  if (same(mine, base)) return theirs;
+  if (same(theirs, base) || depth === 0 || !isRecord(mine) || !isRecord(theirs)) return mine;
+  const out = dict<unknown>();
+  for (const key of new Set([...Object.keys(mine), ...Object.keys(theirs)])) {
+    const before = isRecord(base) && Object.hasOwn(base, key) ? base[key] : undefined;
+    const value = merged(before, mine[key], theirs[key], depth - 1);
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+/** state.json as it is on disk now, or undefined when it is missing or does not read. */
+function stateOnDisk(): State | undefined {
+  try {
+    const raw = readJson(paths.state());
+    return isRecord(raw) && raw.version === 1 && isRecord(raw.sources) && isRecord(raw.skills)
+      ? loadState()
+      : undefined;
+  } catch (error) {
+    if (error instanceof JsonFileError) return undefined;
+    throw error;
+  }
+}
+
+/**
+ * The state a long run (a sync) holds and saves more than once. Each save reads state.json again
+ * and keeps what another writer changed since this run read it, down to each skill's install
+ * record, pending update and merge conflict, so a merge or fork that ran meanwhile is not undone.
+ * Where both changed one record, this run's wins.
+ */
+export class StateFile {
+  readonly state: State;
+  /** The state as this run last read or saved it. */
+  private base: unknown;
+
+  constructor(state: State) {
+    this.state = state;
+    this.base = JSON.parse(JSON.stringify(state));
+  }
+
+  save() {
+    // State, a source or a skill's record, the source's skills or pending, one skill's record.
+    const next = merged(this.base, this.state, stateOnDisk() ?? this.base, 4) as State;
+    saveState(next);
+    this.base = JSON.parse(JSON.stringify(next));
+    if (next === this.state) return;
+    // In place, so whoever holds `state` sees what was merged in.
+    const entries = Object.entries(next);
+    for (const key of Object.keys(this.state))
+      delete (this.state as unknown as Record<string, unknown>)[key];
+    Object.assign(this.state, Object.fromEntries(entries));
+  }
+}
 
 /**
  * The state of `source`. A source that moved from one vendored kind to another (git to npm) keeps

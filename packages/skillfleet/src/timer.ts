@@ -308,6 +308,20 @@ export function installedSchedule(): { cron: string; timeZone: string } | undefi
   return typeof cron === "string" && typeof timeZone === "string" ? { cron, timeZone } : undefined;
 }
 
+/**
+ * What to say when the manifest's `timer` differs from the schedule the installed timer runs on, or
+ * undefined when they agree or no timer was installed.
+ */
+export function scheduleDrift(timer: { cron: string; timeZone?: string }): string | undefined {
+  const installed = installedSchedule();
+  const want = { cron: timer.cron, timeZone: timer.timeZone ?? "local" };
+  if (!installed || (installed.cron === want.cron && installed.timeZone === want.timeZone))
+    return undefined;
+  const zone = (spec: { timeZone: string }) =>
+    spec.timeZone === "local" ? "" : ` (${spec.timeZone})`;
+  return `the manifest's timer is now "${want.cron}"${zone(want)}, but the installed timer runs on "${installed.cron}"${zone(installed)}; run \`skillfleet timer install\` to apply it`;
+}
+
 /** The files the OS scheduler reads the timer's command from, where skillfleet's timer would be. */
 function timerCommandFiles(): string[] {
   const raw = readJsonOrNothing(recordFile());
