@@ -1,7 +1,7 @@
 import { mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { type Hashes, isRecord, JsonFileError, readJson, writeJson } from "./fs.ts";
-import type { Source } from "./manifest.ts";
+import { isVendoredKind, type Source } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 
 /** A vendored skill as skillfleet last installed it: the merge base for local edits. */
@@ -47,9 +47,10 @@ export interface State {
 export const emptyState = (): State => ({ version: 1, sources: {}, skills: {} });
 
 /**
- * Reads state.json. A file that does not parse reads as empty: vendored copies that differ from
- * upstream then count as edited, so nothing local is overwritten. With `warnings` (a sync that
- * will write a new state), the corrupt file is first moved to the backup folder.
+ * Reads state.json. A file that does not parse, or has a shape this version does not know (another
+ * version wrote it), reads as empty: the sync rebuilds what it can from the store, and vendored
+ * copies it cannot vouch for count as edited, so nothing local is overwritten. With `warnings` (a
+ * sync that will write a new state), the old file is first moved to the backup folder.
  */
 export function loadState(warnings?: string[]): State {
   let raw: unknown;
@@ -57,30 +58,51 @@ export function loadState(warnings?: string[]): State {
     raw = readJson(paths.state());
   } catch (error) {
     if (!(error instanceof JsonFileError)) throw error;
-    if (warnings) {
-      const to = join(
-        paths.backup(),
-        `state-${new Date().toISOString().replace(/[:.]/g, "-")}.json`,
-      );
-      mkdirSync(dirname(to), { recursive: true });
-      renameSync(paths.state(), to);
-      warnings.push(
-        `${tildify(paths.state())} was corrupt, so skillfleet started a new one and kept the old one at ${tildify(to)}`,
-      );
-    }
+    if (warnings) backUp("was corrupt", warnings);
     return emptyState();
   }
-  if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.sources) || !isRecord(raw.skills))
+  if (raw === undefined) return emptyState();
+  if (!isRecord(raw) || raw.version !== 1 || !isRecord(raw.sources) || !isRecord(raw.skills)) {
+    if (warnings)
+      backUp(
+        isRecord(raw) && typeof raw.version === "number" && raw.version !== 1
+          ? `is version ${raw.version}, from another skillfleet,`
+          : "has a shape skillfleet does not know,",
+        warnings,
+      );
     return emptyState();
+  }
   // Our own file, written by saveState: the shape was checked when it was written.
   return raw as unknown as State;
 }
 
+function backUp(problem: string, warnings: string[]) {
+  const to = join(paths.backup(), `state-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+  mkdirSync(dirname(to), { recursive: true });
+  renameSync(paths.state(), to);
+  warnings.push(
+    `${tildify(paths.state())} ${problem} so skillfleet started a new one and kept the old one at ${tildify(to)}`,
+  );
+}
+
 export const saveState = (state: State) => writeJson(paths.state(), state);
 
+/**
+ * The state of `source`. A source that moved from one vendored kind to another (git to npm) keeps
+ * its install records, which are still the base of the copies in its store.
+ */
 export function sourceState(state: State, source: Source): SourceState {
   const existing = state.sources[source.id];
   if (existing && existing.kind === source.kind) return existing;
+  if (existing && isVendoredKind(existing.kind) && isVendoredKind(source.kind)) {
+    const moved: SourceState = {
+      kind: source.kind,
+      skills: existing.skills,
+      pending: existing.pending,
+    };
+    state.sources[source.id] = moved;
+    return moved;
+  }
   const fresh: SourceState = { kind: source.kind, skills: {}, pending: {} };
   state.sources[source.id] = fresh;
   return fresh;

@@ -43,7 +43,7 @@ import { formatReport, type Report } from "./report.ts";
 import { commandOnPath, findOnPath, installedCli, selfInstall, stableNode } from "./selfinstall.ts";
 import { promptHook, staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
-import { manifestSpec, sync } from "./sync.ts";
+import { LockHeldError, manifestSpec, sync } from "./sync.ts";
 import {
   foreignTimer,
   foreignTimerResource,
@@ -319,7 +319,15 @@ async function syncReport(options: { only?: string; apply?: string } = {}): Prom
 }
 
 async function runSync(options: { only?: string; apply?: string } = {}) {
-  const report = await syncReport(options);
+  let report: Report;
+  try {
+    report = await syncReport(options);
+  } catch (error) {
+    // The timer comes back on its next run, so meeting a manual sync is no failure for its unit.
+    if (!(error instanceof LockHeldError) || !process.env.SKILLFLEET_TIMER) throw error;
+    console.log(`${new Date().toISOString()} skipped: another sync is running (pid ${error.pid})`);
+    return 0;
+  }
   if (json) emit(report);
   else console.log(reportText(report));
   return report.ok ? 0 : 1;

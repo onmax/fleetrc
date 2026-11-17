@@ -37,7 +37,13 @@ import {
   readTargetManifest,
   type TargetReport,
 } from "./linker.ts";
-import { type LoadedManifest, loadManifest, ManifestError, readConfig } from "./manifest.ts";
+import {
+  isVendoredKind,
+  type LoadedManifest,
+  loadManifest,
+  ManifestError,
+  readConfig,
+} from "./manifest.ts";
 import { nameKey, segmentProblem } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import type { HookRun, Report } from "./report.ts";
@@ -159,6 +165,15 @@ function staleBecause(holder: LockHolder): string | undefined {
   return undefined;
 }
 
+/** Another sync holds the lock and is still running. */
+export class LockHeldError extends UserError {
+  readonly pid: number;
+  constructor(pid: number) {
+    super(`another skillfleet sync is running (pid ${pid})`);
+    this.pid = pid;
+  }
+}
+
 /** Takes the sync lock atomically; a stale lock is moved aside first. Returns the release and a note. */
 function acquireLock(): { release: () => void; note?: string } {
   const file = paths.lock();
@@ -173,7 +188,7 @@ function acquireLock(): { release: () => void; note?: string } {
     const lock = readLock(file);
     if (!lock) continue;
     const reason = staleBecause(lock.holder);
-    if (!reason) throw new UserError(`another skillfleet sync is running (pid ${lock.holder.pid})`);
+    if (!reason) throw new LockHeldError(lock.holder.pid);
     // Move it aside, then check it is still the lock judged stale: another sync may have broken
     // it and taken a fresh one in between, and that one goes back.
     const aside = `${file}.${process.pid}.stale`;
@@ -270,8 +285,8 @@ async function unmatchedHooks(loaded: LoadedManifest, results: SourceResult[]): 
 
 /**
  * `sync <source>` and `update <source>` read the other sources from disk only. What only a fetch
- * finds out, such as a working clone held back or waiting for review, is carried over from the
- * last run for them, so `status` keeps showing it.
+ * finds out, such as a working clone held back or waiting for review, or a source that failed, is
+ * carried over from the last run for them, so `status` keeps showing it.
  */
 function carryOver(report: Report, only: string) {
   const raw = readJsonOrNothing(paths.lastRun());
@@ -281,6 +296,12 @@ function carryOver(report: Report, only: string) {
     if (entry.id === only || entry.status !== "offline") continue;
     const before = last.sources.find((source) => source.id === entry.id);
     if (!before || before.kind !== entry.kind) continue;
+    if (before.status === "error" && before.error) {
+      // Not fetched this time, so it is not known to work again.
+      report.sources[i] = { ...entry, status: "error", error: before.error };
+      report.errors.push(`${entry.id}: ${before.error}`);
+      continue;
+    }
     if (before.status !== "held" && before.status !== "review") continue;
     report.sources[i] = { ...entry, status: before.status, held: before.held };
     report.held.push(...(last.held ?? []).filter((held) => held.source === entry.id));
@@ -437,8 +458,21 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       Object.entries(state.skills)
         .filter(([, record]) => record.source === id && existsSync(record.dir))
         .map(([name, record]) => ({ name, dir: record.dir }));
+    const backupRoot = join(paths.backup(), startedAt.replace(/[:.]/g, "-"));
     const results: SourceResult[] = [];
     for (const source of loaded.sources) {
+      const before = state.sources[source.id];
+      if (before && isVendoredKind(before.kind) && !isVendoredKind(source.kind)) {
+        // Linked in place now: the vendored copies go, and edited ones are kept in the backup.
+        const why = `${source.id} is a ${source.kind === "clone" ? "working clone" : "local folder"} now`;
+        if (dryRun) warnings.push(`${why}; sync removes its vendored copies`);
+        else
+          try {
+            warnings.push(...retireStore(source.id, state, backupRoot, why));
+          } catch (error) {
+            warnings.push(`${why}, but its vendored copies stay: ${errorText(error)}`);
+          }
+      }
       const ctx = {
         offline: offline || (options.only !== undefined && options.only !== source.id),
         offlineRequested: offline,
@@ -469,10 +503,11 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         `kept ${missing.join(", ")} as last synced, because ${loaded.failed.join(", ")} did not load`,
       );
     } else if (!dryRun) {
-      const backupRoot = join(paths.backup(), startedAt.replace(/[:.]/g, "-"));
       for (const id of missing)
         try {
-          warnings.push(...removeSource(id, state, backupRoot));
+          warnings.push(
+            ...retireStore(id, state, backupRoot, `${id} is no longer in the manifest`),
+          );
         } catch (error) {
           warnings.push(
             `${id} is no longer in the manifest, but its store stays: ${errorText(error)}`,
@@ -710,10 +745,11 @@ function adoptCopyEdits(dirs: readonly string[], dryRun: boolean): string[] {
 }
 
 /**
- * Forgets a source the manifest no longer declares. Vendored copies with local edits move to the
- * backup folder first; unedited ones are deleted with the store. Returns what to tell the user.
+ * Forgets the vendored copies of a source the manifest no longer declares, or no longer vendors
+ * (`why` says which). Copies with local edits move to the backup folder first; unedited ones are
+ * deleted with the store. Returns what to tell the user.
  */
-function removeSource(id: string, state: State, backupRoot: string): string[] {
+function retireStore(id: string, state: State, backupRoot: string, why: string): string[] {
   const said: string[] = [];
   const store = paths.store(id);
   for (const [name, copy] of Object.entries(state.sources[id]?.skills ?? {})) {
@@ -726,7 +762,7 @@ function removeSource(id: string, state: State, backupRoot: string): string[] {
     const to = join(backupRoot, id, name);
     moveDir(live, to);
     said.push(
-      `${id} is no longer in the manifest; ${name} had local edits (${files.join(", ")}), so it was moved to ${tildify(to)}`,
+      `${why}; ${name} had local edits (${files.join(", ")}), so it was moved to ${tildify(to)}`,
     );
   }
   rmSync(store, { recursive: true, force: true });

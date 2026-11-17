@@ -62,8 +62,11 @@ export type Source = CloneSource | GitSource | IndexSource | NpmSource | LocalSo
 export type VendoredSource = GitSource | IndexSource | NpmSource;
 export type InPlaceSource = CloneSource | LocalSource;
 
-export const isVendored = (source: Source): source is VendoredSource =>
-  source.kind === "git" || source.kind === "index" || source.kind === "npm";
+/** Kinds copied into the store, rather than linked where they are. */
+export const isVendoredKind = (kind: Source["kind"]): kind is VendoredSource["kind"] =>
+  kind === "git" || kind === "index" || kind === "npm";
+
+export const isVendored = (source: Source): source is VendoredSource => isVendoredKind(source.kind);
 
 export interface Hook {
   name: string;
