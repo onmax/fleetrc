@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { globBase, matchesGlob } from "../src/glob.ts";
 import {
   http,
   type Http,
@@ -17,6 +18,54 @@ import {
   tgz,
   sha256,
 } from "./fixture.ts";
+
+describe("skills and hook globs", () => {
+  it("reads only *, ** and ?; brackets, braces, parentheses and ! are the characters themselves", () => {
+    const cases: [string, string, boolean][] = [
+      ["skills/*", "skills/a", true],
+      ["skills/*", "skills/a/b", false],
+      ["skills/**", "skills", true],
+      ["skills/**", "skills/a/b", true],
+      ["a/**/b", "a/b", true],
+      ["a/**/b", "a/x/y/b", true],
+      ["**", ".hidden/x", true],
+      ["skills/?", "skills/a", true],
+      ["skills/?", "skills/ab", false],
+      ["!x/*", "!x/a", true],
+      ["!x/*", "y/a", false],
+      ["{a,b}", "{a,b}", true],
+      ["{a,b}", "a", false],
+      ["[ab]", "[ab]", true],
+      ["[ab]", "a", false],
+      ["+(a)", "+(a)", true],
+      ["+(a)", "a", false],
+      ["(a|b)*", "(a|b)x", true],
+      ["(a|b)*", "a", false],
+      ["(a|b)*", "b", false],
+      ["a.b", "axb", false],
+    ];
+    for (const [glob, path, expected] of cases)
+      expect.soft(matchesGlob(path, glob), `${glob} on ${path}`).toBe(expected);
+    expect(globBase("{a,b}/[x]/*")).toBe("{a,b}/[x]");
+  });
+
+  it("answers fast for a pathological glob on a long path that almost matches", () => {
+    const cases: [string, string][] = [
+      [`${"*a".repeat(30)}*b`, "a".repeat(2000)],
+      [`${"**/".repeat(30)}x`, `${"a/".repeat(1000)}y`],
+      [`${"**a".repeat(30)}**b`, "a".repeat(2000)],
+      [`${"*?".repeat(30)}/z`, "a".repeat(2000)],
+      ["(a+)+$".repeat(10), "a".repeat(2000)],
+      // A long chain of stars: closures per state would take memory in its length squared.
+      ["*".repeat(20_000) + "b", "a".repeat(200)],
+    ];
+    for (const [glob, path] of cases) {
+      const started = performance.now();
+      expect(matchesGlob(path, glob)).toBe(false);
+      expect(performance.now() - started, glob).toBeLessThan(100);
+    }
+  });
+});
 
 describe("well-known index", () => {
   it("6a. installs skills whose archive matches the digest, from v0.2.0 and v0.1 indexes", async () => {
