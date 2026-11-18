@@ -10,6 +10,7 @@ import {
 import { isIPv4 } from "node:net";
 import { hostname, networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { distance } from "fastest-levenshtein";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
@@ -298,20 +299,6 @@ export const agentIds = () => getSupportedAgents().map((agent) => agent.id);
 
 /** The one of `known` closest to a mistyped `word`, or undefined when none is close. */
 export function closest(word: string, known: readonly string[]): string | undefined {
-  const distance = (a: string, b: string) => {
-    let row = Array.from({ length: b.length + 1 }, (_, i) => i);
-    for (let i = 1; i <= a.length; i++) {
-      const next = [i];
-      for (let j = 1; j <= b.length; j++)
-        next[j] = Math.min(
-          row[j]! + 1,
-          next[j - 1]! + 1,
-          row[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
-        );
-      row = next;
-    }
-    return row[b.length]!;
-  };
   const best = known
     .map((candidate) => ({ candidate, score: distance(word.toLowerCase(), candidate) }))
     .sort((a, b) => a.score - b.score)[0];
