@@ -1,6 +1,7 @@
 // Installs skillfleet from its packed tarball, points it at a local git source with `init`, and
 // runs the session hooks init wrote into Claude Code's and Codex's files the way the agents do:
-// through a shell, from a parent process that exits as soon as the hook does. The sync each hook
+// through a shell, or for Claude Code's exec form on Windows as node and args with no shell, from
+// a parent process that exits as soon as the hook does. The sync each hook
 // starts must outlive both and link the skill that landed upstream. Then a fresh attempt starts no
 // second sync, and `hook remove` takes skillfleet's entries out.
 //
@@ -75,24 +76,27 @@ const startedSyncs = () =>
         .filter((line) => line.endsWith(": starting a sync"))
     : [];
 
-/** The command skillfleet wrote for `event` into an agent's hooks file. */
-function hookCommand(file, event) {
+/** The entry skillfleet wrote for `event` into an agent's hooks file. */
+function hookEntry(file, event) {
   const raw = JSON.parse(readFileSync(file, "utf8"));
-  const commands = (raw.hooks?.[event] ?? []).flatMap((group) =>
-    (group.hooks ?? []).map((hook) => hook.command),
-  );
-  const own = commands.filter((command) => / hook run /.test(command));
-  assert.equal(own.length, 1, `${file} has ${own.length} skillfleet ${event} hooks: ${commands}`);
+  const entries = (raw.hooks?.[event] ?? []).flatMap((group) => group.hooks ?? []);
+  const line = (entry) => [entry.command, ...(entry.args ?? [])].join(" ");
+  const own = entries.filter((entry) => / hook run /.test(line(entry)));
+  assert.equal(own.length, 1, `${file} has ${own.length} skillfleet ${event} hooks`);
   return own[0];
 }
 
 /**
- * Runs `command` as an agent runs a hook: through a shell, with the event on stdin, from a parent
- * process that exits the moment the hook does. Resolves when the parent is gone.
+ * Runs `entry` as an agent runs a hook, with the event on stdin, from a parent process that exits
+ * the moment the hook does: shell form through a shell, exec form (Claude Code on Windows) as its
+ * command and args with no shell. Resolves when the parent is gone.
  */
-async function runAsAgent(command, event) {
+async function runAsAgent(entry, event) {
+  const how = entry.args
+    ? `${JSON.stringify(entry.command)}, ${JSON.stringify(entry.args)}, {`
+    : `${JSON.stringify(entry.command)}, { shell: true,`;
   const parent = `const { spawn } = require("node:child_process");
-const child = spawn(${JSON.stringify(command)}, { shell: true, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+const child = spawn(${how} windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
 let out = "";
 child.stdout.on("data", (chunk) => (out += chunk));
 child.stderr.on("data", (chunk) => (out += chunk));
@@ -173,6 +177,12 @@ try {
     ["Codex", join(home, ".codex", "hooks.json")],
   ]) {
     const name = `skill-${agent === "Codex" ? "codex" : "claude"}`;
+    // Claude Code on Windows gets exec form: node.exe through bin/'s link, and the installed copy.
+    if (agent === "Claude Code" && process.platform === "win32") {
+      const entry = hookEntry(file, "SessionStart");
+      assert.equal(entry.command, join(stateDir, "bin", "node-dir", "node.exe"));
+      assert.deepEqual(entry.args, [join(stateDir, "app", "cli.mjs"), "hook", "run", "claude-code"]);
+    }
     step(`${agent}: commit ${name} upstream, then start a session`);
     mkdirSync(join(work, "skills", name), { recursive: true });
     writeFileSync(join(work, "skills", name, "SKILL.md"), skillMd(name));
@@ -183,14 +193,14 @@ try {
     rmSync(join(stateDir, "hook-attempt"), { force: true });
     const before = lastRun().finishedAt;
     const syncs = startedSyncs().length;
-    await runAsAgent(hookCommand(file, "SessionStart"), "SessionStart");
+    await runAsAgent(hookEntry(file, "SessionStart"), "SessionStart");
     assert.equal(startedSyncs().length, syncs + 1, "the hook started no sync");
     await waitFor(`${agent}'s sync`, () => lastRun().finishedAt > before);
     assert.equal(lastRun().ok, true, JSON.stringify(lastRun(), null, 2));
     assert.ok(existsSync(join(claudeSkills, name, "SKILL.md")), `${name} is not linked`);
 
     step(`${agent}: a prompt right after starts no second sync`);
-    await runAsAgent(hookCommand(file, "UserPromptSubmit"), "UserPromptSubmit");
+    await runAsAgent(hookEntry(file, "UserPromptSubmit"), "UserPromptSubmit");
     assert.equal(startedSyncs().length, syncs + 1, "a fresh attempt started another sync");
   }
 

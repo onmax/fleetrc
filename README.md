@@ -84,7 +84,7 @@ A mistake, such as a typo'd repository or agent id, prints one line that says wh
 
 ### Syncs from session hooks
 
-`init` adds a hook to Claude Code (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) and to Codex (`~/.codex/hooks.json`, or `$CODEX_HOME/hooks.json`), for each one whose folder exists. It runs `skillfleet hook run <agent>`, through the launcher's full path, when a session starts and on each prompt. If no sync started in the last 15 minutes and none is running, the hook starts one in the background and returns at once; the sync writes to `logs/skillfleet-sync.log` in the state folder, like the timer. The hook makes no network call and prints nothing about the sync, so the agent never waits on it.
+`init` adds a hook to Claude Code (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) and to Codex (`~/.codex/hooks.json`, or `$CODEX_HOME/hooks.json`), for each one whose folder exists. It runs `skillfleet hook run <agent>`, through the launcher's full path, when a session starts and on each prompt. On Windows, Claude Code's entry names node and skillfleet's installed copy instead of the `.cmd` launcher, which Claude Code would hand to Git Bash or PowerShell. If no sync started in the last 15 minutes and none is running, the hook starts one in the background and returns at once; the sync writes to `logs/skillfleet-sync.log` in the state folder, like the timer. The hook makes no network call and prints nothing about the sync, so the agent never waits on it.
 
 `skillfleet hook install` and `skillfleet hook remove` add or take out skillfleet's entry and leave your other hooks alone. Codex runs a new hook only after you trust it: open `/hooks` in Codex and approve it.
 

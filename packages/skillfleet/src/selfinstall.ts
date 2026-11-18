@@ -92,6 +92,16 @@ export function launchers(
   };
 }
 
+/**
+ * `node` through the link in bin/ that `selfInstall` points at node's folder on Windows, so what
+ * runs it follows the next node; `node` itself where there is no link.
+ */
+export function linkedNode(node: string, dir = paths.bin()): string {
+  return process.platform === "win32" && lstat(join(dir, NODE_LINK))
+    ? join(dir, NODE_LINK, basename(node))
+    : node;
+}
+
 /** The node path a launcher written by `launchers` runs; `dir` is the launcher's folder. */
 export function launcherNode(text: string, dir = paths.bin()): string | undefined {
   const sh = text.match(/^exec "((?:[^"\\]|\\.)*)"/m);
@@ -322,17 +332,18 @@ export function selfInstall(): { cli: string; launcher: string; node: string; no
   const notes: string[] = [];
   let nodeLink = false;
   if (process.platform === "win32") {
+    // Claude Code's hook runs node through the link too, so it follows each new node.
     const link = join(bin, NODE_LINK);
     if (lstat(link)) removeLink(link);
-    if (/[^\x20-\x7e]/.test(node))
-      try {
-        symlinkSync(dirname(node), link, "junction");
-        nodeLink = true;
-      } catch (error) {
-        notes.push(
-          `could not link ${link} to ${dirname(node)} (${(error as Error).message}), so the .cmd launcher names node's path, which cmd may read in another code page`,
-        );
-      }
+    const unicode = /[^\x20-\x7e]/.test(node);
+    try {
+      symlinkSync(dirname(node), link, "junction");
+      nodeLink = unicode;
+    } catch (error) {
+      notes.push(
+        `could not link ${link} to ${dirname(node)} (${(error as Error).message}), so ${unicode ? "the .cmd launcher names node's path, which cmd may read in another code page, and " : ""}Claude Code's hook runs ${node}, which a Node.js upgrade may remove`,
+      );
+    }
   }
   const text = launchers(node, cli, { nodeLink });
   const sh = join(bin, "skillfleet");

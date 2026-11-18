@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { hookHandler, isOwnHandler, withHook, withoutHooks } from "../src/agenthooks.ts";
 import { lockText } from "../src/lock.ts";
 import { machine, type Machine, read, skillMd, writeFiles } from "./fixture.ts";
 
@@ -48,10 +49,18 @@ async function waitFor(what: string, check: () => boolean, ms = 60_000) {
   }
 }
 
+interface Entry {
+  command: string;
+  args?: string[];
+}
+
 const settings = (m: Machine) =>
   JSON.parse(read(m.at(".claude", "settings.json"))) as {
-    hooks?: Record<string, { hooks: { command: string }[] }[]>;
+    hooks?: Record<string, { hooks: Entry[] }[]>;
   };
+
+/** An entry as one line: its command, then its args in exec form. */
+const line = (entry: Entry) => [entry.command, ...(entry.args ?? [])].join(" ");
 
 describe("hook run", () => {
   it("does nothing, says nothing and creates nothing on a machine that was never set up", async () => {
@@ -172,14 +181,18 @@ describe("hook run", () => {
     expect((await m.runWith({ input: PROMPT }, "hook", "prompt")).stdout).toBe("");
   });
 
-  it("runs the command it wrote into settings.json, through a shell, from a parent that exits at once", async () => {
+  it("runs the entry it wrote into settings.json as Claude Code does, from a parent that exits at once", async () => {
     const { m, mine } = await hooked();
     const before = lastRun(m).finishedAt;
     writeFiles(mine, { "skills/third/SKILL.md": skillMd("third") });
-    const [command] = settings(m).hooks!.SessionStart!.map((group) => group.hooks[0]!.command);
+    const entry = settings(m).hooks!.SessionStart![0]!.hooks[0]!;
+    // Shell form through a shell; exec form (Windows) spawns the command itself, with no shell.
+    const how = entry.args
+      ? `${JSON.stringify(entry.command)}, ${JSON.stringify(entry.args)}, {`
+      : `${JSON.stringify(entry.command)}, { shell: true,`;
     // The parent is gone as soon as the hook is: what an agent that quits right after does.
     const parent = `const { spawn } = require("node:child_process");
-const child = spawn(${JSON.stringify(command)}, { shell: true, stdio: ["pipe", "inherit", "inherit"] });
+const child = spawn(${how} stdio: ["pipe", "inherit", "inherit"] });
 child.stdin.end(${JSON.stringify(SESSION)});
 child.on("exit", (code) => process.exit(code ?? 1));`;
     const run = await new Promise<{ code: number | null; out: string }>((done) => {
@@ -215,15 +228,17 @@ describe("hook install and remove", () => {
     const text = read(m.at(".claude", "settings.json"));
     expect(text).toContain('\n    "model": "opus"');
     const after = settings(m);
-    const launcher = join(m.stateDir, "bin", "skillfleet");
     const ours = (event: string) =>
       after
-        .hooks![event]!.flatMap((group) => group.hooks.map((h) => h.command))
-        .filter((command) => command.includes(" hook run claude-code"));
+        .hooks![event]!.flatMap((group) => group.hooks.map(line))
+        .filter((text) => text.includes(" hook run claude-code"));
     expect(ours("SessionStart")).toHaveLength(1);
     expect(ours("UserPromptSubmit")).toHaveLength(1);
+    // Windows: node, through bin/'s link, and the installed copy, in exec form.
     expect(ours("SessionStart")[0]).toContain(
-      process.platform === "win32" ? "skillfleet.cmd" : launcher,
+      process.platform === "win32"
+        ? `${join(m.stateDir, "bin", "node-dir")}\\node.exe ${join(m.stateDir, "app", "cli.mjs")}`
+        : join(m.stateDir, "bin", "skillfleet"),
     );
     expect(after.hooks!.UserPromptSubmit![0]!.hooks[0]!.command).toBe("echo mine");
     expect(after.hooks!.Stop).toEqual(own.hooks.Stop);
@@ -259,7 +274,63 @@ describe("hook install and remove", () => {
     expect((await m.run("hook", "install", "claude-code")).code).toBe(0);
     const prompt = settings(m).hooks!.UserPromptSubmit!;
     expect(prompt).toHaveLength(1);
-    expect(prompt[0]!.hooks[0]!.command).toMatch(/ hook run claude-code$/);
+    expect(line(prompt[0]!.hooks[0]!)).toMatch(/ hook run claude-code$/);
+  });
+
+  it("on Windows writes Claude Code's entry in exec form, and Codex's for cmd, with % kept from cmd", () => {
+    const profile = "C:\\Users\\Jo & Ann %PATH% x";
+    const state = `${profile}\\AppData\\Local\\skillfleet`;
+    const options = {
+      platform: "win32" as const,
+      launcher: `${state}\\bin\\skillfleet.cmd`,
+      node: `${state}\\bin\\node-dir\\node.exe`,
+      cli: `${state}\\app\\cli.mjs`,
+      profile,
+    };
+    expect(hookHandler("claude-code", options)).toEqual({
+      type: "command",
+      command: options.node,
+      args: [options.cli, "hook", "run", "claude-code"],
+    });
+    // cmd /C expands %PATH% even in quotes, but not inside what %USERPROFILE% expands to.
+    expect(hookHandler("codex", options).command).toBe(
+      '"%USERPROFILE%\\AppData\\Local\\skillfleet\\bin\\skillfleet.cmd" hook run codex',
+    );
+    const plain = "C:\\Users\\Jo & Ann\\AppData\\Local\\skillfleet\\bin\\skillfleet.cmd";
+    expect(hookHandler("codex", { ...options, launcher: plain }).command).toBe(
+      `"${plain}" hook run codex`,
+    );
+    expect(
+      hookHandler("claude-code", { platform: "linux", launcher: "/h/a b/skillfleet" }),
+    ).toEqual({
+      type: "command",
+      command: '"/h/a b/skillfleet" hook run claude-code',
+    });
+
+    // An entry an older install wrote in shell form gives way to exec form, once.
+    const old = { type: "command", command: `"${options.launcher}" hook run claude-code` };
+    const mine = { type: "command", command: "echo mine" };
+    const raw: Record<string, unknown> = {
+      hooks: { SessionStart: [{ hooks: [old] }], UserPromptSubmit: [{ hooks: [mine, old] }] },
+    };
+    const handler = hookHandler("claude-code", options);
+    withHook(raw, handler);
+    expect(raw).toEqual({
+      hooks: {
+        SessionStart: [{ hooks: [handler] }],
+        UserPromptSubmit: [{ hooks: [mine] }, { hooks: [handler] }],
+      },
+    });
+    const once = JSON.stringify(raw);
+    withHook(raw, handler);
+    expect(JSON.stringify(raw)).toBe(once);
+    expect(isOwnHandler(handler)).toBe(true);
+    // Another program's node script is not skillfleet's.
+    expect(
+      isOwnHandler({ command: "node", args: ["C:\\tools\\app\\cli.mjs", "hook", "run"] }),
+    ).toBe(false);
+    withoutHooks(raw);
+    expect(raw).toEqual({ hooks: { UserPromptSubmit: [{ hooks: [mine] }] } });
   });
 
   it("--dry-run writes nothing", async () => {

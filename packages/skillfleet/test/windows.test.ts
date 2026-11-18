@@ -899,22 +899,22 @@ describe.skipIf(!isWindows)(
         expect(lastRun(m).ok).toBe(true);
       }
 
-      it("W-HOOK-1. Codex's `cmd /C` and Git Bash's `sh -c` of the written command start a sync that outlives them", async () => {
-        const m = machine();
-        const { vendor, manifest } = await setUp(m);
-        expect((await m.run("init", manifest)).code).toBe(0);
-        const command = (file: string) =>
-          (
-            JSON.parse(read(file)) as {
-              hooks: Record<string, { hooks: { command: string }[] }[]>;
-            }
-          ).hooks.SessionStart![0]!.hooks[0]!.command;
-        const codex = command(m.at(".codex", "hooks.json"));
-        expect(codex).toMatch(/skillfleet\.cmd"? hook run codex$/);
+      type Entry = { command: string; args?: string[] };
+      const entry = (file: string) =>
+        (JSON.parse(read(file)) as { hooks: Record<string, { hooks: Entry[] }[]> }).hooks
+          .SessionStart![0]!.hooks[0]!;
+
+      /**
+       * Codex's `cmd.exe /C "<command>"` of its entry, then Claude Code's exec form of its own: the
+       * node the entry names, with its args and no shell. Each sync must outlive what started it.
+       */
+      async function bothAgents(m: Machine, vendor: ReturnType<typeof remote>) {
+        const codex = entry(m.at(".codex", "hooks.json"));
+        expect(codex.args).toBeUndefined();
+        expect(codex.command).toMatch(/skillfleet\.cmd" hook run codex$/);
         vendor.commit({ "skills/second/SKILL.md": skillMd("second") });
         let before = lastRun(m).finishedAt;
-        // Codex runs a hook as `cmd.exe /C "<command>"`, with the event on stdin.
-        const run = await start(comspec, ["/C", `"${codex}"`], {
+        const run = await start(comspec, ["/C", `"${codex.command}"`], {
           env: m.env,
           cwd: m.home,
           verbatim: true,
@@ -923,16 +923,43 @@ describe.skipIf(!isWindows)(
         expect(both(run)).toBe("");
         await synced(m, before);
         expect(existsSync(m.at(".claude/skills/second/SKILL.md"))).toBe(true);
-        if (!gitBash) return;
-        // Claude Code runs a hook with Git Bash.
+
         rmSync(join(m.stateDir, "hook-attempt"), { force: true });
         vendor.commit({ "skills/third/SKILL.md": skillMd("third") });
         before = lastRun(m).finishedAt;
-        const claude = command(m.at(".claude", "settings.json"));
-        const bashRun = await bash(claude, { env: m.env, cwd: m.home });
-        expect(bashRun.code, both(bashRun)).toBe(0);
+        const claude = entry(m.at(".claude", "settings.json"));
+        // node.exe through the link in bin/, which self-install points at each new node.
+        expect(claude.command).toBe(join(bin(m), "node-dir", "node.exe"));
+        expect(claude.args).toEqual([
+          join(m.stateDir, "app", "cli.mjs"),
+          "hook",
+          "run",
+          "claude-code",
+        ]);
+        const exec = await start(claude.command, claude.args!, { env: m.env, cwd: m.home }).done;
+        expect(exec.code, both(exec)).toBe(0);
+        expect(both(exec)).toBe("");
         await synced(m, before);
         expect(existsSync(m.at(".claude/skills/third/SKILL.md"))).toBe(true);
+      }
+
+      it("W-HOOK-1. Codex's `cmd /C` and Claude Code's exec form of the written entries start a sync that outlives them", async () => {
+        const m = machine();
+        const { vendor, manifest } = await setUp(m);
+        expect((await m.run("init", manifest)).code).toBe(0);
+        await bothAgents(m, vendor);
+        // self-install moves the link, not the entry: install again is unchanged.
+        expect((await m.run("self-install")).code).toBe(0);
+        expect((await m.run("hook", "install")).stdout).toContain("Claude Code: hook already in");
+      });
+
+      it("W-HOOK-2. under a USERPROFILE with spaces, & and %PATH%, both entries still run", async () => {
+        const m = machine({ home: "Jo & Ann pct %PATH% x" });
+        const { vendor, manifest } = await setUp(m);
+        expect((await m.run("init", manifest)).code).toBe(0);
+        // cmd would expand %PATH% in the path, even quoted; through %USERPROFILE% it does not.
+        expect(entry(m.at(".codex", "hooks.json")).command).toMatch(/^"%USERPROFILE%\\/);
+        await bothAgents(m, vendor);
       });
     });
   },

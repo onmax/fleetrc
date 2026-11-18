@@ -3,7 +3,9 @@
 // prompt. Both files take Claude Code's hook format:
 //   { "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "…" }] }], … } }
 // Codex reads $CODEX_HOME/hooks.json, which may hold only "description" and "hooks" (openai/codex,
-// codex-rs/hooks/src/engine/discovery.rs and codex-rs/config/src/hook_config.rs).
+// codex-rs/hooks/src/engine/discovery.rs and codex-rs/config/src/hook_config.rs). On Windows,
+// Claude Code's entry is in exec form, `"command"` and `"args"`, which Claude Code starts with no
+// shell (code.claude.com/docs/en/hooks, "Exec form and shell form").
 import {
   existsSync,
   mkdirSync,
@@ -18,7 +20,7 @@ import { isRecord, JsonFileError, readJson } from "./fs.ts";
 import { HOOK_AGENTS, type HookAgent } from "./hook.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { tildify } from "./paths.ts";
-import { launcherPath } from "./selfinstall.ts";
+import { installedCli, launcherPath, linkedNode, stableNode } from "./selfinstall.ts";
 
 export { HOOK_AGENTS, type HookAgent };
 
@@ -41,21 +43,89 @@ export function agentHome(agent: HookAgent): string {
 export const hookFile = (agent: HookAgent) =>
   join(agentHome(agent), agent === "claude-code" ? "settings.json" : "hooks.json");
 
+/** A hook entry in an event's matcher group: shell form, or with `args`, exec form. */
+export interface HookHandler {
+  type: "command";
+  command: string;
+  args?: string[];
+}
+
 /**
- * The launcher's absolute path, so the agent's PATH does not matter. Claude Code runs a hook with
- * sh (Git Bash on Windows) and Codex with $SHELL, or cmd on Windows: double quotes work in each.
+ * The launcher in a shell command, by its absolute path so the agent's PATH does not matter.
+ * Claude Code runs shell form with sh (macOS, Linux) and Codex with $SHELL, or `cmd /C` on Windows:
+ * double quotes work in each. cmd expands `%NAME%` even inside quotes, so on Windows a path that
+ * holds a `%` goes through `%USERPROFILE%`, which cmd expands once, without expanding the result.
  */
-export function hookCommand(agent: HookAgent, launcher = launcherPath()): string {
+function shellCommand(
+  agent: HookAgent,
+  launcher: string,
+  platform: NodeJS.Platform,
+  profile = process.env.USERPROFILE,
+): string {
+  if (platform === "win32") {
+    const rest =
+      profile && launcher.toLowerCase().startsWith(`${profile.toLowerCase()}\\`)
+        ? launcher.slice(profile.length)
+        : undefined;
+    const path =
+      launcher.includes("%") && rest !== undefined && !rest.includes("%")
+        ? `%USERPROFILE%${rest}`
+        : launcher;
+    return `"${path}" hook run ${agent}`;
+  }
   const path = /^[\w./:+-]+$/.test(launcher)
     ? launcher
-    : `"${process.platform === "win32" ? launcher : launcher.replace(/[$`"\\]/g, "\\$&")}"`;
+    : `"${launcher.replace(/[$`"\\]/g, "\\$&")}"`;
   return `${path} hook run ${agent}`;
+}
+
+/**
+ * What the agent runs. Claude Code on Windows gets exec form: in shell form it uses Git Bash, or
+ * PowerShell without it, which refuses a quoted path followed by arguments; and exec form needs a
+ * real executable, not the .cmd launcher. So it runs node, through the node link in bin/ that
+ * `self-install` points at each new node, with the installed copy's entry, as the launcher does.
+ */
+export function hookHandler(
+  agent: HookAgent,
+  options: {
+    platform?: NodeJS.Platform;
+    launcher?: string;
+    node?: string;
+    cli?: string;
+    profile?: string;
+  } = {},
+): HookHandler {
+  const platform = options.platform ?? process.platform;
+  if (agent === "claude-code" && platform === "win32")
+    return {
+      type: "command",
+      command: options.node ?? linkedNode(stableNode()),
+      args: [options.cli ?? installedCli(), "hook", "run", agent],
+    };
+  return {
+    type: "command",
+    command: shellCommand(agent, options.launcher ?? launcherPath(), platform, options.profile),
+  };
 }
 
 /** A command skillfleet wrote, by this install or another one: `… skillfleet hook run|prompt`. */
 export const isOwnCommand = (command: unknown) =>
   typeof command === "string" &&
-  /(?:^|[\\/"'\s])skillfleet(?:\.cmd|\.ps1|\.mjs)?["']?\s+hook\s+(?:run|prompt)\b/.test(command);
+  /(?:(?:^|[\\/"'\s])skillfleet(?:\.cmd|\.ps1|\.mjs)?|skillfleet[\\/]app[\\/]cli\.mjs)["']?\s+hook\s+(?:run|prompt)\b/.test(
+    command,
+  );
+
+/** An entry skillfleet wrote, in shell form or in exec form (its command, then its args). */
+export const isOwnHandler = (hook: unknown) =>
+  isRecord(hook) &&
+  isOwnCommand(
+    [hook.command, ...(Array.isArray(hook.args) ? hook.args : [])]
+      .filter((part) => typeof part === "string")
+      .join(" "),
+  );
+
+const sameHandler = (a: Record<string, unknown>, b: HookHandler) =>
+  a.command === b.command && JSON.stringify(a.args) === JSON.stringify(b.args);
 
 type Json = Record<string, unknown>;
 
@@ -65,9 +135,7 @@ function withoutOwn(groups: unknown): { groups: unknown[]; removed: number } {
   let removed = 0;
   const kept = groups.flatMap((group: unknown) => {
     if (!isRecord(group) || !Array.isArray(group.hooks)) return [group];
-    const hooks = group.hooks.filter(
-      (hook: unknown) => !(isRecord(hook) && isOwnCommand(hook.command)),
-    );
+    const hooks = group.hooks.filter((hook: unknown) => !isOwnHandler(hook));
     if (hooks.length === group.hooks.length) return [group];
     removed += group.hooks.length - hooks.length;
     // A group that held only skillfleet's handler goes with it.
@@ -76,17 +144,15 @@ function withoutOwn(groups: unknown): { groups: unknown[]; removed: number } {
   return { groups: kept, removed };
 }
 
-/** The events of `raw` that run skillfleet's hook, and their commands. */
-function ownHandlers(raw: unknown): { event: string; command: string }[] {
+/** The events of `raw` that run skillfleet's hook, and its entries. */
+function ownHandlers(raw: unknown): { event: string; handler: Record<string, unknown> }[] {
   if (!isRecord(raw) || !isRecord(raw.hooks)) return [];
   return Object.entries(raw.hooks).flatMap(([event, groups]) =>
     Array.isArray(groups)
       ? groups.flatMap((group: unknown) =>
           isRecord(group) && Array.isArray(group.hooks)
             ? group.hooks.flatMap((hook: unknown) =>
-                isRecord(hook) && isOwnCommand(hook.command)
-                  ? [{ event, command: hook.command as string }]
-                  : [],
+                isRecord(hook) && isOwnHandler(hook) ? [{ event, handler: hook }] : [],
               )
             : [],
         )
@@ -163,31 +229,48 @@ function chosen(
   );
 }
 
-/** Adds skillfleet's hook to each agent's file, replacing an older entry of skillfleet's. */
+/**
+ * Puts `handler` in `raw`'s SessionStart and UserPromptSubmit, in place of any entry of
+ * skillfleet's; an event that already holds it, once, is left alone.
+ */
+export function withHook(raw: Json, handler: HookHandler) {
+  const hooks: Json = isRecord(raw.hooks) ? raw.hooks : {};
+  for (const event of EVENTS) {
+    const own = ownHandlers({ hooks: { [event]: hooks[event] } });
+    if (own.length === 1 && sameHandler(own[0]!.handler, handler)) continue;
+    hooks[event] = [...withoutOwn(hooks[event]).groups, { hooks: [handler] }];
+  }
+  raw.hooks = hooks;
+}
+
+/** Takes every entry of skillfleet's out of `raw`, and the groups and events left empty by it. */
+export function withoutHooks(raw: Json) {
+  if (!isRecord(raw.hooks)) return;
+  for (const [event, groups] of Object.entries(raw.hooks)) {
+    const { groups: kept, removed } = withoutOwn(groups);
+    if (removed === 0) continue;
+    if (kept.length > 0) raw.hooks[event] = kept;
+    else delete raw.hooks[event];
+  }
+  if (Object.keys(raw.hooks).length === 0) delete raw.hooks;
+}
+
+/**
+ * Adds skillfleet's hook to each agent's file, replacing an older entry of skillfleet's. `node` is
+ * the node the launcher runs (Claude Code on Windows runs it through bin/'s node link).
+ */
 export function installHooks(
   agents: readonly HookAgent[] | undefined,
-  options: { dryRun?: boolean; launcher?: string } = {},
+  options: { dryRun?: boolean; node?: string } = {},
 ): HookChange[] {
+  const node = options.node === undefined ? undefined : linkedNode(options.node);
   return chosen(agents).map(({ agent, skipped }) => {
     if (skipped) return { agent, file: hookFile(agent), changed: false, skipped };
-    const command = hookCommand(agent, options.launcher);
-    return changeFile(
-      agent,
-      (raw) => {
-        const hooks: Json = isRecord(raw.hooks) ? raw.hooks : {};
-        for (const event of EVENTS) {
-          const own = ownHandlers({ hooks: { [event]: hooks[event] } });
-          // Already there, once and as this install writes it: unchanged, wherever it is.
-          if (own.length === 1 && own[0]!.command === command) continue;
-          hooks[event] = [
-            ...withoutOwn(hooks[event]).groups,
-            { hooks: [{ type: "command", command }] },
-          ];
-        }
-        raw.hooks = hooks;
-      },
-      { dryRun: options.dryRun ?? false, create: true },
-    );
+    const handler = hookHandler(agent, node === undefined ? {} : { node });
+    return changeFile(agent, (raw) => withHook(raw, handler), {
+      dryRun: options.dryRun ?? false,
+      create: true,
+    });
   });
 }
 
@@ -198,20 +281,10 @@ export function removeHooks(
 ): HookChange[] {
   return chosen(agents).map(({ agent, skipped }) => {
     if (skipped) return { agent, file: hookFile(agent), changed: false, skipped };
-    return changeFile(
-      agent,
-      (raw) => {
-        if (!isRecord(raw.hooks)) return;
-        for (const [event, groups] of Object.entries(raw.hooks)) {
-          const { groups: kept, removed } = withoutOwn(groups);
-          if (removed === 0) continue;
-          if (kept.length > 0) raw.hooks[event] = kept;
-          else delete raw.hooks[event];
-        }
-        if (Object.keys(raw.hooks).length === 0) delete raw.hooks;
-      },
-      { dryRun: options.dryRun ?? false, create: false },
-    );
+    return changeFile(agent, withoutHooks, {
+      dryRun: options.dryRun ?? false,
+      create: false,
+    });
   });
 }
 

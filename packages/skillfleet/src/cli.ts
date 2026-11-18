@@ -874,8 +874,9 @@ function addHooks(
   agents: readonly HookAgent[] | undefined,
   node?: string,
 ): { lines: string[]; changes: HookChange[]; code: number } {
-  if (!dryRun) saveHookEnv(node ?? selfInstall().node);
-  const changes = installHooks(agents, { dryRun });
+  const nodePath = dryRun ? undefined : (node ?? selfInstall().node);
+  if (nodePath) saveHookEnv(nodePath);
+  const changes = installHooks(agents, { dryRun, ...(nodePath ? { node: nodePath } : {}) });
   const lines = formatHookChanges(changes, "install", dryRun);
   if (changes.every((change) => change.skipped))
     lines.push(
