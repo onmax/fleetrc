@@ -67,8 +67,9 @@ const dq = (text: string) => `"${text.replace(/[$`"\\]/g, "\\$&")}"`;
  *
  * On macOS and Linux a launcher under HOME is written as `"$HOME/…"`, so a settings file shared
  * between machines through dotfiles works on each; and a launcher or node that is gone exits 0
- * quietly (`2>/dev/null || true`) instead of failing every prompt. Both read the same in those four
- * shells.
+ * quietly instead of failing every prompt: `test -x <launcher> && <launcher> hook run <agent>
+ * 2>/dev/null; true`. It reads the same in those four shells. `<launcher> … || true` does not:
+ * fish stops at a command it can't find, before `|| true`, says so and exits 127.
  *
  * On Windows cmd expands `%NAME%` even inside quotes, so a path that holds a `%` goes through
  * `%USERPROFILE%`, which cmd expands once, without expanding the result. Known limit: a `%` in a
@@ -95,7 +96,7 @@ function shellCommand(
   const path = launcher.startsWith(`${home}/`)
     ? `"$HOME${dq(launcher.slice(home.length)).slice(1)}`
     : dq(launcher);
-  return `${path} ${RUN(agent)} 2>/dev/null || true`;
+  return `test -x ${path} && ${path} ${RUN(agent)} 2>/dev/null; true`;
 }
 
 /**
@@ -138,13 +139,16 @@ export function hookHandler(
 const LAUNCHER = String.raw`(?:"(?:[^"\\]|\\.)*[\\/]skillfleet(?:\.cmd)?"|[^\s"'\`;&|<>()$]*[\\/]skillfleet(?:\.cmd)?)`;
 
 /**
- * The commands skillfleet writes, by this install or another one: the launcher (any path, also
- * `"$HOME/…"` or `"%USERPROFILE%\…"`) with `hook run <agent>`, alone or with `2>/dev/null || true`;
- * and the prompt hook older versions documented, `[npx] skillfleet hook prompt` or the launcher
- * with `hook prompt`. Nothing else: a user's command that only mentions them is not skillfleet's.
+ * The commands skillfleet writes, by this install or another one: `test -x <launcher> &&
+ * <launcher> hook run <agent> 2>/dev/null; true`, one launcher (any path, also `"$HOME/…"`) named
+ * twice; on Windows the launcher (also `"%USERPROFILE%\…"`) with `hook run <agent>`. And, so they
+ * are replaced, what earlier versions wrote: the launcher with `hook run <agent>` alone or with
+ * `2>/dev/null || true`, and the documented prompt hook, `[npx] skillfleet hook prompt` or the
+ * launcher with `hook prompt`. Nothing else: a user's command that only mentions them is not
+ * skillfleet's.
  */
 const OWN_COMMAND = new RegExp(
-  String.raw`^(?:${LAUNCHER} hook run (?:claude-code|codex)(?: 2>/dev/null \|\| true)?|(?:npx (?:-y )?)?skillfleet hook prompt|${LAUNCHER} hook prompt)$`,
+  String.raw`^(?:test -x (${LAUNCHER}) && \1 hook run (?:claude-code|codex) 2>/dev/null; true|${LAUNCHER} hook run (?:claude-code|codex)(?: 2>/dev/null \|\| true)?|(?:npx (?:-y )?)?skillfleet hook prompt|${LAUNCHER} hook prompt)$`,
 );
 
 export const isOwnCommand = (command: unknown) =>
