@@ -6,10 +6,13 @@
 // codex-rs/hooks/src/engine/discovery.rs and codex-rs/config/src/hook_config.rs). On Windows,
 // Claude Code's entry is in exec form, `"command"` and `"args"`, which Claude Code starts with no
 // shell (code.claude.com/docs/en/hooks, "Exec form and shell form").
+import { randomBytes } from "node:crypto";
 import {
-  chmodSync,
+  closeSync,
   existsSync,
+  fchmodSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -283,10 +286,20 @@ export function editHooksFile(
       (snapshot === undefined ? undefined : editJsonText(snapshot, before, after)) ??
       `${JSON.stringify(after, null, 2)}\n`;
     mkdirSync(dirname(target), { recursive: true });
-    const temp = `${target}.skillfleet-${process.pid}.tmp`;
-    writeFileSync(temp, out);
-    if (snapshot !== undefined) chmodSync(temp, statSync(target).mode & 0o7777);
+    // The temp file is created with the target's mode, so a 0600 settings.json is never readable
+    // by others, not even in its copy; the umask can only narrow the mode, which fchmod restores.
+    const mode = snapshot === undefined ? undefined : statSync(target).mode & 0o7777;
+    const temp = `${target}.skillfleet-${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
+    const fd = openSync(temp, "wx", mode ?? 0o666);
+    try {
+      if (mode !== undefined) fchmodSync(fd, mode);
+      writeFileSync(fd, out);
+    } finally {
+      closeSync(fd);
+    }
     options.step?.();
+    // Claude Code writes settings.json too, without a lock, so a write of its between this read
+    // and the rename below is lost: a narrow window this check can't close.
     if (readText(target) !== snapshot) {
       rmSync(temp, { force: true });
       continue;

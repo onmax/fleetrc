@@ -598,11 +598,17 @@ describe("the hooks on shared and upgraded machines", () => {
       expect(readdirSync(dirname(settings))).toEqual(["settings.json"]);
     });
 
-    it.skipIf(isWindows)("keeps the file's mode", () => {
+    it.skipIf(isWindows)("keeps the file's mode, in its temporary copy too", () => {
       const settings = file();
       writeFileSync(settings, "{}\n");
       chmodSync(settings, 0o600);
-      expect(editHooksFile(settings, addHook).changed).toBe(true);
+      const modes: number[] = [];
+      const step = () => {
+        for (const name of readdirSync(dirname(settings)))
+          if (name.endsWith(".tmp")) modes.push(statSync(join(dirname(settings), name)).mode & 0o777);
+      };
+      expect(editHooksFile(settings, addHook, { step }).changed).toBe(true);
+      expect(modes).toEqual([0o600]);
       expect(statSync(settings).mode & 0o777).toBe(0o600);
     });
 
