@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import {
   describeTrigger,
@@ -57,6 +57,7 @@ import {
   commandOnPath,
   findOnPath,
   installedCli,
+  launcherNode,
   launcherPath,
   selfInstall,
   stableNode,
@@ -869,6 +870,21 @@ function saveHookEnv(node: string) {
   writeJson(paths.hookEnv(), timerEnv(findOnPath("git"), node));
 }
 
+/**
+ * After self-install moved the launcher to another node, the saved hook environment follows it:
+ * its PATH gets the new node's folder in place of the old one, and nothing else changes. `fleet
+ * upgrade` runs self-install over a bare ssh shell, whose environment is not the user's.
+ */
+function moveHookEnvNode(old: string | undefined, node: string) {
+  const saved = readJsonOrNothing(paths.hookEnv());
+  if (!isRecord(saved) || typeof saved.PATH !== "string") return;
+  const from = old === undefined ? undefined : dirname(old);
+  const to = dirname(node);
+  const dirs = saved.PATH.split(delimiter).map((dir) => (dir === from ? to : dir));
+  const PATH = [...new Set(dirs.includes(to) ? dirs : [to, ...dirs])].join(delimiter);
+  if (PATH !== saved.PATH) writeJson(paths.hookEnv(), { ...saved, PATH });
+}
+
 /** Installs the session hooks, after the launcher they run; init and `hook install`. */
 function addHooks(
   agents: readonly HookAgent[] | undefined,
@@ -1187,9 +1203,11 @@ async function main(): Promise<number> {
     case "hook":
       return hookCommand(rest[0]);
     case "self-install": {
+      const before = existsSync(launcherPath())
+        ? launcherNode(readFileSync(launcherPath(), "utf8"))
+        : undefined;
       const result = selfInstall();
-      // The hooks' syncs run with the environment and node they were installed with.
-      if (installedHooks().length > 0) saveHookEnv(result.node);
+      moveHookEnvNode(before, result.node);
       say(
         `installed ${tildify(result.launcher)} (node ${result.node})`,
         commandOnPath(result.launcher),

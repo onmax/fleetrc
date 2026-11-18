@@ -1,13 +1,39 @@
 // Session hooks, skillfleet's default trigger: `hook run <agent>` starts a sync in the background
 // when the last attempt is stale, `hook install` and `hook remove` edit Claude Code's settings.json
 // and Codex's hooks.json, and init, status and doctor follow the hooks or the timer.
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { delimiter, dirname, join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { hookHandler, isOwnHandler, withHook, withoutHooks } from "../src/agenthooks.ts";
+import {
+  editHooksFile,
+  hookHandler,
+  isOwnHandler,
+  withHook,
+  withoutHooks,
+} from "../src/agenthooks.ts";
 import { lockText } from "../src/lock.ts";
-import { machine, type Machine, read, skillMd, writeFiles } from "./fixture.ts";
+import {
+  cli,
+  isWindows,
+  machine,
+  type Machine,
+  read,
+  skillMd,
+  systemdShim,
+  writeFiles,
+} from "./fixture.ts";
 
 const SESSION = JSON.stringify({ session_id: "s1", hook_event_name: "SessionStart" });
 const PROMPT = JSON.stringify({ session_id: "s1", hook_event_name: "UserPromptSubmit" });
@@ -457,4 +483,38 @@ describe("init, status and doctor with the hooks or the timer", () => {
     expect(init.stdout).toContain("no Claude Code or Codex here, so no session hook starts a sync");
     expect(readFileSync(join(m.stateDir, "hook-env.json"), "utf8")).toContain('"PATH"');
   });
+});
+
+describe("the hooks on shared and upgraded machines", () => {
+  it("self-install over a bare shell keeps the saved hook environment and only moves node's folder", async () => {
+    if (isWindows) return;
+    const m = machine();
+    const node = (name: string) => {
+      const dir = join(m.root, name, "bin");
+      mkdirSync(dir, { recursive: true });
+      symlinkSync(process.execPath, join(dir, "node"));
+      return dir;
+    };
+    const [a, b] = [node("node-a"), node("node-b")];
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    const init = await m.runWith(
+      { env: { PATH: [a, m.env.PATH].join(delimiter) } },
+      "init",
+      manifest,
+    );
+    expect(init.code, init.stderr).toBe(0);
+    const saved = JSON.parse(read(join(m.stateDir, "hook-env.json"))) as Record<string, string>;
+    expect(saved.PATH!.split(delimiter)[0]).toBe(a);
+    // What `fleet upgrade` gets over ssh: HOME and a PATH, nothing else.
+    const bare = { HOME: m.home, PATH: [b, "/usr/bin", "/bin"].join(delimiter) };
+    const run = spawnSync(process.execPath, [cli, "self-install"], {
+      env: bare,
+      cwd: m.home,
+      encoding: "utf8",
+    });
+    expect(run.status, run.stderr).toBe(0);
+    const after = JSON.parse(read(join(m.stateDir, "hook-env.json"))) as Record<string, string>;
+    expect(after).toEqual({ ...saved, PATH: saved.PATH!.replace(a, b) });
+  });
+
 });
