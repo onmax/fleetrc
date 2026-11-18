@@ -153,8 +153,12 @@ function pruneRecords(now: Date) {
  * compacted keeps its record.
  */
 export function sessionStarted(input: string, now = new Date()) {
-  startRecord(recordFile(sessionOf(input)), now);
+  const file = recordFile(sessionOf(input));
+  mkdirSync(dirname(file), { recursive: true });
+  // Pruned first: a session resumed after a week would otherwise keep its old record only until
+  // the prune deleted it, and start its first prompt without one.
   pruneRecords(now);
+  startRecord(file, now);
 }
 
 /**

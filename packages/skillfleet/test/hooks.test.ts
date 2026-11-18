@@ -706,6 +706,13 @@ describe("the hooks on shared and upgraded machines", () => {
         args: exec,
       }),
     ).toBe(true);
+    // bin/node-dir keeps node's own name, which may be a renamed binary.
+    expect(
+      isOwnHandler({
+        command: "C:\\Users\\u\\AppData\\Local\\skillfleet\\bin\\node-dir\\node-v24.exe",
+        args: exec,
+      }),
+    ).toBe(true);
     expect(isOwnHandler({ command: "node", args: exec })).toBe(true);
     // A user's program that happens to take skillfleet's args is theirs.
     expect(isOwnHandler({ command: "C:\\tools\\audit-hook.exe", args: exec })).toBe(false);
@@ -899,6 +906,19 @@ describe("the hooks on shared and upgraded machines", () => {
     expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
     expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
     expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
+  });
+
+  it("gives a session resumed after a week a fresh record on its start", async () => {
+    const { m } = await hooked();
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    const file = join(m.stateDir, "sessions", "s1.json");
+    mkdirSync(dirname(file), { recursive: true });
+    const old = new Date(Date.now() - 8 * 24 * 3600_000);
+    writeFileSync(file, JSON.stringify({ startedAt: old.toISOString(), announced: [] }));
+    utimesSync(file, old, old);
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    const record = JSON.parse(read(file));
+    expect(Date.now() - Date.parse(record.startedAt)).toBeLessThan(60_000);
   });
 
   it("keeps the record of each of 12 sessions that start together", async () => {
