@@ -7,16 +7,20 @@
 // Claude Code's entry is in exec form, `"command"` and `"args"`, which Claude Code starts with no
 // shell (code.claude.com/docs/en/hooks, "Exec form and shell form").
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { isRecord, JsonFileError, readJson } from "./fs.ts";
+import { isErrno, isRecord, JsonFileError, lstat, readJson } from "./fs.ts";
 import { HOOK_AGENTS, type HookAgent } from "./hook.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { tildify } from "./paths.ts";
@@ -170,28 +174,85 @@ export interface HookChange {
   error?: string;
 }
 
-/** Reads a hooks file: undefined when it does not exist, an error when it is not a JSON object. */
-function readHooksFile(file: string): Json | undefined {
-  const raw = readJson(file);
-  if (raw === undefined) return undefined;
+/** The file's text, or undefined when it does not exist. */
+function readText(file: string): string | undefined {
+  try {
+    return readFileSync(file, "utf8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
+/** A hooks file's text as a JSON object. */
+function parseObject(text: string, file: string): Json {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text.replace(/^﻿/, ""));
+  } catch (error) {
+    throw new JsonFileError(`${file} is not valid JSON: ${(error as Error).message}`);
+  }
   if (!isRecord(raw)) throw new JsonFileError(`${file} is not a JSON object`);
   return raw;
 }
 
-/** Writes `after` over `file`, which held `before`, keeping its layout; through a link to its target. */
-function writeHooksFile(file: string, before: Json | undefined, after: Json) {
-  const target = existsSync(file) ? realpathSync(file) : file;
-  const text = before === undefined ? undefined : readFileSync(target, "utf8");
-  const out =
-    (text === undefined ? undefined : editJsonText(text, before, after)) ??
-    `${JSON.stringify(after, null, 2)}\n`;
-  mkdirSync(dirname(target), { recursive: true });
-  const temp = `${target}.skillfleet-${process.pid}.tmp`;
-  writeFileSync(temp, out);
-  renameSync(temp, target);
-}
-
 const copy = (value: Json): Json => JSON.parse(JSON.stringify(value)) as Json;
+
+/**
+ * Changes a hooks file with `change`, keeping its layout and mode, through a link to its target.
+ * The edit comes from one read of the file, and is written only if the file still holds what was
+ * read: the agent or the user may write it meanwhile. Then it tries once more, and after that
+ * reports a conflict and writes nothing. A link to a file that does not exist is left alone. `step`
+ * runs before that last check, for tests.
+ */
+export function editHooksFile(
+  file: string,
+  change: (raw: Json) => void,
+  options: { dryRun?: boolean; create?: boolean; step?: () => void } = {},
+): { changed: boolean; error?: string } {
+  let target = file;
+  if (lstat(file)?.isSymbolicLink())
+    try {
+      target = realpathSync(file);
+    } catch {
+      return {
+        changed: false,
+        error: `${tildify(file)} is a link to ${readlinkSync(file)}, which does not exist; skillfleet left it alone`,
+      };
+    }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const snapshot = readText(target);
+    if (snapshot === undefined && !options.create) return { changed: false };
+    let before: Json;
+    try {
+      before = snapshot === undefined ? {} : parseObject(snapshot, file);
+    } catch (error) {
+      return { changed: false, error: (error as Error).message };
+    }
+    const after = copy(before);
+    change(after);
+    if (JSON.stringify(after) === JSON.stringify(before)) return { changed: false };
+    if (options.dryRun) return { changed: true };
+    const out =
+      (snapshot === undefined ? undefined : editJsonText(snapshot, before, after)) ??
+      `${JSON.stringify(after, null, 2)}\n`;
+    mkdirSync(dirname(target), { recursive: true });
+    const temp = `${target}.skillfleet-${process.pid}.tmp`;
+    writeFileSync(temp, out);
+    if (snapshot !== undefined) chmodSync(temp, statSync(target).mode & 0o7777);
+    options.step?.();
+    if (readText(target) !== snapshot) {
+      rmSync(temp, { force: true });
+      continue;
+    }
+    renameSync(temp, target);
+    return { changed: true };
+  }
+  return {
+    changed: false,
+    error: `${tildify(file)} changed while skillfleet was editing it, so nothing was written; run the command again`,
+  };
+}
 
 /** Changes the agent's hooks file with `change`; a file that would not change is left alone. */
 function changeFile(
@@ -200,18 +261,7 @@ function changeFile(
   options: { dryRun: boolean; create: boolean },
 ): HookChange {
   const file = hookFile(agent);
-  let before: Json | undefined;
-  try {
-    before = readHooksFile(file);
-  } catch (error) {
-    return { agent, file, changed: false, error: (error as Error).message };
-  }
-  if (before === undefined && !options.create) return { agent, file, changed: false };
-  const after = copy(before ?? {});
-  change(after);
-  const changed = JSON.stringify(after) !== JSON.stringify(before ?? {});
-  if (changed && !options.dryRun) writeHooksFile(file, before, after);
-  return { agent, file, changed };
+  return { agent, file, ...editHooksFile(file, change, options) };
 }
 
 /**

@@ -517,4 +517,71 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(after).toEqual({ ...saved, PATH: saved.PATH!.replace(a, b) });
   });
 
+  describe("writing a hooks file", () => {
+    const file = () => {
+      const dir = join(machine().root, "claude");
+      mkdirSync(dir);
+      return join(dir, "settings.json");
+    };
+    const addHook = (raw: Record<string, unknown>) =>
+      withHook(raw, { type: "command", command: '"/s/skillfleet" hook run claude-code' });
+    const stop = { Stop: [{ hooks: [{ type: "command", command: "echo stop" }] }] };
+
+    it("keeps a handler added while it edits, by trying again on what is there now", () => {
+      const settings = file();
+      writeFileSync(settings, "{}\n");
+      let first = true;
+      const result = editHooksFile(settings, addHook, {
+        step: () => {
+          if (first) writeFileSync(settings, `${JSON.stringify({ hooks: stop })}\n`);
+          first = false;
+        },
+      });
+      expect(result).toEqual({ changed: true });
+      const raw = JSON.parse(read(settings)) as { hooks: Record<string, unknown> };
+      expect(raw.hooks.Stop).toEqual(stop.Stop);
+      expect(Object.keys(raw.hooks)).toEqual(["Stop", "SessionStart", "UserPromptSubmit"]);
+    });
+
+    it("writes nothing and says so when the file keeps changing", () => {
+      const settings = file();
+      writeFileSync(settings, "{}\n");
+      let n = 0;
+      const result = editHooksFile(settings, addHook, {
+        step: () => writeFileSync(settings, `{ "n": ${++n} }\n`),
+      });
+      expect(result.changed).toBe(false);
+      expect(result.error).toContain("changed while skillfleet was editing it");
+      expect(read(settings)).toBe('{ "n": 2 }\n');
+      expect(readdirSync(dirname(settings))).toEqual(["settings.json"]);
+    });
+
+    it.skipIf(isWindows)("keeps the file's mode", () => {
+      const settings = file();
+      writeFileSync(settings, "{}\n");
+      chmodSync(settings, 0o600);
+      expect(editHooksFile(settings, addHook).changed).toBe(true);
+      expect(statSync(settings).mode & 0o777).toBe(0o600);
+    });
+
+    it.skipIf(isWindows)(
+      "edits a linked file through the link, and leaves a dangling link alone",
+      () => {
+        const settings = file();
+        const target = join(dirname(settings), "real.json");
+        writeFileSync(target, "{}\n");
+        symlinkSync(target, settings);
+        expect(editHooksFile(settings, addHook).changed).toBe(true);
+        expect(lstatSync(settings).isSymbolicLink()).toBe(true);
+        expect(read(target)).toContain("hook run claude-code");
+        rmSync(target);
+        const dangling = editHooksFile(settings, addHook, { create: true });
+        expect(dangling.changed).toBe(false);
+        expect(dangling.error).toContain("which does not exist; skillfleet left it alone");
+        expect(lstatSync(settings).isSymbolicLink()).toBe(true);
+        expect(existsSync(target)).toBe(false);
+      },
+    );
+  });
+
 });
