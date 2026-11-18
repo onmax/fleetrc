@@ -112,7 +112,7 @@ child.on("exit", (code) => { process.stdout.write(out); process.exit(code ?? 1);
   });
   step(`hook (${event}) exited ${result.code} after ${Date.now() - started} ms`);
   assert.equal(result.code, 0, `the hook failed: ${result.out}`);
-  assert.equal(result.out, "", `the hook printed something: ${result.out}`);
+  return result.out;
 }
 
 async function waitFor(what, check) {
@@ -193,14 +193,18 @@ try {
     rmSync(join(stateDir, "hook-attempt"), { force: true });
     const before = lastRun().finishedAt;
     const syncs = startedSyncs().length;
-    await runAsAgent(hookEntry(file, "SessionStart"), "SessionStart");
+    assert.equal(await runAsAgent(hookEntry(file, "SessionStart"), "SessionStart"), "");
     assert.equal(startedSyncs().length, syncs + 1, "the hook started no sync");
     await waitFor(`${agent}'s sync`, () => lastRun().finishedAt > before);
     assert.equal(lastRun().ok, true, JSON.stringify(lastRun(), null, 2));
     assert.ok(existsSync(join(claudeSkills, name, "SKILL.md")), `${name} is not linked`);
 
     step(`${agent}: a prompt right after starts no second sync`);
-    await runAsAgent(hookEntry(file, "UserPromptSubmit"), "UserPromptSubmit");
+    const said = await runAsAgent(hookEntry(file, "UserPromptSubmit"), "UserPromptSubmit");
+    // Claude Code's session started before its sync linked the skill, so its first prompt is told;
+    // Codex reads skills only when a session starts, and is told nothing.
+    if (agent === "Claude Code") assert.match(said, new RegExp(`available now: ${name}\\.`));
+    else assert.equal(said, "");
     assert.equal(startedSyncs().length, syncs + 1, "a fresh attempt started another sync");
   }
 
