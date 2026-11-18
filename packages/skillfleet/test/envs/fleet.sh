@@ -123,7 +123,7 @@ step "4. an ssh_config alias" "alias-ok: last run"
 want=1 cmd='sf fleet status alias-unknown-key --timeout 10'
 step "5. unknown host key" "unreachable (Host key verification failed"
 want=1 cmd='sf fleet status "ssh://fleet@127.0.0.1:22229" "fleet@10.255.255.1" --timeout 3'
-step "6. nothing listening, and a blackhole with --timeout 3" "Connection refused" "timed out after 3s"
+step "6. nothing listening, and a blackhole with --timeout 3" "Connection refused" "no answer within 3 s"
 want=1 cmd='sf fleet sync alias-ok "ssh://fleet@127.0.0.1:22223" --timeout 30 --json'
 step "7. two hosts, one failing, --json" '"host": "alias-ok"' '"ok": true' '"error": "skillfleet is not installed there, and node'
 want=1 cmd='sf fleet upgrade alias-ok --timeout 60'
@@ -163,7 +163,7 @@ step "12. container controller, plain ssh, ~/.ssh/config with Port" "okhost: las
 # host as alias-ok in its own ~/.ssh/config: a manifest in a repository, as fleet init requires.
 docker exec -u fleet sf-u2-h-ok sh -c '
 set -e
-cd ~ && rm -rf m.git m-work && git init -q --bare m.git && git init -q -b main m-work && cd m-work
+cd ~ && rm -rf m.git m-work && git init -q --bare -b main m.git && git init -q -b main m-work && cd m-work
 mkdir -p .skillfleet skills/team-skill
 printf -- "---\nname: team-skill\ndescription: d\n---\n" > skills/team-skill/SKILL.md
 echo "{\"agents\":[\"claude-code\"],\"sources\":[{\"id\":\"team\",\"git\":\"alias-ok:/home/fleet/m.git\",\"skills\":\"skills/*\"}]}" > .skillfleet/manifest.json
@@ -173,13 +173,13 @@ docker exec sf-u2-h-bare sh -c '
 chown fleet /home/fleet/.ssh/id_ed25519 && chmod 600 /home/fleet/.ssh/id_ed25519
 printf "Host alias-ok\n  HostName sf-u2-h-ok\n  User fleet\n" > /home/fleet/.ssh/config
 ssh-keyscan sf-u2-h-ok 2>/dev/null > /home/fleet/.ssh/known_hosts
-chown fleet /home/fleet/.ssh/config /home/fleet/.ssh/known_hosts'
+chown fleet /home/fleet/.ssh/config /home/fleet/.ssh/known_hosts && chmod 600 /home/fleet/.ssh/config /home/fleet/.ssh/known_hosts'
 H2="$T/home2"
 rm -rf "$H2"
 mkdir -p "$H2/.claude"
 spec="alias-ok:/home/fleet/m.git//.skillfleet/manifest.json"
 sf2() { env -i PATH="$PATH" HOME="$H2" SKILLFLEET_SSH="$T/ssh" GIT_SSH_COMMAND="$T/ssh" SKILLFLEET_PACKAGE=/pkg/skillfleet.tgz DO_NOT_TRACK=1 node "$cli" "$@"; }
-sf2 init "$spec" --no-hooks >/dev/null
+sf2 init "$spec" --no-hooks >"$T/init2.log" 2>&1 || { echo "controller init failed:"; cat "$T/init2.log"; }
 
 want=0 cmd='sf2 fleet init "ssh://fleet@127.0.0.1:22222" --no-hooks --dry-run'
 step "13. fleet init --dry-run names the command" "would run npx -y --package /pkg/skillfleet.tgz -- skillfleet init $spec --no-hooks --json"
