@@ -522,7 +522,7 @@ describe("init, status and doctor with the hooks or the timer", () => {
 });
 
 describe("the hooks on shared and upgraded machines", () => {
-  it("self-install over a bare shell keeps the saved hook environment and only moves node's folder", async () => {
+  it("self-install over a bare shell keeps the saved hook environment, putting the new node's folder before the old", async () => {
     if (isWindows) return;
     const m = machine();
     const node = (name: string) => {
@@ -532,6 +532,9 @@ describe("the hooks on shared and upgraded machines", () => {
       return dir;
     };
     const [a, b] = [node("node-a"), node("node-b")];
+    // The old node's folder holds git too, as /usr/bin or /opt/homebrew/bin do.
+    writeFileSync(join(a, "git"), "#!/bin/sh\necho old-folder-git\n");
+    chmodSync(join(a, "git"), 0o755);
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
     const init = await m.runWith(
       { env: { PATH: [a, m.env.PATH].join(delimiter) } },
@@ -550,7 +553,10 @@ describe("the hooks on shared and upgraded machines", () => {
     });
     expect(run.status, run.stderr).toBe(0);
     const after = JSON.parse(read(join(m.stateDir, "hook-env.json"))) as Record<string, string>;
-    expect(after).toEqual({ ...saved, PATH: saved.PATH!.replace(a, b) });
+    expect(after).toEqual({ ...saved, PATH: [b, saved.PATH].join(delimiter) });
+    // The tools in the old folder are still found.
+    const git = spawnSync("git", [], { env: { PATH: after.PATH }, encoding: "utf8", shell: true });
+    expect(git.stdout.trim()).toBe("old-folder-git");
   });
 
   describe("writing a hooks file", () => {

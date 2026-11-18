@@ -872,7 +872,8 @@ function saveHookEnv(node: string) {
 
 /**
  * After self-install moved the launcher to another node, the saved hook environment follows it:
- * its PATH gets the new node's folder in place of the old one, and nothing else changes. `fleet
+ * the new node's folder goes on its PATH right before the old one's, which stays, since it often
+ * holds git and other tools too (/usr/bin, /opt/homebrew/bin). Nothing else changes. `fleet
  * upgrade` runs self-install over a bare ssh shell, whose environment is not the user's.
  */
 function moveHookEnvNode(old: string | undefined, node: string) {
@@ -880,8 +881,10 @@ function moveHookEnvNode(old: string | undefined, node: string) {
   if (!isRecord(saved) || typeof saved.PATH !== "string") return;
   const from = old === undefined ? undefined : dirname(old);
   const to = dirname(node);
-  const dirs = saved.PATH.split(delimiter).map((dir) => (dir === from ? to : dir));
-  const PATH = [...new Set(dirs.includes(to) ? dirs : [to, ...dirs])].join(delimiter);
+  const dirs = saved.PATH.split(delimiter).filter((dir) => dir !== to);
+  const at = from === undefined ? -1 : dirs.indexOf(from);
+  dirs.splice(Math.max(at, 0), 0, to);
+  const PATH = [...new Set(dirs)].join(delimiter);
   if (PATH !== saved.PATH) writeJson(paths.hookEnv(), { ...saved, PATH });
 }
 
