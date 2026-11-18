@@ -196,7 +196,12 @@ export function runHook(agent: HookAgent, event?: string, options: { sync?: bool
         ? parsed.hook_event_name
         : "a session hook");
     // Before the sync this hook may start, so a skill it links counts as new to the session.
-    if (agent === "claude-code" && name === "SessionStart") sessionStarted(input);
+    if (agent === "claude-code" && name === "SessionStart")
+      try {
+        sessionStarted(input);
+      } catch {
+        // The record only lets the next prompt name new skills; the sync goes ahead without it.
+      }
     if (options.sync !== false)
       try {
         syncIfStale(`${agent} ${name}`);

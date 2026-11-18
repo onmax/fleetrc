@@ -832,7 +832,7 @@ describe("the hooks on shared and upgraded machines", () => {
     },
   );
 
-  it("names a skill linked between SessionStart and the first prompt, and rewrites sessions.json only on a change", async () => {
+  it("names a skill linked between SessionStart and the first prompt, and rewrites the session's record only on a change", async () => {
     const { m, mine } = await hooked();
     // A sync this session's hook did not start: the attempt is fresh.
     writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
@@ -842,12 +842,39 @@ describe("the hooks on shared and upgraded machines", () => {
     expect((await m.run("sync")).code).toBe(0);
     const said = await hook(m, "claude-code", PROMPT);
     expect(said.stdout).toContain("available now: early");
-    const sessions = join(m.stateDir, "sessions.json");
+    const sessions = join(m.stateDir, "sessions", "s1.json");
     const { mtimeMs } = statSync(sessions);
     await new Promise((done) => setTimeout(done, 50));
     expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
     expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
     expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
+  });
+
+  it("keeps the record of each of 12 sessions that start together", async () => {
+    const { m } = await hooked();
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    // What older versions kept all sessions in: left alone by the prompt hook, removed on a start.
+    writeFileSync(join(m.stateDir, "sessions.json"), "{");
+    const ids = Array.from({ length: 12 }, (_, i) => `session-${i}`);
+    await Promise.all(
+      ids.map((id) =>
+        hook(m, "claude-code", JSON.stringify({ session_id: id, hook_event_name: "SessionStart" })),
+      ),
+    );
+    const dir = join(m.stateDir, "sessions");
+    expect(readdirSync(dir).sort()).toEqual(ids.map((id) => `${id}.json`).sort());
+    for (const id of ids)
+      expect(JSON.parse(read(join(dir, `${id}.json`)))).toMatchObject({ announced: [] });
+    expect(existsSync(join(m.stateDir, "sessions.json"))).toBe(false);
+  });
+
+  it("starts the sync even when the session can't be recorded", async () => {
+    const { m } = await hooked();
+    // A file where the sessions folder goes: the record can't be made.
+    writeFileSync(join(m.stateDir, "sessions"), "");
+    const run = await hook(m, "claude-code", SESSION);
+    expect(run).toEqual({ code: 0, stdout: "", stderr: "" });
+    expect(started(m)).toHaveLength(1);
   });
 
   it("hook prompt, the entry older versions documented, names new skills but starts no sync", async () => {

@@ -1,6 +1,8 @@
-import { basename } from "node:path";
+import { mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { exec } from "./exec.ts";
-import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
+import { isRecord, readJsonOrNothing, sha256, writeJson } from "./fs.ts";
+import { create } from "./lock.ts";
 import { paths } from "./paths.ts";
 import type { State } from "./state.ts";
 
@@ -110,30 +112,39 @@ function sessionOf(input: string): string {
 }
 
 /**
- * Claude Code's sessions from sessions.json, those older than a week left out; `pruned` says some
- * were, so the file needs writing.
+ * A session's own record, `sessions/<id>.json`: one file each, so sessions that start together
+ * never write over each other's record. An id that is not a plain name is hashed.
  */
-function readSessions(now: Date): { sessions: Record<string, SessionRecord>; pruned: boolean } {
-  const raw = readJsonOrNothing(paths.sessions());
-  const sessions = dict<SessionRecord>();
-  let pruned = false;
-  if (isRecord(raw))
-    for (const [id, record] of Object.entries(raw)) {
-      if (
-        !isRecord(record) ||
-        typeof record.startedAt !== "string" ||
-        !Array.isArray(record.announced) ||
-        now.getTime() - new Date(record.startedAt).getTime() > WEEK_MS
-      ) {
-        pruned = true;
-        continue;
-      }
-      sessions[id] = {
-        startedAt: record.startedAt,
-        announced: record.announced.filter((name): name is string => typeof name === "string"),
-      };
-    }
-  return { sessions, pruned };
+function recordFile(id: string): string {
+  const name = /^[\w-]{1,100}$/.test(id) ? id : sha256(id).slice(0, 32);
+  return join(paths.sessions(), `${name}.json`);
+}
+
+function readRecord(file: string): SessionRecord | undefined {
+  const raw = readJsonOrNothing(file);
+  if (!isRecord(raw) || typeof raw.startedAt !== "string" || !Array.isArray(raw.announced))
+    return undefined;
+  return {
+    startedAt: raw.startedAt,
+    announced: raw.announced.filter((name): name is string => typeof name === "string"),
+  };
+}
+
+/** Creates a session's record, unless one is there: exclusively, so a record is never replaced. */
+function startRecord(file: string, now: Date) {
+  mkdirSync(dirname(file), { recursive: true });
+  create(file, `${JSON.stringify({ startedAt: now.toISOString(), announced: [] })}\n`);
+}
+
+/** Deletes records untouched for a week, and sessions.json, where older versions kept them all. */
+function pruneRecords(now: Date) {
+  rmSync(join(dirname(paths.sessions()), "sessions.json"), { force: true });
+  for (const name of readdirSync(paths.sessions())) {
+    const file = join(paths.sessions(), name);
+    try {
+      if (now.getTime() - statSync(file).mtimeMs > WEEK_MS) rmSync(file, { force: true });
+    } catch {}
+  }
 }
 
 /**
@@ -142,36 +153,32 @@ function readSessions(now: Date): { sessions: Record<string, SessionRecord>; pru
  * compacted keeps its record.
  */
 export function sessionStarted(input: string, now = new Date()) {
-  const id = sessionOf(input);
-  const { sessions, pruned } = readSessions(now);
-  if (sessions[id] && !pruned) return;
-  sessions[id] ??= { startedAt: now.toISOString(), announced: [] };
-  writeJson(paths.sessions(), sessions);
+  startRecord(recordFile(sessionOf(input)), now);
+  pruneRecords(now);
 }
 
 /**
  * Claude Code's UserPromptSubmit hook (hook.ts): the skills that arrived after the session started,
  * once each. Claude Code adds the output to the prompt's context and has already loaded those
- * skills, so the text says to use them, not to read their files. sessions.json is written only
- * when something in it changed.
+ * skills, so the text says to use them, not to read their files. The session's record is written
+ * only when a skill is named.
  */
 export function promptHook(
   input: string,
   state: { skills: Record<string, { addedAt: string }> },
   now = new Date(),
 ): string {
-  const id = sessionOf(input);
-  const { sessions, pruned } = readSessions(now);
-  const known = sessions[id];
-  const session = known ?? { startedAt: now.toISOString(), announced: [] };
-  sessions[id] = session;
+  const file = recordFile(sessionOf(input));
+  let session = readRecord(file);
+  if (!session) {
+    startRecord(file, now);
+    session = readRecord(file) ?? { startedAt: now.toISOString(), announced: [] };
+  }
+  const { startedAt, announced } = session;
   const fresh = Object.entries(state.skills)
-    .filter(
-      ([name, record]) => record.addedAt > session.startedAt && !session.announced.includes(name),
-    )
+    .filter(([name, record]) => record.addedAt > startedAt && !announced.includes(name))
     .map(([name]) => name);
-  session.announced.push(...fresh);
-  if (!known || pruned || fresh.length > 0) writeJson(paths.sessions(), sessions);
+  if (fresh.length > 0) writeJson(file, { startedAt, announced: [...announced, ...fresh] });
   if (fresh.length === 0) return "";
   const one = fresh.length === 1;
   return `skillfleet: ${one ? "a new skill arrived" : `${fresh.length} new skills arrived`} after this session started and ${one ? "is" : "are"} available now: ${fresh.join(", ")}. Use ${one ? "it" : "them"} like any other skill, with the Skill tool.`;
