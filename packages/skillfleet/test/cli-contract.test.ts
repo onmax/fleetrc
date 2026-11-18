@@ -425,14 +425,15 @@ describe("docs and help", () => {
     expect(wrong.stderr).toContain("status does not take --id");
   });
 
-  it("MAC10. doctor leaves the timer and the scheduler alone on a machine without the timer", async () => {
-    const m = machine();
+  it("MAC10. doctor only asks the scheduler whether a timer exists, on a machine without the timer", async () => {
+    const m = machine({ scheduler: "empty" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
     expect((await m.run("init", manifest)).code).toBe(0);
     const doctor = await m.run("doctor");
     expect(doctor.stdout).not.toMatch(/^\w+ +timer:/m);
     expect(doctor.stdout).not.toContain("linger");
     expect(doctor.code, doctor.stdout).toBe(0);
+    expect(m.schedulerCalls().every((call) => call.answered)).toBe(true);
   });
 
   it("MAC10. the timer's runs start with their time, so its log reads as a history", async () => {

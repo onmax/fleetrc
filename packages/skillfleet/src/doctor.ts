@@ -8,7 +8,7 @@ import { exec, git } from "./exec.ts";
 import { isErrno, lstat } from "./fs.ts";
 import { gitUrl } from "./gitcache.ts";
 import { linkTarget } from "./linker.ts";
-import { loadManifest, readConfig, remoteManifest, type Source } from "./manifest.ts";
+import { loadManifest, readConfig, remoteManifest, type Source, updateConfig } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 import { installedBuild, installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
 import { loadState } from "./state.ts";
@@ -176,6 +176,44 @@ function triggerCheck(timer: boolean): Check {
     : { name, ok: true, warn: true, detail };
 }
 
+/**
+ * Whether a session hook ran lately: hook-attempt holds the last time one checked whether to sync.
+ * Missing or a day old, the hooks may not run at all; Codex runs a new hook only once the user has
+ * approved it.
+ */
+function hookRunsCheck(hooks: readonly { agent: string }[]): Check | undefined {
+  if (hooks.length === 0) return undefined;
+  const name = "session hooks";
+  let at = Number.NaN;
+  try {
+    at = Number(readFileSync(paths.hookAttempt(), "utf8"));
+  } catch {}
+  if (Number.isFinite(at) && Date.now() - at < 24 * 60 * 60_000)
+    return { name, ok: true, detail: `one last ran at ${new Date(at).toISOString()}` };
+  const codex = hooks.some((hook) => hook.agent === "codex")
+    ? "; in Codex, the likely cause is a hook not yet approved: open /hooks in Codex and approve skillfleet's"
+    : "";
+  return {
+    name,
+    ok: true,
+    warn: true,
+    detail: `no session hook has run ${Number.isFinite(at) ? "in the last day" : "yet"}, so no sync started from one${codex}`,
+  };
+}
+
+/**
+ * On a machine whose config.json does not say it has the timer, asks the OS once whether it has
+ * skillfleet's timer anyway (installed before config.json recorded it), and records it if so.
+ */
+async function adoptTimer(): Promise<void> {
+  try {
+    if (!readConfig() || timerWanted()) return;
+    if ((await timerStatus()).installed) updateConfig({ timer: true });
+  } catch {
+    // No scheduler, or a config.json that does not read: the checks below say so.
+  }
+}
+
 /** Whether the OS scheduler has the timer, and how its last run ended. */
 async function timerCheck(): Promise<Check & { noSystemd?: boolean }> {
   const name = "timer";
@@ -239,8 +277,11 @@ export async function doctor(manifest?: string): Promise<Check[]> {
     ok: gitVersion.code === 0,
     detail: gitVersion.code === 0 ? gitVersion.stdout.trim() : "git is not on PATH",
   });
+  await adoptTimer();
   const timer = timerWanted();
   checks.push(triggerCheck(timer));
+  const runs = hookRunsCheck(installedHooks());
+  if (runs) checks.push(runs);
   if (timer) {
     const { noSystemd, ...check } = await timerCheck();
     checks.push(check);

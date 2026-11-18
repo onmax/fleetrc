@@ -39,7 +39,7 @@ const SESSION = JSON.stringify({ session_id: "s1", hook_event_name: "SessionStar
 const PROMPT = JSON.stringify({ session_id: "s1", hook_event_name: "UserPromptSubmit" });
 
 /** A machine pointed at a local folder of skills, with the session hooks installed. */
-async function hooked(options: { agents?: boolean } = {}) {
+async function hooked(options: { agents?: boolean; scheduler?: "forbid" | "empty" } = {}) {
   const m = machine(options);
   const mine = join(m.root, "mine");
   writeFiles(mine, { "skills/first/SKILL.md": skillMd("first") });
@@ -421,8 +421,9 @@ describe("hook install and remove", () => {
 
 describe("init, status and doctor with the hooks or the timer", () => {
   it("init installs the hooks and no timer; status and doctor report the hooks", async () => {
-    // The scheduler forbids every call: init must not reach it.
-    const { m } = await hooked();
+    const { m } = await hooked({ scheduler: "empty" });
+    // init does not reach the scheduler; doctor asks it once whether a timer exists.
+    expect(m.schedulerCalls()).toEqual([]);
     expect(settings(m).hooks!.SessionStart).toHaveLength(1);
     expect(existsSync(m.at(".codex", "hooks.json"))).toBe(true);
     const status = await m.run("status");
@@ -444,7 +445,7 @@ describe("init, status and doctor with the hooks or the timer", () => {
   });
 
   it("init --no-hooks installs neither, and status and doctor warn that nothing starts a sync", async () => {
-    const m = machine();
+    const m = machine({ scheduler: "empty" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
     expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(existsSync(m.at(".claude", "settings.json"))).toBe(false);
@@ -707,6 +708,41 @@ describe("the hooks on shared and upgraded machines", () => {
         expect(run({ PATH: "/usr/bin:/bin" }).status, shell).toBe(0);
         expect(read(marker).trim(), shell).toBe("hook run codex");
       }
+    },
+  );
+
+  it("doctor warns when the hooks are installed but none has run in a day, naming Codex's /hooks", async () => {
+    const { m } = await hooked({ scheduler: "empty" });
+    const never = await m.run("doctor");
+    expect(never.stdout).toMatch(
+      /^warn session hooks: no session hook has run yet.*open \/hooks in Codex/m,
+    );
+    await hook(m, "codex");
+    expect((await m.run("doctor")).stdout).toMatch(/^ok {3}session hooks: one last ran at /m);
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now() - 25 * 60 * 60_000));
+    expect((await m.run("doctor")).stdout).toMatch(
+      /^warn session hooks: no session hook has run in the last day/m,
+    );
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "doctor finds a timer installed before config.json recorded it, and records it",
+    async () => {
+      const m = machine();
+      const PATH = systemdShim(m);
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      expect((await m.runWith({ env: { PATH } }, "init", manifest, "--timer")).code).toBe(0);
+      const config = m.at(".config", "skillfleet", "config.json");
+      writeFileSync(config, JSON.stringify({ manifest }));
+      const doctor = await m.runWith({ env: { PATH } }, "doctor");
+      expect(doctor.stdout).toMatch(/^ok {3}sync trigger: .*, and the timer$/m);
+      expect(JSON.parse(read(config))).toEqual({ manifest, timer: true });
+      // status alone does not ask.
+      writeFileSync(config, JSON.stringify({ manifest }));
+      expect((await m.runWith({ env: { PATH } }, "status")).stdout).toMatch(
+        /^syncs start from: the session hooks of Claude Code and Codex$/m,
+      );
+      expect(JSON.parse(read(config))).toEqual({ manifest });
     },
   );
 
