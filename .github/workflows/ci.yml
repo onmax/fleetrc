@@ -133,6 +133,37 @@ jobs:
       - name: Install skillfleet, let the OS timer sync twice, remove it
         run: node .github/scripts/timer-e2e.mjs "$RUNNER_TEMP/skillfleet.tgz"
 
+  # The session hooks as the agents run them: init writes them into a throwaway HOME's Claude Code
+  # and Codex files, each runs through a shell from a parent that exits at once, and the sync it
+  # starts must outlive both (.github/scripts/hook-e2e.mjs).
+  hook-e2e:
+    name: hook e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - run: corepack enable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Pack
+        run: pnpm --filter skillfleet pack --out "$RUNNER_TEMP/skillfleet.tgz"
+      - name: Run the session hooks as Claude Code and Codex do, and wait for their syncs
+        run: node .github/scripts/hook-e2e.mjs "$RUNNER_TEMP/skillfleet.tgz"
+
   # Windows breaks that change the machine or need the real Task Scheduler: a subst drive for HOME
   # (packages/skillfleet/test/windows.test.ts, W-SUBST), and the timer e2e under a USERPROFILE with
   # cmd and PowerShell metacharacters, with and without a %VAR% in it.

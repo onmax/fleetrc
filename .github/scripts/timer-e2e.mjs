@@ -1,4 +1,4 @@
-// Installs skillfleet from its packed tarball, points it at a local git source with `init`, and
+// Installs skillfleet from its packed tarball, points it at a local git source with `init --timer`, and
 // waits for the real OS scheduler (systemd, launchd or Task Scheduler) to run the sync twice: once
 // on its own, and again after a new skill lands upstream. Then it checks `status`, installs again
 // to prove that changes nothing, removes the timer, and checks the OS has nothing left.
@@ -248,8 +248,8 @@ try {
     )}\n`,
   );
 
-  step("skillfleet init: sync once and install the timer");
-  const init = skillfleet("init", manifestFile);
+  step("skillfleet init --timer: sync once and install the timer");
+  const init = skillfleet("init", manifestFile, "--timer");
   installed = true;
   console.log(init.stdout, init.stderr);
   assert.equal(init.code, 0, "init failed");
