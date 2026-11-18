@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { exec } from "./exec.ts";
 import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
@@ -471,8 +472,15 @@ export interface TailscalePeer {
   online: boolean;
 }
 
+/** What `tailscale status --json` says: the peers, and whether MagicDNS names reach them. */
+export interface Tailnet {
+  peers: TailscalePeer[];
+  /** False when the tailnet has MagicDNS off, so only a peer's Tailscale IP reaches it. */
+  magicDNS: boolean;
+}
+
 /** The machines on the tailnet other than this one, or why Tailscale could not list them. */
-export async function tailnet(): Promise<{ peers: TailscalePeer[] } | { error: string }> {
+export async function tailnet(): Promise<Tailnet | { error: string }> {
   const { command, prefix } = program("SKILLFLEET_TAILSCALE", "tailscale");
   const run = await exec(command, [...prefix, "status", "--json"], {
     timeoutMs: 10_000,
@@ -518,7 +526,9 @@ export async function tailnet(): Promise<{ peers: TailscalePeer[] } | { error: s
       },
     ];
   });
-  return { peers };
+  // Older Tailscale versions leave CurrentTailnet out; MagicDNS is on unless it says otherwise.
+  const current = isRecord(parsed.CurrentTailnet) ? parsed.CurrentTailnet : {};
+  return { peers, magicDNS: current.MagicDNSEnabled !== false };
 }
 
 /** Machines on the tailnet, for `fleet add` to suggest; none when Tailscale can't say. */
@@ -529,36 +539,96 @@ export async function tailscalePeers(): Promise<TailscalePeer[]> {
     : [];
 }
 
-/** The machine a host entry names, for comparing with a Tailscale peer: no user, port or brackets. */
-function machineName(host: string): string {
-  return host
-    .replace(/^ssh:\/\//, "")
-    .replace(/^[^@]*@/, "")
-    .replace(/:[0-9]+$/, "")
-    .replace(/^\[(.*)\]$/, "$1")
-    .replace(/\.$/, "")
-    .toLowerCase();
+/**
+ * Whether a name or address `tailscale status` gave is one to hand ssh: a DNS name or an IP
+ * address, nothing ssh reads as an option or a user (`-oProxyCommand=x`, `user@x`).
+ */
+const tailnetHost = (host: string) =>
+  !hostProblem(host) &&
+  (isIP(host) !== 0 ||
+    /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)*$/.test(
+      host,
+    ));
+
+/**
+ * A host name or address, normalised for comparing: lower case, no trailing dot, an IPv6 address
+ * in its shortest form (`fd7a:0::9` is `fd7a::9`). A short name and a MagicDNS name are one
+ * machine only when Tailscale says so: two tailnets can each have a `vps`.
+ */
+function hostKey(host: string): string {
+  const name = host.replace(/\.$/, "").toLowerCase();
+  if (name.includes(":")) {
+    const [address = "", zone] = name.split("%", 2);
+    let canonical = address;
+    try {
+      canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+    } catch {}
+    return zone === undefined ? canonical : `${canonical}%${zone}`;
+  }
+  return name;
+}
+
+/**
+ * The machine, user and port a fleet entry names: `host`, `user@host`, a bare IP address (IPv6
+ * has no port there, so its last group stays), or `ssh://[user@]host[:port]` with the host in
+ * brackets for IPv6. A port is kept as written, since `~/.ssh/config` may give the bare name
+ * another one.
+ */
+function sshTarget(entry: string): { machine: string; user: string; port: string } {
+  const url = entry.startsWith("ssh://");
+  let rest = url ? entry.slice("ssh://".length) : entry;
+  const at = rest.lastIndexOf("@");
+  const user = at >= 0 ? rest.slice(0, at) : "";
+  rest = rest.slice(at + 1);
+  let port = "";
+  if (url) {
+    const parts = rest.match(/^(?:\[([^\]]*)\]|([^:]*))(?::([0-9]+))?$/);
+    if (parts) {
+      rest = parts[1] ?? parts[2] ?? rest;
+      port = parts[3] ?? "";
+    }
+  }
+  return { machine: hostKey(rest), user, port };
 }
 
 /**
  * The hosts to run on: the explicit ones as they are, and each `tag:` entry as every tailnet
- * machine with that tag, by MagicDNS name or else its first Tailscale IP. Tailscale is asked once,
- * and only when there is a tag. A machine named twice runs once: an explicit host wins over a tag's
- * match for the same machine (by its full or short MagicDNS name, or an IP), and the first tag wins
- * over later ones. A tag that matches nothing gets a warning; one that can't be expanded comes back
- * as a target with its `error`.
+ * machine with that tag, by MagicDNS name, or its first Tailscale IP when it has none or the
+ * tailnet has MagicDNS off. Tailscale is asked once, and only when there is a tag. A machine named
+ * twice runs once. Entries are compared by the machine they reach: an IPv6 address in any
+ * spelling, a MagicDNS name or its short name, and, when Tailscale was asked, any name or IP of the
+ * same peer. Two explicit entries for one machine run once when they also have the same user and
+ * port; an explicit host wins over a tag's match for its machine, whatever its user or port, and
+ * the first tag wins over later ones. A tag that matches nothing gets a warning, and so does a
+ * machine whose name ssh can't take; a tag that can't be expanded comes back as a target with its
+ * `error`.
  */
 export async function resolveFleet(
   entries: readonly string[],
 ): Promise<{ targets: FleetTarget[]; warnings: string[] }> {
   const warnings: string[] = [];
-  const answer = entries.some(isTag) ? await tailnet() : { peers: [] };
-  const explicit = new Set(entries.filter((entry) => !isTag(entry)).map(machineName));
+  const answer: Tailnet | { error: string } = entries.some(isTag)
+    ? await tailnet()
+    : { peers: [], magicDNS: true };
+  // Every name and IP of a peer leads to the peer's first one, so they compare as one machine.
+  const peerOf = new Map<string, string>();
+  const names = (peer: TailscalePeer) =>
+    [peer.dns, peer.host, ...peer.ips].filter(Boolean).map(hostKey);
+  if ("peers" in answer)
+    for (const peer of answer.peers) {
+      const [id] = names(peer);
+      for (const name of names(peer)) if (id && !peerOf.has(name)) peerOf.set(name, id);
+    }
+  const machine = (name: string) => peerOf.get(hostKey(name)) ?? hostKey(name);
+  const explicit = new Set(
+    entries.filter((entry) => !isTag(entry)).map((entry) => machine(sshTarget(entry).machine)),
+  );
   const seen = new Set<string>();
   const targets: FleetTarget[] = [];
   for (const entry of entries) {
     if (!isTag(entry)) {
-      const key = entry.toLowerCase();
+      const target = sshTarget(entry);
+      const key = [machine(target.machine), target.user, target.port].join("\0");
       if (!seen.has(key)) targets.push({ host: entry });
       seen.add(key);
       continue;
@@ -572,11 +642,16 @@ export async function resolveFleet(
     if (matches.length === 0)
       warnings.push(`${entry} matches no machine on your tailnet besides this one`);
     for (const peer of matches) {
-      const host = peer.dns || peer.ips[0];
-      if (!host || hostProblem(host)) continue;
-      const names = [peer.dns, peer.host, ...peer.ips].filter(Boolean).map((n) => n.toLowerCase());
-      if (names.some((name) => explicit.has(name) || seen.has(name))) continue;
-      for (const name of names) seen.add(name);
+      const host = (answer.magicDNS && peer.dns) || peer.ips[0];
+      if (!host || !tailnetHost(host)) {
+        warnings.push(
+          `${entry}: skipped a machine Tailscale calls ${JSON.stringify(peer.dns || peer.host)}, which has no name or address ssh takes`,
+        );
+        continue;
+      }
+      const id = machine(host);
+      if (explicit.has(id) || seen.has(id)) continue;
+      seen.add(id);
       targets.push({ host, via: entry, ...(peer.online ? {} : { offline: true }) });
     }
   }

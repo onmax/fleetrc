@@ -388,6 +388,103 @@ describe("fleet tags", () => {
     ]);
   });
 
+  it("compares entries by the machine they reach: IPv6 in any spelling, written ports, names Tailscale gives one peer", async () => {
+    const m = machine();
+    const program = fakeTailscale(
+      m.root,
+      status([
+        peer("", ["tag:servers"], { ips: ["100.64.0.9", "fd7a:0:0::9"] }),
+        peer("", ["tag:servers"], { ips: ["fd7a::10"] }),
+        peer("web.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.7"] }),
+        peer("db.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.8"] }),
+      ]),
+    );
+    const { targets } = await withTailscale(program, () =>
+      resolveFleet([
+        // A bare IPv6 address has no port: fd7a::9 is not fd7a: on port 9.
+        "fd7a::9",
+        "ssh://me@[FD7A:0::10]:2222",
+        "tag:servers",
+        "100.64.0.7",
+        "web.tail.ts.net",
+        "me@db",
+        "ssh://me@db.tail.ts.net:22",
+        "ssh://me@db:2222",
+        "root@db",
+      ]),
+    );
+    expect(targets).toEqual([
+      { host: "fd7a::9" },
+      { host: "ssh://me@[FD7A:0::10]:2222" },
+      { host: "100.64.0.7" },
+      { host: "me@db" },
+      // A written port stays: ~/.ssh/config may give the bare name another one.
+      { host: "ssh://me@db.tail.ts.net:22" },
+      { host: "ssh://me@db:2222" },
+      { host: "root@db" },
+    ]);
+    // Without a tag, Tailscale isn't asked, so a short name and a MagicDNS name stay apart: two
+    // tailnets can each have a vps2.
+    const plain = await resolveFleet(["vps2", "vps2.tail.ts.net", "vps2.other.ts.net", "VPS2"]);
+    expect(plain.targets).toEqual([
+      { host: "vps2" },
+      { host: "vps2.tail.ts.net" },
+      { host: "vps2.other.ts.net" },
+    ]);
+  });
+
+  it("runs on a machine's Tailscale IP when the tailnet has MagicDNS off", async () => {
+    const m = machine();
+    const program = fakeTailscale(m.root, {
+      ...status([peer("web.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.5", "fd7a::5"] })]),
+      CurrentTailnet: {
+        Name: "example.com",
+        MagicDNSSuffix: "tail.ts.net",
+        MagicDNSEnabled: false,
+      },
+    });
+    const { targets } = await withTailscale(program, () => resolveFleet(["tag:servers"]));
+    expect(targets).toEqual([{ host: "100.64.0.5", via: "tag:servers" }]);
+  });
+
+  it("never hands ssh a name from tailscale status that ssh would read as an option, a user or shell", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const program = fakeTailscale(
+      m.root,
+      status([
+        peer("-oProxyCommand=x", ["tag:servers"]),
+        peer("a;b.tail.ts.net", ["tag:servers"]),
+        peer("user@x", ["tag:servers"]),
+        peer("$(id).tail.ts.net", ["tag:servers"]),
+        { ...peer("", ["tag:servers"], { ips: ["-oProxyCommand=y"] }), HostName: "$(id)" },
+        { ...peer("", ["tag:servers"], { ips: ["a;b"] }), HostName: "-oProxyCommand=z" },
+        peer("ok.tail.ts.net", ["tag:servers"]),
+      ]),
+    );
+    const log = join(m.root, "ssh-argv.jsonl");
+    const ssh = join(m.root, "record-ssh.mjs");
+    writeFileSync(
+      ssh,
+      `import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+process.exit(255);`,
+    );
+    const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: program };
+    const run = await m.runWith({ env }, "fleet", "status", "tag:servers", "--json");
+    expect(run.code).toBe(1);
+    const calls = readFileSync(log, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    expect(calls.map((argv) => argv[argv.indexOf("--") + 1])).toEqual(["ok.tail.ts.net"]);
+    for (const hostile of ["ProxyCommand", "a;b", "user@x", "$(id)"])
+      expect(calls.flat().slice(0, -1).join(" ")).not.toContain(hostile);
+    expect((JSON.parse(run.stdout) as Hosts).map((host) => host.host)).toEqual(["ok.tail.ts.net"]);
+    expect(run.stderr).toMatch(/skipped a machine Tailscale calls "-oProxyCommand=x"/);
+  });
+
   it("warns about a tag that matches no machine, and asks Tailscale nothing without a tag", async () => {
     const m = machine();
     const program = fakeTailscale(m.root, status([peer("web.tail.ts.net", ["tag:web"])]));
