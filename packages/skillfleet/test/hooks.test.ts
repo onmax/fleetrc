@@ -12,6 +12,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
@@ -23,7 +24,7 @@ import {
   withHook,
   withoutHooks,
 } from "../src/agenthooks.ts";
-import { lockText } from "../src/lock.ts";
+import { create, LockHeldError, lockText, takeLock } from "../src/lock.ts";
 import {
   cli,
   isWindows,
@@ -166,6 +167,33 @@ describe("hook run", () => {
     expect((await hook(m, "claude-code")).code).toBe(0);
     expect(started(m)).toHaveLength(1);
     expect(existsSync(claim)).toBe(false);
+  });
+
+  it("waits out an empty claim for 2 s, as without hard links its holder may still be writing it", async () => {
+    // What create() does without hard links: an exclusive open, then the write.
+    const dir = join(machine().root, "locks");
+    mkdirSync(dir);
+    const file = join(dir, "hook-attempt.claim");
+    const mine = lockText("hook");
+    expect(create(file, mine, false)).toBe(true);
+    expect(read(file)).toBe(mine);
+    expect(create(file, "another", false)).toBe(false);
+    // Between that open and write, a contender finds the file empty.
+    writeFileSync(file, "");
+    expect(() => takeLock(file, mine, { link: false })).toThrow(LockHeldError);
+    const old = new Date(Date.now() - 5000);
+    utimesSync(file, old, old);
+    takeLock(file, mine, { link: false });
+    expect(read(file)).toBe(mine);
+    // The hook waits it out the same way.
+    const { m } = await hooked();
+    const claim = join(m.stateDir, "hook-attempt.claim");
+    writeFileSync(claim, "");
+    expect((await hook(m, "claude-code")).code).toBe(0);
+    expect(started(m)).toEqual([]);
+    utimesSync(claim, old, old);
+    expect((await hook(m, "claude-code")).code).toBe(0);
+    expect(started(m)).toHaveLength(1);
   });
 
   it("starts one sync among hooks that all find the attempt stale, because only one holds the claim", async () => {

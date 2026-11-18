@@ -42,7 +42,16 @@ export interface LockHolder {
   uptime?: number;
   /** Linux: the holder's start in clock ticks since boot, which setting the clock does not move. */
   ticks?: number;
+  /** The file is empty: created, its holder not yet written (`create` without hard links). */
+  empty?: boolean;
 }
+
+/**
+ * How long an empty lock file is taken for one whose holder is still writing it. Without hard
+ * links, `create` opens the file exclusively and then writes it, and a contender that reads it in
+ * between must not break it.
+ */
+const EMPTY_GRACE_MS = 2000;
 
 const optional = <T extends "string" | "number">(
   raw: Record<string, unknown>,
@@ -79,7 +88,10 @@ export function readLock(file: string): { text: string; holder: LockHolder } | u
         ticks: optional(raw, "ticks", "number"),
       },
     };
-  return { text, holder: { pid: typeof raw === "number" ? raw : 0, at: mtime } };
+  return {
+    text,
+    holder: { pid: typeof raw === "number" ? raw : 0, at: mtime, ...(text ? {} : { empty: true }) },
+  };
 }
 
 /** What this process writes into the sync lock: who it is, and where. */
@@ -112,6 +124,7 @@ function elsewhere(holder: LockHolder, here: Whereabouts): string | undefined {
  * it is too old.
  */
 export function staleBecause(holder: LockHolder): string | undefined {
+  if (holder.empty && Math.abs(Date.now() - holder.at) < EMPTY_GRACE_MS) return undefined;
   const here = whereabouts();
   const { pid } = holder;
   const sameBoot = holder.boot !== undefined && bootsMatch(holder.boot, here.boot);
@@ -182,6 +195,8 @@ export interface LockOptions {
   staleBecause?: (holder: LockHolder) => string | undefined;
   /** Called after each step that reads or changes the lock's files. */
   step?: () => void;
+  /** False creates the file as on a file system without hard links; for tests. */
+  link?: boolean;
 }
 
 /**
@@ -197,7 +212,7 @@ export function takeLock(
   const step = options.step ?? (() => {});
   let note: string | undefined;
   for (let attempt = 0; attempt < 5; attempt++) {
-    if (create(file, mine)) {
+    if (create(file, mine, options.link)) {
       sweepBreakMarkers(file, judge);
       return note;
     }
@@ -269,11 +284,12 @@ function sweepBreakMarkers(file: string, judge: (holder: LockHolder) => string |
 }
 
 /** Creates `file` with `text` only if it does not exist, never leaving it half written. */
-export function create(file: string, text: string): boolean {
+export function create(file: string, text: string, link = true): boolean {
   // Unique across machines and containers that share this folder, where pids repeat.
   const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   writeFileSync(temp, text);
   try {
+    if (!link) throw Object.assign(new Error("no hard links"), { code: "EPERM" });
     linkSync(temp, file);
     return true;
   } catch (error) {
