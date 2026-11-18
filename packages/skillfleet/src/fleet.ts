@@ -4,7 +4,7 @@ import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
 import type { Report } from "./report.ts";
 
-export type FleetAction = "status" | "sync" | "upgrade";
+export type FleetAction = "status" | "sync" | "upgrade" | "init";
 
 export interface HostResult {
   host: string;
@@ -23,6 +23,8 @@ export interface HostResult {
   };
   /** `fleet upgrade`: the version the host ran before, when known, and the one it runs now. */
   upgrade?: { from?: string; to: string };
+  /** `fleet init`: the host was set up now, or already had this manifest and only synced. */
+  setup?: "set up" | "already set up";
   error?: string;
   behind: string[];
 }
@@ -38,6 +40,12 @@ const HOST_NOTES = {
     "skillfleet is installed there, but the node its launcher and timer run is gone, as after a Node.js upgrade; run `npx skillfleet@latest self-install` on it",
   "no-node":
     "skillfleet is not installed there, and node is not on the PATH ssh commands get; install Node.js 22.12 or newer, then run `npx skillfleet init <manifest>` on it",
+  "no-npx":
+    "node is there, but npx is not on the PATH ssh commands get; install Node.js 22.12 or newer with npm, then run `skillfleet fleet init` again",
+  "init-no-node":
+    "node is not on the PATH ssh commands get; install Node.js 22.12 or newer, then run `skillfleet fleet init` again",
+  /** `fleet init` says which manifest, from the host's `has` line. */
+  "other-manifest": "it has another manifest; pass --force to set it up with this one",
 } as const;
 
 /**
@@ -71,14 +79,52 @@ const FIND = `f=${STATE}/bin/skillfleet; [ -x "$f" ] || f=$(command -v skillflee
  * the launcher names that is gone, as after a Node.js upgrade, is in `g`.
  */
 const LAUNCHER_NODE = `l=${STATE}/bin/skillfleet; n=; g=; if [ -f "$l" ]; then n=$(sed -n 's/^exec "\\([^"]*\\)" .*/\\1/p' "$l" | sed 's/\\\\\\(.\\)/\\1/g'); if [ -n "$n" ] && [ ! -x "$n" ]; then g=$n; n=; fi; fi`;
+/**
+ * npx in `x`: the one next to the launcher's node, with that node first on PATH for npx's own
+ * `#!/usr/bin/env node`, else the one on PATH.
+ */
+const NPX = `x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi`;
+/**
+ * The manifest the host's config.json names, in `m`: empty without one, or without a node to read
+ * it, the launcher's or one on PATH.
+ */
+const CONFIGURED = `c="\${XDG_CONFIG_HOME:-$HOME/.config}/skillfleet/config.json"; k=\${n:-node}; m=; if [ -f "$c" ] && command -v "$k" >/dev/null 2>&1; then m=$("$k" -e 'try{const m=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).manifest;if(typeof m==="string")process.stdout.write(m)}catch{}' "$c" </dev/null 2>/dev/null); fi`;
 /** Prints why there is no skillfleet to run. */
 const MISSING = `if command -v node >/dev/null 2>&1; then echo "${NOTE} not-installed"; else echo "${NOTE} no-node"; fi`;
 
-/** The POSIX sh script each action runs on a host. A dry run asks the host's sync for one too. */
+/** What `fleet init` sets a host up with. */
+export interface InitSetup {
+  /** The manifest spec, as this machine's config.json keeps it. */
+  spec: string;
+  /** Options for the host's `init`: --copy, --no-copy, --timer, --no-hooks, --force. */
+  flags: readonly string[];
+  /** Set the host up even when its config.json names another manifest. */
+  force: boolean;
+  /** Whether a manifest spec a host's config.json names is `spec` in another spelling. */
+  same: (configured: string) => boolean;
+}
+
+/**
+ * The npx arguments that run `skillfleet init` on a host: this version from npm, or the package
+ * SKILLFLEET_PACKAGE names (a tarball, a URL or a pkg.pr.new preview).
+ */
+export function initArgs(version: string, { spec, flags }: InitSetup): string[] {
+  const pkg = process.env.SKILLFLEET_PACKAGE || `skillfleet@${version}`;
+  return ["-y", "--package", pkg, "--", "skillfleet", "init", spec, ...flags];
+}
+
+/** `npx <args>` as a person would type it, quoting only the words a shell would split. */
+export const commandLine = (args: readonly string[]) =>
+  ["npx", ...args.map((arg) => (/^[\w@%+=:,./-]+$/.test(arg) ? arg : quote(arg)))].join(" ");
+
+/**
+ * The POSIX sh script each action runs on a host. A dry run asks the host's sync for one too.
+ * `init` needs `setup`.
+ */
 export function remoteScript(
   action: FleetAction,
   version: string,
-  { dryRun = false } = {},
+  { dryRun = false, setup }: { dryRun?: boolean; setup?: InitSetup } = {},
 ): string {
   switch (action) {
     case "status":
@@ -86,8 +132,17 @@ export function remoteScript(
     case "sync":
       return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then ${watched(`"$f" sync --json${dryRun ? " --dry-run" : ""}`)}; else ${MISSING}; fi`;
     case "upgrade":
-      // npx next to the launcher's node, with that node first on PATH for npx's own `#!/usr/bin/env node`.
-      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${NOW} && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
+      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; ${NPX}; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${NOW} && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
+    case "init": {
+      if (!setup) throw new Error("remoteScript: init needs a setup");
+      const init = ['"$x"', ...initArgs(version, setup).map(quote), "--json"].join(" ");
+      // A host with another manifest says which, unless --force sets it up with this one anyway.
+      const other = setup.force
+        ? ""
+        : `elif [ -n "$m" ]; then printf '%s has %s\\n' "${NOTE}" "$m" >&2; echo "${NOTE} other-manifest"; `;
+      // A host with this manifest and a skillfleet that runs only syncs.
+      return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; ${NPX}; ${CONFIGURED}; if [ -n "$m" ] && [ "$m" = ${quote(setup.spec)} ] && [ -n "$f" ] && [ -z "$g" ]; then echo "${NOTE} already" >&2; ${watched('"$f" sync --json')}; ${other}elif [ -n "$x" ]; then ${watched(init)}; elif [ -n "$n" ] || command -v node >/dev/null 2>&1; then echo "${NOTE} no-npx"; else echo "${NOTE} init-no-node"; fi`;
+    }
     default: {
       const exhaustive: never = action;
       return exhaustive;
@@ -123,8 +178,14 @@ export function hostProblem(host: string): string | undefined {
  * cannot be asked. 0.0.0 is the version in the repository, which development and preview builds
  * carry; any other version is looked up on the registry npm uses.
  */
-export async function unpublished(version: string): Promise<string | undefined> {
-  const fix = "run the upgrade from a release, such as `npx skillfleet@latest fleet upgrade`";
+export async function unpublished(
+  version: string,
+  command: "upgrade" | "init" = "upgrade",
+): Promise<string | undefined> {
+  const fix =
+    command === "upgrade"
+      ? "run the upgrade from a release, such as `npx skillfleet@latest fleet upgrade`"
+      : "run it from a release, such as `npx skillfleet@latest fleet init`, or name a package hosts can install in SKILLFLEET_PACKAGE";
   if (version === "0.0.0")
     return `this skillfleet is a development or preview build (0.0.0), which hosts cannot install from npm; ${fix}`;
   const registry = (process.env.npm_config_registry || "https://registry.npmjs.org").replace(
@@ -214,6 +275,7 @@ async function runOnHost(
   version: string,
   timeoutMs: number,
   dryRun: boolean,
+  setup?: InitSetup,
 ) {
   const problem = hostProblem(host);
   if (problem) return { error: problem, reached: false, checked: false };
@@ -227,7 +289,7 @@ async function runOnHost(
     // hostProblem already refuses a leading "-"; this keeps ssh from reading any host as an option.
     "--",
     host,
-    `sh -c ${quote(remoteScript(action, version, { dryRun }))}`,
+    `sh -c ${quote(remoteScript(action, version, { dryRun, ...(setup ? { setup } : {}) }))}`,
   ];
   // The report is parsed whole, so it is not cut to the default tail. stdin stays open for `watched`.
   const run = await exec(command, args, {
@@ -247,6 +309,9 @@ async function runOnHost(
     run.stderr.match(new RegExp(`^${NOTE} ${what} (\\d+\\.\\d+\\.\\d+[\\w.+-]*)\r?$`, "m"))?.[1];
   const was = told("was");
   const now = told("now");
+  // `fleet init`: the host had this manifest and only synced, or has another one.
+  const already = new RegExp(`^${NOTE} already\r?$`, "m").test(run.stderr);
+  const has = run.stderr.match(new RegExp(`^${NOTE} has (.*?)\r?$`, "m"))?.[1];
   const stderr = run.stderr.replace(new RegExp(`^${NOTE} .*\r?\n?`, "gm"), "");
   if (run.timedOut) {
     const after = `${Math.round(timeoutMs / 1000)} s`;
@@ -263,10 +328,12 @@ async function runOnHost(
   }
   const note = run.stdout.match(new RegExp(`^${NOTE} ([\\w-]+)$`, "m"))?.[1];
   if (note !== undefined && Object.hasOwn(HOST_NOTES, note))
-    return { note: note as keyof typeof HOST_NOTES };
+    return { note: note as keyof typeof HOST_NOTES, has };
   // sync --json prints the report last, and exits 1 when a source failed; status prints the file.
-  const report = parseReport(run.stdout);
-  if (report !== undefined) return { report, was, now };
+  // init --json prints its sync's report under "sync", or {"ok": false, "error"} when it stopped.
+  const report = parseReport(run.stdout, action === "init" && !already);
+  if (report !== undefined && "error" in report) return { error: report.error, reached: true };
+  if (report !== undefined) return { report: report.report, was, now, already };
   if (run.code !== 0)
     return {
       error: (stderr || run.stdout).trim().split("\n").slice(-3).join(" ") || `exit ${run.code}`,
@@ -280,17 +347,28 @@ async function runOnHost(
   };
 }
 
-/** The skillfleet report a host printed, or undefined when its output holds none. */
-function parseReport(stdout: string): unknown {
+/**
+ * The skillfleet report a host printed, or undefined when its output holds none. From `init`, the
+ * report of the sync it ran, or the error it stopped with.
+ */
+function parseReport(
+  stdout: string,
+  init = false,
+): { report: unknown } | { error: string } | undefined {
   const text = stdout.trim();
   const start = text.indexOf("{");
   if (start < 0) return undefined;
+  let raw: unknown;
   try {
-    const raw: unknown = JSON.parse(text.slice(start));
-    return summarize(raw) ? raw : undefined;
+    raw = JSON.parse(text.slice(start));
   } catch {
     return undefined;
   }
+  if (init && isRecord(raw)) {
+    if (raw.ok === false && typeof raw.error === "string") return { error: raw.error };
+    raw = raw.sync;
+  }
+  return summarize(raw) ? { report: raw } : undefined;
 }
 
 /**
@@ -302,7 +380,7 @@ export async function fleet(
   action: FleetAction,
   version: string,
   timeoutMs = 30_000,
-  { dryRun = false } = {},
+  { dryRun = false, setup }: { dryRun?: boolean; setup?: InitSetup } = {},
 ): Promise<HostResult[]> {
   const cache = readCache();
   const results = await Promise.all(
@@ -322,7 +400,28 @@ export async function fleet(
           error: "offline in Tailscale",
           behind: [],
         };
-      const answer = await runOnHost(host, action, version, timeoutMs, dryRun);
+      let answer = await runOnHost(host, action, version, timeoutMs, dryRun, setup);
+      let already = "already" in answer && answer.already === true;
+      if ("note" in answer && answer.note === "other-manifest" && setup && answer.has) {
+        // The same manifest written another way (github:me/skills, me/skills): init writes it this
+        // machine's way, and installs what the host lacks.
+        if (setup.same(answer.has)) {
+          answer = await runOnHost(host, "init", version, timeoutMs, false, {
+            ...setup,
+            force: true,
+          });
+          already = false;
+        } else
+          return {
+            host,
+            ...from,
+            reachable: true,
+            checked: true,
+            lastRun: cache[host],
+            error: `it has the manifest ${answer.has}; pass --force to set it up with ${setup.spec}`,
+            behind: [],
+          };
+      }
       // The host answered, but has no report to give.
       if ("note" in answer && answer.note) {
         const note = HOST_NOTES[answer.note];
@@ -358,6 +457,7 @@ export async function fleet(
           checked: true,
           lastRun: run,
           ...upgrade,
+          ...(action === "init" ? { setup: already ? "already set up" : "set up" } : {}),
           behind: [],
         };
       }
@@ -426,7 +526,7 @@ export function formatFleet(results: readonly HostResult[]): string {
           : result.error
             ? `${result.error}; ${last}`
             : last;
-      return `${result.host}${result.via ? ` (${result.via})` : ""}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
+      return `${result.host}${result.via ? ` (${result.via})` : ""}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${result.setup ? `${result.setup}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
     })
     .join("\n");
 }
@@ -656,4 +756,41 @@ export async function resolveFleet(
     }
   }
   return { targets, warnings };
+}
+
+/**
+ * The entries of `wanted` that `entries`, a manifest's fleet, does not cover yet: a host not named
+ * there and, unless it names a user or a port, not on the tailnet under one of its tags; and a tag
+ * not there. Tailscale is asked only when it could matter; when it can't say, a tag covers nothing.
+ */
+export async function notInFleet(
+  entries: readonly string[],
+  wanted: readonly string[],
+): Promise<string[]> {
+  const key = (entry: string) => {
+    const { machine, user, port } = sshTarget(entry);
+    return [machine, user, port].join("\0");
+  };
+  const named = new Set(entries.filter((entry) => !isTag(entry)).map(key));
+  const tags = new Set(entries.filter(isTag).map((tag) => tag.toLowerCase()));
+  const answer =
+    tags.size > 0 && wanted.some((entry) => !isTag(entry)) ? await tailnet() : { peers: [] };
+  const tagged = new Set(
+    ("peers" in answer ? answer.peers : [])
+      .filter((peer) => peer.tags.some((tag) => tags.has(tag.toLowerCase())))
+      .flatMap((peer) => [peer.dns, peer.host, ...peer.ips])
+      .filter(Boolean)
+      .map(hostKey),
+  );
+  const missing: string[] = [];
+  for (const entry of wanted) {
+    const target = sshTarget(entry);
+    // A tag's machines are reached as ssh's default user on port 22, so it covers only a bare name.
+    const bare = !target.user && !target.port;
+    const known = isTag(entry)
+      ? tags.has(entry.toLowerCase())
+      : named.has(key(entry)) || (bare && tagged.has(target.machine));
+    if (!known && !missing.some((each) => key(each) === key(entry))) missing.push(entry);
+  }
+  return missing;
 }

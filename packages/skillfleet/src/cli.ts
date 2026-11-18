@@ -27,11 +27,15 @@ import {
 import { UserError } from "./errors.ts";
 import { GitError } from "./exec.ts";
 import {
+  commandLine,
   fleet,
   type FleetAction,
   fleetEntryProblem,
   formatFleet,
+  initArgs,
+  type InitSetup,
   isTag,
+  notInFleet,
   resolveFleet,
   tagProblem,
   tailscalePeers,
@@ -51,6 +55,8 @@ import {
   type Manifest,
   ManifestError,
   readConfig,
+  sameManifest,
+  sharedManifestProblem,
   updateConfig,
   webPage,
 } from "./manifest.ts";
@@ -108,7 +114,10 @@ const OPTIONS = {
   },
   "no-copy": { type: "boolean", help: "Link skill folders again after --copy" },
   manifest: { type: "string", help: "<m>  Use this manifest instead of the configured one" },
-  timeout: { type: "string", help: "<s>  Seconds to wait for each host (default 30)" },
+  timeout: {
+    type: "string",
+    help: "<s>  Seconds to wait for each host (default 30; 120 for fleet init)",
+  },
   timer: { type: "boolean", help: "Install the timer too, for a machine where no agent runs" },
   "no-hooks": { type: "boolean", help: "Do not install the session hooks" },
   force: { type: "boolean", help: "Go ahead even when skill names would be lost" },
@@ -222,11 +231,21 @@ const COMMANDS: Record<string, Command> = {
     options: ["dry-run", "json", "manifest"],
   },
   fleet: {
-    usage: "fleet sync|status|upgrade|add [host|tag:<name>...]",
+    usage: "fleet sync|status|upgrade|init|add [host|tag:<name>...]",
     summary: "Run on the manifest's machines over SSH, or add machines to it",
     details:
-      "fleet sync and fleet status take host names to run on fewer machines than the manifest lists. A tag:<name> stands for every machine on your tailnet with that Tailscale tag, as `tailscale status` lists them when the command runs. fleet add with no host suggests machines and tags on your tailnet. fleet upgrade installs this version on every host with npx.",
-    options: ["dry-run", "json", "manifest", "timeout"],
+      "fleet sync and fleet status take host names to run on fewer machines than the manifest lists. A tag:<name> stands for every machine on your tailnet with that Tailscale tag, as `tailscale status` lists them when the command runs. fleet add with no host suggests machines and tags on your tailnet. fleet upgrade installs this version on every host with npx. fleet init <host|tag:<name>...> sets new machines up from this one: on each, it runs `npx skillfleet init` with this machine's manifest, which must be in a repository, then adds the hosts to the fleet; --copy, --no-copy, --timer, --no-hooks and --force go to each host's init, and --force also sets up a host that has another manifest.",
+    options: [
+      "dry-run",
+      "json",
+      "manifest",
+      "timeout",
+      "copy",
+      "no-copy",
+      "timer",
+      "no-hooks",
+      "force",
+    ],
   },
   hook: {
     usage: "hook install|remove [agent]",
@@ -1072,8 +1091,13 @@ async function fleetCommand(action: string | undefined) {
     if (json) emit({ added: hosts, file: target.file, push: target.push, dryRun });
     return 0;
   }
+  const initOnly = (["copy", "no-copy", "timer", "no-hooks", "force"] as const).filter(
+    (name) => values[name],
+  );
+  if (action !== "init" && initOnly.length > 0) usage(`only fleet init takes --${initOnly[0]}`);
+  if (action === "init") return fleetInit(loaded);
   if (action !== "sync" && action !== "status" && action !== "upgrade")
-    return usage("fleet takes sync, status, upgrade or add");
+    return usage("fleet takes sync, status, upgrade, init or add");
   if (dryRun && action !== "sync")
     usageError(
       action === "status"
@@ -1089,8 +1113,28 @@ async function fleetCommand(action: string | undefined) {
     const reason = await unpublished(version);
     if (reason) throw new UserError(reason);
   }
-  const timeout = values.timeout ? Number(values.timeout) * 1000 : 30_000;
+  const timeout = fleetTimeout(30_000);
+  const targets = await fleetTargets(entries);
+  const results = await fleet(targets, action satisfies FleetAction, version, timeout, { dryRun });
+  if (json) emit(results);
+  else if (results.length > 0) say(formatFleet(results));
+  // A sync that ran with errors on a host fails here as it does there.
+  const failed = (result: (typeof results)[number]) =>
+    !result.reachable ||
+    result.error !== undefined ||
+    (action !== "status" && result.lastRun?.ok === false);
+  return results.some(failed) ? 1 : 0;
+}
+
+/** --timeout in milliseconds, else `fallback`. */
+function fleetTimeout(fallback: number): number {
+  const timeout = values.timeout ? Number(values.timeout) * 1000 : fallback;
   if (!Number.isFinite(timeout) || timeout <= 0) usage("--timeout takes seconds");
+  return timeout;
+}
+
+/** The hosts `entries` stand for, with Tailscale's warnings told, and a dry run told each tag's machines. */
+async function fleetTargets(entries: readonly string[]) {
   const { targets, warnings } = await resolveFleet(entries);
   for (const warning of warnings) console.error(`skillfleet: warning: ${warning}`);
   if (dryRun)
@@ -1103,15 +1147,122 @@ async function fleetCommand(action: string | undefined) {
           .map((target) => `${target.host}${target.offline ? " (offline)" : ""}`)
           .join(", ")}`,
       );
-  const results = await fleet(targets, action satisfies FleetAction, version, timeout, { dryRun });
+  return targets;
+}
+
+/**
+ * `fleet init <host|tag:...>...`: on each host, over ssh, `npx skillfleet init` with this machine's
+ * manifest; a host that has it already syncs. Then the hosts set up go into the manifest's fleet,
+ * unless it names them or a tag of theirs; a tag named here goes in as the tag.
+ */
+async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
+  const entries = rest.slice(1);
+  if (entries.length === 0)
+    usage("fleet init takes the hosts to set up, or tag:<name> for a tag's machines");
+  const problems = entries.flatMap((entry) => fleetEntryProblem(entry) ?? []);
+  if (problems.length > 0) usage(problems.join("; "));
+  const spec = manifestSpec(values.manifest);
+  const shared = sharedManifestProblem(spec);
+  if (shared) throw new UserError(shared);
+  if (!process.env.SKILLFLEET_PACKAGE) {
+    const reason = await unpublished(version, "init");
+    if (reason) throw new UserError(reason);
+  }
+  const timeout = fleetTimeout(120_000);
+  const setup: InitSetup = {
+    spec,
+    flags: (["copy", "no-copy", "timer", "no-hooks", "force"] as const)
+      .filter((name) => values[name])
+      .map((name) => `--${name}`),
+    force: values.force ?? false,
+    same: (configured) => sameManifest(configured, spec),
+  };
+  const targets = await fleetTargets(entries);
+  const command = commandLine([...initArgs(version, setup), "--json"]);
+  if (dryRun) {
+    const hosts = targets.map(
+      ({
+        host,
+        via,
+        offline,
+        error,
+      }): { host: string; via?: string; command?: string; error?: string } => ({
+        host,
+        ...(via ? { via } : {}),
+        ...(error ? { error } : offline ? { error: "offline in Tailscale" } : { command }),
+      }),
+    );
+    for (const host of hosts)
+      say(
+        `${host.host}${host.via && host.via !== host.host ? ` (${host.via})` : ""}: ${host.command ? `would run ${host.command}` : `skipped (${host.error})`}`,
+      );
+    say(...(await addToFleet(loaded, entries, { dryRun: true })));
+    if (json) emit(hosts);
+    return 0;
+  }
+  const results = await fleet(targets, "init", version, timeout, { setup });
   if (json) emit(results);
   else if (results.length > 0) say(formatFleet(results));
-  // A sync that ran with errors on a host fails here as it does there.
+  // Hosts named here that are set up now, and tags named here with a machine set up.
+  const ready = new Set(
+    results
+      .filter((result) => result.setup)
+      .flatMap(({ host, via }) => (via ? [host, via] : [host])),
+  );
+  say(
+    ...(await addToFleet(
+      loaded,
+      entries.filter((entry) => ready.has(entry)),
+      { dryRun: false },
+    )),
+  );
   const failed = (result: (typeof results)[number]) =>
-    !result.reachable ||
-    result.error !== undefined ||
-    (action !== "status" && result.lastRun?.ok === false);
+    !result.reachable || result.error !== undefined || result.lastRun?.ok === false;
   return results.some(failed) ? 1 : 0;
+}
+
+/**
+ * Adds the fleet entries the manifest does not cover yet, the way `fleet add` does, and says what
+ * it did. A manifest in a repository without a working clone is not changed: the lines say what to
+ * add there.
+ */
+async function addToFleet(
+  loaded: Awaited<ReturnType<typeof loadManifest>>,
+  entries: readonly string[],
+  { dryRun }: { dryRun: boolean },
+): Promise<string[]> {
+  const already = entries.length > 0 ? ["the fleet already has them"] : [];
+  let missing = await notInFleet(loaded.root.fleet, entries);
+  if (missing.length === 0) return already;
+  let target: ManifestTarget;
+  try {
+    target = manifestToEdit(
+      loaded,
+      manifestSpec(values.manifest),
+      `Add ${JSON.stringify(missing)} to "fleet"`,
+    );
+  } catch (error) {
+    if (error instanceof UserError) return [error.message];
+    throw error;
+  }
+  // A working clone may hold entries not pushed yet, such as from an earlier fleet init.
+  const edited = target.push ? readJsonOrNothing(target.file) : undefined;
+  if (isRecord(edited) && Array.isArray(edited.fleet))
+    missing = await notInFleet(
+      edited.fleet.filter((entry): entry is string => typeof entry === "string"),
+      missing,
+    );
+  if (missing.length === 0) return already;
+  editManifest(
+    target.file,
+    (raw) => {
+      raw.fleet = [...new Set([...(Array.isArray(raw.fleet) ? raw.fleet : []), ...missing])];
+    },
+    { dryRun },
+  );
+  return [
+    `${dryRun ? "would add" : "added"} ${missing.join(", ")} to the fleet in ${tildify(target.file)}${target.push && !dryRun ? "; commit and push it" : ""}`,
+  ];
 }
 
 /**

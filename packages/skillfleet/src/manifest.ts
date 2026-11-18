@@ -13,7 +13,7 @@ import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
-import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
+import { fetchClone, gitUrl, repoKey, splitRepoPath } from "./gitcache.ts";
 import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
@@ -601,6 +601,25 @@ export function canonicalManifestSpec(spec: string): string {
   const remote = remoteManifest(spec);
   if (remote?.ref) return spec;
   return remote ? `${remote.repo}//${remote.path}` : expandPath(spec);
+}
+
+/**
+ * Why another machine can't init with the manifest `spec`, or undefined when it can: the manifest
+ * must be in a repository on another machine, not in a file, folder or repository on this one.
+ */
+export function sharedManifestProblem(spec: string): string | undefined {
+  const remote = remoteManifest(spec);
+  if (remote && isRemoteGit(remote.repo)) return undefined;
+  return `the manifest is ${spec}, on this machine, which other machines can't read; push it to a repository and run \`skillfleet init <repository>\` with that`;
+}
+
+/** Whether two manifest specs name the same file in the same repository, in any spelling. */
+export function sameManifest(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [x, y] = [remoteManifest(a), remoteManifest(b)];
+  if (!x || !y) return false;
+  const file = (path: string) => path.replace(/^\/+|\/+$/g, "");
+  return repoKey(x.repo) === repoKey(y.repo) && file(x.path) === file(y.path) && x.ref === y.ref;
 }
 
 interface LocateOptions {
