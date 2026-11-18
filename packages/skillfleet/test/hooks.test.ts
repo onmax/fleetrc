@@ -264,7 +264,7 @@ describe("hook install and remove", () => {
     expect(ours("SessionStart")[0]).toContain(
       process.platform === "win32"
         ? `${join(m.stateDir, "bin", "node-dir")}\\node.exe ${join(m.stateDir, "app", "cli.mjs")}`
-        : join(m.stateDir, "bin", "skillfleet"),
+        : '"$HOME/.local/state/skillfleet/bin/skillfleet" hook run claude-code 2>/dev/null || true',
     );
     expect(after.hooks!.UserPromptSubmit![0]!.hooks[0]!.command).toBe("echo mine");
     expect(after.hooks!.Stop).toEqual(own.hooks.Stop);
@@ -300,7 +300,7 @@ describe("hook install and remove", () => {
     expect((await m.run("hook", "install", "claude-code")).code).toBe(0);
     const prompt = settings(m).hooks!.UserPromptSubmit!;
     expect(prompt).toHaveLength(1);
-    expect(line(prompt[0]!.hooks[0]!)).toMatch(/ hook run claude-code$/);
+    expect(line(prompt[0]!.hooks[0]!)).toMatch(/ hook run claude-code( 2>\/dev\/null \|\| true)?$/);
   });
 
   it("on Windows writes Claude Code's entry in exec form, and Codex's for cmd, with % kept from cmd", () => {
@@ -327,10 +327,10 @@ describe("hook install and remove", () => {
       `"${plain}" hook run codex`,
     );
     expect(
-      hookHandler("claude-code", { platform: "linux", launcher: "/h/a b/skillfleet" }),
+      hookHandler("claude-code", { platform: "linux", launcher: "/h/a b/skillfleet", home: "/u" }),
     ).toEqual({
       type: "command",
-      command: '"/h/a b/skillfleet" hook run claude-code',
+      command: '"/h/a b/skillfleet" hook run claude-code 2>/dev/null || true',
     });
 
     // An entry an older install wrote in shell form gives way to exec form, once.
@@ -583,5 +583,87 @@ describe("the hooks on shared and upgraded machines", () => {
       },
     );
   });
+
+  it("owns only the commands it writes, and a user's command that mentions them is left", async () => {
+    const own = [
+      '"$HOME/.local/state/skillfleet/bin/skillfleet" hook run claude-code 2>/dev/null || true',
+      '"/opt/my state/skillfleet/bin/skillfleet" hook run codex 2>/dev/null || true',
+      "/home/u/.local/state/skillfleet/bin/skillfleet hook run codex",
+      '"%USERPROFILE%\\AppData\\Local\\skillfleet\\bin\\skillfleet.cmd" hook run codex',
+      '"C:\\Users\\Jo & Ann\\AppData\\Local\\skillfleet\\bin\\skillfleet.cmd" hook run codex',
+      "skillfleet hook prompt",
+      "npx skillfleet hook prompt",
+      "/home/u/.local/state/skillfleet/bin/skillfleet hook prompt",
+    ];
+    const theirs = [
+      "printf 'run: skillfleet hook run codex\\n'",
+      "foo && skillfleet hook run codex",
+      '"$HOME/.local/state/skillfleet/bin/skillfleet" hook run codex; rm -rf ~/x',
+      "echo /x/skillfleet hook run claude-code",
+      "skillfleet hook run claude-code | tee log",
+      "my-skillfleet-wrapper hook run codex",
+    ];
+    for (const command of own)
+      expect(isOwnHandler({ type: "command", command }), command).toBe(true);
+    for (const command of theirs)
+      expect(isOwnHandler({ type: "command", command }), command).toBe(false);
+    const exec = [
+      "C:\\Users\\u\\AppData\\Local\\skillfleet\\app\\cli.mjs",
+      "hook",
+      "run",
+      "claude-code",
+    ];
+    expect(isOwnHandler({ command: "C:\\node.exe", args: exec })).toBe(true);
+    expect(isOwnHandler({ command: "node", args: [...exec, "--x"] })).toBe(false);
+
+    const m = machine();
+    const users = theirs.map((command) => ({ hooks: [{ type: "command", command }] }));
+    writeFileSync(
+      m.at(".claude", "settings.json"),
+      JSON.stringify({ hooks: { SessionStart: users } }),
+    );
+    expect((await m.run("hook", "install", "claude-code")).code).toBe(0);
+    expect((await m.run("hook", "remove", "claude-code")).code).toBe(0);
+    expect(settings(m).hooks!.SessionStart).toEqual(users);
+  });
+
+  it.skipIf(isWindows)(
+    "the shell-form command runs from $HOME, and exits 0 silently when the launcher or node is gone, in each shell",
+    () => {
+      const m = machine();
+      const launcher = m.at(".local", "state", "skillfleet", "bin", "skillfleet");
+      const { command } = hookHandler("codex", { launcher, home: m.home });
+      expect(command).toBe(
+        '"$HOME/.local/state/skillfleet/bin/skillfleet" hook run codex 2>/dev/null || true',
+      );
+      const marker = join(m.root, "ran");
+      const shells = ["sh", "bash", "dash", "zsh", "fish"].filter(
+        (shell) => spawnSync(shell, ["-c", "true"]).status === 0,
+      );
+      expect(shells).toContain("sh");
+      for (const shell of shells) {
+        const run = (env: NodeJS.ProcessEnv) =>
+          spawnSync(shell, ["-c", command], { env: { ...env, HOME: m.home }, encoding: "utf8" });
+        rmSync(join(m.home, ".local"), { recursive: true, force: true });
+        expect(run({ PATH: "/usr/bin:/bin" }), `${shell}, no launcher`).toMatchObject({
+          status: 0,
+          stdout: "",
+          stderr: "",
+        });
+        mkdirSync(dirname(launcher), { recursive: true });
+        // A launcher whose node is gone, as after a Node.js upgrade.
+        writeFileSync(launcher, '#!/bin/sh\nexec "/gone/node" "$@"\n');
+        chmodSync(launcher, 0o755);
+        expect(run({ PATH: "/usr/bin:/bin" }), `${shell}, no node`).toMatchObject({
+          status: 0,
+          stdout: "",
+          stderr: "",
+        });
+        writeFileSync(launcher, `#!/bin/sh\necho "$@" > "${marker}"\n`);
+        expect(run({ PATH: "/usr/bin:/bin" }).status, shell).toBe(0);
+        expect(read(marker).trim(), shell).toBe("hook run codex");
+      }
+    },
+  );
 
 });

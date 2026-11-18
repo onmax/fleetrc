@@ -54,17 +54,32 @@ export interface HookHandler {
   args?: string[];
 }
 
+/** What the shell-form command runs after the launcher. */
+const RUN = (agent: HookAgent) => `hook run ${agent}`;
+
+/** The launcher in double quotes, for sh, bash, zsh and fish: `"`, `$`, `` ` `` and `\` escaped. */
+const dq = (text: string) => `"${text.replace(/[$`"\\]/g, "\\$&")}"`;
+
 /**
  * The launcher in a shell command, by its absolute path so the agent's PATH does not matter.
- * Claude Code runs shell form with sh (macOS, Linux) and Codex with $SHELL, or `cmd /C` on Windows:
- * double quotes work in each. cmd expands `%NAME%` even inside quotes, so on Windows a path that
- * holds a `%` goes through `%USERPROFILE%`, which cmd expands once, without expanding the result.
+ * Claude Code runs shell form with sh on macOS and Linux, and Codex with `$SHELL -lc` (sh, bash,
+ * zsh or fish 3+) or `cmd /C` on Windows.
+ *
+ * On macOS and Linux a launcher under HOME is written as `"$HOME/…"`, so a settings file shared
+ * between machines through dotfiles works on each; and a launcher or node that is gone exits 0
+ * quietly (`2>/dev/null || true`) instead of failing every prompt. Both read the same in those four
+ * shells.
+ *
+ * On Windows cmd expands `%NAME%` even inside quotes, so a path that holds a `%` goes through
+ * `%USERPROFILE%`, which cmd expands once, without expanding the result. Known limit: a `%` in a
+ * custom XDG_STATE_HOME outside the profile is written as it is, and cmd may expand it.
  */
 function shellCommand(
   agent: HookAgent,
   launcher: string,
   platform: NodeJS.Platform,
   profile = process.env.USERPROFILE,
+  home = homedir(),
 ): string {
   if (platform === "win32") {
     const rest =
@@ -75,12 +90,12 @@ function shellCommand(
       launcher.includes("%") && rest !== undefined && !rest.includes("%")
         ? `%USERPROFILE%${rest}`
         : launcher;
-    return `"${path}" hook run ${agent}`;
+    return `"${path}" ${RUN(agent)}`;
   }
-  const path = /^[\w./:+-]+$/.test(launcher)
-    ? launcher
-    : `"${launcher.replace(/[$`"\\]/g, "\\$&")}"`;
-  return `${path} hook run ${agent}`;
+  const path = launcher.startsWith(`${home}/`)
+    ? `"$HOME${dq(launcher.slice(home.length)).slice(1)}`
+    : dq(launcher);
+  return `${path} ${RUN(agent)} 2>/dev/null || true`;
 }
 
 /**
@@ -97,6 +112,7 @@ export function hookHandler(
     node?: string;
     cli?: string;
     profile?: string;
+    home?: string;
   } = {},
 ): HookHandler {
   const platform = options.platform ?? process.platform;
@@ -108,25 +124,51 @@ export function hookHandler(
     };
   return {
     type: "command",
-    command: shellCommand(agent, options.launcher ?? launcherPath(), platform, options.profile),
+    command: shellCommand(
+      agent,
+      options.launcher ?? launcherPath(),
+      platform,
+      options.profile,
+      options.home,
+    ),
   };
 }
 
-/** A command skillfleet wrote, by this install or another one: `… skillfleet hook run|prompt`. */
-export const isOwnCommand = (command: unknown) =>
-  typeof command === "string" &&
-  /(?:(?:^|[\\/"'\s])skillfleet(?:\.cmd|\.ps1|\.mjs)?|skillfleet[\\/]app[\\/]cli\.mjs)["']?\s+hook\s+(?:run|prompt)\b/.test(
-    command,
-  );
+/** A launcher path as skillfleet writes it: double-quoted (escapes allowed) or bare, ending in skillfleet. */
+const LAUNCHER = String.raw`(?:"(?:[^"\\]|\\.)*[\\/]skillfleet(?:\.cmd)?"|[^\s"'\`;&|<>()$]*[\\/]skillfleet(?:\.cmd)?)`;
 
-/** An entry skillfleet wrote, in shell form or in exec form (its command, then its args). */
-export const isOwnHandler = (hook: unknown) =>
-  isRecord(hook) &&
-  isOwnCommand(
-    [hook.command, ...(Array.isArray(hook.args) ? hook.args : [])]
-      .filter((part) => typeof part === "string")
-      .join(" "),
+/**
+ * The commands skillfleet writes, by this install or another one: the launcher (any path, also
+ * `"$HOME/…"` or `"%USERPROFILE%\…"`) with `hook run <agent>`, alone or with `2>/dev/null || true`;
+ * and the prompt hook older versions documented, `[npx] skillfleet hook prompt` or the launcher
+ * with `hook prompt`. Nothing else: a user's command that only mentions them is not skillfleet's.
+ */
+const OWN_COMMAND = new RegExp(
+  String.raw`^(?:${LAUNCHER} hook run (?:claude-code|codex)(?: 2>/dev/null \|\| true)?|(?:npx (?:-y )?)?skillfleet hook prompt|${LAUNCHER} hook prompt)$`,
+);
+
+export const isOwnCommand = (command: unknown) =>
+  typeof command === "string" && OWN_COMMAND.test(command.trim());
+
+/**
+ * An entry skillfleet wrote: a command above, or exec form, node with skillfleet's installed copy
+ * (`…/skillfleet/app/cli.mjs`) and `hook run <agent>`.
+ */
+export function isOwnHandler(hook: unknown): boolean {
+  if (!isRecord(hook)) return false;
+  if (hook.args === undefined) return isOwnCommand(hook.command);
+  const args = hook.args;
+  return (
+    typeof hook.command === "string" &&
+    Array.isArray(args) &&
+    args.length === 4 &&
+    typeof args[0] === "string" &&
+    /[\\/]skillfleet[\\/]app[\\/]cli\.mjs$/i.test(args[0]) &&
+    args[1] === "hook" &&
+    args[2] === "run" &&
+    (args[3] === "claude-code" || args[3] === "codex")
   );
+}
 
 const sameHandler = (a: Record<string, unknown>, b: HookHandler) =>
   a.command === b.command && JSON.stringify(a.args) === JSON.stringify(b.args);
