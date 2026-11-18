@@ -393,25 +393,45 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
   });
 
   describe("a manifest in a folder's .skillfleet/", () => {
-    it("resolves relative paths against .skillfleet/ and keeps a team's extends in the folder around it", async () => {
+    it("resolves relative paths against .skillfleet/; a team named by its file keeps its extends in the file's folder", async () => {
       write("r5-folder/.skillfleet/manifest.json", {
         extends: ["./team.json"],
         sources: [{ id: "mine", local: "../skills" }],
       });
       write("r5-folder/.skillfleet/team.json", {
-        extends: ["../shared.json", "../../r5-outside.json"],
+        extends: ["./shared.json", "../outside.json"],
         sources: [{ id: "team", index: "https://team.example.com" }],
       });
-      write("r5-folder/shared.json", {
+      write("r5-folder/.skillfleet/shared.json", {
         sources: [{ id: "shared", index: "https://s.example.com" }],
       });
-      write("r5-outside.json", { sources: [{ id: "outside", index: "https://o.example.com" }] });
+      write("r5-folder/outside.json", {
+        sources: [{ id: "outside", index: "https://o.example.com" }],
+      });
       const loaded = await loadManifest(join(root, "r5-folder"), { offline: true });
       expect(loaded.root.file).toBe(join(root, "r5-folder", ".skillfleet", "manifest.json"));
       expect(loaded.sources.map((source) => source.id)).toEqual(["mine", "team", "shared"]);
       const mine = loaded.sources[0]!;
       expect(mine.kind === "local" && mine.local).toBe(join(root, "r5-folder", "skills"));
-      expect(loaded.failed).toEqual(["../../r5-outside.json"]);
+      expect(loaded.failed).toEqual(["../outside.json"]);
+      expect(loaded.warnings.join("\n")).toMatch(/outside it/);
+    });
+
+    it("a team named by its file path in a .skillfleet/ folder can't extend the folder around it", async () => {
+      // ~/.skillfleet/team.json named as a file: its boundary is ~/.skillfleet, not the home folder.
+      const home = process.env.HOME!;
+      write("home/private.json", { sources: [{ id: "private", index: "https://p.example.com" }] });
+      write("home/.skillfleet/team.json", {
+        extends: ["../private.json"],
+        sources: [{ id: "team", index: "https://team.example.com" }],
+      });
+      const file = write("r5-byfile/me.json", {
+        extends: ["~/.skillfleet/team.json", join(home, ".skillfleet", "manifest.json")],
+      });
+      write("home/.skillfleet/manifest.json", { extends: ["../private.json"], sources: [] });
+      const loaded = await loadManifest(file, { offline: true });
+      expect(loaded.sources.map((source) => source.id)).toEqual(["team"]);
+      expect(loaded.failed).toEqual(["../private.json", "../private.json"]);
       expect(loaded.warnings.join("\n")).toMatch(/outside it/);
     });
 

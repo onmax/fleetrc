@@ -628,7 +628,9 @@ async function locate(
         `${tildify(path)} has no ${DEFAULT_MANIFEST}; name the manifest file as ${join(tildify(path), "<file>")}`,
       );
     if (team) within(team.within, file, spec);
-    return { file, root: team?.within ?? manifestHome(file) };
+    // Naming a folder, as a repository's checkout is, makes the whole folder the manifest's; a
+    // file named on its own, even one in a .skillfleet/ folder, has only its own folder.
+    return { file, root: team?.within ?? (folder ? path : dirname(file)) };
   }
   const url = gitUrl(remote.repo);
   const check = team ? teamGitProblem : undefined;
@@ -644,16 +646,6 @@ async function locate(
     );
   if (team) within(clone.dir, file, spec);
   return { file, root: clone.dir };
-}
-
-/**
- * The folder a manifest on this machine belongs to, which a team manifest's own `extends` stays
- * in: the folder around `.skillfleet/`, as a repository's checkout is, else the file's own folder.
- * Relative paths inside the manifest still resolve against the file's folder.
- */
-function manifestHome(file: string): string {
-  const dir = dirname(file);
-  return basename(dir) === MANIFEST_DIR ? dirname(dir) : dir;
 }
 
 /** Throws unless `file`, links followed, is inside `root`. */
