@@ -774,7 +774,7 @@ describe("the hooks on shared and upgraded machines", () => {
   });
 
   it.skipIf(process.platform !== "linux")(
-    "doctor finds a timer installed before config.json recorded it, and records it",
+    "doctor records a timer installed before config.json did, only when it runs this install and the user did not say no",
     async () => {
       const m = machine();
       const PATH = systemdShim(m);
@@ -790,6 +790,16 @@ describe("the hooks on shared and upgraded machines", () => {
       expect((await m.runWith({ env: { PATH } }, "status")).stdout).toMatch(
         /^syncs start from: the session hooks of Claude Code and Codex$/m,
       );
+      expect(JSON.parse(read(config))).toEqual({ manifest });
+      // `timer: false` is the user's choice.
+      writeFileSync(config, JSON.stringify({ manifest, timer: false }));
+      expect((await m.runWith({ env: { PATH } }, "doctor")).stdout).not.toMatch(/and the timer$/m);
+      expect(JSON.parse(read(config))).toEqual({ manifest, timer: false });
+      // A timer that runs another install's copy is that install's.
+      const service = m.at(".config", "systemd", "user", "skillfleet-sync.service");
+      writeFileSync(service, read(service).replaceAll(m.stateDir, join(m.root, "other", "skillfleet")));
+      writeFileSync(config, JSON.stringify({ manifest }));
+      await m.runWith({ env: { PATH } }, "doctor");
       expect(JSON.parse(read(config))).toEqual({ manifest });
     },
   );

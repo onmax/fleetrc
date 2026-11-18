@@ -202,13 +202,14 @@ function hookRunsCheck(hooks: readonly { agent: string }[]): Check | undefined {
 }
 
 /**
- * On a machine whose config.json does not say it has the timer, asks the OS once whether it has
- * skillfleet's timer anyway (installed before config.json recorded it), and records it if so.
+ * On a machine whose config.json says nothing of the timer, asks the OS once whether it has
+ * skillfleet's timer anyway (installed before config.json recorded it), and records it if that
+ * timer runs this install's copy. `timer: false`, the user's choice, stays.
  */
 async function adoptTimer(): Promise<void> {
   try {
-    if (!readConfig() || timerWanted()) return;
-    if ((await timerStatus()).installed) updateConfig({ timer: true });
+    if (readConfig()?.timer !== undefined) return;
+    if ((await timerStatus()).installed && timerNode()) updateConfig({ timer: true });
   } catch {
     // No scheduler, or a config.json that does not read: the checks below say so.
   }
