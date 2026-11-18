@@ -170,7 +170,7 @@ try {
   assert.match(init.stdout, /^Codex: added skillfleet's hook/m);
   assert.doesNotMatch(init.stdout, /^installed a /m, "init installed a timer");
   const status = JSON.parse(skillfleet("status", "--json").stdout);
-  assert.deepEqual(status.trigger, { hooks: ["claude-code", "codex"], timer: false });
+  assert.deepEqual(status.trigger, { hooks: ["claude-code", "codex"], timer: false, promptOnly: [] });
 
   for (const [agent, file] of [
     ["Claude Code", join(home, ".claude", "settings.json")],
