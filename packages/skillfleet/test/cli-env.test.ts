@@ -31,7 +31,7 @@ describe("cli and environments", () => {
       }),
     });
     const url = pathToFileURL(manifests.url).href;
-    const init = await m.run("init", url, "--no-timer");
+    const init = await m.run("init", url, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["from-repo"]);
     const config = JSON.parse(readFileSync(m.at(".config/skillfleet/config.json"), "utf8")) as {
@@ -43,7 +43,7 @@ describe("cli and environments", () => {
   it("L10. a repository without skills.json says to name the file", async () => {
     const m = machine();
     const manifests = remote(m, "manifests", { "other.json": "{}" });
-    const init = await m.run("init", pathToFileURL(manifests.url).href, "--no-timer");
+    const init = await m.run("init", pathToFileURL(manifests.url).href, "--no-hooks");
     expect(init.code).toBe(1);
     expect(init.stderr).toMatch(/has no skills\.json; name the manifest file as .*\/\/<file>/);
   });
@@ -57,7 +57,7 @@ describe("cli and environments", () => {
       join(folder, "skills.json"),
       JSON.stringify({ agents: ["claude-code"], sources: [{ id: "mine", local: "." }] }),
     );
-    const init = await m.run("init", folder, "--no-timer");
+    const init = await m.run("init", folder, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
   });
@@ -67,7 +67,7 @@ describe("cli and environments", () => {
     const manifests = remote(m, "manifests", {
       "skills.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
     });
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
     const extra = remote(m, "extra", skills("skills/", "extra-a"));
     const added = await m.run("add", extra.url, "--id", "extra");
     expect(added.code).toBe(1);
@@ -91,7 +91,7 @@ describe("cli and environments", () => {
     };
     manifests.commit({ "skills.json": JSON.stringify(content) });
     m.git(work, "pull", "--quiet");
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
     const extra = remote(m, "extra", skills("skills/", "extra-a"));
     const added = await m.run("add", extra.url, "--id", "extra");
     expect(added.code, added.stderr).toBe(0);
@@ -148,7 +148,7 @@ describe("cli and environments", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const uid = process.getuid!();
     const bin = join(m.root, "fakeps");
     mkdirSync(bin);

@@ -129,7 +129,7 @@ describe("init", () => {
     expect(dry.stdout).toContain("skill names: 6 before, 6 after; none lost");
     expect(snapshot(m.root)).toEqual(before);
 
-    const real = await m.run("init", manifest, "--no-timer");
+    const real = await m.run("init", manifest, "--no-hooks");
     expect(real.code, real.stdout + real.stderr).toBe(0);
     for (const dir of AGENT_DIRS) {
       expect(isLink(m.at(dir)), dir).toBe(false);
@@ -157,7 +157,7 @@ describe("init", () => {
       read(join(m.stateDir, "backup", backups[0]!, ".codex", "skills", "nuxt", "SKILL.md")),
     ).toBe(skillMd("nuxt", "old copy"));
     // Running init again is a no-op.
-    const again = await m.run("init", manifest, "--no-timer");
+    const again = await m.run("init", manifest, "--no-hooks");
     expect(again.code).toBe(0);
     expect(again.stdout).not.toContain("replace the link");
     expect(names(m.at(".claude/skills"))).toEqual(namesBefore);
@@ -219,7 +219,7 @@ describe("init", () => {
       { id: "upstream", git: upstream.url, include: ["ag-dev", "ag-update"] },
     ]);
     expect(dry.after).toEqual(["ag-dev", "ag-update", "mine"]);
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["ag-dev", "ag-update", "mine"]);
     expect(JSON.parse(read(manifest)).sources[1]).toEqual({
       id: "upstream",
@@ -256,7 +256,7 @@ describe("init", () => {
         );
         expect(dry.lost).toEqual([]);
         expect(dry.migrations).toEqual([]);
-        const init = await m.run("init", manifest, "--no-timer");
+        const init = await m.run("init", manifest, "--no-hooks");
         expect(init.stdout).not.toContain("LOST");
         expect(init.code, init.stdout + init.stderr).toBe(0);
         // The link stays, and both agents see the hand-made skill and the synced one, once.
@@ -294,7 +294,7 @@ describe("init", () => {
     expect(text.stdout).toMatch(
       new RegExp(`^skillfleet init: manifest ${spec.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}$`, "m"),
     );
-    expect((await m.run("init", team.url, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", team.url, "--no-hooks")).code).toBe(0);
     expect((await m.json("sync", "--dry-run")).manifest).toBe(spec);
     expect((await m.json("sync")).manifest).toBe(spec);
   });
@@ -320,7 +320,7 @@ describe("init", () => {
     it("clones first, then adopts, and the dry run says so in that order", async () => {
       const m = machine();
       const team = newMachine(m);
-      const dry = await m.run("init", team.url, "--dry-run", "--no-timer");
+      const dry = await m.run("init", team.url, "--dry-run", "--no-hooks");
       expect(dry.code, dry.stdout + dry.stderr).toBe(0);
       const clone = dry.stdout.indexOf("clone ");
       const adopt = dry.stdout.indexOf(
@@ -328,7 +328,7 @@ describe("init", () => {
       );
       expect(clone).toBeGreaterThan(-1);
       expect(adopt).toBeGreaterThan(clone);
-      const init = await m.run("init", team.url, "--no-timer");
+      const init = await m.run("init", team.url, "--no-hooks");
       expect(init.code, init.stdout + init.stderr).toBe(0);
       expect(read(m.at("code/mine/skills/handmade/SKILL.md"))).toBe(skillMd("handmade"));
       expect(isLink(m.at(".claude/skills/handmade"))).toBe(true);
@@ -339,7 +339,7 @@ describe("init", () => {
     it("leaves the hand-made skill where it is when the clone fails", async () => {
       const m = machine();
       const team = newMachine(m, { reachable: false });
-      const init = await m.run("init", team.url, "--no-timer");
+      const init = await m.run("init", team.url, "--no-hooks");
       const said = init.stdout + init.stderr;
       expect(said).toContain(`could not clone mine into ${join("~", "code", "mine")} (`);
       expect(said).toContain("so nothing is adopted");
@@ -356,13 +356,13 @@ describe("init", () => {
         migrations: { kind: string }[];
         lost: string[];
         warnings: string[];
-      }>("init", team.url, "--dry-run", "--no-timer");
+      }>("init", team.url, "--dry-run", "--no-hooks");
       expect(dry.migrations.map((migration) => migration.kind)).toEqual([]);
       expect(dry.lost).toEqual([]);
       expect(dry.warnings.join("\n")).toContain(
         `${join("~", "code", "mine")} exists and is not a git repository`,
       );
-      await m.run("init", team.url, "--no-timer");
+      await m.run("init", team.url, "--no-hooks");
       expect(read(m.at(".claude/skills/handmade/SKILL.md"))).toBe(skillMd("handmade"));
       expect(existsSync(m.at("code/mine/skills"))).toBe(false);
     });

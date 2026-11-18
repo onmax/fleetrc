@@ -45,7 +45,7 @@ set -e
 cd ~ && mkdir -p .claude skills/host-skill
 printf -- "---\nname: host-skill\ndescription: d\n---\n" > skills/host-skill/SKILL.md
 echo "{\"sources\":[{\"id\":\"host\",\"local\":\"$HOME/skills\"}]}" > skills.json
-npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/skills.json --no-timer >/dev/null
+npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/skills.json --no-hooks >/dev/null
 npx -y --package /pkg/skillfleet.tgz -- skillfleet self-install'
 
 # Wait for sshd.
@@ -89,7 +89,7 @@ cat >"$H/skills.json" <<EOF
   "fleet": ["ssh://fleet@127.0.0.1:22221", "ssh://fleet@127.0.0.1:22222", "ssh://fleet@127.0.0.1:22223"] }
 EOF
 sf() { env -i PATH="$PATH" HOME="$H" SKILLFLEET_SSH="$T/ssh" DO_NOT_TRACK=1 node "$cli" "$@"; }
-sf init "$H/skills.json" --no-timer >/dev/null
+sf init "$H/skills.json" --no-hooks >/dev/null
 
 pass=0
 fail=0
@@ -149,7 +149,7 @@ printf "Host okhost\n  HostName sf-u2-h-ok\n  Port 22\n  User fleet\n" > ~/.ssh/
 ssh-keyscan sf-u2-h-ok sf-u2-h-bare 2>/dev/null > ~/.ssh/known_hosts
 printf -- "---\nname: c\ndescription: d\n---\n" > ~/l/c/SKILL.md
 echo "{\"sources\":[{\"local\":\"$HOME/l\"}],\"fleet\":[\"okhost\",\"fleet@sf-u2-h-bare\"]}" > ~/m.json
-npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/m.json --no-timer >/dev/null
+npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/m.json --no-hooks >/dev/null
 set +e
 npx -y --package /pkg/skillfleet.tgz -- skillfleet fleet sync --timeout 60; echo "exit $?"
 npx -y --package /pkg/skillfleet.tgz -- skillfleet fleet status; echo "exit $?"'

@@ -10,4 +10,18 @@ if (major < MAJOR || (major === MAJOR && minor < MINOR)) {
   );
   process.exit(1);
 }
-void import("./cli.ts");
+// What an agent's session hook runs, before every prompt: hook.ts alone, without the rest of the CLI.
+const [command, action, agent] = process.argv.slice(2);
+const hook =
+  command === "hook" &&
+  ((action === "prompt" && process.argv.length === 4) ||
+    (action === "run" &&
+      (agent === "claude-code" || agent === "codex") &&
+      process.argv.length === 5));
+if (hook)
+  void import("./hook.ts").then((module) =>
+    action === "prompt"
+      ? module.runHook("claude-code", "UserPromptSubmit")
+      : module.runHook(agent as "claude-code" | "codex"),
+  );
+else void import("./cli.ts");

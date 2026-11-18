@@ -74,7 +74,7 @@ async function workbench() {
     ],
     fleet: ["localhost"],
   });
-  const init = await m.run("init", manifest, "--no-timer");
+  const init = await m.run("init", manifest, "--no-hooks");
   expect(init.code, init.stdout + init.stderr).toBe(0);
   writeFileSync(m.at(".claude/skills/tool/SKILL.md"), skillMd("tool", "one, edited"));
   vendor.commit({ "skills/tool/ref.md": "new upstream file\n" });
@@ -105,7 +105,7 @@ describe("errors", () => {
   it("D1. init with a repository that does not exist says so in one line", async () => {
     const m = machine();
     const missing = pathToFileURL(join(m.root, "remotes", "typo.git")).href;
-    const init = await m.run("init", missing, "--no-timer");
+    const init = await m.run("init", missing, "--no-hooks");
     expect(init.code).toBe(1);
     oneLine(init);
     expect(init.stderr).toMatch(
@@ -120,7 +120,7 @@ describe("errors", () => {
       const bin = join(m.root, "nogit");
       mkdirSync(bin);
       symlinkSync(process.execPath, join(bin, "node"));
-      const init = await m.runWith({ env: { PATH: bin } }, "init", "my-team/agents", "--no-timer");
+      const init = await m.runWith({ env: { PATH: bin } }, "init", "my-team/agents", "--no-hooks");
       expect(init.code).toBe(1);
       oneLine(init);
       expect(init.stderr).toMatch(/git is not installed/);
@@ -142,7 +142,7 @@ describe("errors", () => {
   it("D3. an unknown agent id is a manifest error naming the closest id", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-cod"], sources: [] });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code).toBe(1);
     oneLine(init);
     expect(init.stderr).toContain('agents names "claude-cod", which is not an agent id');
@@ -153,7 +153,7 @@ describe("errors", () => {
   it('D3. "agents": "all" with no agent installed warns that nothing was linked', async () => {
     const m = machine({ agents: false });
     const manifest = m.manifest({ sources: [] });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.stdout).toContain("linked 0 skills into 0 folders");
     expect(init.stdout).toContain(
       'warning: no agent is installed here, so no skills were linked: "agents": "all" means',
@@ -166,7 +166,7 @@ describe("errors", () => {
     expect(none.find((row) => row.id === "claude-code")).toMatchObject({ detected: true });
     expect(none.find((row) => row.id === "claude-code")!.linkedInto).toBeUndefined();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const rows = await m.json<{ id: string; detected: boolean; linkedInto?: string }[]>("agents");
     expect(rows.length).toBeGreaterThan(40);
     expect(rows.find((row) => row.id === "claude-code")!.linkedInto).toBe(m.at(".claude/skills"));
@@ -268,7 +268,7 @@ describe("--json prints one JSON document", () => {
       ["fork", "tool"],
       ["adopt", handmade],
       ["update", "vendor"],
-      ["init", "--no-timer"],
+      ["init", "--no-hooks"],
     ];
     for (const args of runs) {
       const run = await m.runWith({ env }, ...args, "--json");
@@ -288,7 +288,7 @@ describe("--copy", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer", "--copy")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks", "--copy")).code).toBe(0);
     const config = () =>
       JSON.parse(read(m.at(".config/skillfleet/config.json"))) as { copy?: boolean };
     expect(config().copy).toBe(true);
@@ -321,7 +321,7 @@ describe("fork with a manifest kept in a repository", () => {
     };
     manifests.commit({ "skills.json": JSON.stringify(content) });
     m.git(work, "pull", "--quiet");
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
     const fork = await m.run("fork", "tool");
     expect(fork.code, fork.stdout + fork.stderr).toBe(0);
     expect(fork.stdout).toContain(
@@ -357,7 +357,7 @@ describe("fork with a manifest kept in a repository", () => {
         ],
       }),
     });
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
     const before = snapshot(m.root);
     const fork = await m.run("fork", "tool");
     expect(fork.code).toBe(1);
@@ -376,7 +376,7 @@ describe("docs and help", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url, update: "review" }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect((await m.run("diff")).stdout).toBe("no updates are waiting for review\n");
     vendor.commit({
       "skills/a/SKILL.md": skillMd("a", "a v2"),
@@ -396,7 +396,7 @@ describe("docs and help", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url, update: "review" }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     vendor.commit({ "skills/tööl/SKILL.md": skillMd("tööl", "v2") });
     await m.run("sync");
     const diff = await m.run("diff", "tööl");
@@ -425,12 +425,12 @@ describe("docs and help", () => {
     expect(wrong.stderr).toContain("status does not take --id");
   });
 
-  it("MAC10. doctor skips the timer after init --no-timer", async () => {
-    const m = machine({ scheduler: "empty" });
+  it("MAC10. doctor leaves the timer and the scheduler alone on a machine without the timer", async () => {
+    const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest)).code).toBe(0);
     const doctor = await m.run("doctor");
-    expect(doctor.stdout).toMatch(/^skip timer: not installed, as you chose/m);
+    expect(doctor.stdout).not.toMatch(/^\w+ +timer:/m);
     expect(doctor.stdout).not.toContain("linger");
     expect(doctor.code, doctor.stdout).toBe(0);
   });
@@ -438,7 +438,7 @@ describe("docs and help", () => {
   it("MAC10. the timer's runs start with their time, so its log reads as a history", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const spec = await m.json<{ env: Record<string, string> }>("timer", "install", "--dry-run");
     expect(spec.env.SKILLFLEET_TIMER).toBe("1");
     const run = await m.runWith({ env: { SKILLFLEET_TIMER: "1" } }, "sync");
@@ -462,7 +462,7 @@ describe("what users paste and how errors read (R2-13, R2-15, R2-16, R2-17)", ()
   it("R2-13. add takes a GitHub folder or SKILL.md link apart into git, ref and skills", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const added = async (link: string) =>
       (await m.json<{ added: object }>("add", link, "--dry-run")).added;
     expect(await added("https://github.com/vercel-labs/agent-skills/tree/main/skills")).toEqual({
@@ -502,7 +502,7 @@ describe("what users paste and how errors read (R2-13, R2-15, R2-16, R2-17)", ()
         { id: "blob", git: vendor.url, skills: "single/solo" },
       ],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["other", "outside", "solo", "tool"]);
   });
@@ -510,7 +510,7 @@ describe("what users paste and how errors read (R2-13, R2-15, R2-16, R2-17)", ()
   it("R2-15. a usage error under --json prints {ok: false, error} on stdout", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     for (const args of [["fleet", "status"], ["sync", "--bogus"], ["add"]]) {
       const run = await m.run(...args, "--json");
       expect(run.code, args.join(" ")).toBe(2);
@@ -524,7 +524,7 @@ describe("what users paste and how errors read (R2-13, R2-15, R2-16, R2-17)", ()
     const m = machine();
     expect((await m.run("agents")).code).toBe(0);
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const linked = await m.run("agents");
     expect(linked.code).toBe(0);
     expect(linked.stdout).toMatch(/^claude-code .*linked into/m);

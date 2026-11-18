@@ -99,7 +99,7 @@ describe("hostile skill names", () => {
       agents: ["claude-code"],
       sources: [{ id: "v", git: vendor.url }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     expect(tree(m.at("victim"))).toEqual(["authorized_keys"]);
     expect(read(m.at("victim", "authorized_keys"))).toBe("my key\n");
     expect(names(m.at(".claude/skills"))).toEqual(["fine"]);
@@ -125,7 +125,7 @@ describe("hostile skill names", () => {
       agents: ["claude-code"],
       sources: [{ id: "mine", local: folder }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     expect(existsSync(join(m.root, "escape"))).toBe(false);
     expect(existsSync(join(m.root, "loose-escape"))).toBe(false);
     expect(names(m.at(".claude/skills"))).toEqual(["ok"]);
@@ -141,7 +141,7 @@ describe("hostile skill names", () => {
       agents: ["claude-code"],
       sources: [{ id: "v", git: vendor.url }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     expect(names(m.at(".claude/skills"))).toEqual(["fine"]);
     expect(read(m.at(".claude/skills/fine/SKILL.md"))).toBe(skillMd("fine"));
     expect(existsSync(join(m.stateDir, "store", "v", "SKILL.md"))).toBe(false);
@@ -160,7 +160,7 @@ describe("hostile skill names", () => {
       agents: ["claude-code"],
       sources: [{ id: "mine", local: folder }],
     });
-    const run = await m.run("init", manifest, "--no-timer");
+    const run = await m.run("init", manifest, "--no-hooks");
     expect(run.stderr).not.toMatch(/ENAMETOOLONG.*\n\s+at /);
     expect(names(m.at(".claude/skills"))).toContain("ok");
     expect(isLink(m.at(".claude/skills/ok"))).toBe(true);
@@ -173,7 +173,7 @@ describe("hostile manifests", () => {
     const vendor = remote(m, "vendor", skills("skills/", "bom"));
     const file = m.manifest({ agents: ["claude-code"], sources: [{ id: "v", git: vendor.url }] });
     writeFileSync(file, `﻿${read(file)}`);
-    const run = await m.run("init", file, "--no-timer");
+    const run = await m.run("init", file, "--no-hooks");
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["bom"]);
   });
@@ -200,7 +200,7 @@ describe("hostile manifests", () => {
       agents: ["claude-code"],
       sources: [{ id: "v", git: vendor.url, skills: "../../../../../../../outside/*" }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     expect(names(m.at(".claude/skills"))).not.toContain("private");
     expect(existsSync(join(m.stateDir, "store", "v", "live", "private", "secret.txt"))).toBe(false);
   });
@@ -217,7 +217,7 @@ describe("hostile manifests", () => {
       JSON.stringify({ sources: [{ id: "auto", git: evil.url, path: "~/.config/autostart" }] }),
     );
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
-    const run = await m.run("init", manifest, "--no-timer");
+    const run = await m.run("init", manifest, "--no-hooks");
     expect(existsSync(m.at(".config/autostart"))).toBe(false);
     expect(run.stdout).toMatch(/auto/);
   });
@@ -239,7 +239,7 @@ describe("hostile manifests", () => {
       }),
     );
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
-    const run = await m.run("init", manifest, "--no-timer");
+    const run = await m.run("init", manifest, "--no-hooks");
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["team-skill"]);
     expect(existsSync(join(m.root, "hook-ran"))).toBe(false);
@@ -262,7 +262,7 @@ describe("hostile manifests", () => {
         }),
       );
     const manifest = m.manifest({ agents: ["claude-code"], extends: [join(dir, "0.json")] });
-    const run = await m.run("init", manifest, "--no-timer");
+    const run = await m.run("init", manifest, "--no-hooks");
     expect(run.code, run.stdout + run.stderr).toBe(0);
   });
 
@@ -273,7 +273,7 @@ describe("hostile manifests", () => {
     mkdirSync(join(m.root, "team"), { recursive: true });
     writeFileSync(team, JSON.stringify({ sources: [{ id: "team", git: vendor.https }] }));
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const edited = `${skillMd("tool")}\nmy notes, written over a week\n`;
     writeFileSync(m.at(".claude/skills/tool/SKILL.md"), edited);
     // A teammate pushes a manifest with a trailing comma.
@@ -296,7 +296,7 @@ describe("hostile git sources", () => {
       JSON.stringify({ sources: [{ id: "x", git: `--upload-pack=touch ${marker};false` }] }),
     );
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     await m.run("doctor");
     expect(existsSync(marker)).toBe(false);
   });
@@ -313,7 +313,7 @@ describe("hostile git sources", () => {
         { id: "c", git: `--upload-pack=touch ${upload};false`, path: join(m.root, "clone") },
       ],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     await m.run("sync");
     await m.run("sync", "--dry-run");
     expect(existsSync(upload)).toBe(false);
@@ -328,7 +328,7 @@ describe("hostile git sources", () => {
       agents: ["claude-code"],
       sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     personal.commit({ "skills/bad/SKILL.md": skillMd("bad", "a compromised commit") });
     expect((await m.json("sync")).skills.added).toEqual(["bad"]);
     // Upstream removes the commit by force-pushing the branch back.
@@ -357,7 +357,7 @@ describe("hostile git sources", () => {
         { id: "w", git: vendor.url, ref: "main", skills: "skills/*" },
       ],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     const store = join(m.stateDir, "store");
     const found = tree(store).filter((path) => /key|inner|linked-skill/.test(path));
     expect(found).toEqual([]);
@@ -371,7 +371,7 @@ describe("hostile git sources", () => {
       agents: ["claude-code"],
       sources: [{ id: "v", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     rmSync(vendor.url, { recursive: true, force: true });
     const report = await m.json("sync");
     expect(report.warnings.join("\n")).toContain("kept the last good copy");
@@ -418,7 +418,7 @@ describe("hostile npm registries and tarballs", () => {
       agents: ["claude-code"],
       sources: [{ id: "n", npm: "pkg", registry: registry.url }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     expect(existsSync(join(m.root, "planted"))).toBe(false);
     expect(readdirSync(m.root).filter((name) => name.startsWith("planted"))).toEqual([]);
   });
@@ -443,7 +443,7 @@ describe("hostile npm registries and tarballs", () => {
       { env: { NPM_TOKEN: "npm_secret" } },
       "init",
       manifest,
-      "--no-timer",
+      "--no-hooks",
     );
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["x"]);
@@ -469,7 +469,7 @@ describe("hostile npm registries and tarballs", () => {
     mkdirSync(join(m.root, "team"), { recursive: true });
     writeFileSync(team, JSON.stringify({ sources: [{ id: "n", npm: "pkg", registry: url }] }));
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
-    await m.runWith({ env: { NPM_TOKEN: "npm_secret" } }, "init", manifest, "--no-timer");
+    await m.runWith({ env: { NPM_TOKEN: "npm_secret" } }, "init", manifest, "--no-hooks");
     expect(registry.hits.length).toBeGreaterThan(0);
     expect(registry.hits.filter((hit) => hit.headers.authorization)).toEqual([]);
   });
@@ -502,7 +502,7 @@ describe("hostile npm registries and tarballs", () => {
       sources.push({ id: kind, npm: kind, registry: registry.url });
     }
     const manifest = m.manifest({ agents: ["claude-code"], sources });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     const report = await m.json("sync");
     expect(existsSync(join(secret, "planted"))).toBe(false);
     expect(containing("PRIVATE KEY", m.home)).toEqual([]);
@@ -544,7 +544,7 @@ describe("hostile npm registries and tarballs", () => {
       agents: ["claude-code"],
       sources: [{ id: "bomb", npm: "bomb", registry: registry.url }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     const report = await m.json("sync");
     expect(report.errors.join("\n")).toMatch(/bomb.*(large|size|limit)/i);
   });
@@ -559,7 +559,7 @@ describe("hostile npm registries and tarballs", () => {
       agents: ["claude-code"],
       sources: [{ id: "n", npm: "pkg", registry: registry.url }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     const report = await m.json("sync");
     expect(report.errors.join("\n")).toContain("no integrity hash");
     expect(names(m.at(".claude/skills"))).toEqual([]);
@@ -590,7 +590,7 @@ describe("hostile skill indexes", () => {
       agents: ["claude-code"],
       sources: [{ id: "control", index: control.url }, ...sources],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     return m.json("sync");
   }
 
@@ -650,7 +650,7 @@ describe("hostile skill indexes", () => {
       agents: ["claude-code"],
       sources: [{ id: "s", index: site.url }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     expect(names(m.at(".claude/skills"))).toContain("good");
   });
 
@@ -729,7 +729,7 @@ describe("names that differ only on some file systems", () => {
         { id: "two", local: two },
       ],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     const report = await m.json("sync");
     // macOS and Windows would show one folder for each pair, so every machine should agree on one.
     expect(names(m.at(".claude/skills"))).toHaveLength(2);
@@ -750,7 +750,7 @@ describe("names that differ only on some file systems", () => {
       agents: ["claude-code"],
       sources: [{ id: "mine", local: folder }],
     });
-    await m.run("init", manifest, "--no-timer");
+    await m.run("init", manifest, "--no-hooks");
     expect(names(m.at(".claude/skills"))).toEqual(["ok"]);
   });
 });
@@ -777,7 +777,7 @@ describe("fleet over ssh", () => {
   it("F1. a fleet host that looks like an ssh option reaches ssh only after --, or is refused", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const ssh = recordingSsh(m);
     const host = `-oProxyCommand=touch ${join(m.root, "pwned")}`;
     // parseArgs takes it as an option on the command line, so it can only come from the manifest.
@@ -798,7 +798,7 @@ describe("fleet over ssh", () => {
   it("F2. fleet add refuses hosts with spaces or shell characters", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     for (const host of ["two words", "host;id", "host$(id)"]) {
       const run = await m.run("fleet", "add", host);
       expect(run.code, host).not.toBe(0);
@@ -842,7 +842,7 @@ async function editedVendored() {
     agents: ["claude-code"],
     sources: [{ id: "vendor", git: vendor.url }],
   });
-  expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+  expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
   const edited = `${skillMd("tool")}\nnotes I wrote by hand\n`;
   writeFileSync(m.at(".claude/skills/tool/SKILL.md"), edited);
   return { m, vendor, manifest, edited };
@@ -852,7 +852,7 @@ describe("crashes, corrupt state and recovery", () => {
   it("C1. a lock left by a dead sync whose pid now belongs to another program does not block sync forever", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     // The kernel reused the pid for something else: here, the test runner itself.
     writeFileSync(join(m.stateDir, "sync.lock"), String(process.pid));
     const run = await m.run("sync");
@@ -895,7 +895,7 @@ describe("crashes, corrupt state and recovery", () => {
       agents: ["claude-code", "cursor"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     writeFileSync(m.at(".claude/skills/.skillfleet-manifest.json"), "{");
     vendor.commit({ "skills/second/SKILL.md": skillMd("second") });
     const run = await m.run("sync");
@@ -910,7 +910,7 @@ describe("crashes, corrupt state and recovery", () => {
       agents: ["claude-code", "cursor"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     vendor.commit({ "skills/second/SKILL.md": skillMd("second") });
     const folder = m.at(".claude/skills");
     // Windows ignores a folder's read-only mode; an ACL that denies writing makes it read-only.
@@ -937,7 +937,7 @@ describe("crashes, corrupt state and recovery", () => {
       agents: ["claude-code", "cursor"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     // After init: the user swaps Cursor's folder for a file, and points tool at a folder that is gone.
     rmSync(m.at(".cursor/skills"), { recursive: true, force: true });
     writeFileSync(m.at(".cursor/skills"), "not a folder\n");
@@ -954,7 +954,7 @@ describe("crashes, corrupt state and recovery", () => {
   it("C8. status, fleet status and the prompt hook survive their own state files being corrupt", async () => {
     const m = machine({ scheduler: "empty" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [], fleet: ["nowhere"] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     for (const file of ["last-run.json", "fleet.json", "sessions.json"])
       writeFileSync(join(m.stateDir, file), "{");
     const status = await m.run("status");
@@ -1063,7 +1063,7 @@ describe("who holds the sync lock", () => {
   it("W-1. a lock whose pid now runs a process that started after the lock's holder is stale", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
       stdio: "ignore",
     });
@@ -1083,7 +1083,7 @@ describe("who holds the sync lock", () => {
   it("W-1. a lock whose pid runs a process that started no later than the lock's holder is held", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     // This test's own process, as if it were the sync that wrote the lock.
     const started = Math.floor(performance.timeOrigin);
     writeFileSync(
@@ -1100,7 +1100,7 @@ describe("what a killed sync left beside state.json", () => {
   it("W-LOCK-2. the next sync deletes a dead sync's state.json temp and keeps a running command's", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const gone = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
     await new Promise((done) => gone.on("exit", done));
     const dead = jsonTemp(join(m.stateDir, "state.json"), gone.pid!);
@@ -1156,7 +1156,7 @@ describe("prune never deletes what it did not make", () => {
       extends: [`${team.url}//skills.json`],
       sources: [],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
     const edited = `${skillMd("tool")}\nmine\n`;
     writeFileSync(m.at(".claude/skills/tool/SKILL.md"), edited);
@@ -1174,7 +1174,7 @@ describe("prune never deletes what it did not make", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     mkdirSync(m.at(".claude/skills/handmade"), { recursive: true });
     writeFileSync(m.at(".claude/skills/handmade/SKILL.md"), "hand made\n");
     mkdirSync(join(m.root, "elsewhere"), { recursive: true });
@@ -1200,7 +1200,7 @@ describe("edits, merge and fork with awkward files", () => {
       agents: ["claude-code"],
       sources: [{ id: "v", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const mine = Buffer.from([0, 9, 9, 9, 0, 255, 1]);
     writeFileSync(m.at(".claude/skills/tool/logo.bin"), mine);
     writeFiles(vendor.work, { "skills/tool/logo.bin": Buffer.from([0, 7, 7, 0]) });
@@ -1221,7 +1221,7 @@ describe("edits, merge and fork with awkward files", () => {
       agents: ["claude-code"],
       sources: [{ id: "v", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const mine = skillMd("tool", "one\nTWO MINE\nthree\nfour\nfive").replace(/\n/g, "\r\n");
     writeFileSync(m.at(".claude/skills/tool/SKILL.md"), mine);
     vendor.commit({
@@ -1256,7 +1256,7 @@ describe("edits, merge and fork with awkward files", () => {
         { id: "vendor", git: vendor.url },
       ],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     writeFileSync(join(work, "skills/mine/SKILL.md"), `${skillMd("mine")}\nwip\n`);
     writeFileSync(join(work, "scratch.txt"), "untracked\n");
     const fork = await m.run("fork", "tool");
@@ -1289,7 +1289,7 @@ describe("unusual environments", () => {
     writeFileSync(join(folder, "tool/SKILL.md"), skillMd("tool"));
     const manifest = m.manifest({ agents: ["claude-code"], sources: [{ id: "v", local: folder }] });
     const env = { XDG_STATE_HOME: "rel-state", XDG_CONFIG_HOME: "rel-config" };
-    const run = await m.runWith({ env }, "init", manifest, "--no-timer");
+    const run = await m.runWith({ env }, "init", manifest, "--no-hooks");
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(existsSync(m.at("rel-state"))).toBe(false);
     expect(existsSync(m.at("rel-config"))).toBe(false);
@@ -1310,7 +1310,7 @@ describe("unusual environments", () => {
       agents: ["claude-code"],
       sources: [{ id: "v", git: vendor.url }],
     });
-    const init = await m.runWith({ env }, "init", manifest, "--no-timer");
+    const init = await m.runWith({ env }, "init", manifest, "--no-hooks");
     expect(init.code, init.stderr).toBe(0);
     expect(names(join(home, ".claude/skills"))).toEqual(["tool"]);
     expect((await m.runWith({ env }, "self-install")).code).toBe(0);
@@ -1338,7 +1338,7 @@ describe("unusual environments", () => {
         { id: "vendor", git: vendor.url },
       ],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const bin = join(m.root, "nogit");
     mkdirSync(bin, { recursive: true });
     // POSIX keeps sh and env, which commands may need; Windows needs nothing on PATH.
@@ -1362,7 +1362,7 @@ describe("unusual environments", () => {
       agents: ["claude-code"],
       sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     writeFileSync(join(work, "skills/café/SKILL.md"), `${skillMd("café")}\nmine\n`);
     personal.commit({ "skills/café/SKILL.md": skillMd("café", "theirs") });
     const run = await m.runWith({ env: { LANG: "C", LC_ALL: "C" } }, "sync", "--json");
@@ -1379,7 +1379,7 @@ describe("unusual environments", () => {
         sources: [{ id: "v", git: vendor.url }],
       }),
     });
-    expect((await m.run("init", `${repo.url}//skills.json`, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", `${repo.url}//skills.json`, "--no-hooks")).code).toBe(0);
     rmSync(repo.url, { recursive: true, force: true });
     const report = await m.json("sync", "--offline");
     expect(report.ok).toBe(true);
@@ -1398,7 +1398,7 @@ describe("unusual environments", () => {
         { id: "vendor", git: vendor.url },
       ],
     });
-    await m.run("init", manifest, "--no-timer", "--copy");
+    await m.run("init", manifest, "--no-hooks", "--copy");
     await m.run("sync", "--copy");
     await m.run("sync", "--copy");
     for (const dir of [".claude/skills", ".cursor/skills"])

@@ -22,7 +22,7 @@ for c in a b; do
   docker run -d --name "sf-u2-shared-$c" -u root -e HOME=/shared -v "$S:/shared" -v "$tgz:/pkg/skillfleet.tgz:ro" sf-u2-alpine22 sleep infinity >/dev/null
 done
 SF=/shared/.local/state/skillfleet/bin/skillfleet
-docker exec sf-u2-shared-a sh -c "cd /shared && npx -y --package /pkg/skillfleet.tgz -- skillfleet init /shared/m.json --no-timer >/dev/null 2>&1; echo init \$?"
+docker exec sf-u2-shared-a sh -c "cd /shared && npx -y --package /pkg/skillfleet.tgz -- skillfleet init /shared/m.json --no-hooks >/dev/null 2>&1; echo init \$?"
 (cd "$S/work" && echo v2 >> s1/SKILL.md && g commit -qam v2 && g push -q ../up.git main)
 docker exec -d sf-u2-shared-a sh -c "$SF sync > /shared/a.out 2>&1"
 sleep 5

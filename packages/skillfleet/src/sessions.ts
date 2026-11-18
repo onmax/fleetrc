@@ -99,11 +99,15 @@ interface SessionRecord {
 }
 
 /**
- * `skillfleet hook prompt`, a Claude Code UserPromptSubmit hook: prints the skills that arrived
- * after the session started, once each. Claude Code adds the output to the prompt's context and
- * has already loaded those skills, so the text says to use them, not to read their files.
+ * Claude Code's UserPromptSubmit hook (hook.ts): the skills that arrived after the session started,
+ * once each. Claude Code adds the output to the prompt's context and has already loaded those
+ * skills, so the text says to use them, not to read their files.
  */
-export function promptHook(input: string, state: State, now = new Date()): string {
+export function promptHook(
+  input: string,
+  state: { skills: Record<string, { addedAt: string }> },
+  now = new Date(),
+): string {
   let sessionId = "unknown";
   try {
     const parsed: unknown = JSON.parse(input);

@@ -30,7 +30,7 @@ describe("review regression cases", () => {
     const init = await m.run(
       "init",
       `${mine.url}//skills.json`,
-      "--no-timer",
+      "--no-hooks",
       ...(copy ? ["--copy"] : []),
     );
     expect(init.code, init.stderr).toBe(0);
@@ -58,7 +58,7 @@ describe("review regression cases", () => {
         mkdirSync(m.at(`.claude/skills/${name}`), { recursive: true });
         writeFileSync(m.at(`.claude/skills/${name}/SKILL.md`), skillMd(name, "handmade"));
       }
-      const init = await m.run("init", team.url, "--no-timer");
+      const init = await m.run("init", team.url, "--no-hooks");
       expect(init.code, init.stdout + init.stderr).toBe(0);
       expect(read(m.at(".claude/skills/ztool/SKILL.md"))).toBe(skillMd("ztool"));
       const backup = join(m.stateDir, "backup");
@@ -86,7 +86,7 @@ describe("review regression cases", () => {
     });
     mkdirSync(m.at(".claude/skills/tool"), { recursive: true });
     writeFileSync(m.at(".claude/skills/tool/SKILL.md"), skillMd("tool", "handmade"));
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool", "handmade"));
     expect(read(m.at(".claude/skills/other/SKILL.md"))).toBe(skillMd("other"));
@@ -112,7 +112,7 @@ describe("review regression cases", () => {
         agents: ["claude-code"],
         sources: [{ id: "vendor", ...source, skills: "skills/*" }],
       });
-      const init = await m.run("init", manifest, "--no-timer");
+      const init = await m.run("init", manifest, "--no-hooks");
       expect(init.code, init.stdout + init.stderr).toBe(0);
       expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
     },
@@ -127,7 +127,7 @@ describe("review regression cases", () => {
         agents: ["claude-code", "codex"],
         sources: [{ id: "vendor", git: vendor.url }],
       });
-      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
       const record = m.at(".claude/skills/.skillfleet-manifest.json");
       chmodSync(record, 0);
       try {
@@ -149,7 +149,7 @@ describe("review regression cases", () => {
     const team = remote(m, "team", {
       "skills.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
     });
-    expect((await m.run("init", team.url, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", team.url, "--no-hooks")).code).toBe(0);
     const cache = join(m.stateDir, "cache/manifests");
     const marker = readdirSync(cache).find((n) => n.endsWith(".json"))!;
     const key = marker.slice(0, -5);

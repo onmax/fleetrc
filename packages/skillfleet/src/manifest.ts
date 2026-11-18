@@ -438,7 +438,7 @@ export interface Config {
   manifest: string;
   /** Copy skill folders instead of linking them, on every sync (`--copy`, `--no-copy`). */
   copy?: boolean;
-  /** False after `init --no-timer` or `timer remove`: `doctor` then skips the timer. */
+  /** True once this machine has the timer (`init --timer`, `timer install`); false after `timer remove`. */
   timer?: boolean;
 }
 

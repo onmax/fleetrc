@@ -32,7 +32,7 @@ upstream skill added, `add` refused for the remote manifest and the source added
 a local edit and an upstream change to the same skill, an edit in the clone, then `status`, `list`,
 `doctor`, `timer`, `sync --offline` and a look for an uninstall command. In a container without
 systemd it checks that every timer command says so. It runs outside Docker too, against a throwaway
-HOME; on a machine with systemd it passes `--no-timer` unless `SF_TIMER=1`:
+HOME; on a machine with systemd it passes `--timer` only with `SF_TIMER=1`:
 
 ```sh
 SF_TGZ=/tmp/sf/skillfleet-0.0.0.tgz SF_HOME=/tmp/sf/home sh test/envs/scenario.sh

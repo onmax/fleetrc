@@ -32,7 +32,7 @@ describe("skillfleet", () => {
       "update",
       "timer",
       "fleet",
-      "hook prompt",
+      "hook install|remove [agent]",
     ])
       expect(stdout).toContain(`  ${command}`);
   });
@@ -55,7 +55,7 @@ describe("skillfleet", () => {
   it("add and list: adds a source to the manifest and links its skills", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const vendor = remote(m, "extra", skills("skills/", "added"));
     const add = await m.run("add", vendor.url, "--id", "extra");
     expect(add.code, add.stdout + add.stderr).toBe(0);
@@ -70,7 +70,7 @@ describe("skillfleet", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const prompt = () =>
       m.runWith(
         { input: JSON.stringify({ session_id: "abc", hook_event_name: "UserPromptSubmit" }) },
@@ -97,7 +97,7 @@ describe("skillfleet", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     // Processes that look like Codex and Claude Code: node running a script named codex or claude.
     const fake = (name: string) => {
       const file = join(m.root, `${name}.mjs`);

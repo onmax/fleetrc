@@ -45,7 +45,7 @@ async function threeSources() {
 describe("sync", () => {
   it("1. links skills from three sources into every agent folder, with the same names everywhere", async () => {
     const { m, work, manifest } = await threeSources();
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stderr + init.stdout).toBe(0);
     const expected = ["alpha", "beta", "delta", "epsilon", "gamma"];
     for (const dir of AGENT_DIRS) {
@@ -87,7 +87,7 @@ describe("sync", () => {
     });
     const dry = await m.run("init", manifest, "--dry-run");
     expect(dry.stdout).toContain("none lost");
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["dev", "strict"]);
     expect(linkOf(m.at(".claude/skills/dev"))).toBe(join(work, "skills/dev"));
     const report = await m.json("sync");
@@ -98,7 +98,7 @@ describe("sync", () => {
 
   it("2. fast-forwards a dirty working clone when upstream touches other files, keeping local edits byte for byte", async () => {
     const { m, personal, work, manifest } = await threeSources();
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const edited = `${skillMd("alpha")}\nlocal edit\r\nwith CRLF\n`;
     writeFileSync(join(work, "skills/alpha/SKILL.md"), edited);
     writeFileSync(join(work, "skills/alpha/draft.md"), "untracked draft\n");
@@ -122,7 +122,7 @@ describe("sync", () => {
 
   it("3. holds a working clone when upstream changes a file with local edits, and touches nothing", async () => {
     const { m, personal, work, manifest } = await threeSources();
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const before = m.git(work, "rev-parse", "HEAD");
     const edited = `${skillMd("alpha")}\nmine\n`;
     writeFileSync(join(work, "skills/alpha/SKILL.md"), edited);
@@ -165,7 +165,7 @@ describe("sync", () => {
         { id: "other", git: other.url, exclude: ["unwanted"] },
       ],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["own", "picked", "shared", "solo"]);
     expect(linkOf(m.at(".claude/skills/shared"))).toBe(join(work, "skills/shared"));
@@ -188,7 +188,7 @@ describe("sync", () => {
       agents: ["claude-code", "cursor"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     // A folder made by hand, and links skillfleet did not make, one of them under a name the manifest provides.
     mkdirSync(m.at(".claude/skills/handmade"));
     writeFileSync(m.at(".claude/skills/handmade/SKILL.md"), skillMd("handmade"));
@@ -248,7 +248,7 @@ describe("sync", () => {
       agents: ["claude-code"],
       sources: [],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["team-skill"]);
     const report = await m.json("sync");
@@ -273,7 +273,7 @@ describe("sync", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url, update: "review" }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(read(m.at(".claude/skills/watched/SKILL.md"))).toBe(skillMd("watched"));
     vendor.commit({
       "skills/watched/SKILL.md": skillMd("watched", "new upstream text"),
@@ -336,7 +336,7 @@ console.log("pstack rebuilt");`,
             .map((line) => JSON.parse(line) as { changed: string })
         : [];
 
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(runs()).toHaveLength(1);
     expect(runs()[0]!.changed).toBe("personal:pstack/install.mjs");
 
@@ -368,7 +368,7 @@ console.log("pstack rebuilt");`,
       agents: ["claude-code", "codex"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["one"]);
     expect(names(m.at(".agents/skills"))).toEqual(["one"]);
     expect(readdirSync(m.at(".claude/skills"))).toContain(".skillfleet-manifest.json");
@@ -381,7 +381,7 @@ console.log("pstack rebuilt");`,
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const log = join(m.root, "copies.log");
     // The number of files the sync copied, which it writes to SKILLFLEET_DEBUG_COPIES at exit.
     const copies = async () => {
@@ -428,7 +428,7 @@ console.log("pstack rebuilt");`,
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url, skills: "skills/*", path: "~/src/vendor" }],
       });
-      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
       const report = await m.json<{ warnings: string[] }>("sync");
       expect(names(m.at(".claude/skills"))).toEqual(["linked", "tool"]);
       const warnings = report.warnings.join("\n");

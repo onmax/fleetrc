@@ -32,7 +32,7 @@ const HOST_NOTES = {
   "never-synced": undefined,
   "not-installed": "skillfleet is not installed there; run `npx skillfleet init <manifest>` on it",
   "node-gone":
-    "skillfleet is installed there, but the node its launcher and timer run is gone, as after a Node.js upgrade; run `npx skillfleet@latest timer install` on it",
+    "skillfleet is installed there, but the node its launcher and timer run is gone, as after a Node.js upgrade; run `npx skillfleet@latest self-install` on it",
   "no-node":
     "skillfleet is not installed there, and node is not on the PATH ssh commands get; install Node.js 22.12 or newer, then run `npx skillfleet init <manifest>` on it",
 } as const;

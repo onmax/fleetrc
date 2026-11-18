@@ -38,7 +38,7 @@ async function vendored(m: Machine, ...extra: string[]) {
     agents: ["claude-code"],
     sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
   });
-  const init = await m.run("init", manifest, "--no-timer");
+  const init = await m.run("init", manifest, "--no-hooks");
   expect(init.code, init.stdout + init.stderr).toBe(0);
   return { vendor, manifest, live: join(m.stateDir, "store", "vendor", "live") };
 }
@@ -79,7 +79,7 @@ describe("an agent folder that links to another agent's folder", () => {
       // Codex reads both folders, so one link makes them the same folder.
       symlinkSync(m.at(".agents/skills"), m.at(".codex/skills"));
       const manifest = m.manifest({ agents: "all", sources: [{ id: "vendor", git: vendor.url }] });
-      const init = await m.run("init", manifest, "--no-timer");
+      const init = await m.run("init", manifest, "--no-hooks");
       // handmade stays in ~/.agents/skills, which Codex reads; nothing is lost.
       expect(init.stdout).not.toContain("LOST");
       expect(init.code, init.stdout + init.stderr).toBe(0);
@@ -103,7 +103,7 @@ describe("fleet", () => {
         ],
         fleet: ["localhost"],
       });
-      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
       expect((await m.run("self-install")).code).toBe(0);
       // One source on the host stops answering: its sync exits 1 with a full report.
       rmSync(gone.url, { recursive: true, force: true });
@@ -224,7 +224,7 @@ describe("a sync killed or left without its records", () => {
         sources: [{ id: "vendor", git: vendor.url }],
       }),
     });
-    expect((await m.run("init", team.url, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", team.url, "--no-hooks")).code).toBe(0);
     const cache = join(m.stateDir, "cache", "manifests");
     const key = readdirSync(cache)
       .find((name) => name.endsWith(".json"))!
@@ -267,7 +267,7 @@ describe("sync <source>", () => {
         { id: "b", git: b.url },
       ],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     rmSync(b.url, { recursive: true, force: true });
     expect((await m.json("sync")).errors.join("\n")).toMatch(/^b: /);
     // `sync a` does not fetch b, so it cannot know b recovered; status must still show b failing.
@@ -324,7 +324,7 @@ describe("the timer", () => {
       );
       expect(error.message).not.toContain("ENOENT");
       expect(error.message).toMatch(/systemd/);
-      expect(error.message).toContain("--no-timer");
+      expect(error.message).toContain("--no-hooks");
     },
   );
 });
@@ -357,7 +357,7 @@ describe("sources a repository holds in unusual ways", () => {
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
       });
-      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
       const report = await m.json("sync");
       const said = `${names(m.at(".claude/skills")).join(" ")}\n${report.warnings.join("\n")}`;
       expect(said).toContain("linked");
@@ -370,7 +370,7 @@ describe("what users paste", () => {
   it("R2-13. add of a GitHub folder link does not write the page URL as a git URL", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const add = await m.json<{ added: { git?: string } }>(
       "add",
       "https://github.com/vercel-labs/agent-skills/tree/main/skills",

@@ -1,7 +1,15 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import {
+  describeTrigger,
+  formatHookChanges,
+  type HookChange,
+  installedHooks,
+  installHooks,
+  removeHooks,
+} from "./agenthooks.ts";
 import { agentRows } from "./agents.ts";
 import { doctor, formatChecks } from "./doctor.ts";
 import {
@@ -25,7 +33,8 @@ import {
   tailscalePeers,
   unpublished,
 } from "./fleet.ts";
-import { isRecord, JsonFileError, readJsonOrNothing } from "./fs.ts";
+import { isRecord, JsonFileError, readJsonOrNothing, writeJson } from "./fs.ts";
+import { HOOK_AGENTS, type HookAgent, runHook } from "./hook.ts";
 import { applyPlan, cloneBeforeAdopt, formatPlan, planInit } from "./init.ts";
 import { gitUrl } from "./gitcache.ts";
 import { errorText } from "./linker.ts";
@@ -53,7 +62,7 @@ import {
   stableNode,
   timerEnv,
 } from "./selfinstall.ts";
-import { promptHook, staleSessions } from "./sessions.ts";
+import { staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
 import { LockHeldError } from "./lock.ts";
 import { manifestSpec, sync, withSyncLock } from "./sync.ts";
@@ -81,6 +90,9 @@ import {
 } from "./timer.ts";
 import { version } from "./version.ts";
 
+const isHookAgent = (agent: string | undefined): agent is HookAgent =>
+  (HOOK_AGENTS as readonly (string | undefined)[]).includes(agent);
+
 const OPTIONS = {
   offline: { type: "boolean", help: "Use what is already fetched" },
   "dry-run": { type: "boolean", help: "Print what would change and change nothing" },
@@ -92,7 +104,8 @@ const OPTIONS = {
   "no-copy": { type: "boolean", help: "Link skill folders again after --copy" },
   manifest: { type: "string", help: "<m>  Use this manifest instead of the configured one" },
   timeout: { type: "string", help: "<s>  Seconds to wait for each host (default 30)" },
-  "no-timer": { type: "boolean", help: "Do not install the timer" },
+  timer: { type: "boolean", help: "Install the timer too, for a machine where no agent runs" },
+  "no-hooks": { type: "boolean", help: "Do not install the session hooks" },
   force: { type: "boolean", help: "Go ahead even when skill names would be lost" },
   id: {
     type: "string",
@@ -130,10 +143,10 @@ const COMMANDS: Record<string, Command> = {
   },
   init: {
     usage: "init [manifest]",
-    summary: "Point this machine at a manifest, migrate the folders, install the timer",
+    summary: "Point this machine at a manifest, migrate the folders, install the session hooks",
     details:
-      "The manifest is a repository (owner/repo, github:owner/repo, gitlab:group/repo or a git URL ending in .git, read for its skills.json), <repo>//<file>, or a file or folder on this machine. Without one, init uses the configured manifest again.",
-    options: [...SYNC_OPTIONS, "no-timer", "force"],
+      "The manifest is a repository (owner/repo, github:owner/repo, gitlab:group/repo or a git URL ending in .git, read for its skills.json), <repo>//<file>, or a file or folder on this machine. Without one, init uses the configured manifest again. The session hooks go into Claude Code and Codex where they are installed (see `skillfleet hook --help`); a machine that had the timer keeps it.",
+    options: [...SYNC_OPTIONS, "timer", "no-hooks", "force"],
   },
   status: {
     usage: "status",
@@ -150,7 +163,7 @@ const COMMANDS: Record<string, Command> = {
   },
   doctor: {
     usage: "doctor",
-    summary: "Check node, git access, the timer and duplicate skills",
+    summary: "Check node, git access, the hooks or timer, and duplicate skills",
     options: ["json", "manifest"],
   },
   add: {
@@ -199,6 +212,8 @@ const COMMANDS: Record<string, Command> = {
   timer: {
     usage: "timer install|remove|status",
     summary: "Install, remove or show the timer that syncs on the manifest's schedule",
+    details:
+      "The timer is for a machine where no agent runs, such as a server; elsewhere the session hooks start the syncs.",
     options: ["dry-run", "json", "manifest"],
   },
   fleet: {
@@ -209,9 +224,11 @@ const COMMANDS: Record<string, Command> = {
     options: ["dry-run", "json", "manifest", "timeout"],
   },
   hook: {
-    usage: "hook prompt",
-    summary: "Claude Code UserPromptSubmit hook: announce skills newer than the session",
-    options: [],
+    usage: "hook install|remove [agent]",
+    summary: "Add or remove the hooks that sync when a Claude Code or Codex session starts",
+    details:
+      "Without an agent (claude-code or codex), acts on each whose folder exists. The hooks run `skillfleet hook run <agent>` on session start and on each prompt: when no sync was started in the last 15 minutes and none is running, it starts one in the background, and in Claude Code it names skills that arrived after the session started. `hook prompt` is Claude Code's prompt hook alone.",
+    options: ["dry-run", "json"],
   },
   "self-install": {
     usage: "self-install",
@@ -550,7 +567,10 @@ async function status() {
   const state = loadState();
   const stale = await staleSessions(state);
   const config = readConfig();
-  const timerState = await readTimer();
+  const hooks = installedHooks();
+  // The OS is asked only on a machine that has the timer.
+  const withTimer = config?.timer === true;
+  const timerState = withTimer ? await readTimer() : undefined;
   const drift = await timerScheduleDrift();
   if (json) {
     emit({
@@ -559,7 +579,13 @@ async function status() {
       lastChange: state.lastChange,
       forks: state.forks ?? {},
       staleSessions: stale,
-      timer: timerState instanceof TimerError ? { error: timerState.message } : timerState,
+      trigger: { hooks: hooks.map((hook) => hook.agent), timer: withTimer },
+      timer:
+        timerState === undefined
+          ? { installed: false }
+          : timerState instanceof TimerError
+            ? { error: timerState.message }
+            : timerState,
       ...(drift ? { timerSchedule: drift } : {}),
     });
     return 0;
@@ -569,18 +595,19 @@ async function status() {
   else
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
   for (const line of [...forkLines(state), ...conflictLines(state)]) say(line);
-  const declined = config?.timer === false;
-  say(
-    `timer: ${
-      timerState instanceof TimerError
-        ? timerState.noSystemd || declined
-          ? `${declined ? "not installed, as you chose; " : ""}${timerState.message.split("\n")[0]}`
-          : `unknown (${timerState.message.split("\n")[0]})`
-        : timerState.installed
-          ? formatTimerStatus(timerState)
-          : await missingTimer(timerState, declined)
-    }`,
-  );
+  say(`syncs start from: ${describeTrigger(hooks, withTimer)}`);
+  if (timerState !== undefined)
+    say(
+      `timer: ${
+        timerState instanceof TimerError
+          ? timerState.noSystemd
+            ? timerState.message.split("\n")[0]
+            : `unknown (${timerState.message.split("\n")[0]})`
+          : timerState.installed
+            ? formatTimerStatus(timerState)
+            : await missingTimer(timerState)
+      }`,
+    );
   if (drift) say(`timer: ${drift}`);
   for (const proc of stale)
     say(
@@ -827,6 +854,36 @@ async function remove() {
   );
 }
 
+/** Whether this machine runs the timer: `--timer`, or it was installed before (config.json). */
+function timerWanted(): boolean {
+  if (values.timer) return true;
+  try {
+    return readConfig()?.timer === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Saves the environment a sync started by a session hook runs with: the timer's, from this shell. */
+function saveHookEnv(node: string) {
+  writeJson(paths.hookEnv(), timerEnv(findOnPath("git"), node));
+}
+
+/** Installs the session hooks, after the launcher they run; init and `hook install`. */
+function addHooks(
+  agents: readonly HookAgent[] | undefined,
+  node?: string,
+): { lines: string[]; changes: HookChange[]; code: number } {
+  if (!dryRun) saveHookEnv(node ?? selfInstall().node);
+  const changes = installHooks(agents, { dryRun });
+  const lines = formatHookChanges(changes, "install", dryRun);
+  if (changes.every((change) => change.skipped))
+    lines.push(
+      "no Claude Code or Codex here, so no session hook starts a sync; install one of them and run `skillfleet hook install`, or on a machine where no agent runs, `skillfleet timer install`",
+    );
+  return { lines, changes, code: changes.some((change) => change.error) ? 1 : 0 };
+}
+
 async function init() {
   if (rest.length > 1) usage("init takes one manifest");
   const given = rest[0] ?? values.manifest ?? readConfig()?.manifest;
@@ -834,18 +891,26 @@ async function init() {
     usage(
       "init needs a manifest: a path, a repository such as owner/repo (its skills.json), or <repo>//<file> such as github:org/agents//skills.json",
     );
+  const withTimer = timerWanted();
+  const withHooks = !values["no-hooks"];
   const plan = await planInit(canonicalManifestSpec(given), { offline: values.offline, dryRun });
   if (dryRun) {
-    const launcher = `would install ${tildify(launcherPath())}, the copy new shells, the timer and \`fleet\` run (node ${stableNode()})`;
-    const timer = values["no-timer"] ? undefined : await installTimer(plan.timer);
-    const timerLines = timer?.lines ?? ["no timer (--no-timer)"];
+    const launcher = `would install ${tildify(launcherPath())}, the copy new shells, the hooks, the timer and \`fleet\` run (node ${stableNode()})`;
+    const hooks = withHooks ? addHooks(undefined) : undefined;
+    const timer = withTimer ? await installTimer(plan.timer) : undefined;
+    const lines = [
+      launcher,
+      ...(hooks?.lines ?? ["no session hooks (--no-hooks)"]),
+      ...(timer?.lines ?? []),
+    ];
     if (json)
       emit({
         ...plan,
         launcher: { path: launcherPath(), node: stableNode() },
-        timer: timer?.json ?? { declined: true },
+        ...(hooks ? { hooks: hooks.changes } : {}),
+        ...(timer ? { timer: timer.json } : {}),
       });
-    else say(formatPlan(plan), ...[launcher, ...timerLines].map((line) => `  ${line}`));
+    else say(formatPlan(plan), ...lines.map((line) => `  ${line}`));
     return plan.lost.length > 0 ? 1 : 0;
   }
   say(formatPlan(plan, { errors: false }));
@@ -855,19 +920,20 @@ async function init() {
     );
   const applied = [...(await cloneBeforeAdopt(plan)), ...applyPlan(plan)];
   say(...applied.map((line) => `  ${line}`));
-  if (values["no-timer"]) updateConfig({ timer: false });
   // init installs the timer from the manifest next, so the sync need not say it differs.
-  const report = await syncReport({ skipTimerCheck: !values["no-timer"] });
+  const report = await syncReport({ skipTimerCheck: withTimer });
   if (!json) console.log(reportText(report));
-  // The copy that new shells, the timer and `fleet` run, with or without the timer.
+  // The copy that new shells, the hooks, the timer and `fleet` run.
   const installed = selfInstall();
-  // The timer's log folder, which a crontab line on a machine without systemd appends to too.
+  // The log folder of the timer and of syncs the hooks start, which a crontab line appends to too.
   mkdirSync(paths.logs(), { recursive: true });
   const onPath = commandOnPath(installed.launcher);
   say(onPath, ...installed.notes);
-  const timerResult = values["no-timer"] ? undefined : await installTimer(plan.timer);
+  const hooks = withHooks ? addHooks(undefined, installed.node) : undefined;
+  if (hooks) say(...hooks.lines);
+  const timerResult = withTimer ? await installTimer(plan.timer) : undefined;
   if (timerResult) say(...timerResult.lines);
-  // With --no-timer, a timer installed before still runs; it must not keep a node that is gone.
+  // A timer installed before still runs; it must not keep a node that is gone.
   else say(...(await followLauncherNode(installed.node)));
   if (json)
     emit({
@@ -875,10 +941,45 @@ async function init() {
       applied,
       sync: report,
       installed: { ...installed, onPath },
+      ...(hooks ? { hooks: hooks.changes } : {}),
       ...(timerResult ? { timer: timerResult.json } : {}),
     });
   // A machine without systemd can't have a timer; init did its job and said what to use instead.
-  return (report.ok ? 0 : 1) || (timerResult?.noSystemd ? 0 : (timerResult?.code ?? 0));
+  return (
+    (report.ok ? 0 : 1) ||
+    (hooks?.code ?? 0) ||
+    (timerResult?.noSystemd ? 0 : (timerResult?.code ?? 0))
+  );
+}
+
+/** `hook install|remove [agent]`, and `hook run <agent>` and `hook prompt`, which the agents run. */
+async function hookCommand(action: string | undefined) {
+  if (action === "run" || action === "prompt") {
+    const agent = action === "prompt" ? "claude-code" : rest[1];
+    if (rest.length !== (action === "prompt" ? 1 : 2) || !isHookAgent(agent))
+      usage(
+        action === "prompt" ? "hook prompt takes nothing" : "hook run takes claude-code or codex",
+      );
+    runHook(agent, action === "prompt" ? "UserPromptSubmit" : undefined);
+    return 0;
+  }
+  if (action !== "install" && action !== "remove")
+    return usage("hook takes install, remove, run or prompt");
+  if (rest.length > 2) usage(`hook ${action} takes at most one agent`);
+  const named = rest[1];
+  if (named !== undefined && !isHookAgent(named))
+    usage(`hook ${action} takes claude-code or codex, not "${named}"`);
+  const agents = named === undefined ? undefined : [named];
+  if (action === "install") {
+    const result = addHooks(agents);
+    if (json) emit(result.changes);
+    else say(...result.lines);
+    return result.code;
+  }
+  const changes = removeHooks(agents, { dryRun });
+  if (json) emit(changes);
+  else say(...formatHookChanges(changes, "remove", dryRun));
+  return changes.some((change) => change.error) ? 1 : 0;
 }
 
 async function fleetCommand(action: string | undefined) {
@@ -1025,8 +1126,11 @@ async function main(): Promise<number> {
     console.log(commandHelp(command));
     return 0;
   }
+  // The hooks the agents run take no options.
+  const allowed =
+    command === "hook" && rest[0] !== "install" && rest[0] !== "remove" ? [] : entry.options;
   for (const name of Object.keys(values) as Option[])
-    if (!entry.options.includes(name) && name !== "help")
+    if (!allowed.includes(name) && name !== "help")
       usageError(
         name !== "dry-run"
           ? `${command} does not take --${name}; see \`skillfleet ${command} --help\``
@@ -1080,11 +1184,11 @@ async function main(): Promise<number> {
     case "fleet":
       return fleetCommand(rest[0]);
     case "hook":
-      if (rest[0] !== "prompt" || rest.length > 1) usage("hook takes prompt");
-      process.stdout.write(promptHook(readFileSync(0, "utf8"), loadState()));
-      return 0;
+      return hookCommand(rest[0]);
     case "self-install": {
       const result = selfInstall();
+      // The hooks' syncs run with the environment and node they were installed with.
+      if (installedHooks().length > 0) saveHookEnv(result.node);
       say(
         `installed ${tildify(result.launcher)} (node ${result.node})`,
         commandOnPath(result.launcher),

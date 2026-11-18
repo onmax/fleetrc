@@ -95,7 +95,7 @@ describe("mac environments", () => {
       const doctor = await m.runWith({ env }, "doctor", "--json");
       const node = (JSON.parse(doctor.stdout) as Check[]).find((check) => check.name === "node");
       expect(node?.ok).toBe(false);
-      expect(node?.detail).toContain("npx skillfleet@latest timer install");
+      expect(node?.detail).toContain("npx skillfleet@latest self-install");
       expect(node?.detail).not.toContain("run `skillfleet timer install`");
     },
   );
@@ -128,7 +128,7 @@ describe("mac environments", () => {
     async () => {
       const m = machine();
       const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-      const init = await m.runWith({ env: { SHELL: "/bin/zsh" } }, "init", manifest, "--no-timer");
+      const init = await m.runWith({ env: { SHELL: "/bin/zsh" } }, "init", manifest, "--no-hooks");
       expect(init.code, init.stderr).toBe(0);
       expect(init.stdout).toContain(
         process.platform === "darwin" ? "in ~/.zprofile:" : "in ~/.zshrc:",
@@ -185,7 +185,7 @@ describe("mac environments", () => {
   it("MAC6. the timer's PATH drops npx's folders and world-writable ones, the same from npx as from a shell", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const userPath = m.env.PATH!;
     const npxDirs = [
       join(m.root, ".npm", "_npx", "0123abcd", "node_modules", ".bin"),
@@ -257,7 +257,7 @@ describe("mac environments", () => {
     async () => {
       const m = machine({ scheduler: "empty" });
       const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
       const other = join(m.root, "other", ".local", "state", "skillfleet");
       const unit = m.at(".config", "systemd", "user", "skillfleet-sync.service");
       mkdirSync(join(unit, ".."), { recursive: true });
@@ -299,7 +299,7 @@ describe("mac environments", () => {
 
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     m.manifest({ agents: ["claude-code"], sources: [], timer: { cron: "99 * * * *" } });
     const dry = await m.run("timer", "install", "--dry-run");
     expect(dry.code).toBe(1);
@@ -309,7 +309,7 @@ describe("mac environments", () => {
   it("D9. a scheduler failure reads in skillfleet's terms, without the library's options", async () => {
     const m = machine({ scheduler: "refuse" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const install = await m.run("timer", "install");
     expect(install.code).toBe(1);
     expect(install.stdout).toContain("the timer was not installed");
@@ -320,7 +320,7 @@ describe("mac environments", () => {
   it.skipIf(isWindows)("D10. fleet add suggests MagicDNS short names it accepts", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [], fleet: ["slimbook"] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const bin = join(m.root, "tsbin");
     const status = {
       Peer: {

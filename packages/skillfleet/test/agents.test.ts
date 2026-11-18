@@ -51,7 +51,7 @@ describe("agents", () => {
       agents: ["codex", "gemini-cli"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stderr).toBe(0);
     const canonical = names(m.at(".agents/skills"));
     expect(canonical).toEqual(["alpha", "beta"]);
@@ -65,7 +65,7 @@ describe("agents", () => {
     const vendor = remote(m, "vendor", skills("skills/", "alpha", "beta"));
     const sources = [{ id: "vendor", git: vendor.url }];
     const manifest = m.manifest({ agents: ["gemini-cli"], sources });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".gemini/skills"))).toEqual(["alpha", "beta"]);
     writeFiles(m.at(".gemini/skills"), { "mine/SKILL.md": skillMd("mine") });
 
@@ -93,7 +93,7 @@ describe("agents", () => {
       agents: ["codex", "opencode"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect((await m.run("sync")).code).toBe(0);
     expect(isLink(m.at(".agents/skills/alpha"))).toBe(true);
     expect(linkOf(m.at(".agents/skills/alpha"))).toBe(
@@ -113,7 +113,7 @@ describe("agents", () => {
       agents: ["codex"],
       sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stderr).toBe(0);
     // A link that leaves the source would copy a file of this machine into the store.
     expect(init.stdout).toContain(
@@ -138,7 +138,7 @@ describe("agents", () => {
       agents: ["claude-code", "codex", "cursor"],
       sources: [{ id: "mine", local: folder, skills: "skills/*" }],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stderr).toBe(0);
     expect(names(m.at(".agents/skills"))).toEqual(["abs", "plain", "rel", "shared"]);
     const report = await m.json("sync");
@@ -165,7 +165,7 @@ describe("agents", () => {
       agents: ["codex"],
       sources: [{ id: "mine", local: folder, skills: "skills/*" }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const copied = await m.json("sync", "--copy");
     expect(copied.warnings.filter((warning) => warning.includes("SKILL.md"))).toEqual([]);
     for (const name of ["abs", "plain", "rel", "shared"]) {

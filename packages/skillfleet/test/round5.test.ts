@@ -38,9 +38,9 @@ import {
   writeFiles,
 } from "./fixture.ts";
 
-/** Runs init with --no-timer and fails the test unless it exits 0. */
+/** Runs init with --no-hooks and fails the test unless it exits 0. */
 async function init(m: Machine, manifest: string, ...args: string[]) {
-  const run = await m.run("init", manifest, "--no-timer", ...args);
+  const run = await m.run("init", manifest, "--no-hooks", ...args);
   expect(run.code, run.stdout + run.stderr).toBe(0);
   return run;
 }
@@ -616,7 +616,7 @@ describe("index sources", () => {
         agents: ["claude-code"],
         sources: [{ id: "site", index: site.url }],
       });
-      const run = await m.run("init", manifest, "--no-timer");
+      const run = await m.run("init", manifest, "--no-hooks");
       expect(names(m.at(".claude", "skills")), run.stdout + run.stderr).toContain("notes");
       expect(read(m.at(".claude", "skills", "notes", "SKILL.md"))).toBe(body);
     } finally {
@@ -653,7 +653,7 @@ describe("index sources", () => {
         agents: ["claude-code"],
         sources: [{ id: "site", index: site.url }],
       });
-      const run = await m.run("init", manifest, "--no-timer");
+      const run = await m.run("init", manifest, "--no-hooks");
       expect(names(m.at(".claude", "skills")), run.stdout + run.stderr).toContain("zipped");
       expect(read(m.at(".claude", "skills", "zipped", "SKILL.md"))).toBe(body);
     } finally {
@@ -694,7 +694,7 @@ describe("index archives past the copy limits", () => {
         agents: ["claude-code"],
         sources: [{ id: "site", index: site.url }],
       });
-      const run = await m.run("init", manifest, "--no-timer");
+      const run = await m.run("init", manifest, "--no-hooks");
       expect(names(m.at(".claude", "skills"))).not.toContain("huge");
       expect(run.stdout + run.stderr).toContain("more than 200 MB");
     } finally {

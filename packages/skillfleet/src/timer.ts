@@ -177,7 +177,7 @@ export function noSystemdMessage(cron = "*/30 * * * *"): string {
   const logs = join(stateDir(), "logs");
   const log = join(logs, `${TIMER_NAME}.log`);
   // cron's shell opens the log before skillfleet starts, so the line makes its folder first.
-  return `this machine has no systemd user manager (a container, WSL1, or a system that boots without systemd), so skillfleet can't install a timer here. Run \`skillfleet sync\` from cron instead (\`crontab -e\`, then a line such as: ${cron} mkdir -p ${shQuote(logs)} && ${shQuote(launcherPath())} sync >> ${shQuote(log)} 2>&1), and pass --no-timer to init`;
+  return `this machine has no systemd user manager (a container, WSL1, or a system that boots without systemd), so skillfleet can't install a timer here. Run \`skillfleet sync\` from cron instead (\`crontab -e\`, then a line such as: ${cron} mkdir -p ${shQuote(logs)} && ${shQuote(launcherPath())} sync >> ${shQuote(log)} 2>&1), or let the session hooks start syncs (\`skillfleet hook install\`)`;
 }
 
 /** A `systemctl` failure that means systemd itself is missing, not that one call went wrong. */
@@ -423,16 +423,11 @@ export async function removeTimer(
 }
 
 /**
- * What to say about a timer this install does not have. `declined` is the user's choice of no
- * timer; another install's timer that holds the name is named either way, since it runs instead.
+ * What to say about a timer this install does not have: another install's timer that holds the
+ * name, which runs instead, is named.
  */
-export async function missingTimer(status: TimerStatus, declined: boolean): Promise<string> {
+export async function missingTimer(status: TimerStatus): Promise<string> {
   const foreign = await foreignTimerResource();
-  if (declined) {
-    const chose =
-      "not installed, as you chose (`init --no-timer` or `timer remove`); `skillfleet timer install` adds it";
-    return foreign ? `${chose}. Note: ${foreignTimer(TIMER_NAME, foreign)}` : chose;
-  }
   return foreign ? foreignTimer(TIMER_NAME, foreign) : formatTimerStatus(status);
 }
 

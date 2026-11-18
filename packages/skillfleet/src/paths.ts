@@ -53,4 +53,8 @@ export const paths = {
   app: () => join(stateDir(), "app"),
   bin: () => join(stateDir(), "bin"),
   logs: () => join(stateDir(), "logs"),
+  /** When a session hook last started a sync, or found one running; see hook.ts. */
+  hookAttempt: () => join(stateDir(), "hook-attempt"),
+  /** The environment a sync started by a session hook runs with, saved by `hook install`. */
+  hookEnv: () => join(stateDir(), "hook-env.json"),
 };

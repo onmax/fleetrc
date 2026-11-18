@@ -26,7 +26,7 @@ describe("links on each OS", () => {
         agents: ["claude-code", "codex"],
         sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
       });
-      const init = await m.run("init", manifest, "--no-timer");
+      const init = await m.run("init", manifest, "--no-hooks");
       expect(init.code, init.stdout + init.stderr).toBe(0);
       const link = m.at(".claude/skills/win");
       expect(lstatSync(link).isSymbolicLink()).toBe(true);
@@ -55,7 +55,7 @@ describe("links on each OS", () => {
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
       });
-      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
       const record = JSON.parse(read(m.at(".claude/skills/.skillfleet-manifest.json"))) as {
         links: Record<string, { kind: string }>;
       };
@@ -70,7 +70,7 @@ describe("links on each OS", () => {
       agents: ["claude-code", "cursor"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    const init = await m.run("init", manifest, "--no-timer", "--copy");
+    const init = await m.run("init", manifest, "--no-hooks", "--copy");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     for (const dir of [".claude/skills", ".cursor/skills"]) {
       expect(names(m.at(dir))).toEqual(["copied", "other"]);
@@ -119,7 +119,7 @@ describe("links on each OS", () => {
       agents: ["claude-code", "codex"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    const init = await m.run("init", manifest, "--no-timer", "--copy");
+    const init = await m.run("init", manifest, "--no-hooks", "--copy");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     appendFileSync(m.at(".claude/skills/beta/SKILL.md"), "mine\n");
     const edited = beta("one", "two", "three", "four", "mine");
@@ -166,7 +166,7 @@ describe("links on each OS", () => {
       agents: ["claude-code", "codex"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer", "--copy")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks", "--copy")).code).toBe(0);
     appendFileSync(m.at(".agents/skills/beta/SKILL.md"), "mine\n");
     const report = await m.json("sync");
     expect(report.ok, JSON.stringify(report.errors)).toBe(true);

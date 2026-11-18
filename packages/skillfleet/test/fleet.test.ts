@@ -43,7 +43,7 @@ describe("fleet", () => {
       sources: [{ id: "vendor", git: vendor.url }],
       fleet: ["localhost", "gone.example"],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     // What `timer install` does: the copy of skillfleet that hosts run.
     expect((await m.run("self-install")).code).toBe(0);
     const env = sshShim(m);
@@ -87,7 +87,7 @@ describe("fleet", () => {
   it("fleet add records only the hosts named", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const added = await m.run("fleet", "add", "slimbook", "maxi@100.105.98.81");
     expect(added.code).toBe(0);
     expect((JSON.parse(readFileSync(manifest, "utf8")) as { fleet: string[] }).fleet).toEqual([
@@ -99,7 +99,7 @@ describe("fleet", () => {
   it("fleet add takes the host forms ssh reads, including ssh:// with a port", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const hosts = ["box.tail1234.ts.net", "my_alias", "ssh://me@box:2222", "fe80::1%eth0"];
     const added = await m.run("fleet", "add", ...hosts);
     expect(added.code, added.stderr).toBe(0);
@@ -149,7 +149,7 @@ describe("fleet", () => {
         ],
         fleet: ["localhost"],
       });
-      await m.run("init", manifest, "--no-timer");
+      await m.run("init", manifest, "--no-hooks");
       expect((await m.run("self-install")).code).toBe(0);
       const env = sshShim(m);
       const sync = await m.runWith({ env }, "fleet", "sync");

@@ -8,10 +8,10 @@ import { machine } from "./fixture.ts";
 const REFUSED = "tests never reach this machine's real scheduler";
 
 describe("scheduler guard", () => {
-  it("init without --no-timer reaches only the fake scheduler, which refuses the timer", async () => {
+  it("init --timer reaches only the fake scheduler, which refuses the timer", async () => {
     const m = machine({ scheduler: "refuse" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    const init = await m.run("init", manifest);
+    const init = await m.run("init", manifest, "--timer");
     expect(init.code).toBe(1);
     expect(init.stdout).toContain("the timer was not installed");
     expect(init.stdout).toContain(REFUSED);
@@ -50,7 +50,7 @@ for (const [file, args] of ${JSON.stringify(calls)})
   it("an empty scheduler answers reads: the timer is not installed", async () => {
     const m = machine({ scheduler: "empty" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const status = await m.run("timer", "status");
     expect(status.stdout).toContain("not installed");
     expect(status.code).toBe(1);

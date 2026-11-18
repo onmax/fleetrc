@@ -36,7 +36,7 @@ async function vendored(m: Machine, ...extra: string[]) {
     agents: ["claude-code"],
     sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
   });
-  const init = await m.run("init", manifest, "--no-timer");
+  const init = await m.run("init", manifest, "--no-hooks");
   expect(init.code, init.stdout + init.stderr).toBe(0);
   return { vendor, manifest, store: join(m.stateDir, "store", "vendor") };
 }
@@ -65,7 +65,7 @@ describe("linked skill folders", () => {
         agents: ["claude-code"],
         sources: [{ id: "personal", git: r.url, path: work, skills: "skills/*" }],
       });
-      const init = await m.run("init", manifest, "--no-timer", "--copy");
+      const init = await m.run("init", manifest, "--no-hooks", "--copy");
       expect(init.code, init.stdout + init.stderr).toBe(0);
       const copy = m.at(".claude/skills/tool");
       // A copy is a folder; a link `../shared/tool` in ~/.claude/skills points at nothing.
@@ -89,7 +89,7 @@ describe("linked skill folders", () => {
         agents: ["claude-code"],
         sources: [{ id: "personal", git: r.url, path: work, skills: "skills/*" }],
       });
-      const init = await m.run("init", manifest, "--no-timer", "--copy");
+      const init = await m.run("init", manifest, "--no-hooks", "--copy");
       expect(init.code, init.stdout + init.stderr).toBe(0);
       // Linked, Claude Code reads the guide through the clone; copied, the link must still lead to it.
       expect(read(join(work, "skills/tool/refs/guide.md"))).toBe("the guide\n");
@@ -114,7 +114,7 @@ describe("linked skill folders", () => {
         agents: ["claude-code"],
         sources: [{ id: "personal", git: r.url, path: work, skills: "skills/*" }],
       });
-      expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+      expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
       const copied = await m.json("sync", "--copy");
       expect(copied.errors).toEqual([]);
       expect(copied.targets.flatMap((target) => target.warnings).join("\n")).toMatch(
@@ -137,7 +137,7 @@ describe("linked skill folders", () => {
             ? { id: "personal", git: r.url, skills: "skills/*" }
             : { id: "personal", git: r.url, path: clone(m, r, "code/skills"), skills: "skills/*" };
         m.manifest({ agents: ["claude-code"], sources: [source] });
-        await m.run("init", join(m.root, "manifest", "skills.json"), "--no-timer");
+        await m.run("init", join(m.root, "manifest", "skills.json"), "--no-hooks");
         const report = await m.json("sync");
         expect(report.errors).toEqual([]);
         expect(report.skills.names).toEqual(["tool"]);
@@ -222,7 +222,7 @@ describe("agent folders that link to one another", () => {
           agents: ["claude-code", "codex"],
           sources: [{ id: "vendor", git: vendor.url }],
         });
-        expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+        expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
         if (shape === "a broken link") relink(m, ".claude/skills", m.at("missing/skills"));
         else if (shape === "a link loop") {
           relink(m, ".claude/skills", m.at(".agents/skills"));
@@ -246,7 +246,7 @@ describe("links pasted from a browser", () => {
   async function adder() {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     return async (link: string) =>
       (await m.json<{ added: object }>("add", link, "--dry-run")).added;
   }
@@ -365,7 +365,7 @@ describe("init clones an adopt source before adopting", () => {
       agents: ["claude-code"],
       sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true }],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     const all = init.stdout + init.stderr;
     expect(init.code, all).toBe(0);
     // The clone's own tool is as upstream has it.
@@ -417,7 +417,7 @@ describe("names typed in another case or Unicode form", () => {
         { id: "b", git: b.url, skills: "skills/*", update: "review" },
       ],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     // b brings a new Foo, held for review; a's foo is linked.
     b.commit({ "skills/Foo/SKILL.md": skillMd("Foo", "from b") });
     const report = await m.json("sync");

@@ -33,7 +33,7 @@ async function editedVendoredSkill(options: Parameters<typeof machine>[0] = {}) 
       { id: "vendor", git: vendor.url },
     ],
   });
-  expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+  expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
   // Edited through the agent folder: the link leads into skillfleet's copy.
   const local = lines("one", "TWO (mine)", "three", "four", "five");
   writeFileSync(m.at(".claude/skills/tool/SKILL.md"), local);
@@ -179,7 +179,7 @@ describe("edited vendored skills", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     vendor.commit({ "skills/plain/SKILL.md": skillMd("plain", "v2") });
     const report = await m.json("sync");
     expect(report.skills.updated).toEqual(["plain"]);
@@ -201,7 +201,7 @@ describe("forks of sources without git history", () => {
         { id: "site", index: site.url },
       ],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const fork = await m.run("fork", "drop");
     expect(fork.code).toBe(1);
     expect(fork.stderr).toContain(

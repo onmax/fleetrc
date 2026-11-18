@@ -164,7 +164,7 @@ async function setUp(m: Machine, env: NodeJS.ProcessEnv = m.env, ...flags: strin
     agents: ["claude-code", "codex"],
     sources: [{ id: "vendor", git: vendor.url }],
   });
-  const init = await m.runWith({ env }, "init", manifest, "--no-timer", ...flags);
+  const init = await m.runWith({ env }, "init", manifest, "--no-hooks", ...flags);
   expect(init.code, both(init)).toBe(0);
   return { vendor, manifest };
 }
@@ -434,7 +434,7 @@ describe.skipIf(!isWindows)(
           agents: ["claude-code"],
           sources: [{ id: "vendor", git: url }],
         });
-        const report = await json(m, m.env, "init", manifest, "--no-timer");
+        const report = await json(m, m.env, "init", manifest, "--no-hooks");
         expect(report.errors ?? [], JSON.stringify(report)).toEqual([]);
         expect(names(m.at(".claude/skills")), JSON.stringify(report, null, 2)).toEqual([
           "other",
@@ -476,7 +476,7 @@ describe.skipIf(!isWindows)(
             agents: ["claude-code"],
             sources: [{ id: "vendor", git: url }],
           });
-          const report = await json(m, m.env, "init", manifest, "--no-timer");
+          const report = await json(m, m.env, "init", manifest, "--no-hooks");
           const vendor = report.sources?.find((source) => source.id === "vendor");
           expect(vendor?.status, JSON.stringify(report, null, 2)).not.toBe("error");
           expect(names(m.at(".claude/skills")), JSON.stringify(report, null, 2)).toContain("good");
@@ -504,7 +504,7 @@ describe.skipIf(!isWindows)(
           agents: ["claude-code"],
           sources: [{ id: "vendor", git: url }],
         });
-        const report = await json(m, m.env, "init", manifest, "--no-timer");
+        const report = await json(m, m.env, "init", manifest, "--no-hooks");
         const file = m.at(".claude/skills/longname-skill/SKILL.md");
         expect(existsSync(file) ? read(file) : "(missing)", JSON.stringify(report, null, 2)).toBe(
           skillMd("longname-skill", "the real one"),
@@ -673,7 +673,7 @@ describe.skipIf(!isWindows)(
         writeFileSync(join(local, "tool", "frozen.txt"), "frozen\n");
         chmodSync(join(local, "tool", "frozen.txt"), 0o444);
         const manifest = m.manifest({ agents: ["claude-code"], sources: [{ id: "local", local }] });
-        const init = await m.run("init", manifest, "--no-timer", "--copy");
+        const init = await m.run("init", manifest, "--no-hooks", "--copy");
         expect(init.code, both(init)).toBe(0);
         expect(isLink(m.at(".claude/skills/tool"))).toBe(false);
         expect(read(m.at(".claude/skills/tool/frozen.txt"))).toBe("frozen\n");
@@ -700,7 +700,7 @@ describe.skipIf(!isWindows)(
             { id: "other", git: other.url },
           ],
         });
-        const init = await m.run("init", manifest, "--no-timer");
+        const init = await m.run("init", manifest, "--no-hooks");
         expect(init.code, both(init)).toBe(0);
         vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
         other.commit({ "skills/extra/SKILL.md": skillMd("extra", "v2") });
@@ -746,7 +746,7 @@ describe.skipIf(!isWindows)(
             ],
           });
           const flags = copy ? ["--copy"] : [];
-          const init = await m.run("init", manifest, "--no-timer", ...flags);
+          const init = await m.run("init", manifest, "--no-hooks", ...flags);
           expect(init.code, both(init)).toBe(0);
           vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
           personal.commit({ "skills/mine/SKILL.md": skillMd("mine", "v2") });
@@ -780,7 +780,7 @@ describe.skipIf(!isWindows)(
           "\uFEFF---\r\nname: tool\r\ndescription: The tool skill\r\n---\r\ntool body\r\n",
         );
         const manifest = m.manifest({ agents: ["claude-code"], sources: [{ id: "local", local }] });
-        const report = await json(m, m.env, "init", manifest, "--no-timer");
+        const report = await json(m, m.env, "init", manifest, "--no-hooks");
         expect(report.skills?.names ?? [], JSON.stringify(report, null, 2)).toContain("tool");
         expect(existsSync(m.at(".claude/skills/tool/SKILL.md"))).toBe(true);
       });
@@ -880,6 +880,59 @@ describe.skipIf(!isWindows)(
         expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
         expect(leftovers(m.stateDir)).toEqual([]);
         expect(readdirSync(m.stateDir).filter((name) => name.startsWith("sync.lock"))).toEqual([]);
+      });
+    });
+
+    // ---------------------------------------------------------------------------------------------
+    // The session hooks run the .cmd launcher, which starts the sync detached and returns: the
+    // sync must outlive the hook, cmd and the parent that ran them.
+    describe("the session hook", () => {
+      const lastRun = (m: Machine) =>
+        JSON.parse(read(join(m.stateDir, "last-run.json"))) as { finishedAt: string; ok: boolean };
+
+      async function synced(m: Machine, before: string) {
+        const deadline = Date.now() + 90_000;
+        while (lastRun(m).finishedAt <= before) {
+          if (Date.now() > deadline) throw new Error("the hook's sync never finished");
+          await new Promise((done) => setTimeout(done, 250));
+        }
+        expect(lastRun(m).ok).toBe(true);
+      }
+
+      it("W-HOOK-1. Codex's `cmd /C` and Git Bash's `sh -c` of the written command start a sync that outlives them", async () => {
+        const m = machine();
+        const { vendor, manifest } = await setUp(m);
+        expect((await m.run("init", manifest)).code).toBe(0);
+        const command = (file: string) =>
+          (
+            JSON.parse(read(file)) as {
+              hooks: Record<string, { hooks: { command: string }[] }[]>;
+            }
+          ).hooks.SessionStart![0]!.hooks[0]!.command;
+        const codex = command(m.at(".codex", "hooks.json"));
+        expect(codex).toMatch(/skillfleet\.cmd"? hook run codex$/);
+        vendor.commit({ "skills/second/SKILL.md": skillMd("second") });
+        let before = lastRun(m).finishedAt;
+        // Codex runs a hook as `cmd.exe /C "<command>"`, with the event on stdin.
+        const run = await start(comspec, ["/C", `"${codex}"`], {
+          env: m.env,
+          cwd: m.home,
+          verbatim: true,
+        }).done;
+        expect(run.code, both(run)).toBe(0);
+        expect(both(run)).toBe("");
+        await synced(m, before);
+        expect(existsSync(m.at(".claude/skills/second/SKILL.md"))).toBe(true);
+        if (!gitBash) return;
+        // Claude Code runs a hook with Git Bash.
+        rmSync(join(m.stateDir, "hook-attempt"), { force: true });
+        vendor.commit({ "skills/third/SKILL.md": skillMd("third") });
+        before = lastRun(m).finishedAt;
+        const claude = command(m.at(".claude", "settings.json"));
+        const bashRun = await bash(claude, { env: m.env, cwd: m.home });
+        expect(bashRun.code, both(bashRun)).toBe(0);
+        await synced(m, before);
+        expect(existsSync(m.at(".claude/skills/third/SKILL.md"))).toBe(true);
       });
     });
   },

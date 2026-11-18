@@ -35,9 +35,9 @@ import {
   writeFiles,
 } from "./fixture.ts";
 
-/** Runs init with --no-timer and fails the test unless it exits 0. */
+/** Runs init with --no-hooks and fails the test unless it exits 0. */
 async function init(m: Machine, manifest: string, ...args: string[]) {
-  const run = await m.run("init", manifest, "--no-timer", ...args);
+  const run = await m.run("init", manifest, "--no-hooks", ...args);
   expect(run.code, run.stdout + run.stderr).toBe(0);
   return run;
 }
@@ -142,7 +142,7 @@ describe("the user's journey", () => {
     const out = await m.json<{ plan: { after: string[] }; sync: Report }>(
       "init",
       manifest,
-      "--no-timer",
+      "--no-hooks",
     );
     expect(out.sync.skills.names).toContain("my-notes");
     // The plan said "0 before, 0 after; none lost" and listed no names, then linked my-notes.
@@ -496,7 +496,7 @@ describe("discovery containment and refused names", () => {
       m.git(dir, "commit", "--quiet", "-m", "link skills");
       const source = { id: "dotfiles", git: dotfiles.url, path: dir, skills: "skills/*" };
       const manifest = m.manifest({ agents: ["claude-code"], sources: [source] });
-      const out = await m.json<{ sync: Report }>("init", manifest, "--no-timer");
+      const out = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
       // It linked nothing and said only "dotfiles: No valid skills found. Skills require a SKILL.md
       // with name and description.": not the rule (links out of a working clone) that dropped them.
       // A cloned repository's links come from upstream, so they stay unfollowed until you opt in.
@@ -527,7 +527,7 @@ describe("discovery containment and refused names", () => {
       }),
     });
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team.https], sources: [] });
-    const out = await m.json<{ sync: Report }>("init", manifest, "--no-timer");
+    const out = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
     expect(out.sync.warnings).toContain(
       `extends ${team.https}: ignored "followLinks" of source "vendor"; only the root manifest can follow links out of a source`,
     );
@@ -577,7 +577,7 @@ describe("the team manifest's transport allowlist", () => {
       }),
     });
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team.https], sources: [] });
-    const out = await m.json<{ sync: Report }>("init", manifest, "--no-timer");
+    const out = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
     // 'ignored source "vendor"; a team manifest names only remote repositories (https, ssh or owner/repo)'
     expect(JSON.stringify(out)).not.toContain("ignored source");
     expect(out.sync.skills.names).toEqual(["lint", "tool"]);
@@ -625,7 +625,7 @@ describe("attacks that held", () => {
           agents: ["claude-code"],
           sources: [{ id: "loc", local: folder }],
         });
-        const run = await runFor(m, 30_000, "init", manifest, "--no-timer", "--copy");
+        const run = await runFor(m, 30_000, "init", manifest, "--no-hooks", "--copy");
         expect(run.code, run.out).toBe(0);
         expect(names(m.at(".claude", "skills", "tool"))).toEqual(["SKILL.md"]);
       } finally {
@@ -656,7 +656,7 @@ describe("attacks that held", () => {
           { id: "vendor", git: vendor.url, skills: "skills/*" },
         ],
       });
-      const out = await m.json<{ sync: Report }>("init", manifest, "--no-timer");
+      const out = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
       const status = Object.fromEntries(out.sync.sources.map((s) => [s.id, s.status]));
       expect(status.slow).toBe("installed");
       expect(status.broken).toBe("error");

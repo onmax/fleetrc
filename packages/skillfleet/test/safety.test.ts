@@ -37,7 +37,7 @@ import {
 } from "./fixture.ts";
 
 async function init(m: Machine, manifest: string, ...args: string[]) {
-  const run = await m.run("init", manifest, "--no-timer", ...args);
+  const run = await m.run("init", manifest, "--no-hooks", ...args);
   expect(run.code, run.stdout + run.stderr).toBe(0);
   return run;
 }
@@ -254,7 +254,7 @@ describe("R7-19. folder links inside a skill", () => {
     const out = await m.json<{ sync: { warnings: string[] } }>(
       "init",
       manifest,
-      "--no-timer",
+      "--no-hooks",
       "--copy",
     );
     const copy = m.at(".claude", "skills", "bomb");
@@ -277,7 +277,7 @@ describe("R7-19. folder links inside a skill", () => {
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
       });
-      const out = await m.json<{ sync: { warnings: string[] } }>("init", manifest, "--no-timer");
+      const out = await m.json<{ sync: { warnings: string[] } }>("init", manifest, "--no-hooks");
       expect(names(m.at(".claude", "skills"))).toEqual(["bomb", "tool"]);
       expect(read(m.at(".claude", "skills", "bomb", "d5", "leaf.txt"))).toBe("leaf\n");
       expect(count(join(m.stateDir, "store", "vendor", "live", "bomb"))).toBe(2);
@@ -301,7 +301,7 @@ describe("R7-19. folder links inside a skill", () => {
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
       });
-      const out = await m.json<{ sync: { warnings: string[] } }>("init", manifest, "--no-timer");
+      const out = await m.json<{ sync: { warnings: string[] } }>("init", manifest, "--no-hooks");
       expect(names(m.at(".claude", "skills"))).toEqual(["tool"]);
       expect(out.sync.warnings.join("\n")).toContain(
         'vendor: skipped the skill "deep": it nests folders more than 32 deep',

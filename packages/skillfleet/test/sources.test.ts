@@ -40,7 +40,7 @@ describe("well-known index", () => {
         { id: "old", index: v1.url },
       ],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["archived", "legacy"]);
     expect(read(m.at(".cursor/skills/archived/scripts/run.sh"))).toBe("echo hi\n");
@@ -55,7 +55,7 @@ describe("well-known index", () => {
       agents: ["claude-code"],
       sources: [{ id: "site", index: site.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(read(m.at(".claude/skills/signed/SKILL.md"))).toBe(skillMd("signed"));
 
     serveIndexV2(site, [
@@ -97,7 +97,7 @@ describe("well-known index", () => {
       agents: ["claude-code"],
       sources: [{ id: "site", index: site.url }],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["good"]);
     expect(init.stdout).toContain('site: rejected "evil"');
@@ -113,7 +113,7 @@ describe("well-known index", () => {
       agents: ["claude-code"],
       sources: [{ id: "site", index: site.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     await site.close();
 
     const down = await m.run("sync");
@@ -181,7 +181,7 @@ describe("an index server that stalls on one skill", () => {
           agents: ["claude-code"],
           sources: [{ id: "site", index: site.url }],
         });
-        const init = await m.run("init", manifest, "--no-timer");
+        const init = await m.run("init", manifest, "--no-hooks");
         expect(init.code, init.stdout + init.stderr).toBe(0);
         const flaky = m.at(".claude", "skills", "flaky", "SKILL.md");
         expect(read(flaky)).toBe(skillMd("flaky"));
@@ -241,7 +241,7 @@ describe("npm and local sources", () => {
       agents: ["claude-code", "opencode"],
       sources: [{ id: "acme", npm: "@acme/skills", registry: registry.url }],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".config/opencode/skills"))).toEqual(["npm-skill"]);
     expect(read(m.at(".claude/skills/npm-skill/SKILL.md"))).toBe(skillMd("npm-skill", "v1"));
@@ -277,7 +277,7 @@ describe("npm and local sources", () => {
       agents: ["claude-code"],
       sources: [{ npm: "bad-pkg", registry: registry.url }],
     });
-    const init = await m.run("init", manifest, "--no-timer");
+    const init = await m.run("init", manifest, "--no-hooks");
     expect(init.stdout).toContain("integrity mismatch");
     expect(names(m.at(".claude/skills"))).toEqual([]);
   });
@@ -291,7 +291,7 @@ describe("npm and local sources", () => {
       agents: ["claude-code", "github-copilot"],
       sources: [{ id: "here", local: folder }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(linkOf(m.at(".copilot/skills/local-one"))).toBe(join(folder, "local-one"));
     mkdirSync(join(folder, "local-two"));
     writeFileSync(join(folder, "local-two/SKILL.md"), skillMd("local-two"));

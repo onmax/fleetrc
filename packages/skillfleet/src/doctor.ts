@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join, sep } from "node:path";
+import { describeTrigger, installedHooks } from "./agenthooks.ts";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { conflictLines } from "./edits.ts";
 import { exec, git } from "./exec.ts";
@@ -71,7 +72,7 @@ function skillNames(dir: string): string[] {
  * goes through npx, which brings its own skillfleet and writes the launcher and the timer again.
  */
 const REPAIR =
-  "run `npx skillfleet@latest timer install` to write the launcher and the timer again";
+  "run `npx skillfleet@latest self-install` to write the launcher, and the timer's node, again";
 
 /** Why the installed launcher cannot run, or undefined when it can or there is none. */
 function launcherProblem(): string | undefined {
@@ -110,7 +111,7 @@ async function nodeCheck(): Promise<Check> {
     return {
       name: "node",
       ok: true,
-      detail: `${process.execPath} (no installed copy yet; \`skillfleet timer install\` makes one)`,
+      detail: `${process.execPath} (no installed copy yet; \`skillfleet init\` makes one)`,
     };
   const problem = launcherProblem() ?? timerNodeProblem();
   return {
@@ -146,13 +147,33 @@ async function lingerCheck(): Promise<Check | undefined> {
   };
 }
 
-/** The user chose no timer; a config.json that does not read is reported by the manifest check. */
-function timerDeclined(): boolean {
+/**
+ * This machine runs the timer: `init --timer` or `timer install` put it in, and config.json says so.
+ * A config.json that does not read is reported by the manifest check.
+ */
+function timerWanted(): boolean {
   try {
-    return readConfig()?.timer === false;
+    return readConfig()?.timer === true;
   } catch {
     return false;
   }
+}
+
+/** What starts a sync on this machine: the session hooks, the timer, both, or nothing. */
+function triggerCheck(timer: boolean): Check {
+  const hooks = installedHooks();
+  const name = "sync trigger";
+  const launcher = launcherPath();
+  if (hooks.length > 0 && !existsSync(launcher))
+    return {
+      name,
+      ok: false,
+      detail: `the session hooks run ${tildify(launcher)}, which is missing; run \`npx skillfleet@latest self-install\``,
+    };
+  const detail = describeTrigger(hooks, timer);
+  return hooks.length > 0 || timer
+    ? { name, ok: true, detail }
+    : { name, ok: true, warn: true, detail };
 }
 
 /** Whether the OS scheduler has the timer, and how its last run ended. */
@@ -163,13 +184,6 @@ async function timerCheck(): Promise<Check & { noSystemd?: boolean }> {
     status = await timerStatus();
   } catch (error) {
     if (!(error instanceof TimerError)) throw error;
-    if (timerDeclined())
-      return {
-        name,
-        ok: true,
-        skipped: true,
-        detail: `not installed, as you chose; ${error.message.split("\n")[0]!}`,
-      };
     return {
       name,
       ok: false,
@@ -177,15 +191,7 @@ async function timerCheck(): Promise<Check & { noSystemd?: boolean }> {
       ...(error.noSystemd ? { noSystemd: true } : {}),
     };
   }
-  if (!status.installed) {
-    const declined = timerDeclined();
-    return {
-      name,
-      ok: declined,
-      ...(declined ? { skipped: true } : {}),
-      detail: await missingTimer(status, declined),
-    };
-  }
+  if (!status.installed) return { name, ok: false, detail: await missingTimer(status) };
   // One timer name per user: after a change of HOME or XDG_STATE_HOME, it may run another copy.
   const logs = paths.logs();
   if (status.logFile && !status.logFile.startsWith(logs + sep))
@@ -233,11 +239,16 @@ export async function doctor(manifest?: string): Promise<Check[]> {
     ok: gitVersion.code === 0,
     detail: gitVersion.code === 0 ? gitVersion.stdout.trim() : "git is not on PATH",
   });
-  const { noSystemd, ...timer } = await timerCheck();
-  checks.push(timer);
-  // Linger and launchd's PATH only matter to a timer.
-  if (!timerDeclined() && !noSystemd && !systemdMissing())
-    for (const check of [await lingerCheck(), await launchdCheck()]) if (check) checks.push(check);
+  const timer = timerWanted();
+  checks.push(triggerCheck(timer));
+  if (timer) {
+    const { noSystemd, ...check } = await timerCheck();
+    checks.push(check);
+    // Linger and launchd's PATH only matter to a timer.
+    if (!noSystemd && !systemdMissing())
+      for (const check of [await lingerCheck(), await launchdCheck()])
+        if (check) checks.push(check);
+  }
 
   let spec: string;
   try {
@@ -257,7 +268,7 @@ export async function doctor(manifest?: string): Promise<Check[]> {
     // A remote manifest's file is a cache copy; the user knows it by the spec they gave.
     detail: `${remoteManifest(spec) ? spec : tildify(loaded.root.file)}, ${loaded.sources.length} sources`,
   });
-  const drift = timerDeclined() ? undefined : timeZoneDrift(loaded.root.timer.timeZone);
+  const drift = timer ? timeZoneDrift(loaded.root.timer.timeZone) : undefined;
   if (drift) checks.push({ name: "timer time zone", ok: true, warn: true, detail: drift });
   // A sync says this once, often in the timer's own log; doctor says it until it is applied.
   const schedule = scheduleDrift(loaded.root.timer);

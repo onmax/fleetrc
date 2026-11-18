@@ -44,7 +44,7 @@ afterEach(() => {
   if (refused.length > 0)
     throw new Error(
       `this test reached for the OS scheduler, which tests never touch:\n${refused.map((call) => `  ${call.command}`).join("\n")}\n` +
-        `Use --no-timer, machine({ scheduler: "empty" }) for a scheduler with no timer, or machine({ scheduler: "refuse" }) to test the failure.`,
+        `Use machine({ scheduler: "empty" }) for a scheduler with no timer, or machine({ scheduler: "refuse" }) to test the failure.`,
     );
 });
 afterAll(async () => {

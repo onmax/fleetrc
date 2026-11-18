@@ -48,7 +48,7 @@ async function init(m: Machine, manifest: string): Promise<Report> {
   const out = await m.json<{ plan: { warnings?: string[] }; sync: Report }>(
     "init",
     manifest,
-    "--no-timer",
+    "--no-hooks",
   );
   return { ...out.sync, warnings: [...out.sync.warnings, ...(out.plan.warnings ?? [])] };
 }
@@ -150,7 +150,7 @@ describe("CX1. discovery stays inside a fetched source", () => {
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
       });
-      await m.run("init", manifest, "--no-timer");
+      await m.run("init", manifest, "--no-hooks");
       expect(names(m.at(".claude/skills"))).not.toContain("secret");
       expect(containing("PRIVATE", m.home)).toEqual([]);
     },
@@ -170,7 +170,7 @@ describe("CX2. fork merge never reads through upstream links", () => {
         { id: "vendor", git: vendor.url },
       ],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     const fork = await m.run("fork", "tool");
     expect(fork.code, fork.stdout + fork.stderr).toBe(0);
     return { m, work, vendor };
@@ -226,7 +226,7 @@ describe("CX3. fork, adopt and init write only inside the personal clone", () =>
     "CX3. fork refuses a skills folder that links out of the clone",
     async () => {
       const { m, outside, manifest } = await escapingClone();
-      await m.run("init", manifest, "--no-timer");
+      await m.run("init", manifest, "--no-hooks");
       const fork = await m.run("fork", "tool");
       expect(fork.code).not.toBe(0);
       expect(readdirSync(outside)).toEqual([]);
@@ -240,7 +240,7 @@ describe("CX3. fork, adopt and init write only inside the personal clone", () =>
     "CX3. adopt refuses a skills folder that links out of the clone",
     async () => {
       const { m, outside, manifest } = await escapingClone();
-      await m.run("init", manifest, "--no-timer");
+      await m.run("init", manifest, "--no-hooks");
       const handmade = m.at("handmade");
       writeFiles(handmade, { "SKILL.md": skillMd("handmade") });
       const adopt = await m.run("adopt", handmade);
@@ -255,7 +255,7 @@ describe("CX3. fork, adopt and init write only inside the personal clone", () =>
     async () => {
       const { m, outside, manifest } = await escapingClone();
       writeFiles(m.at(".claude/skills/handmade"), { "SKILL.md": skillMd("handmade", "HANDMADE") });
-      await m.run("init", manifest, "--no-timer");
+      await m.run("init", manifest, "--no-hooks");
       expect(readdirSync(outside)).toEqual([]);
       expect(containing("HANDMADE", m.home)).not.toEqual([]);
     },
@@ -322,7 +322,7 @@ describe("CX5. retiring a source keeps edits state.json never recorded", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     // A sync killed after it installed `fresh` and before it saved its record; then the user edits it.
     const store = join(m.stateDir, "store", "vendor");
     writeFiles(join(store, "live", "fresh"), {
@@ -344,7 +344,7 @@ describe("CX6. merge never overwrites a file beside a conflict", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     writeFileSync(m.at(".claude/skills/tool/added.txt"), "mine\n");
     return { m, vendor, dir: m.at(".claude/skills/tool") };
   }
@@ -388,7 +388,7 @@ describe("CX7. names that are Object.prototype keys", () => {
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(read(m.at(".claude/skills/tool/__proto__"))).toBe("v1\n");
     writeFileSync(m.at(".claude/skills/tool/__proto__"), "mine\n");
     vendor.commit({ "skills/tool/__proto__": "v2\n" });
@@ -547,7 +547,7 @@ describe("CX8. an extended manifest names only remote repositories", () => {
       agents: ["claude-code"],
       sources: [{ id: "mine", git: local.url }],
     });
-    expect((await m.run("init", manifest, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["private"]);
   });
 });
@@ -623,7 +623,7 @@ describe("CX10. edits in a copy are adopted only into the source folder itself",
       agents: ["claude-code"],
       sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
     });
-    const run = await m.run("init", manifest, "--no-timer", "--copy");
+    const run = await m.run("init", manifest, "--no-hooks", "--copy");
     expect(run.code, run.stdout + run.stderr).toBe(0);
     return { m, work, copy: m.at(".claude/skills/tool") };
   }
@@ -849,7 +849,7 @@ describe("CX14. discovery in a working clone stays inside it", () => {
 
 /** Runs init with --json under `env`: its sync report, with the plan's warnings added. */
 async function initWith(m: Machine, env: NodeJS.ProcessEnv, manifest: string): Promise<Report> {
-  const result = await m.runWith({ env }, "init", manifest, "--no-timer", "--json");
+  const result = await m.runWith({ env }, "init", manifest, "--no-hooks", "--json");
   const out = JSON.parse(result.stdout) as { plan: { warnings?: string[] }; sync: Report };
   return { ...out.sync, warnings: [...out.sync.warnings, ...(out.plan.warnings ?? [])] };
 }
@@ -902,7 +902,7 @@ describe("CX16. a team source on this machine's own network address is refused",
     expect(names(m.at(".claude/skills"))).not.toContain("private");
     expect(run.warnings.join("\n")).toMatch(/team.*this machine/);
     const own = m.manifest({ agents: ["claude-code"], sources: [{ id: "mine", git: loopback }] });
-    expect((await m.run("init", own, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", own, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["private"]);
   });
 
@@ -1013,7 +1013,7 @@ describe("CX18. a team index or npm registry on this machine is refused, redirec
     expect(names(m.at(".claude/skills"))).not.toContain("inside");
     expect(run.warnings.join("\n")).toMatch(/ignored source "site".*this machine/);
     const own = m.manifest({ agents: ["claude-code"], sources: [{ id: "mine", index: site.url }] });
-    expect((await m.run("init", own, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", own, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["inside"]);
   });
 
@@ -1086,7 +1086,7 @@ describe("CX18. a team index or npm registry on this machine is refused, redirec
     expect(names(m.at(".claude/skills"))).not.toContain("from-npm");
     expect(run.warnings.join("\n")).toMatch(/ignored source "pkg".*this machine/);
     const own = m.manifest({ agents: ["claude-code"], sources: [source] });
-    expect((await m.run("init", own, "--no-timer")).code).toBe(0);
+    expect((await m.run("init", own, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["from-npm"]);
   });
 
