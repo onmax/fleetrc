@@ -5,6 +5,8 @@
  */
 
 // The ESM build: the package's main is a UMD bundle whose require("./impl/...") the bundle can't follow.
+// The package's main is a UMD build that hands `require` to a factory, which the bundler can't
+// follow into dist/cli.mjs; its ESM build is plain imports.
 import { type Node as TreeNode, type ParseError, parseTree } from "jsonc-parser/lib/esm/main.js";
 
 interface Node {
