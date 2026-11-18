@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
-import { Parser } from "tar";
+import { Parser, type ReadEntry } from "tar";
 
 /** A relative `/`-separated path that stays inside the folder it is extracted to, or undefined. */
 export function safeRelativePath(raw: string): string | undefined {
@@ -36,49 +36,83 @@ export function gunzipCapped(gz: Uint8Array): Buffer {
 /** Entry types that hold a file's bytes, as `skills` extracts them. */
 const FILE_TYPES = new Set(["File", "OldFile", "ContiguousFile"]);
 
-export const isFileEntry = (type: string) => FILE_TYPES.has(type);
+const tooMany = () =>
+  new Error(`the archive has more than ${ENTRY_LIMIT} entries, over skillfleet's limit`);
 
 /**
- * Each entry of an unpacked tar as node-tar reads it, the way `skills` does: long names (pax
- * `path`, GNU `L`) applied, and an archive with a bad header checksum refused. Throws past the
- * entry limit.
+ * The Parser method that reads each 512-byte header, the ones it ignores and the pax, long-name
+ * and other metadata headers included. Wrapping it is the one way to count every header: the
+ * Parser's events leave out a metadata header with an empty body.
  */
-export function tarEntries(tar: Uint8Array): { name: string; type: string; body: Buffer }[] {
+const CONSUME_HEADER = Object.getOwnPropertySymbols(Parser.prototype).find(
+  (symbol) => symbol.description === "consumeHeader",
+);
+
+const ZERO_BLOCK = Buffer.alloc(512);
+
+/**
+ * Reads an unpacked tar as node-tar reads it, the way `skills` does: long names (pax `path`, GNU
+ * `L`) applied, and an archive with a bad header checksum refused. Hands `onEntry` each entry
+ * before its body, and throws past the entry limit, which every header counts toward.
+ */
+function readTar(tar: Uint8Array, onEntry: (entry: ReadEntry) => void) {
   // node-tar unpacks a gzip it is given, which here would be a second one, past the unpack limit.
   if (tar[0] === 0x1f && tar[1] === 0x8b) throw new Error("the archive is gzipped twice");
-  const entries: { name: string; type: string; chunks: Buffer[] }[] = [];
+  if (!CONSUME_HEADER)
+    throw new Error("this node-tar has no consumeHeader method, so tar headers can't be counted");
   let failed: Error | undefined;
-  const parser = new Parser({
-    strict: true,
-    zstd: false,
-    onReadEntry(entry) {
-      if (entries.length === ENTRY_LIMIT)
-        throw new Error(
-          `the archive has more than ${ENTRY_LIMIT} entries, over skillfleet's limit`,
-        );
-      const chunks: Buffer[] = [];
-      entry.on("data", (chunk: Buffer) => chunks.push(chunk));
-      entries.push({ name: entry.path, type: entry.type, chunks });
+  const parser = new Parser({ strict: true, zstd: false, onReadEntry: onEntry });
+  const consume = (parser as unknown as Record<symbol, (chunk: Buffer, at: number) => void>)[
+    CONSUME_HEADER
+  ]!;
+  let headers = 0;
+  Object.defineProperty(parser, CONSUME_HEADER, {
+    value(this: Parser, chunk: Buffer, at: number) {
+      // A block of zeros is the end of the archive, not a header.
+      if (!ZERO_BLOCK.equals(chunk.subarray(at, at + 512)) && ++headers > ENTRY_LIMIT)
+        throw tooMany();
+      consume.call(this, chunk, at);
     },
   });
   parser.on("error", (error) => (failed ??= error));
   // Given the whole archive at once, node-tar reads every entry before `end` returns.
   parser.end(Buffer.from(tar.buffer, tar.byteOffset, tar.byteLength));
   if (failed) throw failed;
-  return entries.map(({ name, type, chunks }) => ({ name, type, body: Buffer.concat(chunks) }));
 }
 
-/** Regular files in a .tgz, keyed by path. Throws on links, on paths that leave the archive, and past the size limits. */
+/**
+ * The names and sizes of the regular files in an unpacked tar, without reading their bodies.
+ * Throws past the entry limit.
+ */
+export function tarFileSizes(tar: Uint8Array): { name: string; size: number }[] {
+  const files: { name: string; size: number }[] = [];
+  readTar(tar, (entry) => {
+    if (FILE_TYPES.has(entry.type)) files.push({ name: entry.path, size: entry.size });
+    entry.resume();
+  });
+  return files;
+}
+
+/**
+ * Regular files in a .tgz, keyed by path. Throws on links, on paths that leave the archive, and
+ * past the size limits, each before reading the entry's body.
+ */
 export function readTgz(gz: Uint8Array): Map<string, Uint8Array> {
   const files = new Map<string, Uint8Array>();
-  for (const { name, type, body } of tarEntries(gunzipCapped(gz))) {
-    if (type === "Link" || type === "SymbolicLink")
+  readTar(gunzipCapped(gz), (entry) => {
+    const name = entry.path;
+    if (entry.type === "Link" || entry.type === "SymbolicLink")
       throw new Error(`archive entry ${name} is a link`);
-    if (!isFileEntry(type)) continue;
+    if (!FILE_TYPES.has(entry.type)) return void entry.resume();
     const path = safeRelativePath(name);
     if (!path) throw new Error(`archive entry ${name} would be written outside the package`);
-    files.set(path, new Uint8Array(body));
-  }
+    const chunks: Buffer[] = [];
+    entry.on("data", (chunk: Buffer) => chunks.push(chunk));
+    // A body that came in one chunk is a view of the unpacked archive, kept without a copy.
+    entry.on("end", () =>
+      files.set(path, chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)),
+    );
+  });
   return files;
 }
 

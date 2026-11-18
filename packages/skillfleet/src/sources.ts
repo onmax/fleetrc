@@ -49,7 +49,7 @@ import {
 import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
 import { type FetchBudget, fetchNpm, guardedFetch, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
-import { isFileEntry, tarEntries, zipEntries } from "./tar.ts";
+import { tarFileSizes, zipEntries } from "./tar.ts";
 import type { SourceState } from "./state.ts";
 
 export interface SkillEntry {
@@ -1580,8 +1580,7 @@ function* archiveFiles(
 ): Generator<{ name: string; size: number }> {
   const ustar = body.length >= 262 && new TextDecoder().decode(body.subarray(257, 262)) === "ustar";
   if (unpacked || ustar) {
-    for (const entry of tarEntries(unpacked ?? body))
-      if (isFileEntry(entry.type)) yield { name: entry.name, size: entry.body.byteLength };
+    yield* tarFileSizes(unpacked ?? body);
     return;
   }
   let path = "";

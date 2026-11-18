@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vite-plus/test";
 import { globBase, matchesGlob } from "../src/glob.ts";
+import { readTgz, tarFileSizes } from "../src/tar.ts";
 import {
   http,
   type Http,
@@ -15,6 +17,7 @@ import {
   serveIndexV1,
   serveIndexV2,
   skillMd,
+  tarHeader,
   tgz,
   sha256,
 } from "./fixture.ts";
@@ -64,6 +67,70 @@ describe("skills and hook globs", () => {
       expect(matchesGlob(path, glob)).toBe(false);
       expect(performance.now() - started, glob).toBeLessThan(100);
     }
+  });
+});
+
+describe("tar archives", () => {
+  const end = Buffer.alloc(1024);
+  const file = (name: string, body: string | Buffer) => {
+    const bytes = Buffer.from(body);
+    return [tarHeader(name, bytes.length), bytes, Buffer.alloc((512 - (bytes.length % 512)) % 512)];
+  };
+
+  it("counts every header toward the entry limit, ones node-tar ignores and metadata included", () => {
+    // Unknown types node-tar ignores, and empty global pax headers, which it emits nothing for.
+    const tar = Buffer.concat([
+      ...Array.from({ length: 50_001 }, (_, i) => tarHeader(`p/x${i}`, 0, i % 2 ? "Z" : "g")),
+      end,
+    ]);
+    expect(tar.length).toBeLessThan(100 * 1024 * 1024);
+    expect(() => tarFileSizes(tar)).toThrow(/more than 50000 entries/);
+    expect(() => readTgz(gzipSync(tar))).toThrow(/more than 50000 entries/);
+  });
+
+  it("refuses more than 50,000 files", () => {
+    const tar = Buffer.concat([
+      ...Array.from({ length: 50_001 }, (_, i) => tarHeader(`p/f${i}`, 0)),
+      end,
+    ]);
+    expect(() => readTgz(gzipSync(tar))).toThrow(/more than 50000 entries/);
+  });
+
+  it("refuses a tar gzipped twice and a header with a bad checksum", () => {
+    const tar = Buffer.concat([...file("p/a.md", "a"), end]);
+    expect(() => readTgz(gzipSync(gzipSync(tar)))).toThrow(/gzipped twice/);
+    const bad = Buffer.from(tar);
+    bad[0] = "q".charCodeAt(0);
+    expect(() => readTgz(gzipSync(bad))).toThrow(/checksum/);
+    expect(() => tarFileSizes(bad)).toThrow(/checksum/);
+  });
+
+  it("refuses a link or a path out of the package before reading its body", () => {
+    const link = Buffer.concat([tarHeader("p/l", 0, "2", "/etc/passwd"), end]);
+    expect(() => readTgz(gzipSync(link))).toThrow(/archive entry p\/l is a link/);
+    const out = Buffer.concat([...file("../x.md", "x"), end]);
+    expect(() => readTgz(gzipSync(out))).toThrow(/would be written outside the package/);
+  });
+
+  it("reads files of every size, and only names and sizes for the index check", () => {
+    const big = Buffer.alloc(200_000, "b");
+    const tar = Buffer.concat([
+      ...file("p/empty.md", ""),
+      ...file("p/SKILL.md", "hello"),
+      ...file("p/big.bin", big),
+      tarHeader("p/dir/", 0, "5"),
+      end,
+    ]);
+    const files = readTgz(gzipSync(tar));
+    expect([...files.keys()]).toEqual(["p/empty.md", "p/SKILL.md", "p/big.bin"]);
+    expect(Buffer.from(files.get("p/empty.md")!).toString()).toBe("");
+    expect(Buffer.from(files.get("p/SKILL.md")!).toString()).toBe("hello");
+    expect(Buffer.from(files.get("p/big.bin")!).equals(big)).toBe(true);
+    expect(tarFileSizes(tar)).toEqual([
+      { name: "p/empty.md", size: 0 },
+      { name: "p/SKILL.md", size: 5 },
+      { name: "p/big.bin", size: 200_000 },
+    ]);
   });
 });
 
