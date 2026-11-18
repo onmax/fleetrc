@@ -117,7 +117,7 @@ describe("the user's journey", () => {
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
       });
-      const run = await m.run("init", manifest);
+      const run = await m.run("init", manifest, "--timer");
       const said = run.stdout + run.stderr;
       const log = said.match(/sync >> '([^']+)' 2>&1/)?.[1];
       expect(log, said).toBeDefined();

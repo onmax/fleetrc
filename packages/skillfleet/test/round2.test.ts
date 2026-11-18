@@ -324,7 +324,7 @@ describe("the timer", () => {
       );
       expect(error.message).not.toContain("ENOENT");
       expect(error.message).toMatch(/systemd/);
-      expect(error.message).toContain("--no-hooks");
+      expect(error.message).toContain("skillfleet hook install");
     },
   );
 });

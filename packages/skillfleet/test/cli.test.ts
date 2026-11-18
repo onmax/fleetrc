@@ -71,6 +71,8 @@ describe("skillfleet", () => {
       sources: [{ id: "vendor", git: vendor.url }],
     });
     expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    // A sync the hook started a moment ago: this one starts none, so the next sync meets no lock.
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
     const prompt = () =>
       m.runWith(
         { input: JSON.stringify({ session_id: "abc", hook_event_name: "UserPromptSubmit" }) },

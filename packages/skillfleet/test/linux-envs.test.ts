@@ -177,6 +177,13 @@ describe("linux environments", () => {
         '#!/bin/sh\necho "Failed to get user: User ID 1000 is not logged in or lingering" >&2\nexit 1\n',
       );
       chmodSync(loginctl, 0o755);
+      // A machine that has the timer: linger matters only to it.
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      mkdirSync(m.at(".config/skillfleet"), { recursive: true });
+      writeFileSync(
+        m.at(".config/skillfleet/config.json"),
+        JSON.stringify({ manifest, timer: true }),
+      );
       const checks = await m.runWith({ env: { PATH: `${bin}:${m.env.PATH}` } }, "doctor", "--json");
       const linger = (JSON.parse(checks.stdout) as { name: string; ok: boolean }[]).find(
         (check) => check.name === "systemd linger",

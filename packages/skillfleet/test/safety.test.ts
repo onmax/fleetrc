@@ -3,7 +3,6 @@
 // a self-install under a running build. Every run uses the fixture's temporary HOME.
 import { spawn } from "node:child_process";
 import {
-  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -391,14 +390,13 @@ describe("R7-22. self-install under a running build", () => {
     const dist = dirname(cli);
     const dir = join(m.root, "build-b");
     mkdirSync(dir);
+    const chunks = readdirSync(dist).filter((name) => name !== "cli.mjs");
+    // The entry and the chunks import chunks by name.
     for (const name of readdirSync(dist)) {
-      if (name === "cli.mjs") continue;
-      copyFileSync(join(dist, name), join(dir, name.replace(/\.mjs$/, "-b.mjs")));
+      let text = read(join(dist, name));
+      for (const chunk of chunks) text = text.replaceAll(chunk, chunk.replace(/\.mjs$/, "-b.mjs"));
+      writeFileSync(join(dir, name === "cli.mjs" ? name : name.replace(/\.mjs$/, "-b.mjs")), text);
     }
-    let entry = read(join(dist, "cli.mjs"));
-    for (const name of readdirSync(dist))
-      if (name !== "cli.mjs") entry = entry.replaceAll(name, name.replace(/\.mjs$/, "-b.mjs"));
-    writeFileSync(join(dir, "cli.mjs"), entry);
     return join(dir, "cli.mjs");
   }
 
