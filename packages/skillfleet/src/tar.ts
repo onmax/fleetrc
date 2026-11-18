@@ -1,12 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
-
-const text = (bytes: Uint8Array, start: number, length: number) => {
-  const slice = bytes.subarray(start, start + length);
-  const end = slice.indexOf(0);
-  return new TextDecoder().decode(end >= 0 ? slice.subarray(0, end) : slice);
-};
+import { Parser } from "tar";
 
 /** A relative `/`-separated path that stays inside the folder it is extracted to, or undefined. */
 export function safeRelativePath(raw: string): string | undefined {
@@ -38,46 +33,48 @@ export function gunzipCapped(gz: Uint8Array): Buffer {
   }
 }
 
-/** Each entry of an unpacked tar, long names (pax `path`, GNU `L`) applied. Throws past the entry limit. */
-export function* tarEntries(
-  tar: Uint8Array,
-): Generator<{ name: string; type: string; body: Uint8Array }> {
-  let offset = 0;
-  let longName: string | undefined;
-  let entries = 0;
-  while (offset + 512 <= tar.length) {
-    if (++entries > ENTRY_LIMIT)
-      throw new Error(`the archive has more than ${ENTRY_LIMIT} entries, over skillfleet's limit`);
-    const header = tar.subarray(offset, offset + 512);
-    if (header.every((byte) => byte === 0)) break;
-    const size = Number.parseInt(text(header, 124, 12).trim() || "0", 8);
-    if (!Number.isFinite(size) || size < 0) throw new Error("invalid tar entry size");
-    const type = String.fromCharCode(header[156] ?? 0);
-    const prefix = text(header, 345, 155);
-    const name = longName ?? (prefix ? `${prefix}/${text(header, 0, 100)}` : text(header, 0, 100));
-    const body = tar.subarray(offset + 512, offset + 512 + size);
-    offset += 512 + Math.ceil(size / 512) * 512;
-    longName = undefined;
-    if (type === "x") {
-      // pax header: "<length> path=<value>\n" records
-      const path = new TextDecoder().decode(body).match(/(?:^|\n)\d+ path=([^\n]*)\n/);
-      longName = path?.[1];
-      continue;
-    }
-    if (type === "L") {
-      longName = text(body, 0, body.length);
-      continue;
-    }
-    yield { name, type, body };
-  }
+/** Entry types that hold a file's bytes, as `skills` extracts them. */
+const FILE_TYPES = new Set(["File", "OldFile", "ContiguousFile"]);
+
+export const isFileEntry = (type: string) => FILE_TYPES.has(type);
+
+/**
+ * Each entry of an unpacked tar as node-tar reads it, the way `skills` does: long names (pax
+ * `path`, GNU `L`) applied, and an archive with a bad header checksum refused. Throws past the
+ * entry limit.
+ */
+export function tarEntries(tar: Uint8Array): { name: string; type: string; body: Buffer }[] {
+  // node-tar unpacks a gzip it is given, which here would be a second one, past the unpack limit.
+  if (tar[0] === 0x1f && tar[1] === 0x8b) throw new Error("the archive is gzipped twice");
+  const entries: { name: string; type: string; chunks: Buffer[] }[] = [];
+  let failed: Error | undefined;
+  const parser = new Parser({
+    strict: true,
+    zstd: false,
+    onReadEntry(entry) {
+      if (entries.length === ENTRY_LIMIT)
+        throw new Error(
+          `the archive has more than ${ENTRY_LIMIT} entries, over skillfleet's limit`,
+        );
+      const chunks: Buffer[] = [];
+      entry.on("data", (chunk: Buffer) => chunks.push(chunk));
+      entries.push({ name: entry.path, type: entry.type, chunks });
+    },
+  });
+  parser.on("error", (error) => (failed ??= error));
+  // Given the whole archive at once, node-tar reads every entry before `end` returns.
+  parser.end(Buffer.from(tar.buffer, tar.byteOffset, tar.byteLength));
+  if (failed) throw failed;
+  return entries.map(({ name, type, chunks }) => ({ name, type, body: Buffer.concat(chunks) }));
 }
 
 /** Regular files in a .tgz, keyed by path. Throws on links, on paths that leave the archive, and past the size limits. */
 export function readTgz(gz: Uint8Array): Map<string, Uint8Array> {
   const files = new Map<string, Uint8Array>();
   for (const { name, type, body } of tarEntries(gunzipCapped(gz))) {
-    if (type === "1" || type === "2") throw new Error(`archive entry ${name} is a link`);
-    if (type !== "0" && type !== "\0") continue;
+    if (type === "Link" || type === "SymbolicLink")
+      throw new Error(`archive entry ${name} is a link`);
+    if (!isFileEntry(type)) continue;
     const path = safeRelativePath(name);
     if (!path) throw new Error(`archive entry ${name} would be written outside the package`);
     files.set(path, new Uint8Array(body));
