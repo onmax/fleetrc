@@ -17,7 +17,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { dirname, join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { processStartedAt } from "../src/process.ts";
-import { LockHeldError, takeLock } from "../src/sync.ts";
+import { LockHeldError, takeLock } from "../src/lock.ts";
 import {
   cli,
   clone,

@@ -18,7 +18,8 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { jsonTemp } from "../src/fs.ts";
 import { whereabouts } from "../src/process.ts";
-import { LockHeldError, sweepJsonTemps, takeLock } from "../src/sync.ts";
+import { LockHeldError, takeLock } from "../src/lock.ts";
+import { sweepJsonTemps } from "../src/sync.ts";
 import {
   cli,
   http,

@@ -51,10 +51,12 @@ import {
   launcherPath,
   selfInstall,
   stableNode,
+  timerEnv,
 } from "./selfinstall.ts";
 import { promptHook, staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
-import { LockHeldError, manifestSpec, sync, withSyncLock } from "./sync.ts";
+import { LockHeldError } from "./lock.ts";
+import { manifestSpec, sync, withSyncLock } from "./sync.ts";
 import {
   foreignTimer,
   foreignTimerResource,
@@ -74,7 +76,6 @@ import {
   timerKind,
   type TimerSpec,
   type TimerStatus,
-  timerEnv,
   timerNode,
   timerStatus,
 } from "./timer.ts";

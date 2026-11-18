@@ -193,7 +193,7 @@ describe("agents", () => {
     "SARVAM_HOME",
     "REASONIX_HOME",
   ])("A2. the timer keeps %s, which places an agent's skills folder", async (key) => {
-    const { timerEnv } = await import("../src/timer.ts");
+    const { timerEnv } = await import("../src/selfinstall.ts");
     const saved = process.env[key];
     process.env[key] = "/somewhere/else";
     try {

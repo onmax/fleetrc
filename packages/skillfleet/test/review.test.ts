@@ -22,7 +22,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { changedFiles, hashDir } from "../src/fs.ts";
 import { isRemoteGit, rewriteUrl, teamUrlProblem } from "../src/manifest.ts";
 import { loadState, saveState, type State } from "../src/state.ts";
-import { type LockHolder, LockHeldError, takeLock } from "../src/sync.ts";
+import { type LockHolder, LockHeldError, takeLock } from "../src/lock.ts";
 import {
   clone,
   http,

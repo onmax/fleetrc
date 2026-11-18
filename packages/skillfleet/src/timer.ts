@@ -12,7 +12,7 @@ import { parseCronExpression } from "cron-schedule";
 import { exec } from "./exec.ts";
 import { isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { stateDir, tildify, xdgDir } from "./paths.ts";
-import { lastingPathDirs, launcherPath } from "./selfinstall.ts";
+import { launcherPath } from "./selfinstall.ts";
 
 export const TIMER_NAME = "skillfleet-sync";
 
@@ -447,35 +447,4 @@ export function formatTimerStatus(status: TimerStatus): string {
   if (status.linger === false) parts.push("linger off: it stops when you log out");
   if (status.logFile) parts.push(`log ${status.logFile}`);
   return parts.join(", ");
-}
-
-/**
- * Environment of scheduled runs: PATH with node's folder and git's ahead of the user's own lasting
- * folders, and every variable skillfleet reads to find its config, state and the agents' folders,
- * so the timer works on the same folders as the shell that installed it. Installing from npx and
- * from the launcher gives the same environment, so switching between them leaves the timer alone.
- */
-export function timerEnv(git: string | undefined, node: string): Record<string, string> {
-  const dirs = [dirname(node), ...(git ? [dirname(git)] : []), ...lastingPathDirs()];
-  const env: Record<string, string> = {
-    PATH: [...new Set(dirs)].join(delimiter),
-    DO_NOT_TRACK: "1",
-  };
-  // __SKILLS_AGENT_ENV__: what `skills` reads to place agents' folders (CODEX_HOME, GROK_HOME, …).
-  for (const key of new Set([
-    "HOME",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "SSH_AUTH_SOCK",
-    ...__SKILLS_AGENT_ENV__,
-  ])) {
-    const value = process.env[key];
-    if (value) env[key] = value;
-  }
-  for (const key of ["XDG_CONFIG_HOME", "XDG_STATE_HOME"] as const) {
-    const value = xdgDir(key);
-    if (value) env[key] = value;
-  }
-  return env;
 }

@@ -20,7 +20,7 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "no
 import { fileURLToPath } from "node:url";
 import { hashDir, isErrno, lstat, sameTree, sha256 } from "./fs.ts";
 import { removeLink } from "./linker.ts";
-import { paths, tildify } from "./paths.ts";
+import { paths, tildify, xdgDir } from "./paths.ts";
 
 /** The launcher the timer and `fleet` run: an absolute node path and skillfleet's own copy. */
 export const launcherPath = () =>
@@ -157,6 +157,37 @@ export function findOnPath(command: string): string | undefined {
       } catch {}
     }
   return undefined;
+}
+
+/**
+ * Environment of scheduled runs: PATH with node's folder and git's ahead of the user's own lasting
+ * folders, and every variable skillfleet reads to find its config, state and the agents' folders,
+ * so the timer works on the same folders as the shell that installed it. Installing from npx and
+ * from the launcher gives the same environment, so switching between them leaves the timer alone.
+ */
+export function timerEnv(git: string | undefined, node: string): Record<string, string> {
+  const dirs = [dirname(node), ...(git ? [dirname(git)] : []), ...lastingPathDirs()];
+  const env: Record<string, string> = {
+    PATH: [...new Set(dirs)].join(delimiter),
+    DO_NOT_TRACK: "1",
+  };
+  // __SKILLS_AGENT_ENV__: what `skills` reads to place agents' folders (CODEX_HOME, GROK_HOME, …).
+  for (const key of new Set([
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "SSH_AUTH_SOCK",
+    ...__SKILLS_AGENT_ENV__,
+  ])) {
+    const value = process.env[key];
+    if (value) env[key] = value;
+  }
+  for (const key of ["XDG_CONFIG_HOME", "XDG_STATE_HOME"] as const) {
+    const value = xdgDir(key);
+    if (value) env[key] = value;
+  }
+  return env;
 }
 
 /** The Node.js that skillfleet needs: `engines` in package.json and src/entry.ts. */
