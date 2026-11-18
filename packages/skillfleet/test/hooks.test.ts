@@ -484,7 +484,11 @@ describe("init, status and doctor with the hooks or the timer", () => {
       /^ok {3}sync trigger: the session hooks of Claude Code and Codex$/m,
     );
     const json = await m.json<{ trigger: { hooks: string[]; timer: boolean } }>("status");
-    expect(json.trigger).toEqual({ hooks: ["claude-code", "codex"], timer: false });
+    expect(json.trigger).toEqual({
+      hooks: ["claude-code", "codex"],
+      timer: false,
+      promptOnly: [],
+    });
     // init again: unchanged.
     const text = read(m.at(".claude", "settings.json"));
     const again = await m.run("init");
@@ -633,7 +637,8 @@ describe("the hooks on shared and upgraded machines", () => {
       const modes: number[] = [];
       const step = () => {
         for (const name of readdirSync(dirname(settings)))
-          if (name.endsWith(".tmp")) modes.push(statSync(join(dirname(settings), name)).mode & 0o777);
+          if (name.endsWith(".tmp"))
+            modes.push(statSync(join(dirname(settings), name)).mode & 0o777);
       };
       expect(editHooksFile(settings, addHook, { step }).changed).toBe(true);
       expect(modes).toEqual([0o600]);
@@ -695,7 +700,12 @@ describe("the hooks on shared and upgraded machines", () => {
     ];
     expect(isOwnHandler({ command: "C:\\node.exe", args: exec })).toBe(true);
     expect(isOwnHandler({ command: "node", args: [...exec, "--x"] })).toBe(false);
-    expect(isOwnHandler({ command: "C:\\Users\\u\\AppData\\Local\\skillfleet\\bin\\node-dir\\node.exe", args: exec })).toBe(true);
+    expect(
+      isOwnHandler({
+        command: "C:\\Users\\u\\AppData\\Local\\skillfleet\\bin\\node-dir\\node.exe",
+        args: exec,
+      }),
+    ).toBe(true);
     expect(isOwnHandler({ command: "node", args: exec })).toBe(true);
     // A user's program that happens to take skillfleet's args is theirs.
     expect(isOwnHandler({ command: "C:\\tools\\audit-hook.exe", args: exec })).toBe(false);
@@ -787,17 +797,55 @@ describe("the hooks on shared and upgraded machines", () => {
       );
   });
 
-  it("doctor warns when the hooks are installed but none has run in a day, naming Codex's /hooks", async () => {
+  it("doctor warns about each agent whose hook has not run in a day, naming Codex's /hooks", async () => {
     const { m } = await hooked({ scheduler: "empty" });
     const never = await m.run("doctor");
     expect(never.stdout).toMatch(
-      /^warn session hooks: no session hook has run yet.*open \/hooks in Codex/m,
+      /^warn session hooks: Claude Code's has not run yet, .*; Codex's has not run yet, .*open \/hooks in Codex/m,
+    );
+    // Only Claude Code's hook runs: Codex's is the one doctor warns about.
+    await hook(m, "claude-code", PROMPT);
+    const mixed = (await m.run("doctor")).stdout;
+    expect(mixed).toMatch(
+      /^warn session hooks: Claude Code's ran within the last day; Codex's has not run yet, .*open \/hooks in Codex/m,
     );
     await hook(m, "codex");
-    expect((await m.run("doctor")).stdout).toMatch(/^ok {3}session hooks: one last ran at /m);
-    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now() - 25 * 60 * 60_000));
     expect((await m.run("doctor")).stdout).toMatch(
-      /^warn session hooks: no session hook has run in the last day/m,
+      /^ok {3}session hooks: Claude Code's ran within the last day; Codex's ran within the last day$/m,
+    );
+    const day = new Date(Date.now() - 25 * 60 * 60_000);
+    writeFileSync(join(m.stateDir, "hook-ran-codex"), String(day.getTime()));
+    expect((await m.run("doctor")).stdout).toMatch(
+      /^warn session hooks: Claude Code's ran within the last day; Codex's has not run in the last day/m,
+    );
+  });
+
+  it("the old hook prompt entry is no sync trigger: status and doctor say to run hook install", async () => {
+    const m = machine({ scheduler: "empty" });
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const old = { hooks: [{ type: "command", command: "npx skillfleet hook prompt" }] };
+    writeFileSync(
+      m.at(".claude", "settings.json"),
+      JSON.stringify({ hooks: { UserPromptSubmit: [old] } }),
+    );
+    const status = await m.run("status");
+    expect(status.stdout).toMatch(/^syncs start from: nothing starts a sync on this machine/m);
+    expect(status.stdout).toMatch(
+      /^hooks: .*settings\.json holds the old `skillfleet hook prompt` entry, .*`skillfleet hook install claude-code` replaces it/m,
+    );
+    expect((await m.json<{ trigger: object }>("status")).trigger).toEqual({
+      hooks: [],
+      timer: false,
+      promptOnly: ["claude-code"],
+    });
+    const doctor = (await m.run("doctor")).stdout;
+    expect(doctor).toMatch(/^warn sync trigger: nothing starts a sync.*; .*hook prompt` entry/m);
+    expect(doctor).not.toMatch(/session hooks:/);
+    // With Codex's session hook too, the old entry still gets its nudge.
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    expect((await m.run("doctor")).stdout).toMatch(
+      /^warn sync trigger: the session hooks of Codex; .*hook prompt` entry/m,
     );
   });
 
@@ -825,7 +873,10 @@ describe("the hooks on shared and upgraded machines", () => {
       expect(JSON.parse(read(config))).toEqual({ manifest, timer: false });
       // A timer that runs another install's copy is that install's.
       const service = m.at(".config", "systemd", "user", "skillfleet-sync.service");
-      writeFileSync(service, read(service).replaceAll(m.stateDir, join(m.root, "other", "skillfleet")));
+      writeFileSync(
+        service,
+        read(service).replaceAll(m.stateDir, join(m.root, "other", "skillfleet")),
+      );
       writeFileSync(config, JSON.stringify({ manifest }));
       await m.runWith({ env: { PATH } }, "doctor");
       expect(JSON.parse(read(config))).toEqual({ manifest });

@@ -1,7 +1,13 @@
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join, sep } from "node:path";
-import { describeTrigger, installedHooks } from "./agenthooks.ts";
+import {
+  AGENT_NAMES,
+  describeTrigger,
+  type HookAgent,
+  installedHooks,
+  promptOnlyHooks,
+} from "./agenthooks.ts";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { conflictLines } from "./edits.ts";
 import { exec, git } from "./exec.ts";
@@ -162,6 +168,7 @@ function timerWanted(): boolean {
 /** What starts a sync on this machine: the session hooks, the timer, both, or nothing. */
 function triggerCheck(timer: boolean): Check {
   const hooks = installedHooks();
+  const legacy = promptOnlyHooks().map((hook) => hook.note);
   const name = "sync trigger";
   const launcher = launcherPath();
   if (hooks.length > 0 && !existsSync(launcher))
@@ -170,35 +177,43 @@ function triggerCheck(timer: boolean): Check {
       ok: false,
       detail: `the session hooks run ${tildify(launcher)}, which is missing; run \`npx skillfleet@latest self-install\``,
     };
-  const detail = describeTrigger(hooks, timer);
-  return hooks.length > 0 || timer
+  const detail = [describeTrigger(hooks, timer), ...legacy].join("; ");
+  return (hooks.length > 0 || timer) && legacy.length === 0
     ? { name, ok: true, detail }
     : { name, ok: true, warn: true, detail };
 }
 
 /**
- * Whether a session hook ran lately: hook-attempt holds the last time one checked whether to sync.
- * Missing or a day old, the hooks may not run at all; Codex runs a new hook only once the user has
- * approved it.
+ * Whether each agent's session hook ran lately: hook-ran-<agent> holds when it last did, to the
+ * hour. Missing or a day old, that agent's hook may not run at all; Codex runs a new hook only
+ * once the user has approved it.
  */
-function hookRunsCheck(hooks: readonly { agent: string }[]): Check | undefined {
+function hookRunsCheck(hooks: readonly { agent: HookAgent }[]): Check | undefined {
   if (hooks.length === 0) return undefined;
-  const name = "session hooks";
-  let at = Number.NaN;
-  try {
-    at = Number(readFileSync(paths.hookAttempt(), "utf8"));
-  } catch {}
-  if (Number.isFinite(at) && Date.now() - at < 24 * 60 * 60_000)
-    return { name, ok: true, detail: `one last ran at ${new Date(at).toISOString()}` };
-  const codex = hooks.some((hook) => hook.agent === "codex")
-    ? "; in Codex, the likely cause is a hook not yet approved: open /hooks in Codex and approve skillfleet's"
-    : "";
-  return {
-    name,
-    ok: true,
-    warn: true,
-    detail: `no session hook has run ${Number.isFinite(at) ? "in the last day" : "yet"}, so no sync started from one${codex}`,
+  const ran = (agent: HookAgent): number => {
+    try {
+      return Number(readFileSync(paths.hookRan(agent), "utf8"));
+    } catch {
+      return Number.NaN;
+    }
   };
+  const lines = hooks.map(({ agent }) => {
+    const at = ran(agent);
+    const fresh = Number.isFinite(at) && Date.now() - at < 24 * 60 * 60_000;
+    const name = AGENT_NAMES[agent];
+    if (fresh) return { fresh, text: `${name}'s ran within the last day` };
+    const why =
+      agent === "codex"
+        ? "; the likely cause is a hook not yet approved: open /hooks in Codex and approve skillfleet's"
+        : "";
+    return {
+      fresh,
+      text: `${name}'s has not run ${Number.isFinite(at) ? "in the last day" : "yet"}, so no sync started from it${why}`,
+    };
+  });
+  const ok = lines.every((line) => line.fresh);
+  const detail = lines.map((line) => line.text).join("; ");
+  return { name: "session hooks", ok: true, ...(ok ? {} : { warn: true }), detail };
 }
 
 /**

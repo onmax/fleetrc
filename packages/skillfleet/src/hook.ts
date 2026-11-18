@@ -12,6 +12,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -112,6 +113,16 @@ function startSync(why: string) {
   }
 }
 
+/** Notes that this agent's hook ran, at most once an hour, for `doctor`. */
+function markRan(agent: HookAgent) {
+  const file = paths.hookRan(agent);
+  try {
+    if (Date.now() - statSync(file).mtimeMs < 60 * 60_000) return;
+  } catch {}
+  mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(file, String(Date.now()));
+}
+
 /** Starts a sync when none was attempted lately and none is running. */
 function syncIfStale(why: string) {
   if (attemptedRecently()) return;
@@ -202,6 +213,10 @@ export function runHook(agent: HookAgent, event?: string, options: { sync?: bool
       } catch {
         // The record only lets the next prompt name new skills; the sync goes ahead without it.
       }
+    if (options.sync !== false)
+      try {
+        markRan(agent);
+      } catch {}
     if (options.sync !== false)
       try {
         syncIfStale(`${agent} ${name}`);

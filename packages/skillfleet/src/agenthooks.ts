@@ -154,6 +154,11 @@ const OWN_COMMAND = new RegExp(
   String.raw`^(?:test -x (${LAUNCHER}) && \1 hook run (?:claude-code|codex) 2>/dev/null; true|${LAUNCHER} hook run (?:claude-code|codex)(?: 2>/dev/null \|\| true)?|(?:npx (?:-y )?)?skillfleet hook prompt|${LAUNCHER} hook prompt)$`,
 );
 
+/** The prompt hook older versions documented: it names new skills and starts no sync. */
+const PROMPT_ONLY = new RegExp(
+  String.raw`^(?:(?:npx (?:-y )?)?skillfleet|${LAUNCHER}) hook prompt$`,
+);
+
 export const isOwnCommand = (command: unknown) =>
   typeof command === "string" && OWN_COMMAND.test(command.trim());
 
@@ -399,19 +404,50 @@ export function removeHooks(
   });
 }
 
-/** The agents whose hooks file runs skillfleet's hook, with the events it runs on. */
-export function installedHooks(): { agent: HookAgent; file: string; events: string[] }[] {
-  return HOOK_AGENTS.flatMap((agent) => {
+/** skillfleet's entries in each agent's hooks file, `hook run` apart from the old `hook prompt`. */
+function ownEntries(): { agent: HookAgent; file: string; run: string[]; prompt: boolean }[] {
+  return HOOK_AGENTS.map((agent) => {
     const file = hookFile(agent);
     let raw: unknown;
     try {
       raw = readJson(file);
     } catch {
-      return [];
+      raw = undefined;
     }
-    const events = [...new Set(ownHandlers(raw).map((handler) => handler.event))];
-    return events.length > 0 ? [{ agent, file, events }] : [];
+    const own = ownHandlers(raw);
+    const isPrompt = (handler: Record<string, unknown>) =>
+      typeof handler.command === "string" && PROMPT_ONLY.test(handler.command.trim());
+    return {
+      agent,
+      file,
+      run: [...new Set(own.filter((h) => !isPrompt(h.handler)).map((h) => h.event))],
+      prompt: own.some((h) => isPrompt(h.handler)),
+    };
   });
+}
+
+/**
+ * The agents whose hooks file runs `skillfleet hook run`, with the events it runs on: what starts
+ * syncs. The old `hook prompt` entry only names new skills, so it does not count.
+ */
+export function installedHooks(): { agent: HookAgent; file: string; events: string[] }[] {
+  return ownEntries().flatMap(({ agent, file, run }) =>
+    run.length > 0 ? [{ agent, file, events: run }] : [],
+  );
+}
+
+/** The agents whose hooks file holds the old `hook prompt` entry, and what to say about it. */
+export function promptOnlyHooks(): { agent: HookAgent; note: string }[] {
+  return ownEntries().flatMap(({ agent, file, prompt }) =>
+    prompt
+      ? [
+          {
+            agent,
+            note: `${tildify(file)} holds the old \`skillfleet hook prompt\` entry, which names new skills but starts no sync; \`skillfleet hook install ${agent}\` replaces it with the session hook`,
+          },
+        ]
+      : [],
+  );
 }
 
 /** One line for each agent, for `hook install`, `hook remove` and `init`. */

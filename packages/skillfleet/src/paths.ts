@@ -56,6 +56,8 @@ export const paths = {
   logs: () => join(stateDir(), "logs"),
   /** When a session hook last started a sync, or found one running; see hook.ts. */
   hookAttempt: () => join(stateDir(), "hook-attempt"),
+  /** When an agent's `hook run` last ran, within the hour; for `doctor`. */
+  hookRan: (agent: string) => join(stateDir(), `hook-ran-${agent}`),
   /** The environment a sync started by a session hook runs with, saved by `hook install`. */
   hookEnv: () => join(stateDir(), "hook-env.json"),
 };

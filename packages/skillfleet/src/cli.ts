@@ -8,6 +8,7 @@ import {
   type HookChange,
   installedHooks,
   installHooks,
+  promptOnlyHooks,
   removeHooks,
 } from "./agenthooks.ts";
 import { agentRows } from "./agents.ts";
@@ -580,7 +581,11 @@ async function status() {
       lastChange: state.lastChange,
       forks: state.forks ?? {},
       staleSessions: stale,
-      trigger: { hooks: hooks.map((hook) => hook.agent), timer: withTimer },
+      trigger: {
+        hooks: hooks.map((hook) => hook.agent),
+        timer: withTimer,
+        promptOnly: promptOnlyHooks().map((hook) => hook.agent),
+      },
       timer:
         timerState === undefined
           ? { installed: false }
@@ -597,6 +602,7 @@ async function status() {
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
   for (const line of [...forkLines(state), ...conflictLines(state)]) say(line);
   say(`syncs start from: ${describeTrigger(hooks, withTimer)}`);
+  for (const hook of promptOnlyHooks()) say(`hooks: ${hook.note}`);
   if (timerState !== undefined)
     say(
       `timer: ${
