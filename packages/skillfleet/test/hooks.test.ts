@@ -921,6 +921,15 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(Date.now() - Date.parse(record.startedAt)).toBeLessThan(60_000);
   });
 
+  it("records a session start even when an old sessions.json can't be removed", async () => {
+    const { m } = await hooked();
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    // A folder where the old file was: removing it fails.
+    mkdirSync(join(m.stateDir, "sessions.json", "x"), { recursive: true });
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    expect(existsSync(join(m.stateDir, "sessions", "s1.json"))).toBe(true);
+  });
+
   it("keeps the record of each of 12 sessions that start together", async () => {
     const { m } = await hooked();
     writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));

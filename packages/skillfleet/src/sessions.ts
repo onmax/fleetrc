@@ -157,7 +157,11 @@ export function sessionStarted(input: string, now = new Date()) {
   mkdirSync(dirname(file), { recursive: true });
   // Pruned first: a session resumed after a week would otherwise keep its old record only until
   // the prune deleted it, and start its first prompt without one.
-  pruneRecords(now);
+  try {
+    pruneRecords(now);
+  } catch {
+    // Cleanup only: a record that can't be pruned must not stop this one being made.
+  }
   startRecord(file, now);
 }
 
