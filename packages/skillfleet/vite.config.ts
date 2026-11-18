@@ -62,6 +62,7 @@ export default defineConfig({
         "@vite-hub/schedule",
         "@vite-hub/runtime",
         "cron-schedule",
+        "jsonc-parser",
       ],
     },
     define,

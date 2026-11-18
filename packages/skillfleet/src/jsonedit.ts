@@ -4,6 +4,9 @@
  * blank lines). A new array item or object member copies the layout of its siblings.
  */
 
+// The ESM build: the package's main is a UMD bundle whose require("./impl/...") the bundle can't follow.
+import { type Node as TreeNode, type ParseError, parseTree } from "jsonc-parser/lib/esm/main.js";
+
 interface Node {
   start: number;
   end: number;
@@ -12,93 +15,31 @@ interface Node {
   members?: { key: string; keyStart: number; value: Node }[];
 }
 
-class Scanner {
-  i = 0;
-  readonly text: string;
-  /** Keys an object holds twice, which JSON.parse reads as the last one alone. */
-  readonly duplicates: string[] = [];
-  constructor(text: string) {
-    this.text = text;
-  }
-
-  ws() {
-    while (/\s/.test(this.text[this.i] ?? "")) this.i++;
-  }
-
-  expect(char: string) {
-    if (this.text[this.i] !== char) throw new Error(`expected ${char} at ${this.i}`);
-    this.i++;
-  }
-
-  string(): string {
-    const start = this.i;
-    this.expect('"');
-    while (this.text[this.i] !== '"') {
-      if (this.i >= this.text.length) throw new Error("unterminated string");
-      this.i += this.text[this.i] === "\\" ? 2 : 1;
-    }
-    this.i++;
-    return JSON.parse(this.text.slice(start, this.i)) as string;
-  }
-
-  value(): Node {
-    this.ws();
-    const start = this.i;
-    const char = this.text[this.i];
-    if (char === "{") {
-      this.i++;
-      const members: NonNullable<Node["members"]> = [];
-      this.ws();
-      if (this.text[this.i] === "}") this.i++;
-      else
-        for (;;) {
-          this.ws();
-          const keyStart = this.i;
-          const key = this.string();
-          this.ws();
-          this.expect(":");
-          const value = this.value();
-          if (members.some((member) => member.key === key)) this.duplicates.push(key);
-          members.push({ key, keyStart, value });
-          this.ws();
-          if (this.text[this.i] === ",") {
-            this.i++;
-            continue;
-          }
-          this.expect("}");
-          break;
-        }
-      return { start, end: this.i, members };
-    }
-    if (char === "[") {
-      this.i++;
-      const items: Node[] = [];
-      this.ws();
-      if (this.text[this.i] === "]") this.i++;
-      else
-        for (;;) {
-          items.push(this.value());
-          this.ws();
-          if (this.text[this.i] === ",") {
-            this.i++;
-            continue;
-          }
-          this.expect("]");
-          break;
-        }
-      return { start, end: this.i, items };
-    }
-    if (char === '"') {
-      this.string();
-      return { start, end: this.i };
-    }
-    const literal = /^(?:true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(
-      this.text.slice(this.i),
-    );
-    if (!literal) throw new Error(`unexpected ${char ?? "end"} at ${this.i}`);
-    this.i += literal[0].length;
-    return { start, end: this.i };
-  }
+/**
+ * The value `text` holds as offsets into it, or undefined unless it is plain JSON: no comments, no
+ * trailing commas. Keys an object holds twice, which JSON.parse reads as the last one alone, go
+ * into `duplicates`.
+ */
+function parse(text: string, duplicates: string[]): Node | undefined {
+  const errors: ParseError[] = [];
+  // A byte order mark reads as a space, which keeps every offset.
+  const root = parseTree(text.replace(/^\uFEFF/, " "), errors, { disallowComments: true });
+  if (!root || errors.length > 0) return undefined;
+  const node = (tree: TreeNode): Node => {
+    const range = { start: tree.offset, end: tree.offset + tree.length };
+    const children = tree.children ?? [];
+    if (tree.type === "array") return { ...range, items: children.map(node) };
+    if (tree.type !== "object") return range;
+    const members = children.map(({ children: [key, value] = [] }) => ({
+      key: key!.value as string,
+      keyStart: key!.offset,
+      value: node(value!),
+    }));
+    for (const [i, { key }] of members.entries())
+      if (members.findIndex((member) => member.key === key) < i) duplicates.push(key);
+    return { ...range, members };
+  };
+  return node(root);
 }
 
 interface Edit {
@@ -125,21 +66,14 @@ export function editJsonText(
 ): string | undefined {
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const unit = text.match(/\n([ \t]+)\S/)?.[1] ?? "  ";
-  let root: Node;
-  try {
-    const scanner = new Scanner(text);
-    if (text.charCodeAt(0) === 0xfeff) scanner.i = 1;
-    root = scanner.value();
-    scanner.ws();
-    if (scanner.i !== text.length) return undefined;
-    // JSON.parse keeps the last of a repeated key, which the text's first one does not match.
-    if (scanner.duplicates.length > 0) {
-      notes.push(
-        `it repeats the key${scanner.duplicates.length > 1 ? "s" : ""} ${[...new Set(scanner.duplicates)].map((key) => JSON.stringify(key)).join(", ")}, so it was written out whole with the last of each`,
-      );
-      return undefined;
-    }
-  } catch {
+  const duplicates: string[] = [];
+  const root = parse(text, duplicates);
+  if (!root) return undefined;
+  // JSON.parse keeps the last of a repeated key, which the text's first one does not match.
+  if (duplicates.length > 0) {
+    notes.push(
+      `it repeats the key${duplicates.length > 1 ? "s" : ""} ${[...new Set(duplicates)].map((key) => JSON.stringify(key)).join(", ")}, so it was written out whole with the last of each`,
+    );
     return undefined;
   }
   /** The whitespace a line starts with, for the line holding `at`. */
