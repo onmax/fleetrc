@@ -977,7 +977,9 @@ async function hookCommand(action: string | undefined) {
       usage(
         action === "prompt" ? "hook prompt takes nothing" : "hook run takes claude-code or codex",
       );
-    runHook(agent, action === "prompt" ? "UserPromptSubmit" : undefined);
+    // `hook prompt` only names new skills; it starts no sync.
+    if (action === "prompt") runHook(agent, "UserPromptSubmit", { sync: false });
+    else runHook(agent);
     return 0;
   }
   if (action !== "install" && action !== "remove")

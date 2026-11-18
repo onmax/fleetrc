@@ -12,15 +12,14 @@ import {
   readFileSync,
   renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { isRecord, readJsonOrNothing } from "./fs.ts";
-import { create, syncRunning } from "./lock.ts";
+import { lockText, readLock, syncRunning, takeLock } from "./lock.ts";
 import { paths, stateDir } from "./paths.ts";
 import { findOnPath, timerEnv } from "./selfinstall.ts";
-import { promptHook } from "./sessions.ts";
+import { promptHook, sessionStarted } from "./sessions.ts";
 
 export const HOOK_AGENTS = ["claude-code", "codex"] as const;
 export type HookAgent = (typeof HOOK_AGENTS)[number];
@@ -30,9 +29,6 @@ function staleAfterMs(): number {
   const set = Number(process.env.SKILLFLEET_HOOK_STALE_MS);
   return process.env.SKILLFLEET_HOOK_STALE_MS && set >= 0 ? set : 15 * 60_000;
 }
-
-/** A claim older than this was left by a hook that was killed between claiming and letting go. */
-const CLAIM_MAX_AGE_MS = 60_000;
 
 /** The timer's log, which syncs started by a hook append to as well. */
 const syncLog = () => join(paths.logs(), "skillfleet-sync.log");
@@ -54,17 +50,20 @@ function attemptedRecently(): boolean {
 
 /**
  * Takes the claim file, so of many hooks that find the stamp stale at once (twenty sessions
- * started together), one goes on. A claim that outlived any hook is broken once.
+ * started together), one goes on. The claim is held the way the sync lock is (lock.ts): it names
+ * its holder, a claim whose holder is gone is broken by one breaker at a time, and it is let go
+ * only while it is still this hook's. Returns the release, or undefined when another hook holds it.
  */
-function claim(file: string): boolean {
-  if (create(file, String(process.pid))) return true;
+function claim(file: string): (() => void) | undefined {
+  const mine = lockText("hook");
   try {
-    if (Date.now() - statSync(file).mtimeMs < CLAIM_MAX_AGE_MS) return false;
-    rmSync(file, { force: true });
+    takeLock(file, mine);
   } catch {
-    return false;
+    return undefined;
   }
-  return create(file, String(process.pid));
+  return () => {
+    if (readLock(file)?.text === mine) rmSync(file, { force: true });
+  };
 }
 
 /**
@@ -117,9 +116,12 @@ function startSync(why: string) {
 function syncIfStale(why: string) {
   if (attemptedRecently()) return;
   mkdirSync(stateDir(), { recursive: true });
-  const claimFile = `${paths.hookAttempt()}.claim`;
-  if (!claim(claimFile)) return;
+  const release = claim(`${paths.hookAttempt()}.claim`);
+  if (!release) return;
   try {
+    // For tests: hold the claim a while, so hooks that started together meet it.
+    const hold = Number(process.env.SKILLFLEET_HOOK_CLAIM_HOLD_MS);
+    if (hold > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, hold);
     // Another hook may have attempted between the first look and the claim.
     if (attemptedRecently()) return;
     const stamp = `${paths.hookAttempt()}.${process.pid}.tmp`;
@@ -128,8 +130,28 @@ function syncIfStale(why: string) {
     // A running sync brings the skills up to date itself.
     if (!syncRunning()) startSync(why);
   } finally {
-    rmSync(claimFile, { force: true });
+    release();
   }
+}
+
+/** The variables that place skillfleet's config and state folders (paths.ts). */
+const PLACES = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"] as const;
+
+/**
+ * Where skillfleet was installed, for an agent whose environment lacks the installing shell's
+ * XDG_CONFIG_HOME or XDG_STATE_HOME. The hook runs the installed copy, `<state>/app/cli.mjs`, so
+ * its own path names the state folder; the hook-env.json `hook install` saved there has the
+ * variables that place the config and state folders, which this process takes before it looks.
+ * Run from anywhere else (npx, a checkout), it keeps its own environment.
+ */
+function adoptInstalledPlaces() {
+  const script = process.argv[1];
+  if (!script || basename(script) !== "cli.mjs" || basename(dirname(script)) !== "app") return;
+  const saved = readJsonOrNothing(join(dirname(dirname(script)), "hook-env.json"));
+  if (!isRecord(saved)) return;
+  for (const key of PLACES)
+    if (typeof saved[key] === "string") process.env[key] = saved[key];
+    else delete process.env[key];
 }
 
 /** Whether this machine has a config.json that names a manifest: `skillfleet init` ran. */
@@ -151,12 +173,14 @@ function linkedSkills(): Record<string, { addedAt: string }> {
 }
 
 /**
- * `skillfleet hook run <agent>`, and `hook prompt` (Claude Code's UserPromptSubmit). `event` is the
- * hook's event, else the `hook_event_name` the agent passes on stdin. On a machine without
- * skillfleet's config it does nothing and creates nothing.
+ * `skillfleet hook run <agent>`, and `hook prompt` (Claude Code's UserPromptSubmit), which older
+ * versions documented and which only names new skills: `sync: false`. `event` is the hook's event,
+ * else the `hook_event_name` the agent passes on stdin. On a machine without skillfleet's config
+ * it does nothing and creates nothing.
  */
-export function runHook(agent: HookAgent, event?: string) {
+export function runHook(agent: HookAgent, event?: string, options: { sync?: boolean } = {}) {
   try {
+    adoptInstalledPlaces();
     if (!configured()) return;
     let input = "";
     try {
@@ -171,9 +195,12 @@ export function runHook(agent: HookAgent, event?: string) {
       (isRecord(parsed) && typeof parsed.hook_event_name === "string"
         ? parsed.hook_event_name
         : "a session hook");
-    try {
-      syncIfStale(`${agent} ${name}`);
-    } catch {}
+    // Before the sync this hook may start, so a skill it links counts as new to the session.
+    if (agent === "claude-code" && name === "SessionStart") sessionStarted(input);
+    if (options.sync !== false)
+      try {
+        syncIfStale(`${agent} ${name}`);
+      } catch {}
     // Claude Code loads skills linked mid-session; Codex reads them only when a session starts.
     if (agent === "claude-code" && name === "UserPromptSubmit") {
       process.stdout.on("error", () => {});

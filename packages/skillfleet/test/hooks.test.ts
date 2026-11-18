@@ -152,18 +152,33 @@ describe("hook run", () => {
     expect(started(m)).toHaveLength(1);
   });
 
-  it("breaks a claim left by a hook that was killed", async () => {
+  it("waits out a claim another hook holds, and breaks one whose hook is gone", async () => {
     const { m } = await hooked();
     const claim = join(m.stateDir, "hook-attempt.claim");
-    writeFileSync(claim, "1");
+    // This test's process stands in for a hook that holds the claim.
+    writeFileSync(claim, lockText("hook"));
     expect((await hook(m, "claude-code")).code).toBe(0);
     expect(started(m)).toEqual([]);
-    const old = new Date(Date.now() - 5 * 60_000);
-    const { utimesSync } = await import("node:fs");
-    utimesSync(claim, old, old);
+    expect(existsSync(join(m.stateDir, "hook-attempt"))).toBe(false);
+    // A hook that was killed holding it: the same claim, naming a process that has exited.
+    const gone = spawnSync(process.execPath, ["-e", ""]).pid!;
+    writeFileSync(claim, JSON.stringify({ ...JSON.parse(lockText("hook")), pid: gone }));
     expect((await hook(m, "claude-code")).code).toBe(0);
     expect(started(m)).toHaveLength(1);
     expect(existsSync(claim)).toBe(false);
+  });
+
+  it("starts one sync among hooks that all find the attempt stale, because only one holds the claim", async () => {
+    const { m } = await hooked();
+    // The claim's holder waits before it stamps, so every hook reads the stamp stale: without the
+    // claim, each would start a sync.
+    const env = { SKILLFLEET_HOOK_CLAIM_HOLD_MS: "1500" };
+    const runs = await Promise.all(
+      Array.from({ length: 6 }, (_, i) => hook(m, i % 2 ? "codex" : "claude-code", SESSION, env)),
+    );
+    for (const run of runs) expect(run).toEqual({ code: 0, stdout: "", stderr: "" });
+    expect(started(m)).toHaveLength(1);
+    expect(existsSync(join(m.stateDir, "hook-attempt.claim"))).toBe(false);
   });
 
   it("runs the sync in the state folder, with the installing shell's PATH, not the agent's", async () => {
@@ -627,6 +642,35 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(settings(m).hooks!.SessionStart).toEqual(users);
   });
 
+  it("finds its config through the state folder it runs from, when the agent lacks the installer's XDG folders", async () => {
+    const m = machine();
+    const env = {
+      ...m.env,
+      XDG_CONFIG_HOME: join(m.root, "cfg"),
+      XDG_STATE_HOME: join(m.root, "st"),
+    };
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.runWith({ env }, "init", manifest)).code).toBe(0);
+    const state = join(m.root, "st", "skillfleet");
+    // The agent's environment: no XDG_CONFIG_HOME or XDG_STATE_HOME.
+    const agent = { ...m.env };
+    delete agent.XDG_CONFIG_HOME;
+    delete agent.XDG_STATE_HOME;
+    const run = spawnSync(
+      process.execPath,
+      [join(state, "app", "cli.mjs"), "hook", "run", "codex"],
+      {
+        env: agent,
+        cwd: m.home,
+        input: SESSION,
+        encoding: "utf8",
+      },
+    );
+    expect({ code: run.status, out: run.stdout + run.stderr }).toEqual({ code: 0, out: "" });
+    expect(read(join(state, "logs", "skillfleet-sync.log"))).toContain("starting a sync");
+    expect(existsSync(m.at(".local", "state", "skillfleet"))).toBe(false);
+  });
+
   it.skipIf(isWindows)(
     "the shell-form command runs from $HOME, and exits 0 silently when the launcher or node is gone, in each shell",
     () => {
@@ -666,4 +710,31 @@ describe("the hooks on shared and upgraded machines", () => {
     },
   );
 
+  it("names a skill linked between SessionStart and the first prompt, and rewrites sessions.json only on a change", async () => {
+    const { m, mine } = await hooked();
+    // A sync this session's hook did not start: the attempt is fresh.
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    await new Promise((done) => setTimeout(done, 20));
+    writeFiles(mine, { "skills/early/SKILL.md": skillMd("early") });
+    expect((await m.run("sync")).code).toBe(0);
+    const said = await hook(m, "claude-code", PROMPT);
+    expect(said.stdout).toContain("available now: early");
+    const sessions = join(m.stateDir, "sessions.json");
+    const { mtimeMs } = statSync(sessions);
+    await new Promise((done) => setTimeout(done, 50));
+    expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
+  });
+
+  it("hook prompt, the entry older versions documented, names new skills but starts no sync", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const run = await m.runWith({ input: PROMPT }, "hook", "prompt");
+    expect(run).toEqual({ code: 0, stdout: "", stderr: "" });
+    expect(started(m)).toEqual([]);
+    expect(existsSync(join(m.stateDir, "hook-attempt"))).toBe(false);
+  });
 });

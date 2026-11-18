@@ -21,7 +21,8 @@ const hook =
 if (hook)
   void import("./hook.ts").then((module) =>
     action === "prompt"
-      ? module.runHook("claude-code", "UserPromptSubmit")
+      ? // The prompt hook older versions documented only names new skills; it starts no sync.
+        module.runHook("claude-code", "UserPromptSubmit", { sync: false })
       : module.runHook(agent as "claude-code" | "codex"),
   );
 else void import("./cli.ts");
