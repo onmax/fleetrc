@@ -79,6 +79,10 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      # Codex runs hooks with the user's $SHELL, so the hook's shell form is tested in fish and zsh too.
+      - name: Install fish and zsh
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends fish zsh
       - run: pnpm test
 
   # The real timer: install the packed package, let systemd, launchd or Task Scheduler run the sync
