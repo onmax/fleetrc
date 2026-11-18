@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -11,6 +12,7 @@ import {
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { fleet, formatFleet, type InitSetup, remoteScript, resolveFleet } from "../src/fleet.ts";
+import { hostManifestSpec, sameManifest } from "../src/manifest.ts";
 import { launchers } from "../src/selfinstall.ts";
 import { cli, isWindows, machine, type Machine, pathWith, remote, skills } from "./fixture.ts";
 
@@ -714,7 +716,7 @@ appendFileSync(${JSON.stringify(join(m.root, "npx.jsonl"))}, JSON.stringify(args
 if (process.env.FAKE_NPX_RECORD_ONLY) process.exit(0);
 const words = args.slice(args.indexOf("--") + 2);
 const run = spawnSync(process.execPath, [${JSON.stringify(cli)}, ...words], { stdio: "inherit" });
-process.exit(run.status ?? 1);`,
+process.exit(process.env.FAKE_NPX_EXIT ? Number(process.env.FAKE_NPX_EXIT) : (run.status ?? 1));`,
   );
   writeFileSync(
     join(dir, "npx"),
@@ -858,6 +860,47 @@ describe.skipIf(isWindows)("fleet init", () => {
     expect((JSON.parse(readFileSync(file, "utf8")) as { manifest: string }).manifest).toBe(spec);
   });
 
+  it("an init that exits nonzero there, as when its hooks fail, is not a set-up host and is not added", async () => {
+    const { m, fleetIn } = await controller();
+    const env = { ...initShims(m, { vps2: join(m.root, "vps2") }), FAKE_NPX_EXIT: "1" };
+    const run = await m.runWith({ env }, "fleet", "init", "vps2", "--no-hooks", "--json");
+    expect(run.code, run.stdout + run.stderr).toBe(1);
+    expect(npxCalls(m)).toHaveLength(1);
+    const [host] = JSON.parse(run.stdout) as { host: string; setup?: string; error?: string }[];
+    expect(host!.setup).toBeUndefined();
+    expect(host!.error).toMatch(/^skillfleet init exited 1.*, so the host is not set up$/);
+    expect(run.stderr).not.toContain("added vps2");
+    expect(fleetIn()).toEqual([]);
+  });
+
+  it("runs init again on a host set up already when an option asks for something init does", async () => {
+    const { m } = await controller();
+    const env = initShims(m, { vps2: join(m.root, "vps2") });
+    expect((await m.runWith({ env }, "fleet", "init", "vps2", "--no-hooks")).code).toBe(0);
+    // The launcher runs the real node, whose folder has a real npx; give it a node in a folder
+    // without one, so init there runs the fake npx on PATH.
+    const nodeOnly = join(m.root, "node-only");
+    mkdirSync(nodeOnly);
+    symlinkSync(process.execPath, join(nodeOnly, "node"));
+    const launcher = join(m.root, "vps2", ".local", "state", "skillfleet", "bin", "skillfleet");
+    writeFileSync(
+      launcher,
+      readFileSync(launcher, "utf8").replace(/^exec "[^"]*"/m, `exec "${join(nodeOnly, "node")}"`),
+    );
+    const plain = await m.runWith({ env }, "fleet", "init", "vps2");
+    expect(plain.stdout).toMatch(/^vps2: already set up; /m);
+    expect(npxCalls(m)).toHaveLength(1);
+    const copy = await m.runWith({ env }, "fleet", "init", "vps2", "--copy", "--no-hooks");
+    expect(copy.code, copy.stdout + copy.stderr).toBe(0);
+    expect(copy.stdout).toMatch(/^vps2: set up; /m);
+    expect(npxCalls(m)).toHaveLength(2);
+    expect(npxCalls(m)[1]).toEqual(expect.arrayContaining(["--copy", "--no-hooks"]));
+    const config = JSON.parse(
+      readFileSync(join(m.root, "vps2", ".config", "skillfleet", "config.json"), "utf8"),
+    ) as { copy?: boolean };
+    expect(config.copy).toBe(true);
+  });
+
   it("this machine is already set up; a host a tag of the fleet matches is not added again", async () => {
     const { m, fleetIn } = await controller(["tag:servers"]);
     const program = fakeTailscale(m.root, status([peer("localhost", ["tag:servers"])]));
@@ -951,6 +994,106 @@ describe.skipIf(isWindows)("fleet init", () => {
       ],
     ]);
     for (const file of ["P", "Q", "R"]) expect(existsSync(join(m.root, file))).toBe(false);
+  });
+
+  it("sends the host a spec that no folder there can stand for, and runs its init from /", () => {
+    expect(hostManifestSpec("me/skills//.skillfleet/manifest.json")).toBe(
+      "github:me/skills//.skillfleet/manifest.json",
+    );
+    expect(hostManifestSpec("me/skills//teams/web.json")).toBe("github:me/skills//teams/web.json");
+    expect(hostManifestSpec("me/skills")).toBe("github:me/skills//.skillfleet/manifest.json");
+    for (const kept of [
+      // A link that pins a branch is the one form that keeps it.
+      "https://github.com/me/skills/blob/dev/teams/web.json",
+      "https://github.com/me/skills/tree/v1.2/teams/web",
+      "gitlab:group/skills//team.json",
+      "https://git.example.com/me/skills.git//team.json",
+      "github:me/skills//team.json",
+    ])
+      expect(hostManifestSpec(kept)).toBe(kept);
+
+    // On the host, a folder me/skills in the login folder would be read as the manifest.
+    const m = machine();
+    mkdirSync(join(m.home, "me", "skills"), { recursive: true });
+    writeFileSync(join(m.home, "me", "skills", "team.json"), "{}");
+    const bin = join(m.root, "npx-bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "npx"),
+      `#!/bin/sh\n{ pwd; printf '%s\\n' "$@"; } > "${m.root}/npx-ran"\n`,
+    );
+    chmodSync(join(bin, "npx"), 0o755);
+    const spec = hostManifestSpec("me/skills//team.json");
+    spawnSync(
+      "/bin/sh",
+      [
+        "-c",
+        remoteScript("init", "1.2.3", {
+          setup: { spec, flags: [], force: false, same: () => false },
+        }),
+      ],
+      { cwd: m.home, env: { HOME: m.home, PATH: `${bin}:/usr/bin:/bin` }, input: "" },
+    );
+    const [cwd, ...args] = readFileSync(join(m.root, "npx-ran"), "utf8").trim().split("\n");
+    expect(cwd).toBe("/");
+    expect(args).toEqual(expect.arrayContaining(["init", "github:me/skills//team.json"]));
+  });
+
+  it("finds a relative SKILLFLEET_PACKAGE from the login folder, though init runs from /", () => {
+    const m = machine();
+    const bin = join(m.root, "npx-bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "npx"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${m.root}/npx-ran"\n`);
+    chmodSync(join(bin, "npx"), 0o755);
+    const before = process.env.SKILLFLEET_PACKAGE;
+    process.env.SKILLFLEET_PACKAGE = "./preview.tgz";
+    try {
+      const script = remoteScript("init", "1.2.3", {
+        setup: { spec: "github:me/skills", flags: [], force: false, same: () => false },
+      });
+      spawnSync("/bin/sh", ["-c", script], {
+        cwd: m.home,
+        env: { HOME: m.home, PATH: `${bin}:/usr/bin:/bin` },
+        input: "",
+      });
+    } finally {
+      if (before === undefined) delete process.env.SKILLFLEET_PACKAGE;
+      else process.env.SKILLFLEET_PACKAGE = before;
+    }
+    const args = readFileSync(join(m.root, "npx-ran"), "utf8").trim().split("\n");
+    expect(args).toContain(`${realpathSync(m.home)}/./preview.tgz`);
+  });
+
+  it("takes two manifest specs as the same only when their repository surely is", () => {
+    const file = "//.skillfleet/manifest.json";
+    for (const [a, b] of [
+      ["me/skills", `github:me/skills${file}`],
+      [`me/skills${file}`, `https://github.com/me/skills.git${file}`],
+      [`https://GitHub.com/me/skills${file}`, `git@github.com:me/skills.git${file}`],
+      ["gitlab:group/skills", `https://gitlab.com/group/skills.git${file}`],
+      [`https://git.example.com/me/skills.git${file}`, `https://GIT.example.com/me/skills/${file}`],
+    ])
+      expect.soft(sameManifest(a!, b!), `${a} = ${b}`).toBe(true);
+    for (const [a, b] of [
+      // Repository paths are case-sensitive on many servers.
+      [`https://git.example.com/Docs.git${file}`, `https://git.example.com/docs.git${file}`],
+      [`me/Skills${file}`, `me/skills${file}`],
+      // On a host that isn't GitHub or GitLab, host:path is relative to the user's home there.
+      [`git@git.example.com:me/x.git${file}`, `ssh://git@git.example.com/me/x.git${file}`],
+      [`https://git.example.com:8443/me/x.git${file}`, `https://git.example.com/me/x.git${file}`],
+      [
+        "https://github.com/me/skills/blob/main/a.json",
+        "https://github.com/me/skills/blob/dev/a.json",
+      ],
+      [`me/skills//a.json`, `me/skills//A.json`],
+      // Two accounts on one server each have their own home folder.
+      [`alice@git.example.com:skills.git${file}`, `bob@git.example.com:skills.git${file}`],
+      [
+        `ssh://alice@git.example.com/skills.git${file}`,
+        `ssh://bob@git.example.com/skills.git${file}`,
+      ],
+    ])
+      expect.soft(sameManifest(a!, b!), `${a} ≠ ${b}`).toBe(false);
   });
 
   it("a host without node or npx gets one line on what to install", () => {

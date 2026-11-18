@@ -13,7 +13,7 @@ import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
-import { fetchClone, gitUrl, repoKey, splitRepoPath } from "./gitcache.ts";
+import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
 import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
@@ -613,13 +613,58 @@ export function sharedManifestProblem(spec: string): string | undefined {
   return `the manifest is ${spec}, on this machine, which other machines can't read; push it to a repository and run \`skillfleet init <repository>\` with that`;
 }
 
-/** Whether two manifest specs name the same file in the same repository, in any spelling. */
+/**
+ * `spec`, a manifest in a repository, as another machine is to read it from any folder: GitHub's
+ * `owner/repo` shorthand becomes `github:owner/repo`, which no path there can stand for, and the
+ * file is named. A GitHub or GitLab link that pins a branch stays the link, the one form that keeps
+ * the branch; `gitlab:` and git URLs already name the repository.
+ */
+export function hostManifestSpec(spec: string): string {
+  const remote = remoteManifest(spec);
+  if (!remote || remote.ref) return spec;
+  const shorthand = !remote.repo.startsWith(".") && /^[\w.-]+\/[\w.-]+$/.test(remote.repo);
+  return `${shorthand ? `github:${remote.repo}` : remote.repo}//${remote.path}`;
+}
+
+/**
+ * Whether two manifest specs surely name the same file in the same repository: the same host, in
+ * any case, and the same path, in the same case, since a server may tell `Docs.git` from
+ * `docs.git`. `owner/repo`, `github:`, an https link and `git@github.com:` are one repository on
+ * GitHub, as are their GitLab forms; on another host an scp-style `host:path` and a URL path may
+ * differ, so they don't match. When in doubt, two specs are not the same.
+ */
 export function sameManifest(a: string, b: string): boolean {
   if (a === b) return true;
   const [x, y] = [remoteManifest(a), remoteManifest(b)];
   if (!x || !y) return false;
+  const [rx, ry] = [repoIdentity(x.repo), repoIdentity(y.repo)];
   const file = (path: string) => path.replace(/^\/+|\/+$/g, "");
-  return repoKey(x.repo) === repoKey(y.repo) && file(x.path) === file(y.path) && x.ref === y.ref;
+  return rx !== undefined && rx === ry && file(x.path) === file(y.path) && x.ref === y.ref;
+}
+
+/** Hosts where an scp-style `host:owner/repo` and `https://host/owner/repo` are one repository. */
+const FORGES = new Set(["github.com", "gitlab.com"]);
+
+/**
+ * A repository as host and path, for `sameManifest`: the host lower case, the path as written
+ * without `.git` or a trailing slash, and on a host other than GitHub and GitLab the user and the
+ * form (scp or URL) too. Undefined for a spec this can't read.
+ */
+function repoIdentity(spec: string): string | undefined {
+  const url = gitUrl(spec);
+  const scheme = url.match(
+    /^(?:https?|ssh|git|git\+ssh|ssh\+git):\/\/(?:([^@/]*)@)?([^/]+)(\/.*)$/i,
+  );
+  const scp = scheme ? undefined : url.match(/^(?:([^@/:]+)@)?([^/:]+):(?!\/\/)(.+)$/);
+  const parts = scheme ?? scp;
+  if (!parts) return undefined;
+  const host = parts[2]!.toLowerCase().replace(/^www\./, "");
+  // `https://host:443` and `ssh://host:22` stay apart from the bare host: a port is not guessed.
+  const path = parts[3]!.replace(/\/+$/, "").replace(/\.git$/, "");
+  if (FORGES.has(host)) return `${host}/${path.replace(/^\/+/, "")}`;
+  // Elsewhere the account is part of the repository: `a@host:repo` and `b@host:repo` are each
+  // one's home folder, so the user stays, and scp and URL forms stay apart.
+  return `${scp ? "scp" : "url"}:${parts[1] ?? ""}@${host}:${path}`;
 }
 
 interface LocateOptions {

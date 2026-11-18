@@ -55,6 +55,7 @@ import {
   type Manifest,
   ManifestError,
   readConfig,
+  hostManifestSpec,
   sameManifest,
   sharedManifestProblem,
   updateConfig,
@@ -1161,9 +1162,10 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
     usage("fleet init takes the hosts to set up, or tag:<name> for a tag's machines");
   const problems = entries.flatMap((entry) => fleetEntryProblem(entry) ?? []);
   if (problems.length > 0) usage(problems.join("; "));
-  const spec = manifestSpec(values.manifest);
-  const shared = sharedManifestProblem(spec);
+  const configured = manifestSpec(values.manifest);
+  const shared = sharedManifestProblem(configured);
   if (shared) throw new UserError(shared);
+  const spec = hostManifestSpec(configured);
   if (!process.env.SKILLFLEET_PACKAGE) {
     const reason = await unpublished(version, "init");
     if (reason) throw new UserError(reason);

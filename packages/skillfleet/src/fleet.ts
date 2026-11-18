@@ -135,13 +135,22 @@ export function remoteScript(
       return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; ${NPX}; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${NOW} && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
     case "init": {
       if (!setup) throw new Error("remoteScript: init needs a setup");
-      const init = ['"$x"', ...initArgs(version, setup).map(quote), "--json"].join(" ");
+      // A relative SKILLFLEET_PACKAGE is a path from the login folder, which `cd /` leaves.
+      const word = (arg: string, i: number) =>
+        i === 2 && /^\.\.?\//.test(arg) ? `"$o"/${quote(arg)}` : quote(arg);
+      const init = ['"$x"', ...initArgs(version, setup).map(word), "--json"].join(" ");
+      const spec = quote(setup.spec);
+      // A host with this manifest and a skillfleet that runs only syncs, unless an option asks
+      // for something init does (--timer, --copy, --no-hooks...).
+      const already =
+        setup.flags.length === 0
+          ? `if [ -n "$m" ] && [ "$m" = ${spec} ] && [ -n "$f" ] && [ -z "$g" ]; then echo "${NOTE} already" >&2; ${watched('"$f" sync --json')}; el`
+          : "";
       // A host with another manifest says which, unless --force sets it up with this one anyway.
       const other = setup.force
         ? ""
-        : `elif [ -n "$m" ]; then printf '%s has %s\\n' "${NOTE}" "$m" >&2; echo "${NOTE} other-manifest"; `;
-      // A host with this manifest and a skillfleet that runs only syncs.
-      return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; ${NPX}; ${CONFIGURED}; if [ -n "$m" ] && [ "$m" = ${quote(setup.spec)} ] && [ -n "$f" ] && [ -z "$g" ]; then echo "${NOTE} already" >&2; ${watched('"$f" sync --json')}; ${other}elif [ -n "$x" ]; then ${watched(init)}; elif [ -n "$n" ] || command -v node >/dev/null 2>&1; then echo "${NOTE} no-npx"; else echo "${NOTE} init-no-node"; fi`;
+        : `if [ -n "$m" ] && [ "$m" != ${spec} ]; then printf '%s has %s\\n' "${NOTE}" "$m" >&2; echo "${NOTE} other-manifest"; el`;
+      return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; ${NPX}; ${CONFIGURED}; ${already}${other}if [ -n "$x" ]; then o=$(pwd) && cd / && ${watched(init)}; elif [ -n "$n" ] || command -v node >/dev/null 2>&1; then echo "${NOTE} no-npx"; else echo "${NOTE} init-no-node"; fi`;
     }
     default: {
       const exhaustive: never = action;
@@ -331,8 +340,16 @@ async function runOnHost(
     return { note: note as keyof typeof HOST_NOTES, has };
   // sync --json prints the report last, and exits 1 when a source failed; status prints the file.
   // init --json prints its sync's report under "sync", or {"ok": false, "error"} when it stopped.
-  const report = parseReport(run.stdout, action === "init" && !already);
+  const setUp = action === "init" && !already;
+  const report = parseReport(run.stdout, setUp);
   if (report !== undefined && "error" in report) return { error: report.error, reached: true };
+  // init exits nonzero when its sync, the hooks or the timer failed: the host is not set up.
+  if (report !== undefined && setUp && run.code !== 0)
+    return {
+      report: report.report,
+      error: initFailure(report.report, run.code, stderr),
+      reached: true,
+    };
   if (report !== undefined) return { report: report.report, was, now, already };
   if (run.code !== 0)
     return {
@@ -345,6 +362,16 @@ async function runOnHost(
     error: "the host answered with something that is not a skillfleet report",
     reached: true,
   };
+}
+
+/** Why an init that printed its report and exited `code` did not set the host up. */
+function initFailure(report: unknown, code: number | null, stderr: string): string {
+  const why = summarize(report)?.ok === false ? ["its first sync had errors"] : [];
+  if (why.length === 0) {
+    const said = stderr.trim().split("\n").slice(-2).join(" ");
+    if (said) why.push(said);
+  }
+  return `skillfleet init exited ${code ?? "on a signal"}${why.length > 0 ? ` (${why.join("; ")})` : ""}, so the host is not set up`;
 }
 
 /**
@@ -448,6 +475,18 @@ export async function fleet(
               },
             }
           : {};
+      if (run && "error" in answer) {
+        if (!dryRun) cache[host] = run;
+        return {
+          host,
+          ...from,
+          reachable: true,
+          checked: true,
+          lastRun: run,
+          error: answer.error,
+          behind: [],
+        };
+      }
       if (run) {
         if (!dryRun) cache[host] = run;
         return {

@@ -54,9 +54,9 @@ From a machine that is already set up, name the new one:
 skillfleet fleet init vps2
 ```
 
-skillfleet connects over SSH and runs `npx skillfleet init` there with the same manifest, so the new machine gets its own copy of skillfleet, the session hooks and a first sync. Then it adds `vps2` to `fleet`. On a server where no agent runs, add `--timer`. The manifest has to be in a repository, since the new machine can't read files on this one, and the new machine needs Node.js 22.12 or newer.
+skillfleet connects over SSH and runs `npx skillfleet init` there with the same manifest, so the new machine gets its own copy of skillfleet, the session hooks and a first sync. Then it adds `vps2` to `fleet`, unless that `init` failed there (its first sync, the hooks or the timer), which leaves `vps2` out and makes the command exit 1. On a server where no agent runs, add `--timer`. The manifest has to be in a repository, since the new machine can't read files on this one, and the new machine needs Node.js 22.12 or newer.
 
-With Tailscale, tag the server and run `skillfleet fleet init tag:servers`: every machine with the tag gets set up, and `fleet` gets `tag:servers`, so the next server you tag is in the fleet too. A machine that already has the manifest only syncs. One that has another manifest is left alone unless you pass `--force`. Hosts install the version of skillfleet you run; to set them up with a preview build, set `SKILLFLEET_PACKAGE` to what npx should install, such as a pkg.pr.new URL or a tarball path on the host.
+With Tailscale, tag the server and run `skillfleet fleet init tag:servers`: every machine with the tag gets set up, and `fleet` gets `tag:servers`, so the next server you tag is in the fleet too. A machine that already has the manifest only syncs, unless you pass an option for its `init`, such as `--timer`. One that has another manifest, or the same repository spelled in a way skillfleet can't be sure of, is left alone unless you pass `--force`. Hosts install the version of skillfleet you run; to set them up with a preview build, set `SKILLFLEET_PACKAGE` to what npx should install, such as a pkg.pr.new URL or a tarball path on the host.
 
 ### Commands
 
