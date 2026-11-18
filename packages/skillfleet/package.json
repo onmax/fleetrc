@@ -1,7 +1,7 @@
 {
   "name": "skillfleet",
   "version": "0.0.0",
-  "description": "The same skills on every agent and every machine, kept current by a timer.",
+  "description": "The same skills on every agent and every machine, synced when an agent session starts.",
   "keywords": [
     "agent-skills",
     "ai-agents",

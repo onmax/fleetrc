@@ -1,5 +1,5 @@
 <h1>
-  <img src="https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/banner-light.png" alt="skillfleet: the same skills on every agent and every machine, kept current by a timer" width="100%">
+  <img src="https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/banner-light.png" alt="skillfleet: the same skills on every agent and every machine, synced when an agent session starts" width="100%">
 </h1>
 
 [![npm version](https://comark-ui.onmax.me/badge.svg?source=npm-version&package=skillfleet&icon=npm)](https://www.npmjs.com/package/skillfleet)
@@ -8,9 +8,9 @@
 [![status: early](https://comark-ui.onmax.me/badge.svg?label=status&value=early)](#status)
 [![license: MIT](https://comark-ui.onmax.me/badge.svg?label=license&value=MIT)](./LICENSE)
 
-The same agent skills in Claude Code, Codex, Gemini CLI, OpenCode, Cursor and Copilot, on every machine you use, kept current by a timer.
+The same agent skills in Claude Code, Codex, Gemini CLI, OpenCode, Cursor and Copilot, on every machine you use, synced when you start an agent session.
 
-You list where your skills come from in one manifest in git: your own repo, your team's, GitHub upstreams, skill indexes like Drop's, and npm. Each machine pulls them on a schedule, links every skill into every agent's folder, and reports what changed. A skill you edited on that machine is never overwritten.
+You list where your skills come from in one manifest in git: your own repo, your team's, GitHub upstreams, skill indexes like Drop's, and npm. Each machine pulls them when a Claude Code or Codex session starts, links every skill into every agent's folder, and reports what changed. A skill you edited on that machine is never overwritten.
 
 [Usage](#usage) · [Manifest](#manifest) · [Agents and systems](#agents-and-systems) · [Status](#status) · [GitHub](https://github.com/onmax/skillfleet)
 
@@ -21,16 +21,16 @@ npx skillfleet init my-team/agents
 - **One manifest.** It lives in git next to your skills, so every machine and every teammate reads the same list.
 - **Every agent.** The agent folders come from the [`skills`](https://github.com/vercel-labs/skills) package's agent list, so an agent it adds works here too.
 - **Your edits stay.** If a sync would change a file you edited, skillfleet keeps your copy, holds upstream's update to that skill, and says so in `status`.
-- **On a timer.** systemd, launchd or Task Scheduler runs the sync, with no process left running, and catches up after the machine sleeps.
+- **On session start.** A Claude Code or Codex hook starts a sync in the background when the last one is more than 15 minutes old, so nothing runs while you aren't using an agent. On a machine where no agent runs, such as a VPS, the timer does it instead: systemd, launchd or Task Scheduler runs the sync on a schedule.
 - **The whole fleet.** `skillfleet fleet sync` runs it over SSH on every machine you list. Tailscale names work.
 
 ## Usage
 
 ```sh
-npx skillfleet init <manifest>   # install, link your agents and start the timer
+npx skillfleet init <manifest>   # install, link your agents and add the session hooks
 skillfleet                       # sync now
 skillfleet status                # last run, held updates, edited skills, sessions to restart
-skillfleet doctor                # check node, git access, the timer and duplicate skills
+skillfleet doctor                # check node, git access, the hooks or timer, duplicate skills
 skillfleet fleet sync            # sync every machine in the manifest over SSH
 ```
 
@@ -40,7 +40,7 @@ No manifest yet? [Write one](#write-your-manifest) first. `<manifest>` is one of
 - a file inside a repository, such as `github:my-team/agents//team/skills.json`.
 - a file or a folder on this machine. A folder means the `skills.json` in it.
 
-`init` copies skillfleet out of the npx cache into its state folder (`~/.local/state/skillfleet`, or `%LOCALAPPDATA%\skillfleet` on Windows), so the timer never points at a folder npm may delete. If `~/.local/bin` is on your PATH, `init` links `skillfleet` there; if not, it prints the folder to add to PATH. `--no-timer` skips the timer and still installs the command. The launcher and the timer run node through a path that outlives a Node.js upgrade, such as `/opt/homebrew/bin/node`; if node moves anyway, `skillfleet doctor` says so and `npx skillfleet@latest timer install` repairs both.
+`init` copies skillfleet out of the npx cache into its state folder (`~/.local/state/skillfleet`, or `%LOCALAPPDATA%\skillfleet` on Windows), so the hooks and the timer never point at a folder npm may delete. If `~/.local/bin` is on your PATH, `init` links `skillfleet` there; if not, it prints the folder to add to PATH. `--no-hooks` skips the session hooks and still installs the command; `--timer` adds the timer. The launcher and the timer run node through a path that outlives a Node.js upgrade, such as `/opt/homebrew/bin/node`; if node moves anyway, `skillfleet doctor` says so and `npx skillfleet@latest self-install` repairs both.
 
 `add`, `remove`, `fleet add`, `fork` and `merge` of a fork change the manifest. When it lives in a repository, skillfleet reads a copy that the next sync fetches again, so they change a working clone of that repository instead (a source with a `path`, below) and ask you to push. Without one, they change nothing and print the JSON to add upstream.
 
@@ -51,11 +51,11 @@ No manifest yet? [Write one](#write-your-manifest) first. `<manifest>` is one of
 | Command                                 | What it does                                                                                                                                                                                                                                                                                                                                                                                     |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `sync [source]`                         | Fetches every source, or only `source`, and links the skills. Plain `skillfleet` runs it.                                                                                                                                                                                                                                                                                                        |
-| `init [manifest]`                       | Configures the manifest, moves aside or adopts what the agent folders hold now, syncs, installs the command and the timer. `--no-timer` skips the timer, `--force` goes ahead when a skill name would be lost. Without a manifest, it uses the configured one again.                                                                                                                             |
-| `status`                                | The last run, held and pending updates, edited skills, and Codex sessions to restart.                                                                                                                                                                                                                                                                                                            |
+| `init [manifest]`                       | Configures the manifest, moves aside or adopts what the agent folders hold now, syncs, installs the command and the session hooks. `--no-hooks` skips the hooks, `--timer` installs the timer too, `--force` goes ahead when a skill name would be lost. A machine that has the timer keeps it. Without a manifest, it uses the configured one again.                                            |
+| `status`                                | The last run, held and pending updates, edited skills, what starts the syncs, and Codex sessions to restart.                                                                                                                                                                                                                                                                                     |
 | `list`                                  | Linked skills and the source of each.                                                                                                                                                                                                                                                                                                                                                            |
 | `agents`                                | Every agent id, which agents are installed here, and the folder each one's skills go to.                                                                                                                                                                                                                                                                                                         |
-| `doctor`                                | Checks node, git access to each source, the timer and duplicate skills.                                                                                                                                                                                                                                                                                                                          |
+| `doctor`                                | Checks node, git access to each source, the hooks or the timer, and duplicate skills. It warns when nothing starts a sync.                                                                                                                                                                                                                                                                       |
 | `add <source>`                          | Adds `owner/repo`, `github:` or `gitlab:` repositories, a git URL, a GitHub or GitLab link to a folder or a `SKILL.md` (its branch becomes `ref`, its folder the `skills` glob), an index URL, `npm:<package>` (or `npm:<package>@<version>`) or a path, then syncs. `--id`, `--skills <glob>`, `--include <name>`, `--exclude <name>` (both repeatable) and `--review` set the source's fields. |
 | `remove <source\|skill>`                | Removes a source, or adds a skill to its source's `exclude`. A team manifest's skill or source is left out in your `extends` entry.                                                                                                                                                                                                                                                              |
 | `adopt <path>`                          | Moves a hand-made skill folder into your personal repository.                                                                                                                                                                                                                                                                                                                                    |
@@ -63,10 +63,10 @@ No manifest yet? [Write one](#write-your-manifest) first. `<manifest>` is one of
 | `diff [skill]`                          | Shows one skill's update waiting for review, or its local edits. Without a skill, every update a source is holding.                                                                                                                                                                                                                                                                              |
 | `merge <skill>`                         | Merges an upstream update into an edited skill or a fork.                                                                                                                                                                                                                                                                                                                                        |
 | `update <source>`                       | Takes the updates a review-mode source is holding.                                                                                                                                                                                                                                                                                                                                               |
-| `timer install\|remove\|status`         | Installs, removes or shows the timer.                                                                                                                                                                                                                                                                                                                                                            |
+| `timer install\|remove\|status`         | Installs, removes or shows the timer, for a machine where no agent runs.                                                                                                                                                                                                                                                                                                                         |
 | `fleet sync\|status\|upgrade [host...]` | Runs on every host in `fleet`, or the hosts named. `--timeout <s>` waits that long for each (30 by default).                                                                                                                                                                                                                                                                                     |
 | `fleet add [host...]`                   | Adds hosts to `fleet`. Without hosts, it lists the machines on your tailnet.                                                                                                                                                                                                                                                                                                                     |
-| `hook prompt`                           | The Claude Code hook below.                                                                                                                                                                                                                                                                                                                                                                      |
+| `hook install\|remove [agent]`          | Adds or removes the session hooks in Claude Code and Codex, or only in `claude-code` or `codex`. Without an agent, it acts on each one whose folder exists.                                                                                                                                                                                                                                      |
 | `self-install`                          | Copies this skillfleet into the state folder. `init` and `fleet upgrade` run it.                                                                                                                                                                                                                                                                                                                 |
 
 These options work wherever they make sense, and a command refuses one it can't use:
@@ -74,25 +74,19 @@ These options work wherever they make sense, and a command refuses one it can't 
 - `--dry-run` prints what would change and writes nothing. `fleet sync --dry-run` runs `sync --dry-run` on each host. Commands that only read, and `fleet upgrade`, refuse it.
 - `--json` prints one JSON document on stdout, and messages go to stderr. A failure prints `{ "ok": false, "error": "..." }`.
 - `--offline` uses what is already fetched.
-- `--copy` copies skill folders instead of linking them, for agents or file systems that don't follow links. `init`, `sync` and the other commands that sync remember it in skillfleet's `config.json`, so the timer's runs copy too, until `--no-copy`. An edit made in one agent's copy is an edit of the skill: the next sync moves it into the folder the copy came from, so every agent gets it, upstream changes wait for `diff` and `merge`, and `--no-copy` links the edited skill.
+- `--copy` copies skill folders instead of linking them, for agents or file systems that don't follow links. `init`, `sync` and the other commands that sync remember it in skillfleet's `config.json`, so later syncs copy too, until `--no-copy`. An edit made in one agent's copy is an edit of the skill: the next sync moves it into the folder the copy came from, so every agent gets it, upstream changes wait for `diff` and `merge`, and `--no-copy` links the edited skill.
 
 A mistake, such as a typo'd repository or agent id, prints one line that says what to fix. An error skillfleet did not expect prints its stack trace with `SKILLFLEET_DEBUG=1`.
 
+### Syncs from session hooks
+
+`init` adds a hook to Claude Code (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) and to Codex (`~/.codex/hooks.json`, or `$CODEX_HOME/hooks.json`), for each one whose folder exists. It runs `skillfleet hook run <agent>`, through the launcher's full path, when a session starts and on each prompt. If no sync started in the last 15 minutes and none is running, the hook starts one in the background and returns at once; the sync writes to `logs/skillfleet-sync.log` in the state folder, like the timer. The hook makes no network call and prints nothing about the sync, so the agent never waits on it.
+
+`skillfleet hook install` and `skillfleet hook remove` add or take out skillfleet's entry and leave your other hooks alone. Codex runs a new hook only after you trust it: open `/hooks` in Codex and approve it.
+
 ### New skills in running sessions
 
-Claude Code loads a skill that a sync links mid-session on the next turn. Codex reads its skills when a session starts, so `skillfleet status` lists the Codex sessions to restart.
-
-`skillfleet hook prompt` also tells Claude Code's model when a skill arrived after its session started, once per skill. skillfleet doesn't edit your Claude Code settings, so add the hook yourself, in `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`):
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "skillfleet hook prompt" }] }]
-  }
-}
-```
-
-If `skillfleet` isn't on the PATH that Claude Code runs hooks with, write the full path of the launcher `init` installed: `~/.local/state/skillfleet/bin/skillfleet`, or `%LOCALAPPDATA%\skillfleet\bin\skillfleet.cmd` on Windows.
+Claude Code loads a skill that a sync links mid-session on the next turn, and the hook tells its model once per skill that the skill arrived. Codex reads its skills when a session starts, and the sync that session's own hook starts usually lands after that, so the session sees the new skills at its next start. `skillfleet status` lists the Codex sessions to restart.
 
 ## Manifest
 
@@ -150,7 +144,7 @@ Then `npx skillfleet init me/skills` on each machine. Your sources come first, s
 - `"timeZone"` in `timer` takes an IANA name such as `Europe/Madrid` to run the cron in that zone. launchd and Task Scheduler run timers in the machine's time zone, so on macOS and Windows another zone works only when it gives the same times.
 - `extends` adds a team manifest's sources. Fleet hosts, hooks and reports come only from your own manifest, so a team manifest can't run anything on your machines. Its git sources must be on another machine (`http`, `https`, `git`, `ssh`, `user@host:path` or `owner/repo`), after your git config's `insteadOf` rewrites them, so a team manifest can't reach a repository on yours. To leave part of a team manifest out, write its entry as `{ "manifest": "my-team/agents", "exclude": ["nuxt-ui"], "excludeSources": ["ag-grid"] }`: `exclude` names skills and `excludeSources` names its sources. `skillfleet remove <skill|source>` writes this for a team skill or source.
 - A file whose name Windows can't write, such as `notes~1.md` or `faq: part 1.md`, is left out on Windows and kept on Linux and macOS, in git sources and working clones alike; each sync names it and warns that your Windows machines lack it.
-- `fleet` names SSH destinations: a host, `user@host`, an alias from `~/.ssh/config`, or `ssh://user@host:port` for another port. Each host needs Node.js and its own `skillfleet init`. `fleet upgrade` installs this machine's skillfleet version on every host and prints each host's change, such as `laptop: 0.0.1 → 0.0.2`. To upgrade one machine, run `npx skillfleet@latest self-install` on it: the launcher and the timer run the copy it replaces, so the next timer run uses the new version.
+- `fleet` names SSH destinations: a host, `user@host`, an alias from `~/.ssh/config`, or `ssh://user@host:port` for another port. Each host needs Node.js and its own `skillfleet init`. `fleet upgrade` installs this machine's skillfleet version on every host and prints each host's change, such as `laptop: 0.0.1 → 0.0.2`. To upgrade one machine, run `npx skillfleet@latest self-install` on it: the launcher, the hooks and the timer run the copy it replaces, so the next sync uses the new version.
 - `hooks` run a command when files of a source change: `{ "run": "...", "on": ["mine:skills/**"] }`. A pattern is `<source>:<glob>`, and the path it matches starts at the root of the repository for a `git` source, with or without `"path"`, at the package root for `npm`, at the folder for `local`, and at `<skill>/` for an `index`. The hook gets the matched `<source>:<path>` lines in `SKILLFLEET_CHANGED`. A pattern that matches no file in its source gets a warning on each sync. `"report": { "run": "..." }` gets each run's report as JSON on stdin, and `hub` is a URL the report is posted to.
 - A hook gets the sync report as JSON on stdin and its `name` (which defaults to `run`) in `SKILLFLEET_HOOK`. A hook still running after 5 minutes is stopped.
 
@@ -160,13 +154,13 @@ skillfleet links skills into Claude Code, Codex, Gemini CLI, OpenCode, Cursor, G
 
 When one of your agents reads `~/.agents/skills`, as Codex does, the agents that read it too (Gemini CLI, OpenCode, Cursor, GitHub Copilot and the other ones `skills` calls universal) get their skills from there only, as with `npx skills add -g`. Linking their own folders as well would show each skill twice, and Gemini CLI warns about every one.
 
-| System  | Timer                 | Skills are linked as |
-| ------- | --------------------- | -------------------- |
-| Linux   | a systemd user timer  | symlinks             |
-| macOS   | a launchd agent       | symlinks             |
-| Windows | a Task Scheduler task | junctions, or copies |
+| System  | Timer (`timer install`) | Skills are linked as |
+| ------- | ----------------------- | -------------------- |
+| Linux   | a systemd user timer    | symlinks             |
+| macOS   | a launchd agent         | symlinks             |
+| Windows | a Task Scheduler task   | junctions, or copies |
 
-It needs Node.js 22.12 or newer, and git for git sources. On Linux without systemd (most containers, WSL1, systems that boot with OpenRC or runit), init links your skills but can't install a timer; it prints a crontab line that runs `skillfleet sync` instead, and `init --no-timer` stops it asking. CI runs on all three systems, with Node 22 and 24.
+It needs Node.js 22.12 or newer, and git for git sources. On Linux without systemd (most containers, WSL1, systems that boot with OpenRC or runit), `timer install` can't install a timer; it prints a crontab line that runs `skillfleet sync` instead. The session hooks work there as anywhere. CI runs on all three systems, with Node 22 and 24.
 
 skillfleet fetches sources through Vercel's [`skills`](https://github.com/vercel-labs/skills) package and runs its timers with `@vite-hub/schedule/os`.
 

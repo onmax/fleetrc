@@ -96,7 +96,7 @@ const fleet = (t: Theme) => {
 
 // The mark and name on the left, a line and the two commands under them; the fleet on the right.
 const banner = (t: Theme) => `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-labelledby="t">
-<title id="t">skillfleet: the same skills on every agent and every machine, kept current by a timer</title>
+<title id="t">skillfleet: the same skills on every agent and every machine, synced when an agent session starts</title>
 <style>${style(t)}</style>
 <clipPath id="frame"><rect width="1280" height="400" rx="24"/></clipPath>
 <g clip-path="url(#frame)">
