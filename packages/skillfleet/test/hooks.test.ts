@@ -667,9 +667,17 @@ describe("the hooks on shared and upgraded machines", () => {
     ];
     expect(isOwnHandler({ command: "C:\\node.exe", args: exec })).toBe(true);
     expect(isOwnHandler({ command: "node", args: [...exec, "--x"] })).toBe(false);
+    expect(isOwnHandler({ command: "C:\\Users\\u\\AppData\\Local\\skillfleet\\bin\\node-dir\\node.exe", args: exec })).toBe(true);
+    expect(isOwnHandler({ command: "node", args: exec })).toBe(true);
+    // A user's program that happens to take skillfleet's args is theirs.
+    expect(isOwnHandler({ command: "C:\\tools\\audit-hook.exe", args: exec })).toBe(false);
+    expect(isOwnHandler({ command: "/usr/bin/nodemon", args: exec })).toBe(false);
 
     const m = machine();
-    const users = theirs.map((command) => ({ hooks: [{ type: "command", command }] }));
+    const users = [
+      ...theirs.map((command) => ({ hooks: [{ type: "command", command }] })),
+      { hooks: [{ type: "command", command: "C:\\tools\\audit-hook.exe", args: exec }] },
+    ];
     writeFileSync(
       m.at(".claude", "settings.json"),
       JSON.stringify({ hooks: { SessionStart: users } }),

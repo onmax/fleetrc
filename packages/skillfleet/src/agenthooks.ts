@@ -167,6 +167,8 @@ export function isOwnHandler(hook: unknown): boolean {
   const args = hook.args;
   return (
     typeof hook.command === "string" &&
+    // node: skillfleet's bin/node-dir/node.exe, or any node by name.
+    /^node(?:\.exe)?$/i.test(hook.command.split(/[\\/]/).at(-1)!) &&
     Array.isArray(args) &&
     args.length === 4 &&
     typeof args[0] === "string" &&
