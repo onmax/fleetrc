@@ -21,11 +21,11 @@ const engines = (
 ).engines.node;
 
 describe("cli and environments", () => {
-  it("L10. init <repository URL> reads skills.json from that repository and keeps <repo>//skills.json", async () => {
+  it("L10. init <repository URL> reads .skillfleet/manifest.json from that repository and keeps <repo>//.skillfleet/manifest.json", async () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "from-repo"));
     const manifests = remote(m, "manifests", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
       }),
@@ -37,37 +37,67 @@ describe("cli and environments", () => {
     const config = JSON.parse(readFileSync(m.at(".config/skillfleet/config.json"), "utf8")) as {
       manifest: string;
     };
-    expect(config.manifest).toBe(`${url}//skills.json`);
+    expect(config.manifest).toBe(`${url}//.skillfleet/manifest.json`);
   });
 
-  it("L10. a repository without skills.json says to name the file", async () => {
+  it("L10. a repository with only a skills.json at its root says where it looked and to name the file", async () => {
     const m = machine();
-    const manifests = remote(m, "manifests", { "other.json": "{}" });
+    const manifests = remote(m, "manifests", { "skills.json": "{}" });
     const init = await m.run("init", pathToFileURL(manifests.url).href, "--no-hooks");
     expect(init.code).toBe(1);
-    expect(init.stderr).toMatch(/has no skills\.json; name the manifest file as .*\/\/<file>/);
+    expect(init.stderr).toMatch(
+      /has no \.skillfleet\/manifest\.json; name the manifest file as .*\/\/<file>/,
+    );
   });
 
-  it("L10. a local folder means the skills.json in it", async () => {
+  it("L10. <repo>//<file> reads any other file in the repository", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "from-file"));
+    const manifests = remote(m, "manifests", {
+      "team/fleet.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      }),
+    });
+    const init = await m.run("init", `${manifests.url}//team/fleet.json`, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["from-file"]);
+  });
+
+  it("L10. a local folder means its .skillfleet/manifest.json, whose relative paths start in .skillfleet/", async () => {
     const m = machine();
     const folder = join(m.root, "mine");
-    mkdirSync(join(folder, "tool"), { recursive: true });
-    writeFileSync(join(folder, "tool/SKILL.md"), "---\nname: tool\ndescription: d\n---\n");
+    mkdirSync(join(folder, "skills/tool"), { recursive: true });
+    writeFileSync(join(folder, "skills/tool/SKILL.md"), "---\nname: tool\ndescription: d\n---\n");
+    mkdirSync(join(folder, ".skillfleet"));
     writeFileSync(
-      join(folder, "skills.json"),
-      JSON.stringify({ agents: ["claude-code"], sources: [{ id: "mine", local: "." }] }),
+      join(folder, ".skillfleet/manifest.json"),
+      JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "mine", local: "../skills" }],
+      }),
     );
     const init = await m.run("init", folder, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
   });
 
+  it("L10. a local folder with only a skills.json says where it looked", async () => {
+    const m = machine();
+    const folder = join(m.root, "mine");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "skills.json"), JSON.stringify({ sources: [] }));
+    const init = await m.run("init", folder, "--no-hooks");
+    expect(init.code).toBe(1);
+    expect(init.stderr).toContain(`has no .skillfleet/manifest.json; name the manifest file`);
+  });
+
   it("L1. add on a remote manifest refuses and prints the source to add upstream", async () => {
     const m = machine();
     const manifests = remote(m, "manifests", {
-      "skills.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
+      ".skillfleet/manifest.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
     });
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
+    expect((await m.run("init", manifests.url, "--no-hooks")).code).toBe(0);
     const extra = remote(m, "extra", skills("skills/", "extra-a"));
     const added = await m.run("add", extra.url, "--id", "extra");
     expect(added.code).toBe(1);
@@ -81,7 +111,7 @@ describe("cli and environments", () => {
   it("L1. add on a remote manifest with a working clone edits the clone and asks for a push", async () => {
     const m = machine();
     const manifests = remote(m, "manifests", {
-      "skills.json": "{}",
+      ".skillfleet/manifest.json": "{}",
       "skills/mine/SKILL.md": "---\nname: mine\ndescription: d\n---\n",
     });
     const work = clone(m, manifests, "code/manifests");
@@ -89,14 +119,14 @@ describe("cli and environments", () => {
       agents: ["claude-code"],
       sources: [{ id: "mine", git: manifests.url, path: work, skills: "skills/*" }],
     };
-    manifests.commit({ "skills.json": JSON.stringify(content) });
+    manifests.commit({ ".skillfleet/manifest.json": JSON.stringify(content) });
     m.git(work, "pull", "--quiet");
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
+    expect((await m.run("init", manifests.url, "--no-hooks")).code).toBe(0);
     const extra = remote(m, "extra", skills("skills/", "extra-a"));
     const added = await m.run("add", extra.url, "--id", "extra");
     expect(added.code, added.stderr).toBe(0);
     expect(added.stdout).toContain("commit and push it");
-    const edited = JSON.parse(readFileSync(join(work, "skills.json"), "utf8")) as {
+    const edited = JSON.parse(readFileSync(join(work, ".skillfleet/manifest.json"), "utf8")) as {
       sources: { id: string }[];
     };
     expect(edited.sources.map((source) => source.id)).toEqual(["mine", "extra"]);

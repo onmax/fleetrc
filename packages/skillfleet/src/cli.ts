@@ -147,7 +147,7 @@ const COMMANDS: Record<string, Command> = {
     usage: "init [manifest]",
     summary: "Point this machine at a manifest, migrate the folders, install the session hooks",
     details:
-      "The manifest is a repository (owner/repo, github:owner/repo, gitlab:group/repo or a git URL ending in .git, read for its skills.json), <repo>//<file>, or a file or folder on this machine. Without one, init uses the configured manifest again. The session hooks go into Claude Code and Codex where they are installed (see `skillfleet hook --help`); a machine that had the timer keeps it.",
+      "The manifest is a repository (owner/repo, github:owner/repo, gitlab:group/repo or a git URL ending in .git, read for its .skillfleet/manifest.json), <repo>//<file>, or a file or folder on this machine (a folder means its .skillfleet/manifest.json). Without one, init uses the configured manifest again. The session hooks go into Claude Code and Codex where they are installed (see `skillfleet hook --help`); a machine that had the timer keeps it.",
     options: [...SYNC_OPTIONS, "timer", "no-hooks", "force"],
   },
   status: {
@@ -915,7 +915,7 @@ async function init() {
   const given = rest[0] ?? values.manifest ?? readConfig()?.manifest;
   if (!given)
     usage(
-      "init needs a manifest: a path, a repository such as owner/repo (its skills.json), or <repo>//<file> such as github:org/agents//skills.json",
+      "init needs a manifest: a path, a repository such as owner/repo (its .skillfleet/manifest.json), or <repo>//<file> such as github:org/agents//team.json",
     );
   const withTimer = timerWanted();
   const withHooks = !values["no-hooks"];

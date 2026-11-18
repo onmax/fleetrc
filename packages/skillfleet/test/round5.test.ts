@@ -236,7 +236,7 @@ describe("the timer-schedule warning", () => {
     const m = machine({ scheduler: "empty" });
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const me = remote(m, "me", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
       }),
@@ -253,7 +253,7 @@ describe("the timer-schedule warning", () => {
     // A schedule change pushed from another machine. The first sync to see it is the timer's, and
     // its note goes to the timer's log, which nobody reads.
     me.commit({
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         timer: { cron: "0 * * * *" },
         sources: [{ id: "vendor", git: vendor.url }],
@@ -392,6 +392,37 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       expect.soft(isRemoteGit(url), url).toBe(true);
   });
 
+  describe("a manifest in a folder's .skillfleet/", () => {
+    it("resolves relative paths against .skillfleet/ and keeps a team's extends in the folder around it", async () => {
+      write("r5-folder/.skillfleet/manifest.json", {
+        extends: ["./team.json"],
+        sources: [{ id: "mine", local: "../skills" }],
+      });
+      write("r5-folder/.skillfleet/team.json", {
+        extends: ["../shared.json", "../../r5-outside.json"],
+        sources: [{ id: "team", index: "https://team.example.com" }],
+      });
+      write("r5-folder/shared.json", {
+        sources: [{ id: "shared", index: "https://s.example.com" }],
+      });
+      write("r5-outside.json", { sources: [{ id: "outside", index: "https://o.example.com" }] });
+      const loaded = await loadManifest(join(root, "r5-folder"), { offline: true });
+      expect(loaded.root.file).toBe(join(root, "r5-folder", ".skillfleet", "manifest.json"));
+      expect(loaded.sources.map((source) => source.id)).toEqual(["mine", "team", "shared"]);
+      const mine = loaded.sources[0]!;
+      expect(mine.kind === "local" && mine.local).toBe(join(root, "r5-folder", "skills"));
+      expect(loaded.failed).toEqual(["../../r5-outside.json"]);
+      expect(loaded.warnings.join("\n")).toMatch(/outside it/);
+    });
+
+    it("does not read a skills.json at the folder's root", async () => {
+      write("r5-old/skills.json", { sources: [] });
+      await expect(loadManifest(join(root, "r5-old"), { offline: true })).rejects.toThrow(
+        /r5-old has no \.skillfleet\/manifest\.json; name the manifest file as .*<file>/,
+      );
+    });
+  });
+
   describe("extends objects", () => {
     it("R8-6. keeps a team manifest's own exclusions of what it extends", async () => {
       // The team leaves "legacy" and the skill "old" out of the base it extends; a member who extends
@@ -480,7 +511,7 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       // JSON.parse keeps the last "sources"; the editor walks the first one's items by the last one's
       // indexes and reads past its end.
       const text = `{\n  "sources": [{ "id": "a", "git": "https://example.com/a.git" }],\n  "sources": [\n    { "id": "a", "git": "https://example.com/a.git" },\n    { "id": "b", "git": "https://example.com/b.git" }\n  ]\n}\n`;
-      const file = write("r5-dup/skills.json", text);
+      const file = write("r5-dup/.skillfleet/manifest.json", text);
       editManifest(file, (raw) => {
         const sources = raw.sources as Record<string, unknown>[];
         sources[1]!.exclude = ["x"];

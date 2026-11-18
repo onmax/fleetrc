@@ -226,8 +226,8 @@ describe("sync", () => {
     const m = machine();
     const team = remote(m, "team", skills("skills/", "team-skill"));
     const marker = join(m.root, "hook-ran");
-    const teamManifest = join(m.root, "team", "skills.json");
-    mkdirSync(join(m.root, "team"));
+    const teamManifest = join(m.root, "team", ".skillfleet", "manifest.json");
+    mkdirSync(join(m.root, "team", ".skillfleet"), { recursive: true });
     writeFileSync(
       teamManifest,
       JSON.stringify({

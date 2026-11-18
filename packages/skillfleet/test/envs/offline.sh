@@ -20,14 +20,14 @@ run() { # run <network> <script>
 echo "--- online: init"
 run bridge '
 set -e
-mkdir -p ~/.claude ~/.codex ~/m
-cat >~/m/skills.json <<EOF
+mkdir -p ~/.claude ~/.codex ~/m/.skillfleet
+cat >~/m/.skillfleet/manifest.json <<EOF
 { "agents": "all", "sources": [
   { "id": "nuxt", "git": "onmax/nuxt-skills", "include": ["nuxt"] },
   { "id": "drop", "index": "https://drop.vitehub.dev" }
 ] }
 EOF
-npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/m/skills.json --no-hooks
+npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/m --no-hooks
 npx -y --package /pkg/skillfleet.tgz -- skillfleet self-install
 ls ~/.claude/skills'
 
@@ -43,7 +43,7 @@ run none "$SF status | head -n 8; echo \"exit \$?\""
 echo "--- offline: add a GitHub source"
 run none "$SF add onmax/skills-nope; echo \"exit \$?\""
 echo "--- offline: a second machine, init --offline with nothing cached"
-run none 'mkdir -p /tmp/h2/.claude && HOME=/tmp/h2 npx --offline -y --package /pkg/skillfleet.tgz -- skillfleet init /home/node/m/skills.json --offline --no-hooks; echo "exit $?"'
+run none 'mkdir -p /tmp/h2/.claude && HOME=/tmp/h2 npx --offline -y --package /pkg/skillfleet.tgz -- skillfleet init /home/node/m --offline --no-hooks; echo "exit $?"'
 echo "--- offline: init --offline again on the cached machine"
 run none "$SF init --offline --no-hooks; echo \"exit \$?\""
 docker volume rm -f "$vol" >/dev/null

@@ -15,7 +15,7 @@ import {
 import { dirname, join } from "node:path";
 import { osScheduleErrors } from "@vite-hub/schedule/os";
 import { describe, expect, it } from "vite-plus/test";
-import { remoteManifest } from "../src/manifest.ts";
+import { canonicalManifestSpec, remoteManifest } from "../src/manifest.ts";
 import { pathAdvice } from "../src/selfinstall.ts";
 import { TimerError } from "../src/timer.ts";
 import {
@@ -219,7 +219,7 @@ describe("a sync killed or left without its records", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const team = remote(m, "team", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
       }),
@@ -381,13 +381,43 @@ describe("what users paste", () => {
   });
 
   it("R2-14. a GitHub file link copied with a line anchor or ?plain=1 still names the manifest", () => {
-    const expected = { repo: "https://github.com/org/team", path: "skills.json", ref: "main" };
+    const expected = { repo: "https://github.com/org/team", path: "team.json", ref: "main" };
     expect(
-      remoteManifest("https://github.com/org/team/blob/main/skills.json#L3", "/nonexistent"),
+      remoteManifest("https://github.com/org/team/blob/main/team.json#L3", "/nonexistent"),
     ).toEqual(expected);
     expect(
-      remoteManifest("https://github.com/org/team/blob/main/skills.json?plain=1", "/nonexistent"),
+      remoteManifest("https://github.com/org/team/blob/main/team.json?plain=1", "/nonexistent"),
     ).toEqual(expected);
+  });
+
+  it("a repository, a page link or a folder link means .skillfleet/manifest.json; <repo>//<file> names any file", () => {
+    const at = (spec: string) => remoteManifest(spec, "/nonexistent");
+    const file = ".skillfleet/manifest.json";
+    expect(at("org/team")).toEqual({ repo: "org/team", path: file });
+    expect(at("github:org/team")).toEqual({ repo: "github:org/team", path: file });
+    expect(at("gitlab:group/team")).toEqual({ repo: "gitlab:group/team", path: file });
+    expect(at("https://example.com/org/team.git")).toEqual({
+      repo: "https://example.com/org/team.git",
+      path: file,
+    });
+    expect(at("https://github.com/org/team")).toEqual({
+      repo: "https://github.com/org/team",
+      path: file,
+    });
+    expect(at("https://gitlab.com/group/team")).toEqual({
+      repo: "https://gitlab.com/group/team",
+      path: file,
+    });
+    expect(at("https://github.com/org/team/tree/main/teams/web")).toEqual({
+      repo: "https://github.com/org/team",
+      path: `teams/web/${file}`,
+      ref: "main",
+    });
+    expect(at("github:org/team//skills.json")).toEqual({
+      repo: "github:org/team",
+      path: "skills.json",
+    });
+    expect(canonicalManifestSpec("github:org/team")).toBe(`github:org/team//${file}`);
   });
 
   it("R2-15. a usage error under --json still prints one JSON document", async () => {
@@ -401,9 +431,9 @@ describe("what users paste", () => {
 
   it("R2-16. agents --manifest with a path that does not exist says so", async () => {
     const m = machine();
-    const run = await m.run("agents", "--manifest", m.at("nope/skills.json"));
+    const run = await m.run("agents", "--manifest", m.at("nope/manifest.json"));
     expect(run.code).not.toBe(0);
-    expect(run.stderr).toContain(join("nope", "skills.json"));
+    expect(run.stderr).toContain(join("nope", "manifest.json"));
   });
 
   it("R2-17. PATH advice for csh and nushell users is in their shell's syntax and file", () => {

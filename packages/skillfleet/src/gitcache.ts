@@ -386,7 +386,7 @@ async function usable(repo: string): Promise<boolean> {
   return real(gitDir) === real(repo);
 }
 
-/** Splits `<repo>//<path>` (as in `github:org/repo//skills.json`) into the repository and the file. */
+/** Splits `<repo>//<path>` (as in `github:org/repo//team.json`) into the repository and the file. */
 export function splitRepoPath(spec: string): { repo: string; path: string } | undefined {
   const scheme = spec.indexOf("://");
   const from = scheme >= 0 ? scheme + 3 : 0;

@@ -57,12 +57,14 @@ describe("linux environments", () => {
     const team = remote(m, "team", skills("skills/", "team-a"));
     const extra = remote(m, "extra", skills("skills/", "extra-a"));
     const manifests = remote(m, "manifests", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         sources: [{ id: "team", git: team.url }],
       }),
     });
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
+    expect(
+      (await m.run("init", `${manifests.url}//.skillfleet/manifest.json`, "--no-hooks")).code,
+    ).toBe(0);
     const added = await m.run("add", extra.url);
     await m.run("sync");
     // Either add refuses (the manifest lives in a repository it cannot push to), or the source stays.

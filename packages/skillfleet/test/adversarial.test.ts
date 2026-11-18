@@ -210,8 +210,8 @@ describe("hostile manifests", () => {
     const evil = remote(m, "evil", {
       "evil.desktop": "[Desktop Entry]\nExec=sh -c 'echo owned'\n",
     });
-    const team = join(m.root, "team", "skills.json");
-    mkdirSync(join(m.root, "team"), { recursive: true });
+    const team = join(m.root, "team", ".skillfleet", "manifest.json");
+    mkdirSync(join(m.root, "team", ".skillfleet"), { recursive: true });
     writeFileSync(
       team,
       JSON.stringify({ sources: [{ id: "auto", git: evil.url, path: "~/.config/autostart" }] }),
@@ -226,8 +226,8 @@ describe("hostile manifests", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "team-skill"));
     const hub = await recorder();
-    const team = join(m.root, "team", "skills.json");
-    mkdirSync(join(m.root, "team"), { recursive: true });
+    const team = join(m.root, "team", ".skillfleet", "manifest.json");
+    mkdirSync(join(m.root, "team", ".skillfleet"), { recursive: true });
     writeFileSync(
       team,
       JSON.stringify({
@@ -269,8 +269,8 @@ describe("hostile manifests", () => {
   it("M7. when an extended manifest breaks, the skills it provided keep their local edits", async () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
-    const team = join(m.root, "team", "skills.json");
-    mkdirSync(join(m.root, "team"), { recursive: true });
+    const team = join(m.root, "team", ".skillfleet", "manifest.json");
+    mkdirSync(join(m.root, "team", ".skillfleet"), { recursive: true });
     writeFileSync(team, JSON.stringify({ sources: [{ id: "team", git: vendor.https }] }));
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
     expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
@@ -289,8 +289,8 @@ describe("hostile git sources", () => {
   it("G1. doctor does not run a git URL from a team manifest as an --upload-pack command", async () => {
     const m = machine({ scheduler: "empty" });
     const marker = join(m.root, "pwned-doctor");
-    const team = join(m.root, "team", "skills.json");
-    mkdirSync(join(m.root, "team"), { recursive: true });
+    const team = join(m.root, "team", ".skillfleet", "manifest.json");
+    mkdirSync(join(m.root, "team", ".skillfleet"), { recursive: true });
     writeFileSync(
       team,
       JSON.stringify({ sources: [{ id: "x", git: `--upload-pack=touch ${marker};false` }] }),
@@ -465,8 +465,8 @@ describe("hostile npm registries and tarballs", () => {
       { "1.0.0": { tarball: `${url}/pkg.tgz`, integrity: sha512(archive) } },
       "1.0.0",
     );
-    const team = join(m.root, "team", "skills.json");
-    mkdirSync(join(m.root, "team"), { recursive: true });
+    const team = join(m.root, "team", ".skillfleet", "manifest.json");
+    mkdirSync(join(m.root, "team", ".skillfleet"), { recursive: true });
     writeFileSync(team, JSON.stringify({ sources: [{ id: "n", npm: "pkg", registry: url }] }));
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team], sources: [] });
     await m.runWith({ env: { NPM_TOKEN: "npm_secret" } }, "init", manifest, "--no-hooks");
@@ -1149,11 +1149,11 @@ describe("prune never deletes what it did not make", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const team = remote(m, "team", {
-      "skills.json": JSON.stringify({ sources: [{ id: "team", git: vendor.https }] }),
+      ".skillfleet/manifest.json": JSON.stringify({ sources: [{ id: "team", git: vendor.https }] }),
     });
     const manifest = m.manifest({
       agents: ["claude-code"],
-      extends: [`${team.url}//skills.json`],
+      extends: [`${team.url}//.skillfleet/manifest.json`],
       sources: [],
     });
     expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
@@ -1374,12 +1374,14 @@ describe("unusual environments", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const repo = remote(m, "manifest-repo", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         sources: [{ id: "v", git: vendor.url }],
       }),
     });
-    expect((await m.run("init", `${repo.url}//skills.json`, "--no-hooks")).code).toBe(0);
+    expect((await m.run("init", `${repo.url}//.skillfleet/manifest.json`, "--no-hooks")).code).toBe(
+      0,
+    );
     rmSync(repo.url, { recursive: true, force: true });
     const report = await m.json("sync", "--offline");
     expect(report.ok).toBe(true);

@@ -463,7 +463,7 @@ describe("names macOS and Windows fold together", () => {
     expect(read(join(work, "skills", nfd, "SKILL.md"))).toBe(
       `${cafe("ONE", "two", "three")}mine\n`,
     );
-    const recorded = JSON.parse(read(join(m.root, "manifest", "skills.json"))) as {
+    const recorded = JSON.parse(read(join(m.root, "manifest", ".skillfleet", "manifest.json"))) as {
       forks: Record<string, unknown>;
       sources: { exclude?: string[] }[];
     };
@@ -476,7 +476,7 @@ describe("names macOS and Windows fold together", () => {
     const removed = await m.run("remove", typed);
     expect(removed.code, removed.stdout + removed.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["mine", "plain"]);
-    const manifest = JSON.parse(read(join(m.root, "manifest", "skills.json"))) as {
+    const manifest = JSON.parse(read(join(m.root, "manifest", ".skillfleet", "manifest.json"))) as {
       sources: { exclude?: string[] }[];
     };
     expect(manifest.sources[1]!.exclude).toEqual([nfd]);
@@ -604,9 +604,9 @@ describe("manifest specs", () => {
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url, include: [skill] }],
       });
-    const team = remote(m, "team", { "skills.json": manifest("tool") });
+    const team = remote(m, "team", { ".skillfleet/manifest.json": manifest("tool") });
     m.git(team.work, "checkout", "--quiet", "-b", "dev");
-    writeFiles(team.work, { "team/skills.json": manifest("extra") });
+    writeFiles(team.work, { "team/fleet.json": manifest("extra") });
     m.git(team.work, "add", "-A");
     m.git(team.work, "commit", "--quiet", "-m", "dev");
     m.git(team.work, "push", "--quiet", "origin", "dev");
@@ -615,20 +615,20 @@ describe("manifest specs", () => {
   const configured = (m: Machine) =>
     (JSON.parse(read(m.at(".config/skillfleet/config.json"))) as { manifest: string }).manifest;
 
-  it("D2. a GitHub page link without .git is a repository holding skills.json", async () => {
+  it("D2. a GitHub page link without .git is a repository holding .skillfleet/manifest.json", async () => {
     const m = machine();
     hostAt(m, "https://github.com/org/team", teamRepo(m));
     const init = await m.run("init", "https://github.com/org/team", "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
-    expect(configured(m)).toBe("https://github.com/org/team//skills.json");
+    expect(configured(m)).toBe("https://github.com/org/team//.skillfleet/manifest.json");
     expect((await m.json("sync")).ok).toBe(true);
   });
 
   it("D2. a GitHub blob link names the branch and the file", async () => {
     const m = machine();
     hostAt(m, "https://github.com/org/team", teamRepo(m));
-    const link = "https://github.com/org/team/blob/dev/team/skills.json";
+    const link = "https://github.com/org/team/blob/dev/team/fleet.json";
     const init = await m.run("init", link, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["extra"]);
@@ -642,7 +642,7 @@ describe("manifest specs", () => {
     const init = await m.run("init", team.url, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
-    expect(configured(m)).toBe(`${team.url}//skills.json`);
+    expect(configured(m)).toBe(`${team.url}//.skillfleet/manifest.json`);
     expect((await m.json("sync")).ok).toBe(true);
   });
 });

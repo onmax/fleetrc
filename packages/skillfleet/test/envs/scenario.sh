@@ -99,7 +99,8 @@ if [ "$HAVE_GIT" = 1 ]; then
   skill_md extra-a >"$SF_SRV/work/extra/skills/extra-a/SKILL.md"
   push extra init
   bare manifest
-  cat >"$SF_SRV/work/manifest/skills.json" <<EOF
+  mkdir -p "$SF_SRV/work/manifest/.skillfleet"
+  cat >"$SF_SRV/work/manifest/.skillfleet/manifest.json" <<EOF
 {
   "agents": "all",
   "sources": [
@@ -110,13 +111,13 @@ if [ "$HAVE_GIT" = 1 ]; then
 EOF
   push manifest init
 fi
-MANIFEST="$SF_SRV/manifest.git//skills.json"
+MANIFEST="$SF_SRV/manifest.git"
 if [ "$HAVE_GIT" = 0 ]; then
   # No git: a plain manifest file with a local source, and a git source that must fail clearly.
   rm -rf "$SF_SRV"
-  mkdir -p "$SF_SRV/local-skills/loc-a" "$SF_SRV/manifest"
+  mkdir -p "$SF_SRV/local-skills/loc-a" "$SF_SRV/manifest/.skillfleet"
   skill_md loc-a >"$SF_SRV/local-skills/loc-a/SKILL.md"
-  cat >"$SF_SRV/manifest/skills.json" <<JSON
+  cat >"$SF_SRV/manifest/.skillfleet/manifest.json" <<JSON
 {
   "agents": "all",
   "sources": [
@@ -125,7 +126,7 @@ if [ "$HAVE_GIT" = 0 ]; then
   ]
 }
 JSON
-  MANIFEST="$SF_SRV/manifest/skills.json"
+  MANIFEST="$SF_SRV/manifest"
 fi
 # A skill the user made by hand before skillfleet: init adopts it into the clone it makes first.
 if [ "$HAVE_GIT" = 1 ]; then
@@ -233,7 +234,7 @@ if [ "$HAVE_GIT" = 1 ]; then
     bad add-remote-refused "exit $code"
     show add
   fi
-  cat >"$SF_SRV/work/manifest/skills.json" <<EOF
+  cat >"$SF_SRV/work/manifest/.skillfleet/manifest.json" <<EOF
 {
   "agents": "all",
   "sources": [

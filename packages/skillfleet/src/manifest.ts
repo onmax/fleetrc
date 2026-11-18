@@ -434,7 +434,7 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
 
 /** This machine's settings, in config.json. The manifest is shared; these are not. */
 export interface Config {
-  /** A manifest path, or `<git repo>//<file>` such as `github:org/agents//skills.json`. */
+  /** A manifest path, or `<git repo>//<file>` such as `github:org/agents//team.json`. */
   manifest: string;
   /** Copy skill folders instead of linking them, on every sync (`--copy`, `--no-copy`). */
   copy?: boolean;
@@ -481,8 +481,14 @@ export interface LoadedManifest {
   failed?: string[];
 }
 
-/** The manifest file a repository holds when a spec names only the repository, as in `init owner/repo`. */
-export const DEFAULT_MANIFEST = "skills.json";
+/** The folder a repository or project keeps its manifest in. */
+const MANIFEST_DIR = ".skillfleet";
+
+/**
+ * The manifest file a repository or folder holds when a spec names only the repository or folder,
+ * as in `init owner/repo` or `init .`.
+ */
+export const DEFAULT_MANIFEST = `${MANIFEST_DIR}/manifest.json`;
 
 /** `owner/repo`, `github:owner/repo`, `gitlab:group/repo`, or a git URL ending in `.git`. */
 const isRepository = (spec: string) =>
@@ -539,7 +545,7 @@ function decoded(part: string): string {
   }
 }
 
-/** A `blob` link names a manifest file, a `tree` link a folder holding `skills.json`. */
+/** A `blob` link names a manifest file, a `tree` link a folder holding `.skillfleet/manifest.json`. */
 function webManifest(spec: string): RemoteManifest | undefined {
   const page = webPage(spec);
   if (!page) return undefined;
@@ -558,9 +564,9 @@ export interface RemoteManifest {
 
 /**
  * The repository and file of a manifest kept in git, or undefined for a file on this machine.
- * `<repo>//<file>` names both; a repository alone means its `skills.json`, and so does a GitHub or
- * GitLab page link. A path that exists on this machine, resolved against `base`, is local, unless
- * it is a bare repository.
+ * `<repo>//<file>` names both; a repository alone means its `.skillfleet/manifest.json`, and so does
+ * a GitHub or GitLab page link. A path that exists on this machine, resolved against `base`, is
+ * local, unless it is a bare repository.
  */
 export function remoteManifest(spec: string, base = process.cwd()): RemoteManifest | undefined {
   const local = expandPath(spec, base);
@@ -613,13 +619,16 @@ async function locate(
 ): Promise<{ file: string; root: string }> {
   const remote = remoteManifest(spec, base);
   if (!remote) {
-    // A folder, such as a clone of the manifest's repository, means its skills.json.
+    // A folder, such as a clone of the manifest's repository, means its .skillfleet/manifest.json.
     const path = expandPath(spec, base);
-    const file = statSync(path, { throwIfNoEntry: false })?.isDirectory()
-      ? join(path, DEFAULT_MANIFEST)
-      : path;
+    const folder = statSync(path, { throwIfNoEntry: false })?.isDirectory() === true;
+    const file = folder ? join(path, DEFAULT_MANIFEST) : path;
+    if (folder && !existsSync(file))
+      throw new ManifestError(
+        `${tildify(path)} has no ${DEFAULT_MANIFEST}; name the manifest file as ${join(tildify(path), "<file>")}`,
+      );
     if (team) within(team.within, file, spec);
-    return { file, root: team?.within ?? dirname(file) };
+    return { file, root: team?.within ?? manifestHome(file) };
   }
   const url = gitUrl(remote.repo);
   const check = team ? teamGitProblem : undefined;
@@ -635,6 +644,16 @@ async function locate(
     );
   if (team) within(clone.dir, file, spec);
   return { file, root: clone.dir };
+}
+
+/**
+ * The folder a manifest on this machine belongs to, which a team manifest's own `extends` stays
+ * in: the folder around `.skillfleet/`, as a repository's checkout is, else the file's own folder.
+ * Relative paths inside the manifest still resolve against the file's folder.
+ */
+function manifestHome(file: string): string {
+  const dir = dirname(file);
+  return basename(dir) === MANIFEST_DIR ? dirname(dir) : dir;
 }
 
 /** Throws unless `file`, links followed, is inside `root`. */

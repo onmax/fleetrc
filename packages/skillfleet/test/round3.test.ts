@@ -137,7 +137,7 @@ describe("linked skill folders", () => {
             ? { id: "personal", git: r.url, skills: "skills/*" }
             : { id: "personal", git: r.url, path: clone(m, r, "code/skills"), skills: "skills/*" };
         m.manifest({ agents: ["claude-code"], sources: [source] });
-        await m.run("init", join(m.root, "manifest", "skills.json"), "--no-hooks");
+        await m.run("init", join(m.root, "manifest", ".skillfleet", "manifest.json"), "--no-hooks");
         const report = await m.json("sync");
         expect(report.errors).toEqual([]);
         expect(report.skills.names).toEqual(["tool"]);

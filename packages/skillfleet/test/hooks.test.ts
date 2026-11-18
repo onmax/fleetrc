@@ -217,7 +217,9 @@ describe("hook run", () => {
       script,
       `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(seen)}, JSON.stringify({ cwd: process.cwd(), path: process.env.PATH }));\n`,
     );
-    const manifest = JSON.parse(read(join(m.root, "manifest", "skills.json"))) as object;
+    const manifest = JSON.parse(
+      read(join(m.root, "manifest", ".skillfleet", "manifest.json")),
+    ) as object;
     m.manifest({
       ...manifest,
       hooks: [{ name: "record", run: `"${process.execPath}" "${script}"`, on: ["mine:**"] }],
