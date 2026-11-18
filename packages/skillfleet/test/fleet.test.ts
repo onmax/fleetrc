@@ -1,8 +1,16 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { fleet, formatFleet, remoteScript } from "../src/fleet.ts";
+import { fleet, formatFleet, remoteScript, resolveFleet } from "../src/fleet.ts";
 import { launchers } from "../src/selfinstall.ts";
 import { isWindows, machine, type Machine, pathWith, remote, skills } from "./fixture.ts";
 
@@ -33,6 +41,59 @@ else {
   chmodSync(ssh, 0o755);
   return { PATH: pathWith(dir, m.env) };
 }
+
+let lastIp = 0;
+/** A tailnet peer as `tailscale status --json` lists it. */
+function peer(dns: string, tags: string[], { online = true, ips = [`100.64.1.${++lastIp}`] } = {}) {
+  return {
+    PublicKey: `nodekey:${dns}`,
+    HostName: dns.split(".")[0],
+    DNSName: dns ? `${dns}.` : "",
+    TailscaleIPs: ips,
+    ...(tags.length ? { Tags: tags } : {}),
+    Online: online,
+  };
+}
+
+function status(peers: ReturnType<typeof peer>[], self = peer("me.tail.ts.net", ["tag:servers"])) {
+  return {
+    BackendState: "Running",
+    Self: self,
+    Peer: Object.fromEntries(peers.map((p) => [p.PublicKey, p])),
+  };
+}
+
+/**
+ * A fake `tailscale` for SKILLFLEET_TAILSCALE: prints `output` (JSON for an object) and exits with
+ * `code`, and touches `<dir>/tailscale-ran` so a test can tell it was asked.
+ */
+function fakeTailscale(dir: string, output: object | string, code = 0): string {
+  mkdirSync(dir, { recursive: true });
+  const script = join(dir, "tailscale.mjs");
+  const text = typeof output === "string" ? output : JSON.stringify(output);
+  writeFileSync(
+    script,
+    `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(join(dir, "tailscale-ran"))}, "");
+process.stdout.write(${JSON.stringify(text)});
+process.exit(${code});`,
+  );
+  return script;
+}
+
+/** Runs `body` with `SKILLFLEET_TAILSCALE` set to `program`. */
+async function withTailscale<T>(program: string, body: () => Promise<T>): Promise<T> {
+  const saved = process.env.SKILLFLEET_TAILSCALE;
+  process.env.SKILLFLEET_TAILSCALE = program;
+  try {
+    return await body();
+  } finally {
+    if (saved === undefined) delete process.env.SKILLFLEET_TAILSCALE;
+    else process.env.SKILLFLEET_TAILSCALE = saved;
+  }
+}
+
+type Hosts = { host: string; via?: string; reachable: boolean; checked: boolean; error?: string }[];
 
 describe("fleet", () => {
   it("14. reports localhost through ssh, and an unreachable host times out with its last-run age", async () => {
@@ -273,6 +334,226 @@ esac
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
     }
+  });
+});
+
+describe("fleet tags", () => {
+  it("expands a tag to its tailnet machines by MagicDNS name, or IP without one, and skips this machine", async () => {
+    const m = machine();
+    const program = fakeTailscale(
+      m.root,
+      status([
+        peer("web.tail.ts.net", ["tag:servers"]),
+        peer("", ["tag:servers"], { ips: ["100.64.0.9", "fd7a::9"] }),
+        peer("db.tail.ts.net", ["tag:Servers", "tag:db"], { online: false }),
+        peer("laptop.tail.ts.net", []),
+      ]),
+    );
+    const { targets, warnings } = await withTailscale(program, () => resolveFleet(["tag:servers"]));
+    expect(warnings).toEqual([]);
+    // Self (me.tail.ts.net) has the tag too, and is left out.
+    expect(targets).toEqual([
+      { host: "web.tail.ts.net", via: "tag:servers" },
+      { host: "100.64.0.9", via: "tag:servers" },
+      { host: "db.tail.ts.net", via: "tag:servers", offline: true },
+    ]);
+  });
+
+  it("runs a machine named twice once: an explicit host wins, then the first tag", async () => {
+    const m = machine();
+    const program = fakeTailscale(
+      m.root,
+      status([
+        peer("web.tail.ts.net", ["tag:servers", "tag:web"]),
+        peer("db.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.2"] }),
+        peer("ci.tail.ts.net", ["tag:servers"]),
+        peer("vps.tail.ts.net", ["tag:web"]),
+      ]),
+    );
+    const { targets } = await withTailscale(program, () =>
+      resolveFleet([
+        "tag:servers",
+        "WEB",
+        "me@100.64.0.2",
+        "tag:web",
+        "ssh://me@CI.tail.ts.net:22",
+        "web",
+      ]),
+    );
+    expect(targets).toEqual([
+      { host: "WEB" },
+      { host: "me@100.64.0.2" },
+      { host: "vps.tail.ts.net", via: "tag:web" },
+      { host: "ssh://me@CI.tail.ts.net:22" },
+    ]);
+  });
+
+  it("warns about a tag that matches no machine, and asks Tailscale nothing without a tag", async () => {
+    const m = machine();
+    const program = fakeTailscale(m.root, status([peer("web.tail.ts.net", ["tag:web"])]));
+    const tagged = await withTailscale(program, () => resolveFleet(["tag:servers", "laptop"]));
+    expect(tagged).toEqual({
+      targets: [{ host: "laptop" }],
+      warnings: ["tag:servers matches no machine on your tailnet besides this one"],
+    });
+    rmSync(join(m.root, "tailscale-ran"));
+    await withTailscale(program, () => resolveFleet(["laptop"]));
+    expect(existsSync(join(m.root, "tailscale-ran"))).toBe(false);
+  });
+
+  it("says why a tag can't be expanded when tailscale is missing, logged out, failing or printing junk", async () => {
+    const m = machine();
+    const cases: [string, string][] = [
+      [
+        join(m.root, "nowhere", "tailscale"),
+        "which SKILLFLEET_TAILSCALE names, is not installed or not on PATH",
+      ],
+      [
+        fakeTailscale(join(m.root, "out"), { BackendState: "NeedsLogin" }),
+        "Tailscale is not logged in; run `tailscale up`",
+      ],
+      [
+        fakeTailscale(join(m.root, "junk"), "<html>"),
+        "`tailscale status --json` printed something that is not JSON",
+      ],
+      [fakeTailscale(join(m.root, "down"), "", 1), "`tailscale status` failed: exit 1"],
+    ];
+    for (const [program, error] of cases) {
+      const { targets } = await withTailscale(program, () =>
+        resolveFleet(["laptop", "tag:servers"]),
+      );
+      expect(targets[0]).toEqual({ host: "laptop" });
+      expect(targets[1]).toMatchObject({ host: "tag:servers", via: "tag:servers" });
+      expect(targets[1]!.error).toContain(error);
+    }
+  });
+
+  it("a fleet with tailscale missing still runs its explicit hosts, and the tag line says why, exit 1", async () => {
+    const m = machine();
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [],
+      fleet: ["tag:servers", "localhost"],
+    });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    expect((await m.run("self-install")).code).toBe(0);
+    const env = { ...sshShim(m), SKILLFLEET_TAILSCALE: join(m.root, "nowhere", "tailscale") };
+    const text = await m.runWith({ env }, "fleet", "status", "--timeout", "20");
+    expect(text.code).toBe(1);
+    expect(text.stderr).not.toMatch(/\n\s+at /);
+    const lines = text.stdout.replace(/\r/g, "").trimEnd().split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatch(
+      /^tag:servers: not expanded \(.*tailscale, which SKILLFLEET_TAILSCALE names, is not installed or not on PATH\)$/,
+    );
+    expect(lines[1]).toMatch(/^localhost: last run \d+s ago, 0 skills$/);
+  });
+
+  it("fleet sync|status take a tag on the command line, mark offline machines, and --json says which tag a host came from", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [], fleet: ["laptop"] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    expect((await m.run("self-install")).code).toBe(0);
+    const program = fakeTailscale(
+      m.root,
+      status([
+        peer("localhost", ["tag:servers"]),
+        peer("gone.tail.ts.net", ["tag:servers"], { online: false }),
+      ]),
+    );
+    const env = { ...sshShim(m), SKILLFLEET_TAILSCALE: program };
+    const started = Date.now();
+    const run = await m.runWith({ env }, "fleet", "status", "tag:servers", "--json");
+    // The offline machine is not waited on for ssh's 30 s.
+    expect(Date.now() - started).toBeLessThan(25_000);
+    expect(run.code, run.stderr).toBe(1);
+    const hosts = JSON.parse(run.stdout) as Hosts;
+    expect(hosts).toEqual([
+      expect.objectContaining({ host: "localhost", via: "tag:servers", reachable: true }),
+      expect.objectContaining({
+        host: "gone.tail.ts.net",
+        via: "tag:servers",
+        reachable: false,
+        error: "offline in Tailscale",
+      }),
+    ]);
+    const text = await m.runWith({ env }, "fleet", "status", "tag:servers");
+    expect(text.stdout).toMatch(/^localhost \(tag:servers\): last run /m);
+    expect(text.stdout).toContain(
+      "gone.tail.ts.net (tag:servers): unreachable (offline in Tailscale); no run recorded\n",
+    );
+
+    const dry = await m.runWith({ env }, "fleet", "sync", "tag:servers", "--dry-run");
+    expect(dry.stdout).toMatch(
+      /^tag:servers expands to localhost, gone\.tail\.ts\.net \(offline\)$/m,
+    );
+
+    const none = await m.runWith({ env }, "fleet", "status", "tag:nothing");
+    expect(none.code).toBe(0);
+    expect(none.stderr).toContain(
+      "skillfleet: warning: tag:nothing matches no machine on your tailnet besides this one",
+    );
+
+    const bad = await m.runWith({ env }, "fleet", "sync", "tag:bad_tag");
+    expect(bad.code).toBe(2);
+    expect(bad.stderr).toContain('"tag:bad_tag" is not a Tailscale tag');
+  });
+
+  it("fleet add records a tag, and without hosts suggests the tags it saw", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const program = fakeTailscale(
+      m.root,
+      status([
+        peer("web.tail.ts.net", ["tag:servers"]),
+        peer("db.tail.ts.net", ["tag:servers", "tag:db"]),
+        peer("laptop.tail.ts.net", []),
+      ]),
+    );
+    const env = { SKILLFLEET_TAILSCALE: program };
+    const listed = await m.runWith({ env }, "fleet", "add");
+    expect(listed.code, listed.stderr).toBe(0);
+    expect(listed.stdout).toContain("  tag:db  (1 machine)\n  tag:servers  (2 machines)");
+    expect(listed.stdout).toContain("  laptop  laptop.tail.ts.net");
+
+    expect((await m.runWith({ env }, "fleet", "add", "tag:servers")).code).toBe(0);
+    expect((JSON.parse(readFileSync(manifest, "utf8")) as { fleet: string[] }).fleet).toEqual([
+      "tag:servers",
+    ]);
+    const after = JSON.parse((await m.runWith({ env }, "fleet", "add", "--json")).stdout) as {
+      tags: { tag: string }[];
+    };
+    expect(after.tags.map(({ tag }) => tag)).toEqual(["tag:db"]);
+
+    const bad = await m.runWith({ env }, "fleet", "add", "tag:9lives");
+    expect(bad.code).toBe(1);
+    expect(bad.stderr).toContain('"tag:9lives" is not a Tailscale tag');
+  });
+
+  it("an extended team manifest's tag is ignored, and Tailscale is never asked", async () => {
+    const m = machine();
+    const team = join(m.root, "team", ".skillfleet", "manifest.json");
+    mkdirSync(join(team, ".."), { recursive: true });
+    writeFileSync(team, JSON.stringify({ sources: [], fleet: ["tag:servers"] }));
+    // A host fleet refuses at once, so the run needs no ssh.
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      extends: [team],
+      sources: [],
+      fleet: ["-x"],
+    });
+    const program = fakeTailscale(m.root, status([peer("web.tail.ts.net", ["tag:servers"])]));
+    const run = await m.runWith(
+      { env: { SKILLFLEET_TAILSCALE: program } },
+      "fleet",
+      "status",
+      "--json",
+      "--manifest",
+      manifest,
+    );
+    expect((JSON.parse(run.stdout) as Hosts).map(({ host }) => host)).toEqual(["-x"]);
+    expect(existsSync(join(m.root, "tailscale-ran"))).toBe(false);
   });
 });
 

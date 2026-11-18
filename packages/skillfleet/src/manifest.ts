@@ -12,6 +12,7 @@ import { hostname, networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
+import { isTag, tagProblem } from "./fleet.ts";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
 import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { editJsonText } from "./jsonedit.ts";
@@ -162,6 +163,16 @@ function stringList(file: string, at: string, value: unknown): string[] | undefi
   if (!Array.isArray(value) || !value.every((item) => typeof item === "string"))
     fail(file, at, "must be an array of strings");
   return value;
+}
+
+/** SSH hosts, checked when fleet runs, and `tag:` entries, checked here. */
+function fleetList(file: string, value: unknown): string[] {
+  const fleet = stringList(file, "fleet", value) ?? [];
+  fleet.forEach((entry, i) => {
+    const problem = isTag(entry) ? tagProblem(entry) : undefined;
+    if (problem) fail(file, `fleet[${i}]`, problem);
+  });
+  return fleet;
 }
 
 function optionalString(file: string, at: string, value: unknown): string | undefined {
@@ -425,7 +436,7 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
     sources,
     forks,
     hooks,
-    fleet: stringList(file, "fleet", raw.fleet) ?? [],
+    fleet: fleetList(file, raw.fleet),
     hub: optionalString(file, "hub", raw.hub),
     report,
     timer,

@@ -4,7 +4,9 @@ import { describe, expect, it } from "vite-plus/test";
 import { parseManifest } from "../src/manifest.ts";
 
 interface Schema {
-  properties: Record<string, unknown>;
+  properties: Record<string, unknown> & {
+    fleet: { items: { if: { pattern: string }; then: { pattern: string } } };
+  };
   $defs: {
     common: {
       properties: { id: { pattern: string; maxLength: number; not: { pattern: string } } };
@@ -27,7 +29,7 @@ const samples: Record<string, unknown> = {
   sources: [],
   forks: { x: { from: "a/b", path: "skills/x", base: "abc" } },
   hooks: [{ name: "h", run: "true", on: ["personal:**"] }],
-  fleet: ["host"],
+  fleet: ["host", "tag:servers"],
   hub: "https://hub.example",
   report: { run: "true" },
   timer: { cron: "0 * * * *", timeZone: "UTC" },
@@ -108,6 +110,38 @@ describe("schema.json", () => {
       "a".repeat(256),
     ])
       expect(schemaTakes(id), id).toBe(parserTakes(id));
+  });
+
+  it("takes a fleet tag exactly when the parser does", () => {
+    const { items } = schema.properties.fleet;
+    const schemaTakes = (entry: string) =>
+      !new RegExp(items.if.pattern).test(entry) || new RegExp(items.then.pattern).test(entry);
+    const parserTakes = (entry: string) => {
+      try {
+        parseManifest("m.json", { fleet: [entry] });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    for (const entry of [
+      "tag:servers",
+      "tag:web-1",
+      "tag:Servers",
+      "tag:",
+      "tag:1web",
+      "tag:web_1",
+      "tag:web.prod",
+      "tag:-web",
+      "tag:a b",
+      "laptop",
+      "me@vps",
+      "tagged-box",
+    ])
+      expect(schemaTakes(entry), entry).toBe(parserTakes(entry));
+    expect(() => parseManifest("m.json", { fleet: ["laptop", "tag:web_1"] })).toThrow(
+      'm.json: fleet[1] "tag:web_1" is not a Tailscale tag: write tag: and then a letter followed by letters, digits or dashes, such as "tag:servers"',
+    );
   });
 
   it("asks for path wherever the parser does: adopt and followLinks on a git source", () => {

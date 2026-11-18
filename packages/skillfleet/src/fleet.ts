@@ -7,6 +7,8 @@ export type FleetAction = "status" | "sync" | "upgrade";
 
 export interface HostResult {
   host: string;
+  /** The Tailscale tag the host came from, for a host a `tag:` entry expanded to. */
+  via?: string;
   /** The host answered over ssh. */
   reachable: boolean;
   /** False when skillfleet could not try the host: ssh is not installed, or the name is not one ssh takes. */
@@ -139,12 +141,18 @@ export async function unpublished(version: string): Promise<string | undefined> 
 
 const quote = (script: string) => `'${script.replace(/'/g, `'\\''`)}'`;
 
-/** ssh, or `SKILLFLEET_SSH` (a program, or a .js/.mjs file run with node). */
-function sshCommand(): { command: string; prefix: string[] } {
-  const custom = process.env.SKILLFLEET_SSH;
-  if (!custom) return { command: "ssh", prefix: [] };
+/** `fallback`, or the program `variable` names (a .js/.mjs file runs with node). */
+function program(variable: string, fallback: string): { command: string; prefix: string[] } {
+  const custom = process.env[variable];
+  if (!custom) return { command: fallback, prefix: [] };
   if (/\.(m?js)$/.test(custom)) return { command: process.execPath, prefix: [custom] };
   return { command: custom, prefix: [] };
+}
+
+function notInstalled(command: string, fallback: string, variable: string): string {
+  return command === fallback
+    ? `${fallback} is not installed, or not on PATH`
+    : `${command}, which ${variable} names, is not installed or not on PATH`;
 }
 
 function summarize(raw: unknown): HostResult["lastRun"] {
@@ -208,7 +216,7 @@ async function runOnHost(
 ) {
   const problem = hostProblem(host);
   if (problem) return { error: problem, reached: false, checked: false };
-  const { command, prefix } = sshCommand();
+  const { command, prefix } = program("SKILLFLEET_SSH", "ssh");
   const args = [
     ...prefix,
     "-o",
@@ -229,10 +237,7 @@ async function runOnHost(
   });
   if (run.spawnError === "ENOENT")
     return {
-      error:
-        command === "ssh"
-          ? "ssh is not installed, or not on PATH"
-          : `${command}, which SKILLFLEET_SSH names, is not installed or not on PATH`,
+      error: notInstalled(command, "ssh", "SKILLFLEET_SSH"),
       reached: false,
       checked: false,
     };
@@ -292,7 +297,7 @@ function parseReport(stdout: string): unknown {
  * A dry run of `sync` runs `sync --dry-run` on each host, and its reports are not cached as runs.
  */
 export async function fleet(
-  hosts: readonly string[],
+  hosts: readonly (string | FleetTarget)[],
   action: FleetAction,
   version: string,
   timeoutMs = 30_000,
@@ -300,17 +305,33 @@ export async function fleet(
 ): Promise<HostResult[]> {
   const cache = readCache();
   const results = await Promise.all(
-    hosts.map(async (host): Promise<HostResult> => {
+    hosts.map(async (target): Promise<HostResult> => {
+      const { host, via, offline, error } = typeof target === "string" ? { host: target } : target;
+      const from = via ? { via } : {};
+      // A tag Tailscale could not expand.
+      if (error !== undefined)
+        return { host, ...from, reachable: false, checked: false, error, behind: [] };
+      if (offline)
+        return {
+          host,
+          ...from,
+          reachable: false,
+          checked: true,
+          lastRun: cache[host],
+          error: "offline in Tailscale",
+          behind: [],
+        };
       const answer = await runOnHost(host, action, version, timeoutMs, dryRun);
       // The host answered, but has no report to give.
       if ("note" in answer && answer.note) {
-        const error = HOST_NOTES[answer.note];
+        const note = HOST_NOTES[answer.note];
         return {
           host,
+          ...from,
           reachable: true,
           checked: true,
           lastRun: cache[host],
-          ...(error ? { error } : {}),
+          ...(note ? { error: note } : {}),
           behind: [],
         };
       }
@@ -329,10 +350,19 @@ export async function fleet(
           : {};
       if (run) {
         if (!dryRun) cache[host] = run;
-        return { host, reachable: true, checked: true, lastRun: run, ...upgrade, behind: [] };
+        return {
+          host,
+          ...from,
+          reachable: true,
+          checked: true,
+          lastRun: run,
+          ...upgrade,
+          behind: [],
+        };
       }
       return {
         host,
+        ...from,
         reachable: answer.reached ?? false,
         checked: answer.checked ?? true,
         lastRun: cache[host],
@@ -382,6 +412,8 @@ export function age(iso: string, now = Date.now()): string {
 export function formatFleet(results: readonly HostResult[]): string {
   return results
     .map((result) => {
+      // A tag entry Tailscale could not expand.
+      if (result.via === result.host) return `${result.host}: not expanded (${result.error})`;
       const run = result.lastRun;
       const last = run
         ? `last run ${age(run.finishedAt)} ago, ${run.skills} skills${run.ok ? "" : ", with errors"}`
@@ -393,7 +425,7 @@ export function formatFleet(results: readonly HostResult[]): string {
           : result.error
             ? `${result.error}; ${last}`
             : last;
-      return `${result.host}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
+      return `${result.host}${result.via ? ` (${result.via})` : ""}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
     })
     .join("\n");
 }
@@ -403,27 +435,150 @@ function upgraded({ from, to }: NonNullable<HostResult["upgrade"]>): string {
   return from === to ? `already on ${to}` : `${from} → ${to}`;
 }
 
-export interface TailscalePeer {
+/** A `tag:<name>` fleet entry: Tailscale's rule for a tag name, a letter and then letters, digits or dashes. */
+const TAG = /^tag:[A-Za-z][A-Za-z0-9-]*$/;
+
+export const isTag = (entry: string) => entry.startsWith("tag:");
+
+/** Why `entry`, which starts with `tag:`, is not a Tailscale tag, or undefined when it is one. */
+export function tagProblem(entry: string): string | undefined {
+  if (TAG.test(entry)) return undefined;
+  return `"${entry}" is not a Tailscale tag: write tag: and then a letter followed by letters, digits or dashes, such as "tag:servers"`;
+}
+
+/** Why a fleet entry, a host or a `tag:`, cannot be used, or undefined when it can. */
+export const fleetEntryProblem = (entry: string) =>
+  isTag(entry) ? tagProblem(entry) : hostProblem(entry);
+
+/** A host to run on: named in the fleet, or a machine a `tag:` entry expanded to. */
+export interface FleetTarget {
   host: string;
+  /** The tag the host came from. */
+  via?: string;
+  /** Tailscale says the machine is offline, so ssh is not tried. */
+  offline?: boolean;
+  /** Set on a `tag:` entry that could not be expanded: why. */
+  error?: string;
+}
+
+export interface TailscalePeer {
+  /** The first label of its MagicDNS name, which ssh and `fleet add` take on the tailnet. */
+  host: string;
+  /** Its MagicDNS name without the trailing dot, or "" when it has none. */
   dns: string;
+  ips: string[];
+  tags: string[];
   online: boolean;
 }
 
-/** Machines on the tailnet, for `fleet add` to suggest. */
-export async function tailscalePeers(): Promise<TailscalePeer[]> {
-  const run = await exec("tailscale", ["status", "--json"], {
+/** The machines on the tailnet other than this one, or why Tailscale could not list them. */
+export async function tailnet(): Promise<{ peers: TailscalePeer[] } | { error: string }> {
+  const { command, prefix } = program("SKILLFLEET_TAILSCALE", "tailscale");
+  const run = await exec(command, [...prefix, "status", "--json"], {
     timeoutMs: 10_000,
     maxOutput: 64 * 1024 * 1024,
   });
-  if (run.code !== 0) return [];
-  const parsed: unknown = JSON.parse(run.stdout);
-  if (!isRecord(parsed) || !isRecord(parsed.Peer)) return [];
-  // HostName is the machine's own name, which can have spaces ("Maxi's MacBook Pro"); the first
-  // label of its MagicDNS name is the one ssh and `fleet add` take.
-  return Object.values(parsed.Peer).flatMap((peer) => {
+  if (run.spawnError === "ENOENT")
+    return { error: notInstalled(command, "tailscale", "SKILLFLEET_TAILSCALE") };
+  if (run.timedOut) return { error: "`tailscale status` did not answer within 10 s" };
+  if (run.code !== 0) {
+    const said = run.stderr.trim().split("\n")[0] || `exit ${run.code}`;
+    return { error: `\`tailscale status\` failed: ${said}` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(run.stdout);
+  } catch {
+    return { error: "`tailscale status --json` printed something that is not JSON" };
+  }
+  if (!isRecord(parsed)) return { error: "`tailscale status --json` printed no status" };
+  if (parsed.BackendState === "NeedsLogin" || parsed.BackendState === "NoState")
+    return { error: "Tailscale is not logged in; run `tailscale up`" };
+  if (parsed.BackendState === "Stopped")
+    return { error: "Tailscale is stopped; run `tailscale up`" };
+  const self = isRecord(parsed.Self) ? parsed.Self : {};
+  const peers = Object.values(isRecord(parsed.Peer) ? parsed.Peer : {}).flatMap((peer) => {
     if (!isRecord(peer)) return [];
+    // Tailscale lists this machine under Self, not Peer; a Peer entry that is Self is skipped all the same.
+    if (peer.PublicKey !== undefined && peer.PublicKey === self.PublicKey) return [];
     const dns = typeof peer.DNSName === "string" ? peer.DNSName.replace(/\.$/, "") : "";
+    // HostName is the machine's own name, which can have spaces ("Maxi's MacBook Pro").
     const host = dns.split(".")[0] || (typeof peer.HostName === "string" ? peer.HostName : "");
-    return host && !hostProblem(host) ? [{ host, dns, online: peer.Online === true }] : [];
+    const strings = (value: unknown) =>
+      Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === "string" && item !== "")
+        : [];
+    return [
+      {
+        host,
+        dns,
+        ips: strings(peer.TailscaleIPs),
+        tags: strings(peer.Tags),
+        online: peer.Online === true,
+      },
+    ];
   });
+  return { peers };
+}
+
+/** Machines on the tailnet, for `fleet add` to suggest; none when Tailscale can't say. */
+export async function tailscalePeers(): Promise<TailscalePeer[]> {
+  const answer = await tailnet();
+  return "peers" in answer
+    ? answer.peers.filter((peer) => peer.host && !hostProblem(peer.host))
+    : [];
+}
+
+/** The machine a host entry names, for comparing with a Tailscale peer: no user, port or brackets. */
+function machineName(host: string): string {
+  return host
+    .replace(/^ssh:\/\//, "")
+    .replace(/^[^@]*@/, "")
+    .replace(/:[0-9]+$/, "")
+    .replace(/^\[(.*)\]$/, "$1")
+    .replace(/\.$/, "")
+    .toLowerCase();
+}
+
+/**
+ * The hosts to run on: the explicit ones as they are, and each `tag:` entry as every tailnet
+ * machine with that tag, by MagicDNS name or else its first Tailscale IP. Tailscale is asked once,
+ * and only when there is a tag. A machine named twice runs once: an explicit host wins over a tag's
+ * match for the same machine (by its full or short MagicDNS name, or an IP), and the first tag wins
+ * over later ones. A tag that matches nothing gets a warning; one that can't be expanded comes back
+ * as a target with its `error`.
+ */
+export async function resolveFleet(
+  entries: readonly string[],
+): Promise<{ targets: FleetTarget[]; warnings: string[] }> {
+  const warnings: string[] = [];
+  const answer = entries.some(isTag) ? await tailnet() : { peers: [] };
+  const explicit = new Set(entries.filter((entry) => !isTag(entry)).map(machineName));
+  const seen = new Set<string>();
+  const targets: FleetTarget[] = [];
+  for (const entry of entries) {
+    if (!isTag(entry)) {
+      const key = entry.toLowerCase();
+      if (!seen.has(key)) targets.push({ host: entry });
+      seen.add(key);
+      continue;
+    }
+    if ("error" in answer) {
+      targets.push({ host: entry, via: entry, error: answer.error });
+      continue;
+    }
+    const tag = entry.toLowerCase();
+    const matches = answer.peers.filter((peer) => peer.tags.some((t) => t.toLowerCase() === tag));
+    if (matches.length === 0)
+      warnings.push(`${entry} matches no machine on your tailnet besides this one`);
+    for (const peer of matches) {
+      const host = peer.dns || peer.ips[0];
+      if (!host || hostProblem(host)) continue;
+      const names = [peer.dns, peer.host, ...peer.ips].filter(Boolean).map((n) => n.toLowerCase());
+      if (names.some((name) => explicit.has(name) || seen.has(name))) continue;
+      for (const name of names) seen.add(name);
+      targets.push({ host, via: entry, ...(peer.online ? {} : { offline: true }) });
+    }
+  }
+  return { targets, warnings };
 }
