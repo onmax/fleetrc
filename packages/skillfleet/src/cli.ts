@@ -45,6 +45,7 @@ import { HOOK_AGENTS, type HookAgent, runHook } from "./hook.ts";
 import { applyPlan, cloneBeforeAdopt, formatPlan, planInit } from "./init.ts";
 import { gitUrl } from "./gitcache.ts";
 import { errorText } from "./linker.ts";
+import { skillList } from "./list.ts";
 import {
   canonicalManifestSpec,
   closest,
@@ -167,7 +168,13 @@ const COMMANDS: Record<string, Command> = {
     summary: "Last run, held and pending updates, edited skills, sessions to restart",
     options: ["json"],
   },
-  list: { usage: "list", summary: "Linked skills and where each comes from", options: ["json"] },
+  list: {
+    usage: "list",
+    summary: "Linked skills and where each comes from",
+    details:
+      'With --json it prints {"version": 1, "lastChange", "skills": [{"name", "source", "dir", "changedAt"}]}, sorted by name, for programs built on skillfleet: each skill\'s SKILL.md is in its dir. It reads only this machine\'s state, with no network. A later version only adds fields.',
+    options: ["json"],
+  },
   agents: {
     usage: "agents",
     summary: "Agent ids for the manifest's agents, which are installed, and where skills go",
@@ -646,11 +653,10 @@ async function status() {
 }
 
 function list() {
-  const state = loadState();
-  if (json) emit(state.skills);
+  const listed = skillList();
+  if (json) emit(listed);
   else
-    for (const name of Object.keys(state.skills).sort())
-      say(`${name}  ${state.skills[name]!.source}  ${tildify(state.skills[name]!.dir)}`);
+    for (const skill of listed.skills) say(`${skill.name}  ${skill.source}  ${tildify(skill.dir)}`);
   return 0;
 }
 
