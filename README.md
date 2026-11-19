@@ -18,7 +18,7 @@ The same agent skills in Claude Code, Codex, Gemini CLI, OpenCode, Cursor and Co
 
 You list where your skills come from in one manifest in git: your own repo, your team's, GitHub upstreams, skill indexes like Drop's, and npm. Each machine pulls them when a Claude Code or Codex session starts, links every skill into every agent's folder, and reports what changed. A skill you edited on that machine is never overwritten.
 
-[Usage](#usage) · [Manifest](#manifest) · [Agents and systems](#agents-and-systems) · [Status](#status)
+[Usage](#usage) · [Manifest](#manifest) · [Agents and systems](#agents-and-systems) · [Build on skillfleet](#build-on-skillfleet) · [Status](#status)
 
 ```sh
 npx skillfleet init my-team/agents
@@ -71,7 +71,7 @@ With Tailscale, tag the server and run `skillfleet fleet init tag:servers`: ever
 | `sync [source]`                         | Fetches every source, or only `source`, and links the skills. Plain `skillfleet` runs it.                                                                                                                                                                                                                                                                                                        |
 | `init [manifest]`                       | Configures the manifest (a repo or folder's `.skillfleet/manifest.json`), moves aside or adopts what the agent folders hold now, syncs, installs the command and the session hooks. `--no-hooks` skips the hooks, `--timer` installs the timer too, `--force` goes ahead when a skill name would be lost. A machine that has the timer keeps it. Without one, it reuses the configured manifest. |
 | `status`                                | The last run, held and pending updates, edited skills, what starts the syncs, and Codex sessions to restart.                                                                                                                                                                                                                                                                                     |
-| `list`                                  | Linked skills and the source of each.                                                                                                                                                                                                                                                                                                                                                            |
+| `list`                                  | Linked skills and the source of each. With `--json`, the document in [Build on skillfleet](#build-on-skillfleet).                                                                                                                                                                                                                                                                                |
 | `agents`                                | Every agent id, which agents are installed here, and the folder each one's skills go to.                                                                                                                                                                                                                                                                                                         |
 | `doctor`                                | Checks node, git access to each source, the hooks or the timer, and duplicate skills. It warns when nothing starts a sync.                                                                                                                                                                                                                                                                       |
 | `add <source>`                          | Adds `owner/repo`, `github:` or `gitlab:` repositories, a git URL, a GitHub or GitLab link to a folder or a `SKILL.md` (its branch becomes `ref`, its folder the `skills` glob), an index URL, `npm:<package>` (or `npm:<package>@<version>`) or a path, then syncs. `--id`, `--skills <glob>`, `--include <name>`, `--exclude <name>` (both repeatable) and `--review` set the source's fields. |
@@ -185,6 +185,33 @@ When one of your agents reads `~/.agents/skills`, as Codex does, the agents that
 It needs Node.js 22.12 or newer, and git for git sources. On Linux without systemd (most containers, WSL1, systems that boot with OpenRC or runit), `timer install` can't install a timer; it prints a crontab line that runs `skillfleet sync` instead. The session hooks work there as anywhere. CI runs on all three systems, with Node 22 and 24.
 
 skillfleet fetches sources through Vercel's [`skills`](https://github.com/vercel-labs/skills) package and runs its timers with `@vite-hub/schedule/os`.
+
+## Build on skillfleet
+
+Other runtimes, such as ViteHub agents or a script of yours, can use the skills skillfleet keeps on a machine without running a sync themselves.
+
+- **Ask skillfleet once.** Run `skillfleet list --json` when your runtime starts, and read each skill's `<dir>/SKILL.md`. It reads this machine's state only, with no manifest and no network, and prints the skills sorted by name:
+
+  ```json
+  {
+    "version": 1,
+    "lastChange": "2026-11-19T08:00:00.000Z",
+    "skills": [
+      {
+        "name": "deploy",
+        "source": "team",
+        "dir": "/home/me/code/team-skills/skills/deploy",
+        "changedAt": "2026-11-18T17:20:00.000Z"
+      }
+    ]
+  }
+  ```
+
+  `dir` is the skill's real folder, whether or not any agent folder links it. `lastChange` is `null` before the first sync. Later versions only add fields.
+
+- **Or read the folder, with no dependency.** `~/.agents/skills` holds one folder per skill, each with its `SKILL.md`, when the manifest's agents include one that reads it, such as Codex.
+- **Share the config.** The manifest is `.skillfleet/manifest.json` in a repository, and the published [`schema.json`](https://unpkg.com/skillfleet/schema.json) describes it, so a runtime can read the same file to pick the same sources.
+- **Get your own folder linked.** skillfleet links into the agents of Vercel's [`skills`](https://github.com/vercel-labs/skills) package. A runtime that joins that package's agent list gets its folder linked on every machine, through `"agents": "all"` or its id.
 
 ## Status
 
