@@ -503,14 +503,21 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
     it.each(["file", "folder"])(
       "keeps each team's boundary when the %s is named first",
       async (first) => {
-        write("r5-boundary/team/.skillfleet/manifest.json", {
+        const team = write("r5-boundary/team/.skillfleet/manifest.json", {
           extends: ["../shared.json"],
-          sources: [{ id: "team", npm: "team" }],
+          sources: [
+            { id: "team", npm: "team" },
+            { id: "legacy", npm: "legacy" },
+          ],
         });
         write("r5-boundary/team/shared.json", {
           sources: [{ id: "shared", npm: "shared" }],
         });
-        const fileEntry = { manifest: "./team/.skillfleet/manifest.json", exclude: ["file-only"] };
+        const fileEntry = {
+          manifest: `${dirname(team)}/./manifest.json`,
+          exclude: ["file-only"],
+          excludeSources: ["legacy"],
+        };
         const folderEntry = { manifest: "./team", exclude: ["folder-only"] };
         const file = write("r5-boundary/me.json", {
           extends: first === "file" ? [fileEntry, folderEntry] : [folderEntry, fileEntry],
@@ -546,7 +553,7 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
         });
         m.manifest({
           agents: ["claude-code"],
-          extends: [team, join(team, ".skillfleet", "manifest.json")],
+          extends: [team, `${team}/./.skillfleet/manifest.json`],
         });
 
         const report = await m.json<Report>("sync");

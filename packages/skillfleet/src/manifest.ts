@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { isIPv4 } from "node:net";
 import { hostname, networkInterfaces, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, normalize, sep } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { fetchClone, gitUrl, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
@@ -623,8 +623,14 @@ async function locate(
   if (!remote) {
     // A folder, such as a clone of the manifest's repository, means its .skillfleet/manifest.json.
     const path = expandPath(spec, base);
-    const folder = statSync(path, { throwIfNoEntry: false })?.isDirectory() === true;
-    const file = folder ? join(path, DEFAULT_MANIFEST) : path;
+    const info = statSync(path, { throwIfNoEntry: false });
+    const folder = info?.isDirectory() === true;
+    const traversesParent = path.split(sep === "\\" ? /[\\/]/ : "/").includes("..");
+    const file = folder
+      ? join(path, DEFAULT_MANIFEST)
+      : info && !traversesParent
+        ? normalize(path)
+        : path;
     if (folder && !existsSync(file))
       throw new ManifestError(
         `${tildify(path)} has no ${DEFAULT_MANIFEST}; name the manifest file as ${join(tildify(path), "<file>")}`,
