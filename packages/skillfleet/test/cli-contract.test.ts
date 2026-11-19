@@ -341,7 +341,10 @@ describe("list --json, the API programs built on skillfleet read", () => {
         },
       }),
     );
-    for (const args of [["list", "--json"], ["--json", "list"]]) {
+    for (const args of [
+      ["list", "--json"],
+      ["--json", "list"],
+    ]) {
       const run = await m.run(...args);
       expect(run.code, run.stderr).toBe(0);
       expect(JSON.parse(run.stdout)).toEqual({
