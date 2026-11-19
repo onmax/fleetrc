@@ -29,9 +29,14 @@ function sshShim(m: Machine): NodeJS.ProcessEnv {
     script,
     `import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
+const probe = args[0] === "-G" && args.shift();
 while (args[0] === "-o") args.splice(0, 2);
 if (args[0] === "--") args.shift();
 const [host, command] = args;
+if (probe) {
+  console.log("hostname " + host + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
 if (host !== "localhost") setTimeout(() => {}, 1e9);
 else {
   const run = spawnSync("sh", ["-c", command], { stdio: "inherit" });
@@ -437,6 +442,7 @@ describe("fleet tags", () => {
       { host: "vps2" },
       { host: "vps2.tail.ts.net" },
       { host: "vps2.other.ts.net" },
+      { host: "VPS2" },
     ]);
   });
 
@@ -490,7 +496,7 @@ if (process.argv.includes("-G")) {
     "other-port.invalid": ["alice", 2223],
   };
   const config = aliases[host];
-  console.log("hostname " + (config ? "localhost" : "127.0.0.2"));
+  console.log("hostname " + (config ? "localhost" : host === "localhost" ? "127.0.0.2" : host));
   if (config) console.log("user " + config[0] + "\\nport " + config[1]);
 } else console.log('skillfleet-fleet: never-synced');`,
     );
@@ -574,9 +580,9 @@ console.log(JSON.stringify({ finishedAt: process.env.REPORT_TIME, ok: true, skil
       status([peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] })]),
     );
     const addresses = () =>
-      new Promise<string[]>((resolve) => setTimeout(resolve, 350, ["100.64.0.5"]));
+      new Promise<string[]>((resolve) => setTimeout(resolve, 1000, ["100.64.0.5"]));
     const { targets } = await withTailscale(program, () =>
-      resolveFleet(["tag:servers"], addresses, 100),
+      resolveFleet(["tag:servers"], addresses, 500),
     );
     expect(targets).toMatchObject([{ host: "100.64.0.5", via: "tag:servers" }]);
   });
@@ -602,7 +608,13 @@ console.log(JSON.stringify({ finishedAt: process.env.REPORT_TIME, ok: true, skil
     writeFileSync(
       ssh,
       `import { appendFileSync } from "node:fs";
-appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+if (args.includes("-G")) {
+  const host = args[args.indexOf("--") + 1];
+  console.log("hostname " + host + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
 process.exit(255);`,
     );
     const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: program };
@@ -612,9 +624,12 @@ process.exit(255);`,
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    expect(calls.map((argv) => argv[argv.indexOf("--") + 1])).toEqual(["localhost"]);
-    for (const hostile of ["ProxyCommand", "a;b", "user@x", "$(id)"])
-      expect(calls.flat().slice(0, -1).join(" ")).not.toContain(hostile);
+    expect(
+      calls.filter((argv) => !argv.includes("-G")).map((argv) => argv[argv.indexOf("--") + 1]),
+    ).toEqual(["localhost"]);
+    for (const argv of calls)
+      for (const hostile of ["ProxyCommand", "a;b", "user@x", "$(id)"])
+        expect(argv.slice(0, -1).join(" ")).not.toContain(hostile);
     expect((JSON.parse(run.stdout) as Hosts).map((host) => host.host)).toEqual(["localhost"]);
     expect(run.stderr).toMatch(/skipped a machine Tailscale calls "-oProxyCommand=x"/);
   });
@@ -1326,6 +1341,11 @@ describe.skipIf(isWindows)("fleet init", () => {
       ssh,
       `
 const success = { finishedAt: "2026-01-01T00:00:00Z", ok: true };
+if (process.argv.includes("-G")) {
+  const host = process.argv[process.argv.indexOf("--") + 1];
+  console.log("hostname " + host + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
 if (process.env.FAKE_ANSWER === "mismatch") {
   console.error("skillfleet-fleet: has github:another/manifest");
   console.log("skillfleet-fleet: other-manifest");
