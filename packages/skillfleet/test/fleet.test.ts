@@ -1297,7 +1297,15 @@ describe.skipIf(isWindows)("fleet init", () => {
       ),
       SKILLFLEET_TAILSCALE: fakeTailscale(m.root, status([peer("web", ["tag:servers"])])),
     };
-    const plan = await m.runWith({ env }, "fleet", "init", "build", "build.", "--dry-run", "--json");
+    const plan = await m.runWith(
+      { env },
+      "fleet",
+      "init",
+      "build",
+      "build.",
+      "--dry-run",
+      "--json",
+    );
     expect(plan.code, plan.stdout + plan.stderr).toBe(0);
     expect(JSON.parse(plan.stdout)).toMatchObject([{ host: "build" }, { host: "build." }]);
     const run = await m.runWith({ env }, "fleet", "init", "build.", "web.", "--json");
@@ -1366,8 +1374,12 @@ if (process.env.FAKE_ANSWER === "mismatch") {
 
   it("this machine is already set up; a host a tag of the fleet matches is not added again", async () => {
     const { m, fleetIn } = await controller(["tag:servers"]);
-    const program = fakeTailscale(m.root, status([peer("localhost", ["tag:servers"])]));
-    const env = { ...initShims(m, {}), SKILLFLEET_TAILSCALE: program };
+    const dns = "node.skillfleet.test";
+    const program = fakeTailscale(
+      m.root,
+      status([peer(dns, ["tag:servers"], { ips: ["127.0.0.1"] })]),
+    );
+    const env = { ...initShims(m, {}, { localhost: dns }), SKILLFLEET_TAILSCALE: program };
     const run = await m.runWith({ env }, "fleet", "init", "localhost", "--json");
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(JSON.parse(run.stdout)).toEqual([

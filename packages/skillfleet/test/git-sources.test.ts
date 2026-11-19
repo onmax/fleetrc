@@ -135,12 +135,11 @@ describe("names macOS and Windows fold together", () => {
         "vendor: left out skills/foo: macOS and Windows keep it in the same folder as skills/Foo",
       ]);
     }
-    const listed = JSON.parse((await m.run("list", "--json")).stdout) as Record<
-      string,
-      { dir: string }
-    >;
-    expect(Object.keys(listed)).toEqual(["Foo", "other"]);
-    expect(read(join(listed.Foo!.dir, "SKILL.md"))).toBe(skillMd("Foo"));
+    const { skills: listed } = JSON.parse((await m.run("list", "--json")).stdout) as {
+      skills: { name: string; dir: string }[];
+    };
+    expect(listed.map((skill) => skill.name)).toEqual(["Foo", "other"]);
+    expect(read(join(listed[0]!.dir, "SKILL.md"))).toBe(skillMd("Foo"));
 
     // An upstream change to Foo is an update, not a local edit.
     commitRaw(m, vendor, { ...files, "skills/Foo/SKILL.md": skillMd("Foo", "v2") });

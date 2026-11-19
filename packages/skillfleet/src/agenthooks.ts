@@ -159,6 +159,23 @@ const DISABLED_WINDOWS = "exit /b 0 & rem skillfleet: disabled legacy hook";
 const isDisabledCommand = (command: unknown) =>
   command === DISABLED_POSIX || command === DISABLED_WINDOWS;
 
+/**
+ * A matcher group that runs on every event of its kind in `agent`: no matcher, or one that matches
+ * all. Codex reads a null matcher as none; Claude Code skips that group.
+ */
+const catchAll = (group: Record<string, unknown>, agent: HookAgent) =>
+  group.matcher === undefined ||
+  (agent === "codex" && group.matcher === null) ||
+  group.matcher === "" ||
+  group.matcher === "*";
+
+/** One of the no-ops skillfleet leaves in place of an old Codex entry. */
+const isDisabled = (hook: unknown) =>
+  isRecord(hook) &&
+  hook.type === "command" &&
+  hook.args === undefined &&
+  isDisabledCommand(hook.command);
+
 export const isOwnCommand = (command: unknown) =>
   typeof command === "string" && OWN_COMMAND.test(command.trim());
 
@@ -198,14 +215,16 @@ type Json = Record<string, unknown>;
 function withoutOwn(
   groups: unknown,
   preserveIndices = false,
+  keep?: unknown,
 ): { groups: unknown[]; changed: boolean } {
+  const isOwn = (hook: unknown) => hook !== keep && isOwnHandler(hook);
   if (!Array.isArray(groups)) return { groups: [], changed: false };
   const lastOtherGroup = preserveIndices
     ? groups.findLastIndex(
         (group: unknown) =>
           isRecord(group) &&
           Array.isArray(group.hooks) &&
-          group.hooks.some((hook: unknown) => !isOwnHandler(hook)),
+          group.hooks.some((hook: unknown) => !isOwn(hook)),
       )
     : -1;
   const disabled: HookHandler = {
@@ -216,12 +235,12 @@ function withoutOwn(
   const kept = groups.flatMap((group: unknown, index) => {
     if (!isRecord(group) || !Array.isArray(group.hooks)) return [group];
     const lastOther = preserveIndices
-      ? group.hooks.findLastIndex((hook: unknown) => !isOwnHandler(hook))
+      ? group.hooks.findLastIndex((hook: unknown) => !isOwn(hook))
       : -1;
     const keepGroup = index < lastOtherGroup && lastOther === -1;
     let changedGroup = false;
     const hooks = group.hooks.flatMap((hook: unknown, position: number) => {
-      if (!isRecord(hook) || !isOwnHandler(hook)) return [hook];
+      if (!isRecord(hook) || !isOwn(hook)) return [hook];
       if (keepGroup || position < lastOther) {
         if (hook.type === disabled.type && sameHandler(hook, disabled)) return [hook];
         changedGroup = true;
@@ -396,16 +415,56 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
   }
   for (const event of EVENTS) {
     const own = ownHandlers({ hooks: { [event]: hooks[event] } });
-    if (own.length === 1 && sameHandler(own[0]!.handler, handler)) continue;
-    hooks[event] = [...withoutOwn(hooks[event]).groups, { hooks: [handler] }];
+    // Already there once, in a group that runs for every session start: nothing to do.
+    const holder = Array.isArray(hooks[event])
+      ? (hooks[event] as unknown[]).find(
+          (group: unknown) =>
+            isRecord(group) && Array.isArray(group.hooks) && group.hooks.includes(own[0]?.handler),
+        )
+      : undefined;
+    if (
+      own.length === 1 &&
+      sameHandler(own[0]!.handler, handler) &&
+      isRecord(holder) &&
+      catchAll(holder, agent)
+    )
+      continue;
+    if (agent === "codex" && Array.isArray(hooks[event])) {
+      // Codex keys a hook's approval to its place, so an older entry of skillfleet's is replaced
+      // where it stands, and any others become no-ops where a hook after them would move.
+      let placed = undefined as HookHandler | undefined;
+      const groups = (hooks[event] as unknown[]).map((group: unknown) =>
+        isRecord(group) && Array.isArray(group.hooks)
+          ? {
+              ...group,
+              hooks: group.hooks.map((hook: unknown) => {
+                // Only a group that runs for every session start (no matcher) may hold it.
+                if (placed || !catchAll(group, agent) || !isOwnHandler(hook) || isDisabled(hook))
+                  return hook;
+                placed = { ...handler };
+                return placed;
+              }),
+            }
+          : group,
+      );
+      if (placed) {
+        hooks[event] = withoutOwn(groups, true, placed).groups;
+        continue;
+      }
+    }
+    hooks[event] = [...withoutOwn(hooks[event], agent === "codex").groups, { hooks: [handler] }];
   }
   raw.hooks = hooks;
 }
 
-/** Disables skillfleet's hooks, keeping placeholders only to preserve unrelated Codex approvals. */
+/**
+ * Takes every entry of skillfleet's out of `raw`, and the groups and events left empty by it; in
+ * Codex, one a hook of the user's follows becomes a no-op instead.
+ */
 export function withoutHooks(raw: Json, agent?: HookAgent) {
   if (!isRecord(raw.hooks)) return;
   for (const [event, groups] of Object.entries(raw.hooks)) {
+    // In Codex, a no-op stays where taking the entry out would move a hook after it.
     const { groups: kept, changed } = withoutOwn(groups, agent === "codex");
     if (!changed) continue;
     if (kept.length > 0) raw.hooks[event] = kept;

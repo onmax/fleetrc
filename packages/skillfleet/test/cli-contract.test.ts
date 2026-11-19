@@ -9,10 +9,11 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import { listedPath } from "../src/linker.ts";
@@ -277,6 +278,90 @@ describe("--json prints one JSON document", () => {
         `${args.join(" ")} --json:\n${run.stdout}\n${run.stderr}`,
       ).not.toThrow();
     }
+  });
+});
+
+describe("list --json, the API programs built on skillfleet read", () => {
+  it("prints version 1, lastChange and the skills sorted by name, each with its real folder", async () => {
+    const fresh = machine({ agents: false });
+    const empty = await fresh.run("list", "--json");
+    expect(empty.code, empty.stderr).toBe(0);
+    expect(JSON.parse(empty.stdout)).toEqual({ version: 1, lastChange: null, skills: [] });
+    expect(existsSync(fresh.stateDir)).toBe(false);
+    expect(existsSync(fresh.at(".cache"))).toBe(false);
+
+    // No agent folder here: state.json still records each skill's folder.
+    const m = machine({ agents: false });
+    const mine = join(m.root, "mine");
+    for (const name of ["zeta", "alpha"]) {
+      mkdirSync(join(mine, "skills", name), { recursive: true });
+      writeFileSync(join(mine, "skills", name, "SKILL.md"), skillMd(name));
+    }
+    const manifest = m.manifest({ sources: [{ id: "mine", local: mine, skills: "skills/*" }] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    // It reads the state alone: a manifest that no longer loads changes nothing.
+    rmSync(dirname(manifest), { recursive: true });
+    const run = await m.run("list", "--json");
+    expect(run.code, run.stderr).toBe(0);
+    const listed = JSON.parse(run.stdout) as {
+      version: number;
+      lastChange: string;
+      skills: { name: string; source: string; dir: string; changedAt: string }[];
+    };
+    expect(Object.keys(listed)).toEqual(["version", "lastChange", "skills"]);
+    expect(listed.version).toBe(1);
+    expect(Date.parse(listed.lastChange)).not.toBeNaN();
+    expect(listed.skills.map((skill) => skill.name)).toEqual(["alpha", "zeta"]);
+    for (const skill of listed.skills) {
+      expect(Object.keys(skill)).toEqual(["name", "source", "dir", "changedAt"]);
+      expect(skill.source).toBe("mine");
+      expect(read(join(skill.dir, "SKILL.md"))).toBe(skillMd(skill.name));
+      expect(Date.parse(skill.changedAt)).not.toBeNaN();
+    }
+    // Removing a skill file does not change the recorded snapshot.
+    rmSync(join(listed.skills[0]!.dir, "SKILL.md"));
+    expect(JSON.parse((await m.run("list", "--json")).stdout)).toEqual(listed);
+    // The CLI's own path, which flags in another order take, prints the same document.
+    expect(JSON.parse((await m.run("--json", "list")).stdout)).toEqual(listed);
+  });
+
+  it("keeps legacy version-1 skill records without changedAt in both list formats", async () => {
+    const m = machine({ agents: false });
+    const dir = m.at("mine");
+    const addedAt = "2026-11-19T07:00:00.000Z";
+    mkdirSync(m.stateDir, { recursive: true });
+    writeFileSync(
+      join(m.stateDir, "state.json"),
+      JSON.stringify({
+        version: 1,
+        sources: {},
+        skills: {
+          legacy: { source: "mine", dir, addedAt },
+          epoch: { source: "mine", dir },
+          invalid: { source: "", dir, changedAt: addedAt },
+        },
+      }),
+    );
+    for (const args of [
+      ["list", "--json"],
+      ["--json", "list"],
+    ]) {
+      const run = await m.run(...args);
+      expect(run.code, run.stderr).toBe(0);
+      expect(JSON.parse(run.stdout)).toEqual({
+        version: 1,
+        lastChange: null,
+        skills: [
+          { name: "epoch", source: "mine", dir, changedAt: "1970-01-01T00:00:00.000Z" },
+          { name: "legacy", source: "mine", dir, changedAt: addedAt },
+        ],
+      });
+    }
+    const text = await m.run("list");
+    expect(text.code, text.stderr).toBe(0);
+    expect(text.stdout).toBe(
+      `epoch  mine  ${join("~", "mine")}\nlegacy  mine  ${join("~", "mine")}\n`,
+    );
   });
 });
 
