@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
+export const claudeHome = () => process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
+
 /** `~` and `~/x` become paths in the home directory; relative paths resolve against `base`. */
 export function expandPath(path: string, base = process.cwd()): string {
   if (path === "~") return homedir();
