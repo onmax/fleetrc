@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -31,6 +31,7 @@ import {
   fleet,
   type FleetAction,
   fleetEntryProblem,
+  fleetSuggestions,
   formatFleet,
   initArgs,
   type InitSetup,
@@ -38,7 +39,6 @@ import {
   notInFleet,
   resolveFleet,
   tagProblem,
-  tailscalePeers,
   unpublished,
 } from "./fleet.ts";
 import { isRecord, JsonFileError, readJsonOrNothing, writeJson } from "./fs.ts";
@@ -935,6 +935,7 @@ function addHooks(
 
 async function init() {
   if (rest.length > 1) usage("init takes one manifest");
+  copyMode();
   const given = rest[0] ?? values.manifest ?? readConfig()?.manifest;
   if (!given)
     usage(
@@ -967,6 +968,9 @@ async function init() {
     throw new UserError(
       `init would lose ${plan.lost.join(", ")}; add a source for them, or pass --force`,
     );
+  const pending = paths.initPending();
+  mkdirSync(dirname(pending), { recursive: true });
+  writeFileSync(pending, "");
   const applied = [...(await cloneBeforeAdopt(plan)), ...applyPlan(plan)];
   say(...applied.map((line) => `  ${line}`));
   // init installs the timer from the manifest next, so the sync need not say it differs.
@@ -994,11 +998,12 @@ async function init() {
       ...(timerResult ? { timer: timerResult.json } : {}),
     });
   // A machine without systemd can't have a timer; init did its job and said what to use instead.
-  return (
+  const code =
     (report.ok ? 0 : 1) ||
     (hooks?.code ?? 0) ||
-    (timerResult?.noSystemd ? 0 : (timerResult?.code ?? 0))
-  );
+    (timerResult?.noSystemd ? 0 : (timerResult?.code ?? 0));
+  if (code === 0) rmSync(pending, { force: true });
+  return code;
 }
 
 /** `hook install|remove [agent]`, and `hook run <agent>` and `hook prompt`, which the agents run. */
@@ -1038,17 +1043,18 @@ async function fleetCommand(action: string | undefined) {
     (name) => values[name],
   );
   if (action !== "init" && initOnly.length > 0) usage(`only fleet init takes --${initOnly[0]}`);
+  if (action === "init") copyMode();
   const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
   if (action === "add") {
     const hosts = rest.slice(1);
     if (hosts.length === 0) {
-      const peers = await tailscalePeers();
+      const { named, taggable } = await fleetSuggestions();
       const known = new Set(loaded.root.fleet.map((entry) => entry.toLowerCase()));
-      const suggestions = peers
+      const suggestions = named
         .filter((peer) => !known.has(peer.host.toLowerCase()) && !known.has(peer.dns.toLowerCase()))
         .map(({ host, dns, online }) => ({ host, dns, online }));
       const counts = new Map<string, number>();
-      for (const peer of peers)
+      for (const peer of taggable)
         for (const tag of peer.tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
       const tags = [...counts]
         .filter(([tag]) => !known.has(tag.toLowerCase()))
@@ -1115,7 +1121,7 @@ async function fleetCommand(action: string | undefined) {
     if (reason) throw new UserError(reason);
   }
   const timeout = fleetTimeout(30_000);
-  const targets = await fleetTargets(entries);
+  const { targets } = await fleetTargets(entries);
   const results = await fleet(targets, action satisfies FleetAction, version, timeout, { dryRun });
   if (json) emit(results);
   else if (results.length > 0) say(formatFleet(results));
@@ -1136,7 +1142,7 @@ function fleetTimeout(fallback: number): number {
 
 /** The hosts `entries` stand for, with Tailscale's warnings told, and a dry run told each tag's machines. */
 async function fleetTargets(entries: readonly string[]) {
-  const { targets, warnings } = await resolveFleet(entries);
+  const { targets, warnings, enrollment } = await resolveFleet(entries);
   for (const warning of warnings) console.error(`skillfleet: warning: ${warning}`);
   if (dryRun)
     for (const tag of new Set(
@@ -1148,7 +1154,7 @@ async function fleetTargets(entries: readonly string[]) {
           .map((target) => `${target.host}${target.offline ? " (offline)" : ""}`)
           .join(", ")}`,
       );
-  return targets;
+  return { targets, enrollment };
 }
 
 /**
@@ -1179,7 +1185,7 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
     force: values.force ?? false,
     same: (configured) => sameManifest(configured, spec),
   };
-  const targets = await fleetTargets(entries);
+  const { targets, enrollment } = await fleetTargets(entries);
   const command = commandLine([...initArgs(version, setup), "--json"]);
   if (dryRun) {
     const hosts = targets.map(
@@ -1203,21 +1209,25 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
     return 0;
   }
   const results = await fleet(targets, "init", version, timeout, { setup });
-  if (json) emit(results);
-  else if (results.length > 0) say(formatFleet(results));
+  if (!json && results.length > 0) say(formatFleet(results));
   // Hosts named here that are set up now, and tags named here with a machine set up.
   const ready = new Set(
-    results
-      .filter((result) => result.setup)
-      .flatMap(({ host, via }) => (via ? [host, via] : [host])),
+    results.filter((result) => result.setup).flatMap(({ host }) => enrollment.get(host) ?? []),
   );
-  say(
-    ...(await addToFleet(
-      loaded,
-      entries.filter((entry) => ready.has(entry)),
-      { dryRun: false },
-    )),
-  );
+  try {
+    say(
+      ...(await addToFleet(
+        loaded,
+        entries.filter((entry) => ready.has(entry)),
+        { dryRun: false },
+      )),
+    );
+  } catch (error) {
+    if (!json) throw error;
+    emit({ hosts: results, error: error instanceof Error ? error.message : String(error) });
+    return 1;
+  }
+  if (json) emit(results);
   const failed = (result: (typeof results)[number]) =>
     !result.reachable || result.error !== undefined || result.lastRun?.ok === false;
   return results.some(failed) ? 1 : 0;

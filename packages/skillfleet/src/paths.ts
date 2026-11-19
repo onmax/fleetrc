@@ -44,6 +44,7 @@ export const paths = {
   config: () => join(configDir(), "config.json"),
   state: () => join(stateDir(), "state.json"),
   lastRun: () => join(stateDir(), "last-run.json"),
+  initPending: () => join(stateDir(), "init-pending"),
   fleet: () => join(stateDir(), "fleet.json"),
   /** Claude Code sessions, one record each (sessions.ts). */
   sessions: () => join(stateDir(), "sessions"),

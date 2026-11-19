@@ -651,18 +651,17 @@ const FORGES = new Set(["github.com", "gitlab.com"]);
  */
 function repoIdentity(spec: string): string | undefined {
   const url = gitUrl(spec);
-  const scheme = url.match(
-    /^(https?|ssh|git|git\+ssh|ssh\+git):\/\/(?:([^@/]*)@)?([^/]+)(\/.*)$/i,
-  );
+  const scheme = url.match(/^(https?|ssh|git|git\+ssh|ssh\+git):\/\/(?:([^@/]*)@)?([^/]+)(\/.*)$/i);
   const scp = scheme ? undefined : url.match(/^(?:([^@/:]+)@)?([^/:]+):(?!\/\/)(.+)$/);
   if (!scheme && !scp) return undefined;
   const [, user, authority, path] = scheme ? scheme.slice(1) : scp!;
   const host = authority!.toLowerCase();
   // `https://host:443` and `ssh://host:22` stay apart from the bare host: a port is not guessed.
   const forge = host.replace(/^www\./, "");
-  if (FORGES.has(forge))
-    return `${forge}/${path!.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "")}`;
-  return scheme ? `${scheme[1]!.toLowerCase()}://${user ?? ""}@${host}${path}` : url;
+  if (FORGES.has(forge)) return `${forge}/${path!.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "")}`;
+  return scheme
+    ? `${scheme[1]!.toLowerCase()}://${user ?? ""}@${host}${path}`
+    : `${user === undefined ? "" : `${user}@`}${host}:${path}`;
 }
 
 interface LocateOptions {
@@ -1047,9 +1046,14 @@ export async function loadManifest(
       let known = extended.get(at.file);
       if (!known) {
         let team: Manifest;
+        let ignoredFleet = false;
         try {
           team = readManifestFile(at.file, (raw) => {
-            if (!isRecord(raw) || !Array.isArray(raw.sources)) return;
+            if (!isRecord(raw)) return;
+            ignoredFleet =
+              raw.fleet !== undefined && (!Array.isArray(raw.fleet) || raw.fleet.length > 0);
+            delete raw.fleet;
+            if (!Array.isArray(raw.sources)) return;
             for (const [i, source] of raw.sources.entries()) {
               if (!isRecord(source)) continue;
               for (const key of ROOT_ONLY_SOURCE_KEYS) {
@@ -1069,7 +1073,7 @@ export async function loadManifest(
         }
         const ignored = [
           team.hooks.length > 0 && "hooks",
-          team.fleet.length > 0 && "fleet",
+          ignoredFleet && "fleet",
           team.hub && "hub",
           team.report && "report",
         ].filter(Boolean);
