@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import {
   editHooksFile,
@@ -648,17 +649,19 @@ describe("the hooks on shared and upgraded machines", () => {
       expect(readdirSync(dirname(settings))).toEqual(["settings.json"]);
     });
 
-    it.skipIf(isWindows)("keeps the file's mode, in its temporary copy too", () => {
+    it.skipIf(isWindows).each([false, true])("keeps settings private (exists=%s)", (existing) => {
       const settings = file();
-      writeFileSync(settings, "{}\n");
-      chmodSync(settings, 0o600);
+      if (existing) {
+        writeFileSync(settings, "{}\n");
+        chmodSync(settings, 0o600);
+      }
       const modes: number[] = [];
       const step = () => {
         for (const name of readdirSync(dirname(settings)))
           if (name.endsWith(".tmp"))
             modes.push(statSync(join(dirname(settings), name)).mode & 0o777);
       };
-      expect(editHooksFile(settings, addHook, { step }).changed).toBe(true);
+      expect(editHooksFile(settings, addHook, { create: true, step }).changed).toBe(true);
       expect(modes).toEqual([0o600]);
       expect(statSync(settings).mode & 0o777).toBe(0o600);
     });
@@ -924,6 +927,51 @@ describe("the hooks on shared and upgraded machines", () => {
     expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
     expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
     expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
+  });
+
+  it.each(["before", "after"])("recovers a sync interrupted %s linking", async (boundary) => {
+    const { m, mine } = await hooked();
+    const stateFile = join(m.stateDir, "state.json");
+    const state = () => JSON.parse(read(stateFile));
+    const installed = m.at(".claude", "skills", "early", "SKILL.md");
+    const targetManifest = m.at(".claude", "skills", ".skillfleet-manifest.json");
+    const stop = join(m.root, "stop.mjs");
+    writeFileSync(
+      stop,
+      `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (${boundary === "before"} && to === ${JSON.stringify(stateFile)}) {
+          const state = JSON.parse(fs.readFileSync(to, "utf8"));
+          if (state.skillChanges?.mine?.all) process.exit(86);
+        }
+        if (${boundary === "after"} && to === ${JSON.stringify(targetManifest)}) process.exit(86);
+      };
+      syncBuiltinESMExports();
+    `,
+    );
+    writeFiles(mine, { "skills/early/SKILL.md": skillMd("early") });
+    const stopped = await m.runWith(
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
+      "sync",
+    );
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
+    const checkpoint = state().skillChanges.mine.all;
+    expect(state().skills.early).toBeUndefined();
+    expect(existsSync(installed)).toBe(boundary === "after");
+
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    expect((await m.run("sync")).code).toBe(0);
+    expect(existsSync(installed)).toBe(true);
+    expect(state().skills.early.changedAt).toBe(checkpoint);
+    const prompt = (await hook(m, "claude-code", PROMPT)).stdout;
+    if (boundary === "before") expect(prompt).toContain("available now: early");
+    else expect(prompt).toBe("");
+    expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
   });
 
   it("gives a session resumed after a week a fresh record on its start", async () => {

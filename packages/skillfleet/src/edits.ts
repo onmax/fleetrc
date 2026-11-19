@@ -39,7 +39,7 @@ import {
 } from "./manifest.ts";
 import { findName } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
-import { storePaths } from "./sources.ts";
+import { pendingGitBase, storePaths } from "./sources.ts";
 import { loadState, saveState, type State } from "./state.ts";
 
 /** The file a command changes: the root manifest, or a working clone of the repository it is in. */
@@ -629,10 +629,16 @@ export async function mergeSkill(
     if (resolved) return { merged: [], conflicts: [], resolved, into: store.live };
     throw new UserError(`${name} has no upstream change to merge; \`skillfleet sync\` fetches one`);
   }
+  const hashes = hashDir(store.upstream);
+  const pending = pendingGitBase(sourceState.pending[name], hashes);
   const result = await mergeTrees(store.live, store.base, store.upstream, dryRun);
   if (dryRun) return { ...result, ...(resolved ? { resolved } : {}), into: store.live };
   copyDir(store.upstream, store.base);
-  sourceState.skills[name] = { ...sourceState.skills[name], hashes: hashDir(store.upstream) };
+  sourceState.skills[name] = {
+    ...sourceState.skills[name],
+    hashes,
+    ...(source.kind === "git" ? { path: pending?.path, commit: pending?.commit ?? null } : {}),
+  };
   rmSync(store.upstream, { recursive: true, force: true });
   delete sourceState.pending[name];
   saveState(state);
@@ -670,10 +676,27 @@ export async function forkSkill(
   if (!existsSync(store.live))
     throw new UserError(`${name} has no copy on this machine yet; run \`skillfleet sync\``);
   const sourceState = state.sources[source.id]!;
+  const installed = sourceState.skills[name];
+  if (existsSync(store.upstream)) {
+    const pending = pendingGitBase(sourceState.pending[name], hashDir(store.upstream));
+    if (!pending)
+      throw new UserError(
+        `cannot verify the pending git update of ${name}; run \`skillfleet sync\` online before forking`,
+      );
+    if (pending.path !== installed?.path)
+      throw new UserError(
+        `${name} moved upstream to ${pending.path}; run \`skillfleet merge ${name}\` before forking`,
+      );
+  }
+  const base = installed?.commit === undefined ? sourceState.commit : installed.commit;
+  if (!base || installed?.path === undefined)
+    throw new UserError(
+      `cannot verify the git base of ${name}; run \`skillfleet sync\` online before forking`,
+    );
   const fork: Fork = {
     from: source.git,
-    path: sourceState.skills[name]?.path ?? name,
-    base: sourceState.commit ?? "",
+    path: installed.path,
+    base,
   };
   const excluded = source.origin === loaded.root.file;
   const manifest = manifestToEdit(

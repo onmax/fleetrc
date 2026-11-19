@@ -1,9 +1,10 @@
-import { mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { exec } from "./exec.ts";
 import { isRecord, readJsonOrNothing, sha256, writeJson } from "./fs.ts";
 import { create } from "./lock.ts";
-import { paths } from "./paths.ts";
+import { nameKey } from "./names.ts";
+import { claudeHome, paths } from "./paths.ts";
 import type { State } from "./state.ts";
 
 /**
@@ -98,6 +99,7 @@ export async function staleSessions(state: State): Promise<AgentProcess[]> {
 interface SessionRecord {
   startedAt: string;
   announced: string[];
+  presentAtStart?: string[];
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -127,13 +129,32 @@ function readRecord(file: string): SessionRecord | undefined {
   return {
     startedAt: raw.startedAt,
     announced: raw.announced.filter((name): name is string => typeof name === "string"),
+    ...(Array.isArray(raw.presentAtStart)
+      ? {
+          presentAtStart: raw.presentAtStart.filter(
+            (name): name is string => typeof name === "string",
+          ),
+        }
+      : {}),
   };
 }
 
 /** Creates a session's record, unless one is there: exclusively, so a record is never replaced. */
-function startRecord(file: string, now: Date) {
+function startRecord(file: string, now: Date, presentAtStart?: string[]) {
   mkdirSync(dirname(file), { recursive: true });
-  create(file, `${JSON.stringify({ startedAt: now.toISOString(), announced: [] })}\n`);
+  const record = { startedAt: now.toISOString(), announced: [], presentAtStart };
+  create(file, `${JSON.stringify(record)}\n`);
+}
+
+function claudeSkillsAtStart(): string[] {
+  const dir = join(claudeHome(), "skills");
+  try {
+    return readdirSync(dir)
+      .filter((name) => existsSync(join(dir, name, "SKILL.md")))
+      .map(nameKey);
+  } catch {
+    return [];
+  }
 }
 
 /** Deletes records untouched for a week, and sessions.json, where older versions kept them all. */
@@ -162,7 +183,7 @@ export function sessionStarted(input: string, now = new Date()) {
   } catch {
     // Cleanup only: a record that can't be pruned must not stop this one being made.
   }
-  startRecord(file, now);
+  if (!existsSync(file)) startRecord(file, now, claudeSkillsAtStart());
 }
 
 /**
@@ -182,11 +203,15 @@ export function promptHook(
     startRecord(file, now);
     session = readRecord(file) ?? { startedAt: now.toISOString(), announced: [] };
   }
-  const { startedAt, announced } = session;
+  const { startedAt, announced, presentAtStart } = session;
+  const present = new Set(presentAtStart);
   const fresh = Object.entries(state.skills)
-    .filter(([name, record]) => record.addedAt > startedAt && !announced.includes(name))
+    .filter(
+      ([name, record]) =>
+        record.addedAt > startedAt && !present.has(nameKey(name)) && !announced.includes(name),
+    )
     .map(([name]) => name);
-  if (fresh.length > 0) writeJson(file, { startedAt, announced: [...announced, ...fresh] });
+  if (fresh.length > 0) writeJson(file, { ...session, announced: [...announced, ...fresh] });
   if (fresh.length === 0) return "";
   const one = fresh.length === 1;
   return `skillfleet: ${one ? "a new skill arrived" : `${fresh.length} new skills arrived`} after this session started and ${one ? "is" : "are"} available now: ${fresh.join(", ")}. Use ${one ? "it" : "them"} like any other skill, with the Skill tool.`;
