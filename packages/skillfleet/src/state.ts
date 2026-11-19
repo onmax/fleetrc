@@ -64,6 +64,12 @@ export interface State {
    * its hooks leaves them for the next one.
    */
   hooksDue?: string[];
+  skillChanges?: Record<string, SkillChanges>;
+}
+
+interface SkillChanges {
+  all?: string;
+  skills: Record<string, string>;
 }
 
 /** A merge that left conflicts in a skill's copy in use, as git leaves them in a working tree. */
@@ -120,6 +126,17 @@ export function loadState(warnings?: string[]): State {
     ...(Array.isArray(raw.hooksDue)
       ? { hooksDue: raw.hooksDue.filter((due): due is string => typeof due === "string") }
       : {}),
+    ...(isRecord(raw.skillChanges)
+      ? { skillChanges: records(raw.skillChanges, skillChanges) }
+      : {}),
+  };
+}
+
+function skillChanges(raw: unknown): SkillChanges | undefined {
+  if (!isRecord(raw)) return undefined;
+  return {
+    ...(typeof raw.all === "string" ? { all: raw.all } : {}),
+    skills: records(raw.skills, (time) => (typeof time === "string" ? time : undefined)),
   };
 }
 

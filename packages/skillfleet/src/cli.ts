@@ -941,7 +941,14 @@ async function init() {
     usage(
       "init needs a manifest: a path, a repository such as owner/repo (its .skillfleet/manifest.json), or <repo>//<file> such as github:org/agents//team.json",
     );
-  const withTimer = timerWanted();
+  const pending = paths.initPending();
+  let pendingTimer = false;
+  try {
+    pendingTimer = readFileSync(pending, "utf8") === "timer\n";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const withTimer = pendingTimer || timerWanted();
   const withHooks = !values["no-hooks"];
   const plan = await planInit(canonicalManifestSpec(given), { offline: values.offline, dryRun });
   if (dryRun) {
@@ -968,9 +975,8 @@ async function init() {
     throw new UserError(
       `init would lose ${plan.lost.join(", ")}; add a source for them, or pass --force`,
     );
-  const pending = paths.initPending();
   mkdirSync(dirname(pending), { recursive: true });
-  writeFileSync(pending, "");
+  writeFileSync(pending, withTimer ? "timer\n" : "");
   const applied = [...(await cloneBeforeAdopt(plan)), ...applyPlan(plan)];
   say(...applied.map((line) => `  ${line}`));
   // init installs the timer from the manifest next, so the sync need not say it differs.
@@ -1121,7 +1127,7 @@ async function fleetCommand(action: string | undefined) {
     if (reason) throw new UserError(reason);
   }
   const timeout = fleetTimeout(30_000);
-  const { targets } = await fleetTargets(entries);
+  const { targets } = await fleetTargets(entries, timeout);
   const results = await fleet(targets, action satisfies FleetAction, version, timeout, { dryRun });
   if (json) emit(results);
   else if (results.length > 0) say(formatFleet(results));
@@ -1141,8 +1147,8 @@ function fleetTimeout(fallback: number): number {
 }
 
 /** The hosts `entries` stand for, with Tailscale's warnings told, and a dry run told each tag's machines. */
-async function fleetTargets(entries: readonly string[]) {
-  const { targets, warnings, enrollment } = await resolveFleet(entries);
+async function fleetTargets(entries: readonly string[], timeout: number) {
+  const { targets, warnings, enrollment } = await resolveFleet(entries, undefined, timeout);
   for (const warning of warnings) console.error(`skillfleet: warning: ${warning}`);
   if (dryRun)
     for (const tag of new Set(
@@ -1185,7 +1191,7 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
     force: values.force ?? false,
     same: (configured) => sameManifest(configured, spec),
   };
-  const { targets, enrollment } = await fleetTargets(entries);
+  const { targets, enrollment } = await fleetTargets(entries, timeout);
   const command = commandLine([...initArgs(version, setup), "--json"]);
   if (dryRun) {
     const hosts = targets.map(

@@ -10,7 +10,7 @@
 
 The same agent skills in Claude Code, Codex, Gemini CLI, OpenCode, Cursor and Copilot, on every machine you use, synced when you start an agent session.
 
-[![Watch the 90-second explainer](https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/explainer-poster.png)](https://github.com/onmax/skillfleet/blob/main/.github/assets/explainer.mp4)
+[![Download the 90-second explainer (MP4)](https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/explainer-poster.png)](https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/explainer.mp4)
 
 You list where your skills come from in one manifest in git: your own repo, your team's, GitHub upstreams, skill indexes like Drop's, and npm. Each machine pulls them when a Claude Code or Codex session starts, links every skill into every agent's folder, and reports what changed. A skill you edited on that machine is never overwritten.
 
@@ -56,7 +56,7 @@ skillfleet fleet init vps2
 
 skillfleet connects over SSH and runs `npx skillfleet init` there with the same manifest, so the new machine gets its own copy of skillfleet, the session hooks and a first sync. Then it adds `vps2` to `fleet`, unless that `init` failed there (its first sync, the hooks or the timer), which leaves `vps2` out and makes the command exit 1. On a server where no agent runs, add `--timer`. The manifest has to be in a repository, since the new machine can't read files on this one, and the new machine needs Node.js 22.12 or newer.
 
-With Tailscale, tag the server and run `skillfleet fleet init tag:servers`: every machine with the tag gets set up, and `fleet` gets `tag:servers`, so the next server you tag is in the fleet too. A machine that already has the manifest only syncs, unless you pass an option for its `init`, such as `--timer`. One that has another manifest, or the same repository spelled in a way skillfleet can't be sure of, is left alone unless you pass `--force`. Hosts install the version of skillfleet you run; to set them up with a preview build, set `SKILLFLEET_PACKAGE` to what npx should install, such as a pkg.pr.new URL or a tarball path on the host.
+With Tailscale, tag the server and run `skillfleet fleet init tag:servers`: every machine with the tag gets set up, and `fleet` gets `tag:servers`, so the next server you tag is in the fleet too. A machine that already has the manifest only syncs, unless you pass an option for its `init`, such as `--timer`. One that has another manifest, or the same repository spelled in a way skillfleet can't be sure of, is left alone unless you pass `--force`. Hosts install the version of skillfleet you run; to set them up with a preview build, set `SKILLFLEET_PACKAGE` to what npx should install, such as a pkg.pr.new URL or a tarball path on the host. Prefix a relative path inside the SSH login directory with `./`, for example `./dist/preview.tgz`, to distinguish it from GitHub shorthand.
 
 If setup failed, run the same command again after fixing the cause. If SSH timed out after the host answered, check whether setup is still running there before retrying. With `--json`, successful enrollment returns the host result array; if editing the manifest fails after setup, the command exits 1 and returns an object with `hosts` and `error`.
 
@@ -147,7 +147,7 @@ Then `npx skillfleet init me/skills` on each machine. Your sources come first, s
 ### Fields
 
 - `$schema` points editors at the schema, for completion and checks.
-- Relative paths (`path`, `local`, `extends`) resolve against the manifest's own folder, `.skillfleet/`, so `"local": ".."` is the repository the manifest is in.
+- Relative paths (`path`, `local`, `extends`) resolve against the manifest's own folder, `.skillfleet/`. To use the repository itself as a local source, add `{ "id": "mine", "local": ".." }` to `sources`.
 - A source is one of `git`, `index` (a site serving `/.well-known/agent-skills/index.json`), `npm` (with an optional `registry`) or `local` (a folder on this machine). `skills` is a glob of skill folders inside it, and `ref` pins a git branch, tag or commit, written in full or as its first 7 or more characters. A `"path"` clone pinned to a commit stays on it, since there is nothing to fast-forward, until the manifest names another commit.
 - An `index` site may serve the older v0.1 index at `/.well-known/skills/index.json` instead; skillfleet reads both.
 - `agents` is `"all"` (the default) or a list of agent ids. `"all"` means every agent installed on the machine: one whose folder is in your home, such as `~/.claude` for Claude Code or `~/.codex` for Codex. `skillfleet agents` lists the ids and which agents it found. A sync that links into no folder says so.
