@@ -357,7 +357,12 @@ function checkpointSkillChanges(state: State, result: SourceResult, now: string)
     changes.skills[name] = latestTime(changes.skills[name], now)!;
 }
 
-function recordSkills(state: State, winners: Map<string, DesiredLink>, now: string) {
+function recordSkills(
+  state: State,
+  winners: Map<string, DesiredLink>,
+  now: string,
+  publishedAt: string,
+) {
   let changed: string | undefined;
   for (const [name, link] of winners) {
     const record = state.skills[name];
@@ -367,7 +372,7 @@ function recordSkills(state: State, winners: Map<string, DesiredLink>, now: stri
       // Renamed only in case or Unicode form: the same skill, so it keeps when it arrived.
       const old = renamedFrom(state, winners, name);
       const changedAt = touched ?? now;
-      const addedAt = old === undefined ? changedAt : state.skills[old]!.addedAt;
+      const addedAt = old === undefined ? publishedAt : state.skills[old]!.addedAt;
       state.skills[name] = { source: link.source, dir: link.target, addedAt, changedAt };
       changed = latestTime(changed, changedAt);
     } else if (record.source !== link.source || record.dir !== link.target || touched) {
@@ -578,6 +583,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       }
     };
     const targetReports = targets.map((target) => linkInto(target.dir, desired));
+    const publishedAt = new Date().toISOString();
     // Links skillfleet made in folders it no longer links into are removed. A folder that is a
     // link, or another path to a current target, is left alone.
     const real = (dir: string) => {
@@ -693,7 +699,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         });
     }
     if (!dryRun) {
-      recordSkills(state, winners, startedAt);
+      recordSkills(state, winners, startedAt, publishedAt);
       stateFile.save();
       doing = "running hooks";
       report.hooks = await runHooks(

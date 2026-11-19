@@ -159,11 +159,11 @@ function configured(): boolean {
 }
 
 /**
- * `skillfleet hook run <agent>`, with the event the agent passes on stdin as `hook_event_name`. On
- * explicit events other than SessionStart it does nothing. Calls without an event can still run
- * as a session hook. On a machine without skillfleet's config it does nothing and creates nothing.
+ * `skillfleet hook run <agent>` reads `hook_event_name` from stdin. For Claude Code's legacy prompt
+ * hooks it only names new skills. Only SessionStart or a call without
+ * an event can start a sync. On a machine without skillfleet's config it does nothing.
  */
-export async function runHook(agent: HookAgent) {
+export async function runHook(agent: HookAgent, promptOnly = false) {
   try {
     adoptInstalledPlaces();
     if (!configured()) return;
@@ -175,8 +175,32 @@ export async function runHook(agent: HookAgent) {
     try {
       parsed = JSON.parse(input);
     } catch {}
-    const name = isRecord(parsed) ? parsed.hook_event_name : undefined;
+    const name = promptOnly
+      ? "UserPromptSubmit"
+      : isRecord(parsed)
+        ? parsed.hook_event_name
+        : undefined;
+    if (agent === "claude-code" && name === "UserPromptSubmit") {
+      const { promptHook } = await import("./sessions.ts");
+      const state = readJsonOrNothing(paths.state());
+      const skills = Object.create(null) as Record<string, { addedAt: string }>;
+      if (isRecord(state) && isRecord(state.skills))
+        for (const [skill, record] of Object.entries(state.skills))
+          if (isRecord(record) && typeof record.addedAt === "string")
+            skills[skill] = { addedAt: record.addedAt };
+      const text = promptHook(input, { skills });
+      if (text) {
+        process.stdout.on("error", () => {});
+        process.stdout.write(text);
+      }
+      return;
+    }
     if (name !== undefined && name !== "SessionStart") return;
+    if (agent === "claude-code" && name === "SessionStart")
+      try {
+        const { sessionStarted } = await import("./sessions.ts");
+        sessionStarted(input);
+      } catch {}
     try {
       markRan(agent);
     } catch {}

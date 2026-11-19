@@ -1028,8 +1028,7 @@ async function hookCommand(action: string | undefined) {
       usage(
         action === "prompt" ? "hook prompt takes nothing" : "hook run takes claude-code or codex",
       );
-    // `hook prompt`, which older settings files may still call, does nothing.
-    if (action === "run") await runHook(agent);
+    await runHook(agent, action === "prompt");
     return 0;
   }
   if (action !== "install" && action !== "remove")
@@ -1134,7 +1133,7 @@ async function fleetCommand(action: string | undefined) {
     if (reason) throw new UserError(reason);
   }
   const timeout = fleetTimeout(30_000);
-  const { targets } = await fleetTargets(entries, timeout);
+  const { targets } = await fleetTargets(entries, timeout, action);
   const results = await fleet(targets, action satisfies FleetAction, version, timeout, { dryRun });
   if (json) emit(results);
   else if (results.length > 0) say(formatFleet(results));
@@ -1154,8 +1153,18 @@ function fleetTimeout(fallback: number): number {
 }
 
 /** The hosts `entries` stand for, with Tailscale's warnings told, and a dry run told each tag's machines. */
-async function fleetTargets(entries: readonly string[], timeout: number) {
-  const { targets, warnings, enrollment } = await resolveFleet(entries, undefined, timeout);
+async function fleetTargets(
+  entries: readonly string[],
+  timeout: number,
+  action: FleetAction,
+  setup?: InitSetup,
+) {
+  const { targets, warnings, enrollment } = await resolveFleet(entries, undefined, timeout, {
+    action,
+    version,
+    dryRun,
+    setup,
+  });
   for (const warning of warnings) console.error(`skillfleet: warning: ${warning}`);
   if (dryRun)
     for (const tag of new Set(
@@ -1198,7 +1207,7 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
     force: values.force ?? false,
     same: (configured) => sameManifest(configured, spec),
   };
-  const { targets, enrollment } = await fleetTargets(entries, timeout);
+  const { targets, enrollment } = await fleetTargets(entries, timeout, "init", setup);
   const command = commandLine([...initArgs(version, setup), "--json"]);
   if (dryRun) {
     const hosts = targets.map(
@@ -1217,7 +1226,7 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
       say(
         `${host.host}${host.via && host.via !== host.host ? ` (${host.via})` : ""}: ${host.command ? `would run ${host.command}` : `skipped (${host.error})`}`,
       );
-    say(...(await addToFleet(loaded, entries, { dryRun: true, timeout })));
+    say(...(await addToFleet(loaded, entries, { dryRun: true, timeout, setup })));
     if (json) emit(hosts);
     return 0;
   }
@@ -1232,7 +1241,7 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
       ...(await addToFleet(
         loaded,
         entries.filter((entry) => ready.has(entry)),
-        { dryRun: false, timeout },
+        { dryRun: false, timeout, setup },
       )),
     );
   } catch (error) {
@@ -1254,10 +1263,11 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
 async function addToFleet(
   loaded: Awaited<ReturnType<typeof loadManifest>>,
   entries: readonly string[],
-  { dryRun, timeout }: { dryRun: boolean; timeout: number },
+  { dryRun, timeout, setup }: { dryRun: boolean; timeout: number; setup: InitSetup },
 ): Promise<string[]> {
   const already = entries.length > 0 ? ["the fleet already has them"] : [];
-  let missing = await notInFleet(loaded.root.fleet, entries, timeout);
+  const invocation = { action: "init" as const, version, dryRun, setup };
+  let missing = await notInFleet(loaded.root.fleet, entries, timeout, invocation);
   if (missing.length === 0) return already;
   let target: ManifestTarget;
   try {
@@ -1277,6 +1287,7 @@ async function addToFleet(
       edited.fleet.filter((entry): entry is string => typeof entry === "string"),
       missing,
       timeout,
+      invocation,
     );
   if (missing.length === 0) return already;
   editManifest(

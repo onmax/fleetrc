@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import {
   editHooksFile,
@@ -484,14 +485,14 @@ describe("hook install and remove", () => {
     expect(read(file)).toBe(once);
   });
 
-  it("reads a Codex group with matcher null as one for every session, and leaves its entry in place", async () => {
+  it.each([null, ".*"])("keeps the Codex hook in its catch-all matcher %s", async (matcher) => {
     const m = machine();
     const file = m.at(".codex", "hooks.json");
     expect((await m.run("hook", "install", "codex")).code).toBe(0);
     const current = (JSON.parse(read(file)).hooks as { SessionStart: { hooks: Entry[] }[] })
       .SessionStart[0]!.hooks[0]!;
     const custom = { type: "command", command: "echo mine" };
-    const layout = { hooks: { SessionStart: [{ matcher: null, hooks: [current, custom] }] } };
+    const layout = { hooks: { SessionStart: [{ matcher, hooks: [current, custom] }] } };
     writeFileSync(file, JSON.stringify(layout));
     const before = read(file);
     expect((await m.run("hook", "install", "codex")).code).toBe(0);
@@ -860,17 +861,19 @@ describe("the hooks on shared and upgraded machines", () => {
       expect(readdirSync(dirname(settings))).toEqual(["settings.json"]);
     });
 
-    it.skipIf(isWindows)("keeps the file's mode, in its temporary copy too", () => {
+    it.skipIf(isWindows).each([false, true])("keeps settings private (exists=%s)", (existing) => {
       const settings = file();
-      writeFileSync(settings, "{}\n");
-      chmodSync(settings, 0o600);
+      if (existing) {
+        writeFileSync(settings, "{}\n");
+        chmodSync(settings, 0o600);
+      }
       const modes: number[] = [];
       const step = () => {
         for (const name of readdirSync(dirname(settings)))
           if (name.endsWith(".tmp"))
             modes.push(statSync(join(dirname(settings), name)).mode & 0o777);
       };
-      expect(editHooksFile(settings, addHook, { step }).changed).toBe(true);
+      expect(editHooksFile(settings, addHook, { create: true, step }).changed).toBe(true);
       expect(modes).toEqual([0o600]);
       expect(statSync(settings).mode & 0o777).toBe(0o600);
     });
@@ -989,23 +992,45 @@ describe("the hooks on shared and upgraded machines", () => {
     expect({ code: run.status, out: run.stdout + run.stderr }).toEqual({ code: 0, out: "" });
     expect(read(join(state, "logs", "skillfleet-sync.log"))).toContain("starting a sync");
     expect(existsSync(m.at(".local", "state", "skillfleet"))).toBe(false);
-    // A runtime calling list --json from the same environment reads the same state, without the
-    // hook-env.json that only hook install saves.
-    rmSync(join(state, "hook-env.json"), { force: true });
-    const statePath = join(state, "state.json");
-    const saved = JSON.parse(read(statePath)) as { skills?: Record<string, unknown> };
-    const dir = join(m.root, "old");
-    saved.skills = { old: { source: "mine", dir, changedAt: "2026-01-02T00:00:00.000Z" } };
-    writeFileSync(statePath, JSON.stringify(saved));
-    const list = spawnSync(process.execPath, [join(state, "app", "cli.mjs"), "list", "--json"], {
-      env: agent,
-      cwd: m.home,
-      encoding: "utf8",
+  });
+
+  it("lists installed state without an override and syncs and lists under an explicit override", async () => {
+    const m = machine();
+    const mine = join(m.root, "mine");
+    writeFiles(mine, { "skills/first/SKILL.md": skillMd("first") });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "mine", local: mine, skills: "skills/*" }],
     });
-    expect(list.status, list.stderr).toBe(0);
-    expect((JSON.parse(list.stdout) as { skills: unknown[] }).skills).toEqual([
-      { name: "old", source: "mine", dir, changedAt: "2026-01-02T00:00:00.000Z" },
-    ]);
+    const env = { ...m.env, XDG_STATE_HOME: join(m.root, "st") };
+    const init = await m.runWith({ env }, "init", manifest, "--no-hooks");
+    expect(init.code, init.stderr).toBe(0);
+    const state = join(env.XDG_STATE_HOME, "skillfleet");
+    expect(existsSync(join(state, "hook-env.json"))).toBe(false);
+    const caller: NodeJS.ProcessEnv = { ...env };
+    delete caller.XDG_STATE_HOME;
+    delete caller.LOCALAPPDATA;
+    const run = (...args: string[]) => {
+      const result = spawnSync(process.execPath, [join(state, "app", "cli.mjs"), ...args], {
+        env: caller,
+        cwd: m.home,
+        encoding: "utf8",
+      });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    const names = (output: string) =>
+      (JSON.parse(output) as { skills: { name: string }[] }).skills.map(({ name }) => name);
+    expect(names(run("list", "--json"))).toEqual(["first"]);
+
+    writeFiles(mine, { "skills/second/SKILL.md": skillMd("second") });
+    caller.XDG_STATE_HOME = join(m.root, "alternate");
+    run("sync");
+    expect(names(run("list", "--json"))).toEqual(["first", "second"]);
+    expect(names(run("--json", "list"))).toEqual(["first", "second"]);
+    expect(run("list")).toContain("second");
+    delete caller.XDG_STATE_HOME;
+    expect(names(run("list", "--json"))).toEqual(["first"]);
     // The installed copy keeps node's compile cache beside itself, and nowhere else.
     expect(existsSync(join(state, "app", "compile"))).toBe(true);
     expect(existsSync(m.at(".cache"))).toBe(false);
@@ -1135,4 +1160,126 @@ describe("the hooks on shared and upgraded machines", () => {
       expect(JSON.parse(read(config))).toEqual({ manifest });
     },
   );
+
+  it("names a skill linked between SessionStart and the first prompt, and rewrites the session's record only on a change", async () => {
+    const { m, mine } = await hooked();
+    // A sync this session's hook did not start: the attempt is fresh.
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    await new Promise((done) => setTimeout(done, 20));
+    writeFiles(mine, { "skills/early/SKILL.md": skillMd("early") });
+    expect((await m.run("sync")).code).toBe(0);
+    const said = await hook(m, "claude-code", PROMPT);
+    expect(said.stdout).toContain("available now: early");
+    const sessions = join(m.stateDir, "sessions", "s1.json");
+    const { mtimeMs } = statSync(sessions);
+    await new Promise((done) => setTimeout(done, 50));
+    expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
+  });
+
+  it.each(["before", "after"])("recovers a sync interrupted %s linking", async (boundary) => {
+    const { m, mine } = await hooked();
+    const stateFile = join(m.stateDir, "state.json");
+    const state = () => JSON.parse(read(stateFile));
+    const installed = m.at(".claude", "skills", "early", "SKILL.md");
+    const targetManifest = m.at(".claude", "skills", ".skillfleet-manifest.json");
+    const stop = join(m.root, "stop.mjs");
+    writeFileSync(
+      stop,
+      `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (${boundary === "before"} && to === ${JSON.stringify(stateFile)}) {
+          const state = JSON.parse(fs.readFileSync(to, "utf8"));
+          if (state.skillChanges?.mine?.all) process.exit(86);
+        }
+        if (${boundary === "after"} && to === ${JSON.stringify(targetManifest)}) process.exit(86);
+      };
+      syncBuiltinESMExports();
+    `,
+    );
+    writeFiles(mine, { "skills/early/SKILL.md": skillMd("early") });
+    const stopped = await m.runWith(
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
+      "sync",
+    );
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
+    const checkpoint = state().skillChanges.mine.all;
+    expect(state().skills.early).toBeUndefined();
+    expect(existsSync(installed)).toBe(boundary === "after");
+
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    expect((await m.run("sync")).code).toBe(0);
+    expect(existsSync(installed)).toBe(true);
+    expect(state().skills.early.changedAt).toBe(checkpoint);
+    const prompt = (await hook(m, "claude-code", PROMPT)).stdout;
+    if (boundary === "before") expect(prompt).toContain("available now: early");
+    else expect(prompt).toBe("");
+    expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
+  });
+
+  it("gives a session resumed after a week a fresh record on its start", async () => {
+    const { m } = await hooked();
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    const file = join(m.stateDir, "sessions", "s1.json");
+    mkdirSync(dirname(file), { recursive: true });
+    const old = new Date(Date.now() - 8 * 24 * 3600_000);
+    writeFileSync(file, JSON.stringify({ startedAt: old.toISOString(), announced: [] }));
+    utimesSync(file, old, old);
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    const record = JSON.parse(read(file));
+    expect(Date.now() - Date.parse(record.startedAt)).toBeLessThan(60_000);
+  });
+
+  it("records a session start even when an old sessions.json can't be removed", async () => {
+    const { m } = await hooked();
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    // A folder where the old file was: removing it fails.
+    mkdirSync(join(m.stateDir, "sessions.json", "x"), { recursive: true });
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    expect(existsSync(join(m.stateDir, "sessions", "s1.json"))).toBe(true);
+  });
+
+  it("keeps the record of each of 12 sessions that start together", async () => {
+    const { m } = await hooked();
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    // What older versions kept all sessions in: left alone by the prompt hook, removed on a start.
+    writeFileSync(join(m.stateDir, "sessions.json"), "{");
+    const ids = Array.from({ length: 12 }, (_, i) => `session-${i}`);
+    await Promise.all(
+      ids.map((id) =>
+        hook(m, "claude-code", JSON.stringify({ session_id: id, hook_event_name: "SessionStart" })),
+      ),
+    );
+    const dir = join(m.stateDir, "sessions");
+    expect(readdirSync(dir).sort()).toEqual(ids.map((id) => `${id}.json`).sort());
+    for (const id of ids)
+      expect(JSON.parse(read(join(dir, `${id}.json`)))).toMatchObject({ announced: [] });
+    expect(existsSync(join(m.stateDir, "sessions.json"))).toBe(false);
+  });
+
+  it("starts the sync even when the session can't be recorded", async () => {
+    const { m } = await hooked();
+    // A file where the sessions folder goes: the record can't be made.
+    writeFileSync(join(m.stateDir, "sessions"), "");
+    const run = await hook(m, "claude-code", SESSION);
+    expect(run).toEqual({ code: 0, stdout: "", stderr: "" });
+    expect(started(m)).toHaveLength(1);
+  });
+
+  it("hook prompt, the entry older versions documented, names new skills but starts no sync", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const run = await m.runWith({ input: PROMPT }, "hook", "prompt");
+    expect(run).toEqual({ code: 0, stdout: "", stderr: "" });
+    expect(started(m)).toEqual([]);
+    expect(existsSync(join(m.stateDir, "hook-attempt"))).toBe(false);
+  });
 });

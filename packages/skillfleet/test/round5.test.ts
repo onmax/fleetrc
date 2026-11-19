@@ -25,6 +25,7 @@ import { fleet, formatFleet } from "../src/fleet.ts";
 import { editJsonText } from "../src/jsonedit.ts";
 import { editManifest, isRemoteGit, loadManifest, teamGitProblem } from "../src/manifest.ts";
 import {
+  clone,
   isWindows,
   machine,
   type Machine,
@@ -47,15 +48,51 @@ async function init(m: Machine, manifest: string, ...args: string[]) {
 }
 
 describe("a sync stopped before it saved state.json", () => {
-  it("recovers a copy published just before a sync stopped", async () => {
+  async function reviewableFork() {
     const m = machine();
-    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const vendor = remote(m, "vendor", skills("old/", "tool"));
+    const personal = remote(m, "personal", skills("skills/", "mine"));
+    const work = clone(m, personal, "code/personal");
     const manifest = m.manifest({
       agents: ["claude-code"],
-      sources: [{ id: "vendor", git: vendor.url }],
+      sources: [
+        { id: "vendor", git: vendor.url, update: "review" },
+        { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+      ],
     });
     await init(m, manifest);
-    const live = join(m.stateDir, "store", "vendor", "live", "tool");
+    return { m, vendor, work, manifest };
+  }
+
+  it("requires merging a held upstream move before forking", async () => {
+    const { m, vendor, work, manifest } = await reviewableFork();
+    const revision = vendor.commit({
+      "old/tool/SKILL.md": null,
+      "new/Tool/SKILL.md": skillMd("Tool", "moved"),
+    });
+    expect((await m.json("sync")).pending).toMatchObject([{ skill: "Tool", reason: "review" }]);
+    const rejected = await m.run("fork", "Tool");
+    expect(rejected.code).not.toBe(0);
+    expect(rejected.stderr).toContain("moved upstream to new/Tool");
+    expect(existsSync(join(work, "skills", "Tool"))).toBe(false);
+    expect((await m.run("merge", "Tool")).code).toBe(0);
+    expect((await m.run("fork", "Tool")).code).toBe(0);
+    expect(JSON.parse(read(manifest)).forks.Tool).toEqual({
+      from: vendor.url,
+      path: "new/Tool",
+      base: revision,
+    });
+    expect(read(join(work, "skills", "Tool", "SKILL.md"))).toBe(skillMd("Tool", "moved"));
+  });
+
+  it("does not promote a stale pending revision after offline recovery", async () => {
+    const { m, vendor, work, manifest } = await reviewableFork();
+    const earlier = vendor.commit({ "old/tool/SKILL.md": skillMd("tool", "earlier") });
+    expect((await m.json("sync")).pending).toHaveLength(1);
+    const latest = skillMd("tool", "latest");
+    const revision = vendor.commit({ "old/tool/SKILL.md": latest });
+    const stateFile = join(m.stateDir, "state.json");
+    const upstream = join(m.stateDir, "store", "vendor", "upstream", "tool");
     const stop = join(m.root, "stop.mjs");
     writeFileSync(
       stop,
@@ -66,25 +103,149 @@ describe("a sync stopped before it saved state.json", () => {
       const rename = fs.renameSync;
       fs.renameSync = (from, to) => {
         rename(from, to);
-        if (normalize(to) === normalize(${JSON.stringify(live)}) && from.endsWith(".new"))
+        if (normalize(to) === normalize(${JSON.stringify(upstream)}) && from.endsWith(".new"))
           process.exit(86);
       };
       syncBuiltinESMExports();
     `,
     );
-    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "published") });
     const stopped = await m.runWith(
       { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
       "sync",
     );
     expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
-    expect(read(join(live, "SKILL.md"))).toContain("published");
-    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "latest") });
-    const report = await m.json("sync");
-    expect(report.pending).toEqual([]);
-    expect(report.edited).toEqual([]);
-    expect(read(join(live, "SKILL.md"))).toContain("latest");
+    expect(read(join(upstream, "SKILL.md"))).toBe(latest);
+    expect(JSON.parse(read(stateFile)).sources.vendor.pending.tool.commit).toBe(earlier);
+    expect((await m.json("sync", "--offline")).pending).toHaveLength(1);
+    expect((await m.run("merge", "tool")).code).toBe(0);
+    expect(JSON.parse(read(stateFile)).sources.vendor.skills.tool.commit).toBeNull();
+    const rejected = await m.run("fork", "tool");
+    expect(rejected.code).not.toBe(0);
+    expect(rejected.stderr).toContain("cannot verify the git base");
+    expect((await m.json("sync")).pending).toEqual([]);
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    expect(JSON.parse(read(manifest)).forks.tool.base).toBe(revision);
+    expect(read(join(work, "skills", "tool", "SKILL.md"))).toBe(latest);
   });
+
+  it.each(["uninterrupted", "interrupted", "upstream advanced", "offline fork"])(
+    "reports the published path (%s)",
+    async (scenario) => {
+      const m = machine();
+      const vendor = remote(m, "vendor", skills("old/", "tool"));
+      const initial = vendor.head();
+      const personal = remote(m, "personal", skills("skills/", "mine"));
+      const work = clone(m, personal, "code/personal");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          { id: "vendor", git: vendor.url },
+          { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+        ],
+        hooks: ["old", "new", "latest"].map((path) => ({
+          name: path,
+          run: "echo changed",
+          on: [`vendor:${path}/tool/SKILL.md`],
+        })),
+      });
+      await init(m, manifest);
+      const statePath = join(m.stateDir, "state.json");
+      const state = () =>
+        JSON.parse(read(statePath)) as {
+          lastChange: string;
+          skills: { tool: { changedAt: string } };
+          sources: { vendor: { commit: string } };
+        };
+      const before = state();
+      const live = join(m.stateDir, "store", "vendor", "live", "tool");
+      const stop = join(m.root, "stop.mjs");
+      writeFileSync(
+        stop,
+        `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      import { normalize } from "node:path";
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        if (process.env.STOP_AT === "checkpoint" && normalize(to) === normalize(${JSON.stringify(statePath)}))
+          process.exit(87);
+        rename(from, to);
+        if (process.env.STOP_AT === "live" && normalize(to) === normalize(${JSON.stringify(live)}) && from.endsWith(".new"))
+          process.exit(86);
+      };
+      syncBuiltinESMExports();
+    `,
+      );
+      const interrupt = async (at: string, code: number) => {
+        const stopped = await m.runWith(
+          {
+            env: {
+              NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}`,
+              STOP_AT: at,
+            },
+          },
+          "sync",
+        );
+        expect(stopped.code, stopped.stdout + stopped.stderr).toBe(code);
+        expect(read(join(live, "SKILL.md"))).toContain("published");
+        expect(state()).toEqual(before);
+      };
+      const published = "published\nfirst\nsecond\nthird\nlast";
+      vendor.commit({
+        "old/tool/SKILL.md": null,
+        "new/tool/SKILL.md": skillMd("tool", published),
+      });
+      const revision = vendor.head();
+      if (scenario !== "uninterrupted") {
+        await interrupt("live", 86);
+        await interrupt("checkpoint", 87);
+      }
+      const advanced = scenario === "upstream advanced";
+      if (advanced)
+        vendor.commit({
+          "new/tool/SKILL.md": null,
+          "latest/tool/SKILL.md": skillMd("tool", "latest"),
+        });
+      const offline = scenario === "offline fork";
+      const report = await m.json("sync", ...(offline ? ["--offline"] : []));
+      expect(report.pending).toEqual([]);
+      expect(report.edited).toEqual([]);
+      expect(read(join(live, "SKILL.md"))).toContain(advanced ? "latest" : "published");
+      expect(report.skills.updated).toEqual(["tool"]);
+      expect(report.hooks.map(({ name, matched, code }) => ({ name, matched, code }))).toEqual(
+        (advanced ? ["new", "latest"] : ["new"]).map((name) => ({
+          name,
+          matched: [`vendor:${name}/tool/SKILL.md`],
+          code: 0,
+        })),
+      );
+      const after = state();
+      expect(after.lastChange > before.lastChange).toBe(true);
+      expect(after.skills.tool.changedAt > before.skills.tool.changedAt).toBe(true);
+      if (offline) {
+        expect(after.sources.vendor.commit).toBe(initial);
+        const fork = await m.run("fork", "tool");
+        expect(fork.code, fork.stdout + fork.stderr).toBe(0);
+        const savedFork = JSON.parse(read(manifest)).forks.tool;
+        const file = join(work, "skills", "tool", "SKILL.md");
+        writeFileSync(file, skillMd("tool", published.replace("first", "local edit")));
+        vendor.commit({
+          "new/tool/SKILL.md": skillMd("tool", published.replace("last", "upstream edit")),
+        });
+        const merge = await m.run("merge", "tool");
+        expect(merge.code, merge.stdout + merge.stderr).toBe(0);
+        expect(read(file)).toBe(
+          skillMd(
+            "tool",
+            published.replace("first", "local edit").replace("last", "upstream edit"),
+          ),
+        );
+        expect(savedFork).toEqual({ from: vendor.url, path: "new/tool", base: revision });
+        return;
+      }
+      expect((await m.json("sync")).hooks).toEqual([]);
+    },
+  );
 
   it.skipIf(isWindows)(
     "R8-1. an update a stopped sync put in place is not taken for a local edit once upstream moves again",
@@ -250,13 +411,13 @@ describe("merge while a sync runs", () => {
       // records a conflict in tool, with the file it is waiting on.
       const script = join(m.root, "writer.mjs");
       const state = join(m.stateDir, "state.json");
-      const armed = join(m.root, "writer.armed");
+      const enabled = join(m.root, "writer.enabled");
       writeFileSync(
         script,
         [
           `import { existsSync, readFileSync, writeFileSync } from "node:fs";`,
           `import { join } from "node:path";`,
-          `if (!existsSync(${JSON.stringify(armed)})) process.exit(0);`,
+          `if (!existsSync(${JSON.stringify(enabled)})) process.exit(0);`,
           `const state = JSON.parse(readFileSync(${JSON.stringify(state)}, "utf8"));`,
           `const dir = state.skills.tool.dir;`,
           `writeFileSync(join(dir, "notes.md.upstream"), "theirs\\n");`,
@@ -270,7 +431,7 @@ describe("merge while a sync runs", () => {
         hooks: [{ name: "writer", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
       });
       await init(m, manifest);
-      writeFileSync(armed, "");
+      writeFileSync(enabled, "");
       vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
       const report = await m.json("sync");
       expect(report.hooks.map((hook) => hook.code)).toEqual([0]);
@@ -490,14 +651,21 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
     it.each(["file", "folder"])(
       "keeps each team's boundary when the %s is named first",
       async (first) => {
-        write("r5-boundary/team/.skillfleet/manifest.json", {
+        const team = write("r5-boundary/team/.skillfleet/manifest.json", {
           extends: ["../shared.json"],
-          sources: [{ id: "team", npm: "team" }],
+          sources: [
+            { id: "team", npm: "team" },
+            { id: "legacy", npm: "legacy" },
+          ],
         });
         write("r5-boundary/team/shared.json", {
           sources: [{ id: "shared", npm: "shared" }],
         });
-        const fileEntry = { manifest: "./team/.skillfleet/manifest.json", exclude: ["file-only"] };
+        const fileEntry = {
+          manifest: `${dirname(team)}/./manifest.json`,
+          exclude: ["file-only"],
+          excludeSources: ["legacy"],
+        };
         const folderEntry = { manifest: "./team", exclude: ["folder-only"] };
         const file = write("r5-boundary/me.json", {
           extends: first === "file" ? [fileEntry, folderEntry] : [folderEntry, fileEntry],
@@ -507,8 +675,39 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
         expect(loaded.sources.map((source) => source.id)).toEqual(["team", "shared"]);
         expect(loaded.sources[0]!.exclude?.toSorted()).toEqual(["file-only", "folder-only"]);
         expect(loaded.sources[1]!.exclude).toEqual(["folder-only"]);
-        expect(loaded.failed).toEqual(["../shared.json"]);
+        expect(loaded.failed).toEqual([]);
         expect(loaded.warnings).toEqual([expect.stringContaining("outside it")]);
+      },
+    );
+
+    it.each([true, false])(
+      "retires a removed source only if the shared manifest is readable (%s)",
+      async (readable) => {
+        const m = machine();
+        const local = join(m.root, "local");
+        writeFiles(local, skills("", "old-skill"));
+        const manifest = m.manifest({
+          agents: ["claude-code"],
+          sources: [{ id: "old", local }],
+        });
+        await init(m, manifest);
+        const link = m.at(".claude", "skills", "old-skill");
+        expect(existsSync(link)).toBe(true);
+
+        const team = join(m.root, "team");
+        writeFiles(team, {
+          ".skillfleet/manifest.json": JSON.stringify({ extends: ["../shared.json"] }),
+          "shared.json": readable ? "{}" : "{",
+        });
+        m.manifest({
+          agents: ["claude-code"],
+          extends: [team, `${team}/./.skillfleet/manifest.json`],
+        });
+
+        const report = await m.json<Report>("sync");
+        expect(report.warnings).toContainEqual(expect.stringContaining("outside it"));
+        expect(report.warnings.some((warning) => warning.includes("did not load"))).toBe(!readable);
+        expect(existsSync(link)).toBe(!readable);
       },
     );
 
@@ -518,6 +717,24 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
         /r5-old has no \.skillfleet\/manifest\.json; name the manifest file as .*<file>/,
       );
     });
+  });
+
+  it("uses the transport's config for the team Git redirect check", async () => {
+    const url = "https://example.com/team.git";
+    const redirects = `[http "${url}"]\n\tfollowRedirects = true\n`;
+    const alternate = write("alternate.gitconfig", redirects);
+    const previous = process.env.GIT_CONFIG;
+    process.env.GIT_CONFIG = alternate;
+    try {
+      expect(await teamGitProblem(url, root)).toBeUndefined();
+      write("gitconfig", redirects);
+      write("alternate.gitconfig", "");
+      expect(await teamGitProblem(url, root)).toMatch(/with Git redirects disabled/);
+    } finally {
+      if (previous === undefined) delete process.env.GIT_CONFIG;
+      else process.env.GIT_CONFIG = previous;
+      write("gitconfig", "");
+    }
   });
 
   describe("extends objects", () => {

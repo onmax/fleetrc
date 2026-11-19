@@ -10,12 +10,16 @@ export interface InstalledCopy {
   hashes: Hashes;
   /** Folder of the skill inside its source, when the source has a tree. */
   path?: string;
+  commit?: string | null;
 }
 
 export interface PendingUpdate {
   /** `review`: the source waits for `skillfleet update`; `edited`: the local copy has edits. */
   reason: "review" | "edited";
   since: string;
+  path?: string;
+  commit?: string;
+  tree?: string;
 }
 
 export interface SourceState {
@@ -174,13 +178,21 @@ function installedCopy(record: unknown): InstalledCopy | undefined {
   if (!isRecord(record) || !isRecord(record.hashes)) return undefined;
   const hashes = Object.entries(record.hashes);
   if (hashes.some(([, hash]) => typeof hash !== "string")) return undefined;
-  return { hashes: dict(hashes as [string, string][]), ...strings(record, "path") };
+  return {
+    hashes: dict(hashes as [string, string][]),
+    ...strings(record, "path", "commit"),
+    ...(record.commit === null ? { commit: null } : {}),
+  };
 }
 
 function pendingUpdate(record: unknown): PendingUpdate | undefined {
   if (!isRecord(record) || (record.reason !== "review" && record.reason !== "edited"))
     return undefined;
-  return { reason: record.reason, since: text(record.since) ?? new Date(0).toISOString() };
+  return {
+    reason: record.reason,
+    since: text(record.since) ?? new Date(0).toISOString(),
+    ...strings(record, "path", "commit", "tree"),
+  };
 }
 
 function forkRecord(record: unknown): ForkState | undefined {

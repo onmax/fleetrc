@@ -26,15 +26,18 @@ import {
   inside,
   isRecord,
   listFiles,
+  readJsonOrNothing,
   recoverReplaced,
   removeUnchanged,
   renameFolder,
   replaceDir,
   replaceUnchanged,
   sameTree,
+  sha256,
   SKILL_LIMITS,
   skillBudget,
   SkillTooLargeError,
+  writeJson,
 } from "./fs.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
 import { globBase, globFilter } from "./glob.ts";
@@ -50,7 +53,7 @@ import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
 import { type FetchBudget, fetchNpm, guardedFetch, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
 import { tarFileSizes, zipEntries } from "./tar.ts";
-import type { SourceState } from "./state.ts";
+import type { PendingUpdate, SourceState } from "./state.ts";
 
 export interface SkillEntry {
   name: string;
@@ -1388,7 +1391,10 @@ function rebuildRecords(state: SourceState, storeDir: string): string[] {
     if (state.skills[name] || segmentProblem(name)) continue;
     const base = storePaths(storeDir, name).base;
     if (!existsSync(base)) continue;
-    state.skills[name] = { hashes: hashDir(base) };
+    state.skills[name] = {
+      hashes: hashDir(base),
+      ...(state.kind === "git" ? { commit: null } : {}),
+    };
     rebuilt.push(name);
   }
   return rebuilt.sort();
@@ -1413,6 +1419,7 @@ function nothingNew(
   return chosen.every(
     (skill) =>
       state.skills[skill.name]?.path === skill.path &&
+      (source.kind !== "git" || !!state.skills[skill.name]?.commit) &&
       existsSync(storePaths(ctx.storeDir, skill.name).live),
   );
 }
@@ -1658,6 +1665,23 @@ async function withDigestCheck<T>(work: () => Promise<T>, mismatched: Map<string
 const mismatchText = (name: string, digest: string) =>
   `the archive of "${name}" does not match the digest the index gives (received ${digest})`;
 
+const publicationPaths = (storeDir: string, name: string) =>
+  join(storeDir, "publication-paths", name);
+
+const treeKey = (hashes: Hashes) =>
+  sha256(
+    JSON.stringify(
+      Object.keys(hashes)
+        .sort()
+        .map((file) => [file, hashes[file]]),
+    ),
+  );
+
+export function pendingGitBase(pending: PendingUpdate | undefined, hashes: Hashes) {
+  if (pending?.commit && pending.path !== undefined && pending.tree === treeKey(hashes))
+    return { path: pending.path, commit: pending.commit };
+}
+
 async function fetchVendored(
   source: VendoredSource,
   state: SourceState,
@@ -1693,19 +1717,30 @@ async function fetchVendored(
     const publishing = join(ctx.storeDir, "publishing", name);
     if (!existsSync(live)) continue;
     const now = hashDir(live);
-    if (existsSync(publishing)) {
-      if (sameTree(hashDir(publishing), now)) {
-        if (!ctx.dryRun) replaceDir(publishing, base);
-        copy.hashes = now;
-      }
-      if (!ctx.dryRun) rmSync(publishing, { recursive: true, force: true });
-    }
     const files = changedFiles(copy.hashes, now);
-    if (files.length === 0) continue;
-    // A sync stopped after it put an update in place (the base first, then the copy) and before it
-    // saved state.json leaves both at the update and the record behind: the copy is that update,
-    // unedited, and the record takes its hashes.
-    if (existsSync(base) && sameTree(hashDir(base), now)) {
+    const published = existsSync(publishing) && sameTree(hashDir(publishing), now);
+    if (existsSync(publishing) && !ctx.dryRun) {
+      if (published) replaceDir(publishing, base);
+      rmSync(publishing, { recursive: true, force: true });
+    }
+    const receipts = publicationPaths(ctx.storeDir, name);
+    if (files.length === 0) {
+      if (!ctx.dryRun) rmSync(receipts, { recursive: true, force: true });
+      continue;
+    }
+    // If the witness was already retired, the matching base still proves publication until the
+    // source checkpoint saves the new hashes together with its change notifications.
+    if (published || (existsSync(base) && sameTree(hashDir(base), now))) {
+      const pathsByTree = readJsonOrNothing(join(receipts, "paths.json"));
+      const receipt = isRecord(pathsByTree) ? pathsByTree[treeKey(now)] : undefined;
+      const path = isRecord(receipt) ? receipt.path : receipt;
+      copy.path = typeof path === "string" ? path : path === null ? undefined : copy.path;
+      if (source.kind === "git")
+        copy.commit =
+          typeof path === "string" && isRecord(receipt) && typeof receipt.commit === "string"
+            ? receipt.commit
+            : null;
+      reportVendoredUpdate(source, out, { name, path: copy.path }, files);
       copy.hashes = now;
       continue;
     }
@@ -1912,6 +1947,7 @@ async function fetchVendored(
       firstRun,
       earlier,
       heldBack,
+      commit: source.kind === "git" ? opened.version : undefined,
     });
     state.fetchedAt = ctx.now;
     if (source.kind === "npm") state.version = opened.version;
@@ -2058,7 +2094,7 @@ function carryRenames(
           renameFolder(from[kind], to[kind]);
         }
     }
-    state.skills[skill.name] = { ...state.skills[old]!, path: skill.path };
+    state.skills[skill.name] = state.skills[old]!;
     delete state.skills[old];
     if (state.pending[old]) {
       state.pending[skill.name] = state.pending[old];
@@ -2077,6 +2113,11 @@ const filesAt = (source: Source, skill: Found) =>
       ? ""
       : `${skill.path}/`;
 
+function reportVendoredUpdate(source: Source, out: SourceResult, skill: Found, files: string[]) {
+  if (!out.updated.includes(skill.name)) out.updated.push(skill.name);
+  out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
+}
+
 function applyVendored(
   source: VendoredSource,
   state: SourceState,
@@ -2088,6 +2129,7 @@ function applyVendored(
     rebuilt,
     firstRun,
     earlier,
+    commit,
     heldBack = new Set(),
   }: {
     /** Skills whose install record was rebuilt from the store this run. */
@@ -2098,6 +2140,7 @@ function applyVendored(
      * the copy's hashes then.
      */
     earlier: ReadonlyMap<string, Hashes>;
+    commit?: string;
     /** Skills upstream still has but whose download was refused: their copy stays as it is. */
     heldBack?: ReadonlySet<string>;
   },
@@ -2106,11 +2149,17 @@ function applyVendored(
   const edited = new Map(out.edited.map((entry) => [entry.skill, entry.files]));
   const pending = new Map<string, SourceResult["pending"][number]>();
   const review = source.update === "review" && !ctx.apply;
+  const installed = (hashes: Hashes, path: string | undefined) => ({
+    hashes,
+    path,
+    ...(source.kind === "git" ? { commit: commit ?? null } : {}),
+  });
   const hold = (
     name: string,
     from: string | undefined,
     reason: "review" | "edited",
     files: string[],
+    path?: string,
   ) => {
     const paths = storePaths(ctx.storeDir, name);
     const incoming = from ? hashDir(from) : {};
@@ -2121,7 +2170,12 @@ function applyVendored(
       else rmSync(paths.upstream, { recursive: true, force: true });
     }
     const since = upstreamChanged ? ctx.now : (state.pending[name]?.since ?? ctx.now);
-    if (write) state.pending[name] = { reason, since };
+    if (write)
+      state.pending[name] = {
+        reason,
+        since,
+        ...(from && commit ? { path, commit, tree: treeKey(incoming) } : {}),
+      };
     pending.set(name, { skill: name, reason, files });
   };
   // The base first: a kill between the two leaves a copy that matches its record or the update.
@@ -2146,7 +2200,7 @@ function applyVendored(
           : changedFiles(incoming, hashDir(paths.live));
       if (write) {
         replaceDir(from, paths.base);
-        state.skills[skill.name] = { hashes: incoming, path: skill.path };
+        state.skills[skill.name] = installed(incoming, skill.path);
       }
       out.skills.push({ name: skill.name, dir: paths.live, path: skill.path });
       // New to the records (a killed sync may have copied it), so hooks hear about it again.
@@ -2161,14 +2215,14 @@ function applyVendored(
       continue;
     }
     if ((!record || !existsSync(paths.live)) && review && !firstRun) {
-      hold(skill.name, from, "review", Object.keys(incoming));
+      hold(skill.name, from, "review", Object.keys(incoming), skill.path);
       continue;
     }
     out.skills.push({ name: skill.name, dir: paths.live, path: skill.path });
     if (!record || !existsSync(paths.live)) {
       if (write) {
         install(from, paths);
-        state.skills[skill.name] = { hashes: incoming, path: skill.path };
+        state.skills[skill.name] = installed(incoming, skill.path);
       }
       out.added.push(skill.name);
       out.changed.push(...Object.keys(incoming).map((file) => `${filesAt(source, skill)}${file}`));
@@ -2178,7 +2232,7 @@ function applyVendored(
     if (files.length === 0) {
       if (write) rmSync(paths.upstream, { recursive: true, force: true });
       delete state.pending[skill.name];
-      if (write) record.path = skill.path;
+      if (write) state.skills[skill.name] = installed(incoming, skill.path);
       if (rebuilt.includes(skill.name)) {
         // New to the records (a killed sync may have copied it), so hooks hear about it again.
         out.added.push(skill.name);
@@ -2194,40 +2248,45 @@ function applyVendored(
       if (write) {
         replaceDir(from, paths.base);
         rmSync(paths.upstream, { recursive: true, force: true });
-        state.skills[skill.name] = { hashes: incoming, path: skill.path };
+        state.skills[skill.name] = installed(incoming, skill.path);
         delete state.pending[skill.name];
       }
       edited.delete(skill.name);
       out.edited = out.edited.filter((entry) => entry.skill !== skill.name);
-      out.updated.push(skill.name);
-      out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
+      reportVendoredUpdate(source, out, skill, files);
       continue;
     }
     const editedFiles = edited.get(skill.name);
     if (review || editedFiles) {
-      hold(skill.name, from, editedFiles ? "edited" : "review", files);
+      hold(skill.name, from, editedFiles ? "edited" : "review", files, skill.path);
       continue;
     }
     if (write) {
       // Edits were looked for before the fetch; one saved since then is caught here.
       const publishing = join(ctx.storeDir, "publishing", skill.name);
+      writeJson(join(publicationPaths(ctx.storeDir, skill.name), "paths.json"), {
+        [treeKey(record.hashes)]: {
+          path: record.path ?? null,
+          commit: record.commit === undefined ? state.commit : record.commit,
+        },
+        [treeKey(incoming)]: { path: skill.path ?? null, commit },
+      });
       replaceDir(from, publishing);
       const late = replaceUnchanged(publishing, paths.live, record.hashes);
       if (late.length > 0) {
         rmSync(publishing, { recursive: true, force: true });
         edited.set(skill.name, late);
         out.edited.push({ skill: skill.name, files: late });
-        hold(skill.name, from, "edited", files);
+        hold(skill.name, from, "edited", files, skill.path);
         continue;
       }
       replaceDir(publishing, paths.base);
       rmSync(publishing, { recursive: true, force: true });
       rmSync(paths.upstream, { recursive: true, force: true });
-      state.skills[skill.name] = { hashes: incoming, path: skill.path };
+      state.skills[skill.name] = installed(incoming, skill.path);
       delete state.pending[skill.name];
     }
-    out.updated.push(skill.name);
-    out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
+    reportVendoredUpdate(source, out, skill, files);
   }
   // A skill held back keeps the update it was already waiting on.
   for (const entry of out.pending)
@@ -2268,6 +2327,7 @@ function applyVendored(
         continue;
       }
       for (const dir of Object.values(paths)) rmSync(dir, { recursive: true, force: true });
+      rmSync(publicationPaths(ctx.storeDir, name), { recursive: true, force: true });
       delete state.skills[name];
       delete state.pending[name];
     }

@@ -30,10 +30,10 @@ if (
     module.enableCompileCache?.(join(dirname(script), "compile"));
   } catch {}
 // What an agent's session hook runs, when a session starts: hook.ts alone, without the rest of the
-// CLI. `hook prompt`, the per-prompt hook older versions documented, does nothing now; settings
-// files may still call it, so it exits 0 at once.
+// CLI. `hook prompt`, the legacy Claude Code hook, only reports new skills and never starts a sync.
 const [command, action, agent] = args;
-if (command === "hook" && action === "prompt" && process.argv.length === 4) process.exitCode = 0;
+if (command === "hook" && action === "prompt" && process.argv.length === 4)
+  void import("./hook.ts").then((hook) => hook.runHook("claude-code", true));
 else if (
   command === "hook" &&
   action === "run" &&

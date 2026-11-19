@@ -2,6 +2,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { isRecord, readJsonOrNothing } from "./fs.ts";
 
+export const claudeHome = () => process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
+
 /** `~` and `~/x` become paths in the home directory; relative paths resolve against `base`. */
 export function expandPath(path: string, base = process.cwd()): string {
   if (path === "~") return homedir();
@@ -47,6 +49,8 @@ export const paths = {
   lastRun: () => join(stateDir(), "last-run.json"),
   initPending: () => join(stateDir(), "init-pending"),
   fleet: () => join(stateDir(), "fleet.json"),
+  /** Claude Code sessions, one record each (sessions.ts). */
+  sessions: () => join(stateDir(), "sessions"),
   lock: () => join(stateDir(), "sync.lock"),
   store: (source: string) => join(stateDir(), "store", source),
   cache: () => join(stateDir(), "cache"),

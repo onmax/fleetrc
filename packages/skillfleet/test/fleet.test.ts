@@ -11,7 +11,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import * as execution from "../src/exec.ts";
 import { fleet, formatFleet, type InitSetup, remoteScript, resolveFleet } from "../src/fleet.ts";
 import { hostManifestSpec, loadManifest, sameManifest } from "../src/manifest.ts";
 import { launchers } from "../src/selfinstall.ts";
@@ -29,9 +30,14 @@ function sshShim(m: Machine): NodeJS.ProcessEnv {
     script,
     `import { spawnSync } from "node:child_process";
 const args = process.argv.slice(2);
+const probe = args[0] === "-G" && args.shift();
 while (args[0] === "-o") args.splice(0, 2);
 if (args[0] === "--") args.shift();
 const [host, command] = args;
+if (probe) {
+  console.log("hostname " + host + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
 if (host !== "localhost") setTimeout(() => {}, 1e9);
 else {
   const run = spawnSync("sh", ["-c", command], { stdio: "inherit" });
@@ -432,12 +438,27 @@ describe("fleet tags", () => {
     ]);
     // Without a tag, Tailscale isn't asked, so a short name and a MagicDNS name stay apart: two
     // tailnets can each have a vps2.
-    const plain = await resolveFleet(["vps2", "vps2.tail.ts.net", "vps2.other.ts.net"]);
-    expect(plain.targets).toEqual([
-      { host: "vps2" },
-      { host: "vps2.tail.ts.net" },
-      { host: "vps2.other.ts.net" },
-    ]);
+    const config = vi.spyOn(execution, "exec").mockImplementation(async (_command, args) => {
+      const host = args[args.indexOf("--") + 1];
+      return {
+        stdout: `hostname ${host === "VPS2" ? "192.0.2.2" : "192.0.2.1"}\nuser alice\nport 22\n`,
+        stderr: "",
+        code: 0,
+        timedOut: false,
+        truncated: false,
+      };
+    });
+    try {
+      const plain = await resolveFleet(["vps2", "vps2.tail.ts.net", "vps2.other.ts.net", "VPS2"]);
+      expect(plain.targets).toEqual([
+        { host: "vps2" },
+        { host: "vps2.tail.ts.net" },
+        { host: "vps2.other.ts.net" },
+        { host: "VPS2" },
+      ]);
+    } finally {
+      config.mockRestore();
+    }
   });
 
   it("runs on a machine's Tailscale IP when the tailnet has MagicDNS off", async () => {
@@ -474,6 +495,47 @@ describe("fleet tags", () => {
     expect(targets).toMatchObject([{ host: "web" }, { host: "100.64.0.5", via: "tag:servers" }]);
   });
 
+  it("dispatches to all tagged peers through bounded, address-family-aware probes", async () => {
+    const peers = Array.from({ length: 20 }, (_, index) =>
+      peer(`peer${index}.invalid`, ["tag:servers"], {
+        ips: [`100.64.0.${index + 1}`, `fd7a::${index + 1}`],
+      }),
+    );
+    const mixedDns = "peer1.invalid";
+    const hosts = peers.map((entry, index) => (index === 1 ? mixedDns : entry.TailscaleIPs[1]));
+    const dispatched: string[] = [];
+    let active = 0;
+    const exec = vi.spyOn(execution, "exec").mockImplementation(async (_command, args) => {
+      const result = { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false };
+      if (args.includes("--json")) return { ...result, stdout: JSON.stringify(status(peers)) };
+      const host = args[args.indexOf("--") + 1]!;
+      if (!args.includes("-G")) {
+        dispatched.push(host);
+        return {
+          ...result,
+          code: hosts.includes(host) ? 0 : 255,
+          stdout: hosts.includes(host) ? "skillfleet-fleet: never-synced" : "",
+        };
+      }
+      const saturated = ++active > 12;
+      await Promise.resolve();
+      active--;
+      if (saturated) return { ...result, code: null, spawnError: "EMFILE" };
+      const record = peers.find(({ DNSName }) => DNSName === `${host}.`);
+      const name = host === mixedDns ? host : (record?.TailscaleIPs[0] ?? host);
+      return { ...result, stdout: `hostname ${name}\nuser alice\nport 22\naddressfamily inet6\n` };
+    });
+    try {
+      const addresses = async () => ["192.0.2.10", "fd7a::2"];
+      const { targets } = await resolveFleet(["tag:servers"], addresses);
+      const results = await fleet(targets, "status", "0.0.0", 30_000, { dryRun: true });
+      expect(dispatched).toEqual(hosts);
+      expect(results.every(({ reachable }) => reachable)).toBe(true);
+    } finally {
+      exec.mockRestore();
+    }
+  });
+
   it("deduplicates an explicit SSH alias by its effective destination, not its name", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
@@ -490,7 +552,7 @@ if (process.argv.includes("-G")) {
     "other-port.invalid": ["alice", 2223],
   };
   const config = aliases[host];
-  console.log("hostname " + (config ? "localhost" : "127.0.0.2"));
+  console.log("hostname " + (config ? "localhost" : host === "localhost" ? "127.0.0.2" : host));
   if (config) console.log("user " + config[0] + "\\nport " + config[1]);
 } else console.log('skillfleet-fleet: never-synced');`,
     );
@@ -574,9 +636,9 @@ console.log(JSON.stringify({ finishedAt: process.env.REPORT_TIME, ok: true, skil
       status([peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] })]),
     );
     const addresses = () =>
-      new Promise<string[]>((resolve) => setTimeout(resolve, 350, ["100.64.0.5"]));
+      new Promise<string[]>((resolve) => setTimeout(resolve, 1000, ["100.64.0.5"]));
     const { targets } = await withTailscale(program, () =>
-      resolveFleet(["tag:servers"], addresses, 100),
+      resolveFleet(["tag:servers"], addresses, 500),
     );
     expect(targets).toMatchObject([{ host: "100.64.0.5", via: "tag:servers" }]);
   });
@@ -602,7 +664,13 @@ console.log(JSON.stringify({ finishedAt: process.env.REPORT_TIME, ok: true, skil
     writeFileSync(
       ssh,
       `import { appendFileSync } from "node:fs";
-appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+if (args.includes("-G")) {
+  const host = args[args.indexOf("--") + 1];
+  console.log("hostname " + host + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
 process.exit(255);`,
     );
     const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: program };
@@ -612,9 +680,12 @@ process.exit(255);`,
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    expect(calls.map((argv) => argv[argv.indexOf("--") + 1])).toEqual(["localhost"]);
-    for (const hostile of ["ProxyCommand", "a;b", "user@x", "$(id)"])
-      expect(calls.flat().slice(0, -1).join(" ")).not.toContain(hostile);
+    expect(
+      calls.filter((argv) => !argv.includes("-G")).map((argv) => argv[argv.indexOf("--") + 1]),
+    ).toEqual(["localhost"]);
+    for (const argv of calls)
+      for (const hostile of ["ProxyCommand", "a;b", "user@x", "$(id)"])
+        expect(argv.slice(0, -1).join(" ")).not.toContain(hostile);
     expect((JSON.parse(run.stdout) as Hosts).map((host) => host.host)).toEqual(["localhost"]);
     expect(run.stderr).toMatch(/skipped a machine Tailscale calls "-oProxyCommand=x"/);
   });
@@ -1326,6 +1397,11 @@ describe.skipIf(isWindows)("fleet init", () => {
       ssh,
       `
 const success = { finishedAt: "2026-01-01T00:00:00Z", ok: true };
+if (process.argv.includes("-G")) {
+  const host = process.argv[process.argv.indexOf("--") + 1];
+  console.log("hostname " + host + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
 if (process.env.FAKE_ANSWER === "mismatch") {
   console.error("skillfleet-fleet: has github:another/manifest");
   console.log("skillfleet-fleet: other-manifest");
@@ -1374,18 +1450,36 @@ if (process.env.FAKE_ANSWER === "mismatch") {
 
   it("this machine is already set up; a host a tag of the fleet matches is not added again", async () => {
     const { m, fleetIn } = await controller(["tag:servers"]);
-    const dns = "node.skillfleet.test";
+    const ip = "100.64.0.5";
     const program = fakeTailscale(
       m.root,
-      status([peer(dns, ["tag:servers"], { ips: ["127.0.0.1"] })]),
+      status([peer("web.invalid", ["tag:servers"], { ips: [ip] })]),
     );
-    const env = { ...initShims(m, {}, { localhost: dns }), SKILLFLEET_TAILSCALE: program };
+    const env = { ...initShims(m, {}, { localhost: ip }), SKILLFLEET_TAILSCALE: program };
     const run = await m.runWith({ env }, "fleet", "init", "localhost", "--json");
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(JSON.parse(run.stdout)).toEqual([
       expect.objectContaining({ host: "localhost", setup: "already set up", reachable: true }),
     ]);
     expect(npxCalls(m)).toEqual([]);
+    expect(run.stderr).toContain("the fleet already has them");
+    expect(fleetIn()).toEqual(["tag:servers"]);
+  });
+
+  it("does not enroll IPv6 when the tag selects the same peer's IPv4 address", async () => {
+    const { m, fleetIn } = await controller(["tag:servers"]);
+    const ipv6 = "fd7a::5";
+    const tailscale = fakeTailscale(m.root, {
+      ...status([peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5", ipv6] })]),
+      CurrentTailnet: { MagicDNSEnabled: false },
+    });
+    const env = {
+      ...initShims(m, { [ipv6]: join(m.root, "web") }),
+      SKILLFLEET_TAILSCALE: tailscale,
+    };
+    const run = await m.runWith({ env }, "fleet", "init", ipv6, "--no-hooks", "--json");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject([{ host: ipv6, setup: "set up" }]);
     expect(run.stderr).toContain("the fleet already has them");
     expect(fleetIn()).toEqual(["tag:servers"]);
   });

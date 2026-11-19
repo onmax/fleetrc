@@ -26,7 +26,7 @@ import { dirname, join } from "node:path";
 import { isErrno, isRecord, JsonFileError, lstat, readJson } from "./fs.ts";
 import { HOOK_AGENTS, type HookAgent } from "./hook.ts";
 import { editJsonText } from "./jsonedit.ts";
-import { tildify } from "./paths.ts";
+import { claudeHome, tildify } from "./paths.ts";
 import { installedCli, launcherPath, linkedNode, stableNode } from "./selfinstall.ts";
 
 export { HOOK_AGENTS, type HookAgent };
@@ -41,8 +41,7 @@ export const AGENT_NAMES: Record<HookAgent, string> = {
 
 /** The agent's config folder, whose presence means the agent is installed here. */
 export function agentHome(agent: HookAgent): string {
-  if (agent === "claude-code")
-    return process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
+  if (agent === "claude-code") return claudeHome();
   return process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
 }
 
@@ -161,11 +160,11 @@ const isDisabledCommand = (command: unknown) =>
 
 /**
  * A matcher group that runs on every event of its kind in `agent`: no matcher, or one that matches
- * all. Codex reads a null matcher as none; Claude Code skips that group.
+ * all. Codex also accepts null and the regex `.*` as catch-alls.
  */
 const catchAll = (group: Record<string, unknown>, agent: HookAgent) =>
   group.matcher === undefined ||
-  (agent === "codex" && group.matcher === null) ||
+  (agent === "codex" && (group.matcher === null || group.matcher === ".*")) ||
   group.matcher === "" ||
   group.matcher === "*";
 
@@ -350,7 +349,7 @@ export function editHooksFile(
     // by others, not even in its copy; the umask can only narrow the mode, which fchmod restores.
     const mode = snapshot === undefined ? undefined : statSync(target).mode & 0o7777;
     const temp = `${target}.skillfleet-${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
-    const fd = openSync(temp, "wx", mode ?? 0o666);
+    const fd = openSync(temp, "wx", mode ?? 0o600);
     try {
       if (mode !== undefined) fchmodSync(fd, mode);
       writeFileSync(fd, out);
@@ -438,7 +437,7 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
           ? {
               ...group,
               hooks: group.hooks.map((hook: unknown) => {
-                // Only a group that runs for every session start (no matcher) may hold it.
+                // Only a group that runs for every session start may hold it.
                 if (placed || !catchAll(group, agent) || !isOwnHandler(hook) || isDisabled(hook))
                   return hook;
                 placed = { ...handler };
