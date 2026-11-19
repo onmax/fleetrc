@@ -529,10 +529,18 @@ if (process.argv.includes("-G")) {
     writeFileSync(
       ssh,
       `import { appendFileSync } from "node:fs";
-appendFileSync(${JSON.stringify(log)}, process.argv[process.argv.indexOf("--") + 1] + "\\n");
+const destination = process.argv[process.argv.indexOf("--") + 1];
+if (process.argv.includes("-G")) {
+  console.log("hostname " + destination + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
+appendFileSync(${JSON.stringify(log)}, destination + "\\n");
 console.log(JSON.stringify({ finishedAt: process.env.REPORT_TIME, ok: true, skills: 1 }));`,
     );
-    const online = peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] });
+    const online = {
+      ...peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] }),
+      ID: "server",
+    };
     const tailscale = fakeTailscale(m.root, status([online]));
     const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: tailscale };
     const run = (host: string, time?: string) =>
