@@ -9,7 +9,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import * as execution from "../src/exec.ts";
 import { fleet, formatFleet, remoteScript, resolveFleet } from "../src/fleet.ts";
 import { loadManifest } from "../src/manifest.ts";
 import { launchers } from "../src/selfinstall.ts";
@@ -476,6 +477,47 @@ describe("fleet tags", () => {
     });
     const { targets } = await withTailscale(program, () => resolveFleet(["web", "tag:servers"]));
     expect(targets).toMatchObject([{ host: "web" }, { host: "100.64.0.5", via: "tag:servers" }]);
+  });
+
+  it("dispatches to all tagged peers through bounded, address-family-aware probes", async () => {
+    const peers = Array.from({ length: 20 }, (_, index) =>
+      peer(`peer${index}.invalid`, ["tag:servers"], {
+        ips: [`100.64.0.${index + 1}`, `fd7a::${index + 1}`],
+      }),
+    );
+    const mixedDns = "peer1.invalid";
+    const hosts = peers.map((entry, index) => (index === 1 ? mixedDns : entry.TailscaleIPs[1]));
+    const dispatched: string[] = [];
+    let active = 0;
+    const exec = vi.spyOn(execution, "exec").mockImplementation(async (_command, args) => {
+      const result = { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false };
+      if (args.includes("--json")) return { ...result, stdout: JSON.stringify(status(peers)) };
+      const host = args[args.indexOf("--") + 1]!;
+      if (!args.includes("-G")) {
+        dispatched.push(host);
+        return {
+          ...result,
+          code: hosts.includes(host) ? 0 : 255,
+          stdout: hosts.includes(host) ? "skillfleet-fleet: never-synced" : "",
+        };
+      }
+      const saturated = ++active > 12;
+      await Promise.resolve();
+      active--;
+      if (saturated) return { ...result, code: null, spawnError: "EMFILE" };
+      const record = peers.find(({ DNSName }) => DNSName === `${host}.`);
+      const name = host === mixedDns ? host : (record?.TailscaleIPs[0] ?? host);
+      return { ...result, stdout: `hostname ${name}\nuser alice\nport 22\naddressfamily inet6\n` };
+    });
+    try {
+      const addresses = async () => ["192.0.2.10", "fd7a::2"];
+      const { targets } = await resolveFleet(["tag:servers"], addresses);
+      const results = await fleet(targets, "status", "0.0.0", 30_000, { dryRun: true });
+      expect(dispatched).toEqual(hosts);
+      expect(results.every(({ reachable }) => reachable)).toBe(true);
+    } finally {
+      exec.mockRestore();
+    }
   });
 
   it("deduplicates an explicit SSH alias by its effective destination, not its name", async () => {

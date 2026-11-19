@@ -742,14 +742,13 @@ async function effectiveDestination(
     name,
     user: /^user (\S+)\r?$/m.exec(run.stdout)?.[1],
     port: /^port (\d+)\r?$/m.exec(run.stdout)?.[1],
+    family: /^addressfamily (inet6?)\r?$/m.exec(run.stdout)?.[1],
   };
 }
 
-function endpointKey({
-  name,
-  user,
-  port,
-}: NonNullable<Awaited<ReturnType<typeof effectiveDestination>>>) {
+type EffectiveDestination = NonNullable<Awaited<ReturnType<typeof effectiveDestination>>>;
+
+function endpointKey({ name, user, port }: EffectiveDestination) {
   return user && port ? JSON.stringify([hostKey(name), user, port]) : undefined;
 }
 
@@ -827,41 +826,43 @@ export async function resolveFleet(
       peer.tags.some((tag) => tagNames.has(tag.toLowerCase())),
     );
     const budget = Math.min(1500, timeoutMs);
+    const probeTimeout = budget / 2;
     const deadline = performance.now() + budget;
     const remoteCommand = sshRemoteCommand(action, version, dryRun);
     const entriesToProbe = new Set([
       ...(tagged.length ? explicit : probes),
-      ...tagged.flatMap(({ peer, dns, ips }) => (peer.online ? [...(dns ? [dns] : []), ...ips] : [])),
+      ...tagged.flatMap(({ peer, dns, ips }) =>
+        peer.online ? [...(dns ? [dns] : []), ...ips] : [],
+      ),
     ]);
-    const effective = new Map(
-      await Promise.all(
-        [...entriesToProbe].map(async (entry) => {
-          const target = await effectiveDestination(entry, remoteCommand, timeoutMs, budget / 2);
-          return [entry, target] as const;
-        }),
-      ),
+    const pending = entriesToProbe.values();
+    const effective = new Map<string, EffectiveDestination>();
+    await Promise.all(
+      Array.from({ length: Math.min(12, entriesToProbe.size) }, async () => {
+        for (const entry of pending) {
+          const target = await effectiveDestination(entry, remoteCommand, timeoutMs, probeTimeout);
+          if (target) effective.set(entry, target);
+        }
+      }),
     );
-    const names = [
-      ...new Set(
-        [...effective.values()].flatMap((target) =>
-          target && !isIP(target.name) ? [target.name] : [],
-        ),
-      ),
-    ];
+    const names = new Set<string>();
+    for (const { name } of effective.values()) if (!isIP(name)) names.add(name);
     const found = await verifyAddresses(
-      names,
-      Math.max(0, deadline - performance.now()),
+      [...names],
+      Math.max(probeTimeout, deadline - performance.now()),
       addresses,
     );
-    const matches = (name: string, { ips }: (typeof peers)[number]) => {
-      const resolved = isIP(name) ? [name] : (found.get(name) ?? []);
+    const matches = ({ name, family }: EffectiveDestination, { ips }: (typeof peers)[number]) => {
+      const resolved = (isIP(name) ? [name] : (found.get(name) ?? [])).filter(
+        (ip) => !family || isIP(ip) === (family === "inet" ? 4 : 6),
+      );
       const keys = ips.map(hostKey);
       return resolved.length > 0 && resolved.every((ip) => keys.includes(hostKey(ip)));
     };
     for (const entry of explicit) {
       const target = effective.get(entry);
       if (!target) continue;
-      const candidates = peers.filter((candidate) => matches(target.name, candidate));
+      const candidates = peers.filter((candidate) => matches(target, candidate));
       const candidate = candidates.length === 1 ? candidates[0] : undefined;
       if (!candidate) continue;
       if (tagged.length) peerOf.set(entry, { ...candidate, user: target.user, port: target.port });
@@ -887,7 +888,7 @@ export async function resolveFleet(
       });
       for (const host of candidates) {
         const target = effective.get(host);
-        if (!target || !matches(target.name, candidate)) continue;
+        if (!target || !matches(target, candidate)) continue;
         const endpoint = stableCacheKey(cacheKey) ? endpointKey(target) : undefined;
         destination.set(peer, { host, cacheKey, endpoint });
         break;
