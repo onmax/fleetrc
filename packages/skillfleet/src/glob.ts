@@ -1,8 +1,8 @@
 /**
- * A glob as an automaton: `*` matches within one path segment, `**` across segments (`**/ ` any
- * folders or none, a trailing `; /**` the folder and everything in it), `?` one character, and every
- * other character itself, `[`, `{`, `(` and `!` included. Each state has the states it reaches
- * without a character (`next`) and on one (`on`).
+ * A glob as an automaton: `*` matches within one path segment, `**` across segments (a `**`
+ * segment at the start or middle is any folders or none, one at the end is the folder and
+ * everything in it), `?` one character, and every other character itself, `[`, `{`, `(` and `!`
+ * included. Each state has the states it reaches without a character (`next`) and on one (`on`).
  */
 interface State {
   next: number[];

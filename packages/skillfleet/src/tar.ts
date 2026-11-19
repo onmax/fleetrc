@@ -103,7 +103,10 @@ export function readTgz(gz: Uint8Array): Map<string, Uint8Array> {
     const name = entry.path;
     if (entry.type === "Link" || entry.type === "SymbolicLink")
       throw new Error(`archive entry ${name} is a link`);
-    if (!FILE_TYPES.has(entry.type)) return void entry.resume();
+    if (!FILE_TYPES.has(entry.type)) {
+      entry.resume();
+      return;
+    }
     const path = safeRelativePath(name);
     if (!path) throw new Error(`archive entry ${name} would be written outside the package`);
     const chunks: Buffer[] = [];
