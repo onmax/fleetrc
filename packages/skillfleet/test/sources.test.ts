@@ -77,10 +77,10 @@ describe("tar archives", () => {
     return [tarHeader(name, bytes.length), bytes, Buffer.alloc((512 - (bytes.length % 512)) % 512)];
   };
 
-  it("counts every header toward the entry limit, ones node-tar ignores and metadata included", () => {
-    // Unknown types node-tar ignores, and empty global pax headers, which it emits nothing for.
+  it("counts entries node-tar ignores toward the entry limit", () => {
+    // An unknown type, which node-tar ignores instead of handing to onReadEntry.
     const tar = Buffer.concat([
-      ...Array.from({ length: 50_001 }, (_, i) => tarHeader(`p/x${i}`, 0, i % 2 ? "Z" : "g")),
+      ...Array.from({ length: 50_001 }, (_, i) => tarHeader(`p/x${i}`, 0, "Z")),
       end,
     ]);
     expect(tar.length).toBeLessThan(100 * 1024 * 1024);
