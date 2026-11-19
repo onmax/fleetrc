@@ -296,7 +296,11 @@ function summarize(raw: unknown): HostResult["lastRun"] {
   };
 }
 
-type CachedRun = { run: NonNullable<HostResult["lastRun"]>; destination?: string };
+type CachedRun = {
+  run: NonNullable<HostResult["lastRun"]>;
+  destination?: string;
+  endpoint?: string;
+};
 
 function readCache(): Record<string, CachedRun> {
   const raw = readJsonOrNothing(paths.fleet());
@@ -304,11 +308,11 @@ function readCache(): Record<string, CachedRun> {
   if (isRecord(raw))
     for (const [host, entry] of Object.entries(raw)) {
       const run = summarize(entry);
-      if (run) {
-        const destination = isRecord(entry) ? entry.destination : undefined;
+      if (run && isRecord(entry)) {
         cache[host] = {
           run,
-          destination: typeof destination === "string" ? destination : undefined,
+          destination: typeof entry.destination === "string" ? entry.destination : undefined,
+          endpoint: typeof entry.endpoint === "string" ? entry.endpoint : undefined,
         };
       }
     }
@@ -467,13 +471,9 @@ export async function fleet(
         offline,
         error,
         cacheKey = host,
+        refreshPeer,
       } = typeof target === "string" ? { host: target } : target;
-      const cached = cache[cacheKey];
-      const literal = cache[cached?.destination ?? host]?.run;
-      const lastRun =
-        literal && (!cached || Date.parse(literal.finishedAt) > Date.parse(cached.run.finishedAt))
-          ? literal
-          : cached?.run;
+      const lastRun = cache[cacheKey]?.run;
       const from = via ? { via } : {};
       // A tag Tailscale could not expand.
       if (error !== undefined)
@@ -527,8 +527,29 @@ export async function fleet(
         };
       }
       const run = "report" in answer ? summarize(answer.report) : undefined;
-      if (run && !dryRun)
-        cache[cacheKey] = { run, destination: cacheKey === host ? undefined : host };
+      if (run && !dryRun) {
+        if (cacheKey !== host) {
+          const effective = stableCacheKey(cacheKey)
+            ? await effectiveDestination(host, timeoutMs, Math.min(750, timeoutMs))
+            : undefined;
+          const endpoint =
+            effective && sshHostKey(effective.name) === sshHostKey(host)
+              ? endpointKey(effective)
+              : undefined;
+          cache[cacheKey] = { run, destination: host, endpoint };
+        } else {
+          cache[host] = { run };
+          if (refreshPeer) {
+            const previous = cache[refreshPeer.key];
+            if (
+              previous?.destination === host &&
+              previous.endpoint === refreshPeer.endpoint &&
+              Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
+            )
+              cache[refreshPeer.key] = { ...previous, run };
+          }
+        }
+      }
       const before = lastRun?.skillfleet;
       // What the host runs once the upgrade went in, told before its sync, which may still fail.
       const to = ("now" in answer ? answer.now : undefined) || run?.skillfleet;
@@ -580,7 +601,7 @@ export async function fleet(
     writeJson(
       paths.fleet(),
       Object.fromEntries(
-        Object.entries(cache).map(([key, { run, destination }]) => [key, { ...run, destination }]),
+        Object.entries(cache).map(([key, { run, ...identity }]) => [key, { ...run, ...identity }]),
       ),
     );
   markBehind(results);
@@ -664,6 +685,7 @@ export const fleetEntryProblem = (entry: string) =>
 export interface FleetTarget {
   host: string;
   cacheKey?: string;
+  refreshPeer?: { key: string; endpoint: string };
   /** The tag the host came from. */
   via?: string;
   /** Tailscale says the machine is offline, so ssh is not tried. */
@@ -691,15 +713,16 @@ export interface Tailnet {
 }
 
 /** The machines on the tailnet other than this one, or why Tailscale could not list them. */
-export async function tailnet(): Promise<Tailnet | { error: string }> {
+export async function tailnet(timeoutMs = 10_000): Promise<Tailnet | { error: string }> {
   const { command, prefix } = program("SKILLFLEET_TAILSCALE", "tailscale");
   const run = await exec(command, [...prefix, "status", "--json"], {
-    timeoutMs: 10_000,
+    timeoutMs,
     maxOutput: 64 * 1024 * 1024,
   });
   if (run.spawnError === "ENOENT")
     return { error: notInstalled(command, "tailscale", "SKILLFLEET_TAILSCALE") };
-  if (run.timedOut) return { error: "`tailscale status` did not answer within 10 s" };
+  if (run.timedOut)
+    return { error: `\`tailscale status\` did not answer within ${timeoutMs / 1000} s` };
   if (run.code !== 0) {
     const said = run.stderr.trim().split("\n")[0] || `exit ${run.code}`;
     return { error: `\`tailscale status\` failed: ${said}` };
@@ -792,6 +815,12 @@ function hostKey(host: string): string {
   return name;
 }
 
+function sshHostKey(host: string): string {
+  const zone = host.indexOf("%");
+  if (zone >= 0 && isIP(host) === 6) return hostKey(host.slice(0, zone)) + host.slice(zone);
+  return isIP(host) ? hostKey(host) : host;
+}
+
 const LOOKUP_ADDRESSES = `
   const { lookup } = require('node:dns');
   const { readFileSync } = require('node:fs');
@@ -858,15 +887,27 @@ async function effectiveDestination(entry: string, timeoutMs: number, budget: nu
   );
   if (run.code !== 0 || run.timedOut || run.truncated) return undefined;
   if (/^proxy(?:command|jump) (?!none\r?$)/im.test(run.stdout)) return undefined;
-  const hostname = /^hostname (\S+)\r?$/m.exec(run.stdout)?.[1];
-  const name = hostname?.replace(/\.$/, "");
-  if (!name || !tailnetHost(name)) return undefined;
+  const name = /^hostname (\S+)\r?$/m.exec(run.stdout)?.[1];
+  if (!name || !tailnetHost(name.replace(/\.$/, ""))) return undefined;
   return {
     name,
     user: /^user (\S+)\r?$/m.exec(run.stdout)?.[1],
     port: /^port (\d+)\r?$/m.exec(run.stdout)?.[1],
+    proxied: /^proxy(?:command|jump) (?!none\r?$)\S/m.test(run.stdout),
   };
 }
+
+function endpointKey({
+  name,
+  user,
+  port,
+  proxied,
+}: NonNullable<Awaited<ReturnType<typeof effectiveDestination>>>) {
+  return !proxied && user && port ? JSON.stringify([sshHostKey(name), user, port]) : undefined;
+}
+
+const stablePeerKey = (peer: TailscalePeer) => (peer.id ? `tag-peer:id:${peer.id}` : undefined);
+const stableCacheKey = (key: string) => key.startsWith("tag-peer:id:");
 
 /**
  * The machine, user and port a fleet entry names: `host`, `user@host`, a bare IP address (IPv6
@@ -894,7 +935,8 @@ function sshTarget(entry: string): { machine: string; user: string; port: string
 /**
  * The hosts to run on: the explicit ones as they are, and each `tag:` entry as every tailnet
  * machine with that tag, by MagicDNS name, or its first usable Tailscale IP when the name is
- * unavailable locally. Tailscale is asked once, and only when there is a tag. A machine named
+ * unavailable locally. Tailscale is asked once for tags or to verify a cached tagged destination.
+ * A machine named
  * twice runs once. Entries are compared by the machine they reach: an IPv6 address in any
  * spelling, a MagicDNS name or its short name, and, when Tailscale was asked, any name or IP of the
  * same peer. Two explicit entries for one machine run once when they also have the same user and
@@ -909,17 +951,37 @@ export async function resolveFleet(
   timeoutMs = 30_000,
 ): Promise<{ targets: FleetTarget[]; warnings: string[]; enrollment: Map<string, string[]> }> {
   const warnings: string[] = [];
-  const answer: Tailnet | { error: string } = entries.some(isTag)
+  const tagNames = new Set(entries.filter(isTag).map((entry) => entry.toLowerCase()));
+  const explicit = [...new Set(entries.filter((entry) => !isTag(entry)))];
+  const variants = new Map<string, Set<string>>();
+  for (const entry of explicit) {
+    const { machine } = sshTarget(entry);
+    const folded = hostKey(machine);
+    const names = variants.get(folded) ?? new Set<string>();
+    names.add(sshHostKey(machine));
+    variants.set(folded, names);
+  }
+  const cachedDestinations = new Set(
+    explicit.length
+      ? Object.entries(readCache()).flatMap(([key, record]) =>
+          stableCacheKey(key) && record.endpoint && record.destination ? [record.destination] : [],
+        )
+      : [],
+  );
+  const probes = explicit.filter((entry) => cachedDestinations.has(entry));
+  const answer: Tailnet | { error: string } = tagNames.size
     ? await tailnet()
-    : { peers: [], magicDNS: true };
+    : probes.length
+      ? await tailnet(Math.min(1500, timeoutMs))
+      : { peers: [], magicDNS: true };
   const peerOf = new Map<
     string,
     { peer: TailscalePeer; index: number; user?: string; port?: string }
   >();
   const destination = new Map<TailscalePeer, { host: string; cacheKey: string }>();
-  const tagNames = new Set(entries.filter(isTag).map((entry) => entry.toLowerCase()));
+  const refresh = new Map<string, NonNullable<FleetTarget["refreshPeer"]>>();
+  const aliases = new Map<string, string>();
   if ("peers" in answer) {
-    const explicit = [...new Set(entries.filter((entry) => !isTag(entry)))];
     const peers = answer.peers.map((peer, index) => ({
       peer,
       index,
@@ -930,11 +992,15 @@ export async function resolveFleet(
     );
     const budget = Math.min(1500, timeoutMs);
     const deadline = performance.now() + budget;
-    const effective = tagged.length
-      ? await Promise.all(
-          explicit.map((entry) => effectiveDestination(entry, timeoutMs, budget / 2)),
-        )
-      : [];
+    const effective = await Promise.all(
+      explicit.map(async (entry) =>
+        tagged.length ||
+        cachedDestinations.has(entry) ||
+        (variants.get(hostKey(sshTarget(entry).machine))?.size ?? 0) > 1
+          ? effectiveDestination(entry, timeoutMs, budget / 2)
+          : undefined,
+      ),
+    );
     const names = [
       ...new Set([
         ...tagged.flatMap(({ peer, dns, ips }) => (peer.online && dns && ips.length ? [dns] : [])),
@@ -947,7 +1013,7 @@ export async function resolveFleet(
       addresses,
     );
     const matches = (name: string, { dns, ips }: (typeof peers)[number]) => {
-      if (!ips.length) return dns !== undefined && hostKey(name) === hostKey(dns);
+      if (!ips.length) return dns !== undefined && sshHostKey(name) === sshHostKey(dns);
       const resolved = isIP(name) ? [name] : (found.get(name) ?? []);
       const keys = ips.map(hostKey);
       return resolved.length > 0 && resolved.every((ip) => keys.includes(hostKey(ip)));
@@ -955,9 +1021,15 @@ export async function resolveFleet(
     for (const [index, target] of effective.entries()) {
       const entry = explicit[index];
       if (!target || entry === undefined) continue;
+      const endpoint = endpointKey(target);
+      if (endpoint) aliases.set(entry, endpoint);
       const candidates = peers.filter((candidate) => matches(target.name, candidate));
-      if (candidates.length === 1 && candidates[0])
-        peerOf.set(entry, { ...candidates[0], user: target.user, port: target.port });
+      const candidate = candidates.length === 1 ? candidates[0] : undefined;
+      if (!candidate) continue;
+      if (tagged.length) peerOf.set(entry, { ...candidate, user: target.user, port: target.port });
+      const key = stablePeerKey(candidate.peer);
+      if (cachedDestinations.has(entry) && candidate.ips.length && key && endpoint)
+        refresh.set(entry, { key, endpoint });
     }
     for (const candidate of tagged) {
       const { peer, dns, ips } = candidate;
@@ -971,9 +1043,7 @@ export async function resolveFleet(
         dns && (!ips.length || !peer.online || (!overridden && matches(dns, candidate)));
       const host = (useDNS ? dns : undefined) ?? ips[0];
       if (!host) continue;
-      const cacheKey = peer.id
-        ? `tag-peer:id:${peer.id}`
-        : `tag-peer:address:${hostKey(ips[0] ?? host)}`;
+      const cacheKey = stablePeerKey(peer) ?? `tag-peer:address:${hostKey(ips[0] ?? host)}`;
       destination.set(peer, { host, cacheKey });
     }
   }
@@ -993,11 +1063,17 @@ export async function resolveFleet(
     if (!isTag(entry)) {
       const target = sshTarget(entry);
       const peer = peerOf.get(entry);
-      const machine = peer ? `peer:${peer.index}` : `host:${hostKey(target.machine)}`;
+      const endpoint = aliases.get(entry);
+      const machine = peer
+        ? `peer:${peer.index}`
+        : endpoint
+          ? `endpoint:${endpoint}`
+          : `host:${sshHostKey(target.machine)}`;
       const key = [machine, target.user, target.port, peer?.user, peer?.port].join("\0");
       const existing = seen.get(key);
       if (!existing) {
-        targets.push({ host: entry });
+        const refreshPeer = refresh.get(entry);
+        targets.push({ host: entry, ...(refreshPeer ? { refreshPeer } : {}) });
         seen.set(key, entry);
       }
       enroll(existing ?? entry, entry);
@@ -1038,31 +1114,64 @@ export async function resolveFleet(
 export async function notInFleet(
   entries: readonly string[],
   wanted: readonly string[],
+  timeoutMs = 30_000,
 ): Promise<string[]> {
   const key = (entry: string) => {
     const { machine, user, port } = sshTarget(entry);
-    return [hostKey(machine), user, port].join("\0");
+    return [sshHostKey(machine), user, port].join("\0");
   };
-  const named = new Set(entries.filter((entry) => !isTag(entry)).map(key));
-  const tags = new Set(entries.filter(isTag).map((tag) => tag.toLowerCase()));
-  const answer =
-    tags.size > 0 && wanted.some((entry) => !isTag(entry)) ? await tailnet() : { peers: [] };
-  const tagged = new Set(
-    ("peers" in answer ? answer.peers : [])
-      .filter((peer) => peer.tags.some((tag) => tags.has(tag.toLowerCase())))
-      .flatMap((peer) => [peer.dns, peer.host, ...peer.ips])
-      .filter(Boolean)
-      .map(hostKey),
-  );
+  const bare = (entry: string) => {
+    const { user, port } = sshTarget(entry);
+    return !user && !port;
+  };
+  const names = entries.filter((entry) => !isTag(entry));
+  const named = new Set(names.map(key));
+  const selectors = entries.filter(isTag);
+  const tags = new Set(selectors.map((tag) => tag.toLowerCase()));
+  const candidates = wanted.filter((entry) => !isTag(entry) && !named.has(key(entry)));
+  const taggedHosts =
+    selectors.length && candidates.some(bare)
+      ? (await resolveFleet(selectors, undefined, timeoutMs)).targets
+          .filter(({ error }) => !error)
+          .map(({ host }) => host)
+      : [];
+  const tagged = new Set(taggedHosts.map(key));
+  const endpoints = new Map<string, Promise<string | undefined>>();
+  const endpoint = (entry: string) => {
+    let pending = endpoints.get(entry);
+    if (!pending) {
+      pending = effectiveDestination(entry, timeoutMs, Math.min(750, timeoutMs)).then((target) =>
+        target ? endpointKey(target) : undefined,
+      );
+      endpoints.set(entry, pending);
+    }
+    return pending;
+  };
+  const compare = async (entry: string, others: string[]) => {
+    if (!others.length) return false;
+    const actual = await endpoint(entry);
+    return actual !== undefined && (await Promise.all(others.map(endpoint))).includes(actual);
+  };
   const missing: string[] = [];
   for (const entry of wanted) {
-    const target = sshTarget(entry);
-    // A tag's machines are reached as ssh's default user on port 22, so it covers only a bare name.
-    const bare = !target.user && !target.port;
-    const known = isTag(entry)
-      ? tags.has(entry.toLowerCase())
-      : named.has(key(entry)) || (bare && tagged.has(hostKey(target.machine)));
-    if (!known && !missing.some((each) => key(each) === key(entry))) missing.push(entry);
+    if (isTag(entry)) {
+      const tag = entry.toLowerCase();
+      if (!tags.has(tag)) missing.push(entry);
+      tags.add(tag);
+      continue;
+    }
+    if (named.has(key(entry)) || (bare(entry) && tagged.has(key(entry)))) continue;
+    const { machine, user, port } = sshTarget(entry);
+    const variants = names.filter((name) => {
+      const other = sshTarget(name);
+      return (
+        user === other.user && port === other.port && hostKey(machine) === hostKey(other.machine)
+      );
+    });
+    if (await compare(entry, bare(entry) ? [...variants, ...taggedHosts] : variants)) continue;
+    missing.push(entry);
+    names.push(entry);
+    named.add(key(entry));
   }
   return missing;
 }

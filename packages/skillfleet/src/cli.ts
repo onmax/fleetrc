@@ -1211,7 +1211,7 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
       say(
         `${host.host}${host.via && host.via !== host.host ? ` (${host.via})` : ""}: ${host.command ? `would run ${host.command}` : `skipped (${host.error})`}`,
       );
-    say(...(await addToFleet(loaded, entries, { dryRun: true })));
+    say(...(await addToFleet(loaded, entries, { dryRun: true, timeout })));
     if (json) emit(hosts);
     return 0;
   }
@@ -1226,7 +1226,7 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
       ...(await addToFleet(
         loaded,
         entries.filter((entry) => ready.has(entry)),
-        { dryRun: false },
+        { dryRun: false, timeout },
       )),
     );
   } catch (error) {
@@ -1248,10 +1248,10 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
 async function addToFleet(
   loaded: Awaited<ReturnType<typeof loadManifest>>,
   entries: readonly string[],
-  { dryRun }: { dryRun: boolean },
+  { dryRun, timeout }: { dryRun: boolean; timeout: number },
 ): Promise<string[]> {
   const already = entries.length > 0 ? ["the fleet already has them"] : [];
-  let missing = await notInFleet(loaded.root.fleet, entries);
+  let missing = await notInFleet(loaded.root.fleet, entries, timeout);
   if (missing.length === 0) return already;
   let target: ManifestTarget;
   try {
@@ -1270,6 +1270,7 @@ async function addToFleet(
     missing = await notInFleet(
       edited.fleet.filter((entry): entry is string => typeof entry === "string"),
       missing,
+      timeout,
     );
   if (missing.length === 0) return already;
   editManifest(
