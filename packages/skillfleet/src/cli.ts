@@ -1034,6 +1034,10 @@ async function hookCommand(action: string | undefined) {
 }
 
 async function fleetCommand(action: string | undefined) {
+  const initOnly = (["copy", "no-copy", "timer", "no-hooks", "force"] as const).filter(
+    (name) => values[name],
+  );
+  if (action !== "init" && initOnly.length > 0) usage(`only fleet init takes --${initOnly[0]}`);
   const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
   if (action === "add") {
     const hosts = rest.slice(1);
@@ -1092,10 +1096,6 @@ async function fleetCommand(action: string | undefined) {
     if (json) emit({ added: hosts, file: target.file, push: target.push, dryRun });
     return 0;
   }
-  const initOnly = (["copy", "no-copy", "timer", "no-hooks", "force"] as const).filter(
-    (name) => values[name],
-  );
-  if (action !== "init" && initOnly.length > 0) usage(`only fleet init takes --${initOnly[0]}`);
   if (action === "init") return fleetInit(loaded);
   if (action !== "sync" && action !== "status" && action !== "upgrade")
     return usage("fleet takes sync, status, upgrade, init or add");

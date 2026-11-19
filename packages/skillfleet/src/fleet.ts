@@ -102,6 +102,8 @@ export interface InitSetup {
   force: boolean;
   /** Whether a manifest spec a host's config.json names is `spec` in another spelling. */
   same: (configured: string) => boolean;
+  /** An equivalent spelling already read from the host; it must still match on retry. */
+  expectedConfig?: string;
 }
 
 /**
@@ -139,17 +141,18 @@ export function remoteScript(
       const word = (arg: string, i: number) =>
         i === 2 && /^\.\.?\//.test(arg) ? `"$o"/${quote(arg)}` : quote(arg);
       const init = ['"$x"', ...initArgs(version, setup).map(word), "--json"].join(" ");
-      const spec = quote(setup.spec);
+      const expected = quote(setup.expectedConfig ?? setup.spec);
       // A host with this manifest and a skillfleet that runs only syncs, unless an option asks
       // for something init does (--timer, --copy, --no-hooks...).
       const already =
         setup.flags.length === 0
-          ? `if [ -n "$m" ] && [ "$m" = ${spec} ] && [ -n "$f" ] && [ -z "$g" ]; then echo "${NOTE} already" >&2; ${watched('"$f" sync --json')}; el`
+          ? `if [ "$m" = ${expected} ] && [ -n "$f" ] && [ -z "$g" ]; then echo "${NOTE} already" >&2; ${watched('"$f" sync --json')}; el`
           : "";
       // A host with another manifest says which, unless --force sets it up with this one anyway.
+      const mismatch = `${setup.expectedConfig === undefined ? '[ -n "$m" ] && ' : ""}[ "$m" != ${expected} ]`;
       const other = setup.force
         ? ""
-        : `if [ -n "$m" ] && [ "$m" != ${spec} ]; then printf '%s has %s\\n' "${NOTE}" "$m" >&2; echo "${NOTE} other-manifest"; el`;
+        : `if ${mismatch}; then printf '%s has %s\\n' "${NOTE}" "$m" >&2; echo "${NOTE} other-manifest"; el`;
       return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; ${NPX}; ${CONFIGURED}; ${already}${other}if [ -n "$x" ]; then o=$(pwd) && cd / && ${watched(init)}; elif [ -n "$n" ] || command -v node >/dev/null 2>&1; then echo "${NOTE} no-npx"; else echo "${NOTE} init-no-node"; fi`;
     }
     default: {
@@ -428,26 +431,29 @@ export async function fleet(
           behind: [],
         };
       let answer = await runOnHost(host, action, version, timeoutMs, dryRun, setup);
-      let already = "already" in answer && answer.already === true;
+      if (
+        "note" in answer &&
+        answer.note === "other-manifest" &&
+        setup &&
+        answer.has &&
+        setup.same(answer.has)
+      ) {
+        answer = await runOnHost(host, "init", version, timeoutMs, false, {
+          ...setup,
+          expectedConfig: answer.has,
+        });
+      }
+      const already = "already" in answer && answer.already === true;
       if ("note" in answer && answer.note === "other-manifest" && setup && answer.has) {
-        // The same manifest written another way (github:me/skills, me/skills): init writes it this
-        // machine's way, and installs what the host lacks.
-        if (setup.same(answer.has)) {
-          answer = await runOnHost(host, "init", version, timeoutMs, false, {
-            ...setup,
-            force: true,
-          });
-          already = false;
-        } else
-          return {
-            host,
-            ...from,
-            reachable: true,
-            checked: true,
-            lastRun: cache[host],
-            error: `it has the manifest ${answer.has}; pass --force to set it up with ${setup.spec}`,
-            behind: [],
-          };
+        return {
+          host,
+          ...from,
+          reachable: true,
+          checked: true,
+          lastRun: cache[host],
+          error: `it has the manifest ${answer.has}; pass --force to set it up with ${setup.spec}`,
+          behind: [],
+        };
       }
       // The host answered, but has no report to give.
       if ("note" in answer && answer.note) {

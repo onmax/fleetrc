@@ -646,25 +646,23 @@ export function sameManifest(a: string, b: string): boolean {
 const FORGES = new Set(["github.com", "gitlab.com"]);
 
 /**
- * A repository as host and path, for `sameManifest`: the host lower case, the path as written
- * without `.git` or a trailing slash, and on a host other than GitHub and GitLab the user and the
- * form (scp or URL) too. Undefined for a spec this can't read.
+ * A repository identity for `sameManifest`. Only known forges normalize repository suffixes or
+ * equate different transports. Elsewhere the account, transport and exact path matter.
  */
 function repoIdentity(spec: string): string | undefined {
   const url = gitUrl(spec);
   const scheme = url.match(
-    /^(?:https?|ssh|git|git\+ssh|ssh\+git):\/\/(?:([^@/]*)@)?([^/]+)(\/.*)$/i,
+    /^(https?|ssh|git|git\+ssh|ssh\+git):\/\/(?:([^@/]*)@)?([^/]+)(\/.*)$/i,
   );
   const scp = scheme ? undefined : url.match(/^(?:([^@/:]+)@)?([^/:]+):(?!\/\/)(.+)$/);
-  const parts = scheme ?? scp;
-  if (!parts) return undefined;
-  const host = parts[2]!.toLowerCase().replace(/^www\./, "");
+  if (!scheme && !scp) return undefined;
+  const [, user, authority, path] = scheme ? scheme.slice(1) : scp!;
+  const host = authority!.toLowerCase();
   // `https://host:443` and `ssh://host:22` stay apart from the bare host: a port is not guessed.
-  const path = parts[3]!.replace(/\/+$/, "").replace(/\.git$/, "");
-  if (FORGES.has(host)) return `${host}/${path.replace(/^\/+/, "")}`;
-  // Elsewhere the account is part of the repository: `a@host:repo` and `b@host:repo` are each
-  // one's home folder, so the user stays, and scp and URL forms stay apart.
-  return `${scp ? "scp" : "url"}:${parts[1] ?? ""}@${host}:${path}`;
+  const forge = host.replace(/^www\./, "");
+  if (FORGES.has(forge))
+    return `${forge}/${path!.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "")}`;
+  return scheme ? `${scheme[1]!.toLowerCase()}://${user ?? ""}@${host}${path}` : url;
 }
 
 interface LocateOptions {
