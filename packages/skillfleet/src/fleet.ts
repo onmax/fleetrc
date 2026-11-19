@@ -7,6 +7,8 @@ import type { Report } from "./report.ts";
 
 export type FleetAction = "status" | "sync" | "upgrade" | "init";
 
+type FleetInvocation = { action: FleetAction; version: string; dryRun?: boolean; setup?: InitSetup };
+
 export interface HostResult {
   host: string;
   /** The Tailscale tag the host came from, for a host a `tag:` entry expanded to. */
@@ -298,7 +300,7 @@ function summarize(raw: unknown): HostResult["lastRun"] {
 
 type CachedRun = {
   run: NonNullable<HostResult["lastRun"]>;
-  destination?: string;
+  destinations?: string[];
   endpoint?: string;
 };
 
@@ -309,9 +311,14 @@ function readCache(): Record<string, CachedRun> {
     for (const [host, entry] of Object.entries(raw)) {
       const run = summarize(entry);
       if (run && isRecord(entry)) {
+        const destinations = Array.isArray(entry.destinations)
+          ? entry.destinations.filter((value) => typeof value === "string")
+          : typeof entry.destination === "string"
+            ? [entry.destination]
+            : undefined;
         cache[host] = {
           run,
-          destination: typeof entry.destination === "string" ? entry.destination : undefined,
+          destinations,
           endpoint: typeof entry.endpoint === "string" ? entry.endpoint : undefined,
         };
       }
@@ -332,13 +339,14 @@ function sshDestination(entry: string): string[] {
   return [...(user ? ["-l", user] : []), ...(port ? ["-p", port] : []), "--", machine];
 }
 
+const sshRemoteCommand = (action: FleetAction, version: string, dryRun: boolean, setup?: InitSetup) =>
+  `sh -c ${quote(remoteScript(action, version, { dryRun, setup }))}`;
+
 async function runOnHost(
   host: string,
   action: FleetAction,
-  version: string,
+  remoteCommand: string,
   timeoutMs: number,
-  dryRun: boolean,
-  setup?: InitSetup,
 ) {
   const problem = hostProblem(host);
   if (problem) return { error: problem, reached: false, checked: false };
@@ -348,7 +356,7 @@ async function runOnHost(
     ...sshOptions(timeoutMs),
     // hostProblem already refuses a leading "-"; this keeps ssh from reading any host as an option.
     ...sshDestination(host),
-    `sh -c ${quote(remoteScript(action, version, { dryRun, ...(setup ? { setup } : {}) }))}`,
+    remoteCommand,
   ];
   // The report is parsed whole, so it is not cut to the default tail. stdin stays open for `watched`.
   const run = await exec(command, args, {
@@ -463,6 +471,7 @@ export async function fleet(
   { dryRun = false, setup }: { dryRun?: boolean; setup?: InitSetup } = {},
 ): Promise<HostResult[]> {
   const cache = readCache();
+  const remoteCommand = sshRemoteCommand(action, version, dryRun, setup);
   const results = await Promise.all(
     hosts.map(async (target): Promise<HostResult> => {
       const {
@@ -488,7 +497,8 @@ export async function fleet(
           error: "offline in Tailscale",
           behind: [],
         };
-      let answer = await runOnHost(host, action, version, timeoutMs, dryRun, setup);
+      let reportCommand = remoteCommand;
+      let answer = await runOnHost(host, action, reportCommand, timeoutMs);
       if (
         "note" in answer &&
         answer.note === "other-manifest" &&
@@ -496,10 +506,11 @@ export async function fleet(
         answer.has &&
         setup.same(answer.has)
       ) {
-        answer = await runOnHost(host, "init", version, timeoutMs, false, {
+        reportCommand = sshRemoteCommand("init", version, false, {
           ...setup,
           expectedConfig: answer.has,
         });
+        answer = await runOnHost(host, "init", reportCommand, timeoutMs);
       }
       const already = "already" in answer && answer.already === true;
       if ("note" in answer && answer.note === "other-manifest" && setup && answer.has) {
@@ -530,23 +541,41 @@ export async function fleet(
       if (run && !dryRun) {
         if (cacheKey !== host) {
           const effective = stableCacheKey(cacheKey)
-            ? await effectiveDestination(host, timeoutMs, Math.min(750, timeoutMs))
+            ? await effectiveDestination(host, reportCommand, timeoutMs, Math.min(750, timeoutMs))
             : undefined;
           const endpoint =
             effective && sshHostKey(effective.name) === sshHostKey(host)
               ? endpointKey(effective)
               : undefined;
-          cache[cacheKey] = { run, destination: host, endpoint };
+          const previous = cache[cacheKey];
+          const known = endpoint && previous?.endpoint === endpoint ? previous.destinations : [];
+          const destinations = endpoint ? [...new Set([host, ...(known ?? [])])] : undefined;
+          cache[cacheKey] = { run, destinations, endpoint };
         } else {
           cache[host] = { run };
           if (refreshPeer) {
             const previous = cache[refreshPeer.key];
+            const taggedHost = refreshPeer.taggedHost;
             if (
-              previous?.destination === host &&
-              previous.endpoint === refreshPeer.endpoint &&
-              Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
-            )
-              cache[refreshPeer.key] = { ...previous, run };
+              reportCommand === remoteCommand &&
+              (previous
+                ? (previous.destinations?.includes(host) || taggedHost) &&
+                  previous.endpoint === refreshPeer.endpoint
+                : taggedHost)
+            ) {
+              const destinations = new Set(previous?.destinations);
+              destinations.add(host);
+              if (taggedHost) destinations.add(taggedHost);
+              const latest =
+                !previous || Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
+                  ? run
+                  : previous.run;
+              cache[refreshPeer.key] = {
+                run: latest,
+                destinations: [...destinations],
+                endpoint: refreshPeer.endpoint,
+              };
+            }
           }
         }
       }
@@ -685,7 +714,7 @@ export const fleetEntryProblem = (entry: string) =>
 export interface FleetTarget {
   host: string;
   cacheKey?: string;
-  refreshPeer?: { key: string; endpoint: string };
+  refreshPeer?: { key: string; endpoint: string; taggedHost?: string };
   /** The tag the host came from. */
   via?: string;
   /** Tailscale says the machine is offline, so ssh is not tried. */
@@ -875,12 +904,17 @@ async function verifyAddresses(
   return found;
 }
 
-async function effectiveDestination(entry: string, timeoutMs: number, budget: number) {
+async function effectiveDestination(
+  entry: string,
+  remoteCommand: string,
+  timeoutMs: number,
+  budget: number,
+) {
   if (hostProblem(entry) || budget <= 0) return undefined;
   const { command, prefix } = program("SKILLFLEET_SSH", "ssh");
   const run = await exec(
     command,
-    [...prefix, "-G", ...sshOptions(timeoutMs), ...sshDestination(entry)],
+    [...prefix, "-G", ...sshOptions(timeoutMs), ...sshDestination(entry), remoteCommand],
     {
       timeoutMs: budget,
     },
@@ -949,6 +983,8 @@ export async function resolveFleet(
   entries: readonly string[],
   addresses?: (name: string) => Promise<string[]>,
   timeoutMs = 30_000,
+  { action, version, dryRun = false, setup }: FleetInvocation = { action: "status", version: "0.0.0" },
+  coveredByTags?: Set<string>,
 ): Promise<{ targets: FleetTarget[]; warnings: string[]; enrollment: Map<string, string[]> }> {
   const warnings: string[] = [];
   const tagNames = new Set(entries.filter(isTag).map((entry) => entry.toLowerCase()));
@@ -964,7 +1000,7 @@ export async function resolveFleet(
   const cachedDestinations = new Set(
     explicit.length
       ? Object.entries(readCache()).flatMap(([key, record]) =>
-          stableCacheKey(key) && record.endpoint && record.destination ? [record.destination] : [],
+          stableCacheKey(key) && record.endpoint ? (record.destinations ?? []) : [],
         )
       : [],
   );
@@ -992,12 +1028,13 @@ export async function resolveFleet(
     );
     const budget = Math.min(1500, timeoutMs);
     const deadline = performance.now() + budget;
+    const remoteCommand = sshRemoteCommand(action, version, dryRun, setup);
     const effective = await Promise.all(
       explicit.map(async (entry) =>
         tagged.length ||
         cachedDestinations.has(entry) ||
         (variants.get(hostKey(sshTarget(entry).machine))?.size ?? 0) > 1
-          ? effectiveDestination(entry, timeoutMs, budget / 2)
+          ? effectiveDestination(entry, remoteCommand, timeoutMs, budget / 2)
           : undefined,
       ),
     );
@@ -1045,6 +1082,57 @@ export async function resolveFleet(
       if (!host) continue;
       const cacheKey = stablePeerKey(peer) ?? `tag-peer:address:${hostKey(ips[0] ?? host)}`;
       destination.set(peer, { host, cacheKey });
+    }
+    if (!dryRun || coveredByTags) {
+      const tagHosts = new Set([...destination.values()].map(({ host }) => sshHostKey(host)));
+      const tagEndpoints = new Map<string, ReturnType<typeof effectiveDestination>>();
+      await Promise.all(
+        explicit.map(async (entry, index) => {
+          const { machine, user, port } = sshTarget(entry);
+          const bare = !user && !port;
+          if (bare && tagHosts.has(sshHostKey(machine))) coveredByTags?.add(entry);
+          const candidate = peerOf.get(entry);
+          const selected = candidate && destination.get(candidate.peer);
+          const member = candidate && peers[candidate.index];
+          const target = effective[index];
+          if (!member || !selected || !target) return;
+          const endpoint = endpointKey(target);
+          if (!endpoint) return;
+          const canRefresh =
+            !dryRun &&
+            stableCacheKey(selected.cacheKey) &&
+            member.ips.length > 0 &&
+            hostKey(target.name) === hostKey(selected.host);
+          if (!canRefresh && (!coveredByTags || !bare)) return;
+          let taggedTarget = target;
+          if (entry !== selected.host) {
+            let probe = tagEndpoints.get(selected.host);
+            if (!probe) {
+              probe = effectiveDestination(
+                selected.host,
+                remoteCommand,
+                timeoutMs,
+                Math.max(0, deadline - performance.now()),
+              );
+              tagEndpoints.set(selected.host, probe);
+            }
+            const resolved = await probe;
+            if (!resolved) return;
+            taggedTarget = resolved;
+          }
+          const taggedEndpoint = endpointKey(taggedTarget);
+          if (canRefresh && taggedEndpoint === endpoint)
+            refresh.set(entry, { key: selected.cacheKey, endpoint, taggedHost: selected.host });
+          if (
+            bare &&
+            taggedEndpoint &&
+            target.user === taggedTarget.user &&
+            target.port === taggedTarget.port &&
+            matches(taggedTarget.name, member)
+          )
+            coveredByTags?.add(entry);
+        }),
+      );
     }
   }
   const explicitPeers = new Map<TailscalePeer, string>();
@@ -1115,6 +1203,7 @@ export async function notInFleet(
   entries: readonly string[],
   wanted: readonly string[],
   timeoutMs = 30_000,
+  invocation: FleetInvocation = { action: "status", version: "0.0.0" },
 ): Promise<string[]> {
   const key = (entry: string) => {
     const { machine, user, port } = sshTarget(entry);
@@ -1129,18 +1218,26 @@ export async function notInFleet(
   const selectors = entries.filter(isTag);
   const tags = new Set(selectors.map((tag) => tag.toLowerCase()));
   const candidates = wanted.filter((entry) => !isTag(entry) && !named.has(key(entry)));
-  const taggedHosts =
-    selectors.length && candidates.some(bare)
-      ? (await resolveFleet(selectors, undefined, timeoutMs)).targets
-          .filter(({ error }) => !error)
-          .map(({ host }) => host)
-      : [];
-  const tagged = new Set(taggedHosts.map(key));
+  const tagged = new Set<string>();
+  if (selectors.length && candidates.some(bare))
+    await resolveFleet(
+      [...selectors, ...candidates.filter(bare)],
+      undefined,
+      timeoutMs,
+      { ...invocation, dryRun: true },
+      tagged,
+    );
   const endpoints = new Map<string, Promise<string | undefined>>();
   const endpoint = (entry: string) => {
     let pending = endpoints.get(entry);
     if (!pending) {
-      pending = effectiveDestination(entry, timeoutMs, Math.min(750, timeoutMs)).then((target) =>
+      const remoteCommand = sshRemoteCommand(
+        invocation.action,
+        invocation.version,
+        invocation.dryRun ?? false,
+        invocation.setup,
+      );
+      pending = effectiveDestination(entry, remoteCommand, timeoutMs, Math.min(750, timeoutMs)).then((target) =>
         target ? endpointKey(target) : undefined,
       );
       endpoints.set(entry, pending);
@@ -1160,7 +1257,7 @@ export async function notInFleet(
       tags.add(tag);
       continue;
     }
-    if (named.has(key(entry)) || (bare(entry) && tagged.has(key(entry)))) continue;
+    if (named.has(key(entry)) || tagged.has(entry)) continue;
     const { machine, user, port } = sshTarget(entry);
     const variants = names.filter((name) => {
       const other = sshTarget(name);
@@ -1168,7 +1265,7 @@ export async function notInFleet(
         user === other.user && port === other.port && hostKey(machine) === hostKey(other.machine)
       );
     });
-    if (await compare(entry, bare(entry) ? [...variants, ...taggedHosts] : variants)) continue;
+    if (await compare(entry, variants)) continue;
     missing.push(entry);
     names.push(entry);
     named.add(key(entry));

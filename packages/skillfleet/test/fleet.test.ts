@@ -1297,7 +1297,15 @@ describe.skipIf(isWindows)("fleet init", () => {
       ),
       SKILLFLEET_TAILSCALE: fakeTailscale(m.root, status([peer("web", ["tag:servers"])])),
     };
-    const plan = await m.runWith({ env }, "fleet", "init", "build", "build.", "--dry-run", "--json");
+    const plan = await m.runWith(
+      { env },
+      "fleet",
+      "init",
+      "build",
+      "build.",
+      "--dry-run",
+      "--json",
+    );
     expect(plan.code, plan.stdout + plan.stderr).toBe(0);
     expect(JSON.parse(plan.stdout)).toMatchObject([{ host: "build" }, { host: "build." }]);
     const run = await m.runWith({ env }, "fleet", "init", "build.", "web.", "--json");
@@ -1366,14 +1374,36 @@ if (process.env.FAKE_ANSWER === "mismatch") {
 
   it("this machine is already set up; a host a tag of the fleet matches is not added again", async () => {
     const { m, fleetIn } = await controller(["tag:servers"]);
-    const program = fakeTailscale(m.root, status([peer("localhost", ["tag:servers"])]));
-    const env = { ...initShims(m, {}), SKILLFLEET_TAILSCALE: program };
+    const ip = "100.64.0.5";
+    const program = fakeTailscale(
+      m.root,
+      status([peer("web.invalid", ["tag:servers"], { ips: [ip] })]),
+    );
+    const env = { ...initShims(m, {}, { localhost: ip }), SKILLFLEET_TAILSCALE: program };
     const run = await m.runWith({ env }, "fleet", "init", "localhost", "--json");
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(JSON.parse(run.stdout)).toEqual([
       expect.objectContaining({ host: "localhost", setup: "already set up", reachable: true }),
     ]);
     expect(npxCalls(m)).toEqual([]);
+    expect(run.stderr).toContain("the fleet already has them");
+    expect(fleetIn()).toEqual(["tag:servers"]);
+  });
+
+  it("does not enroll IPv6 when the tag selects the same peer's IPv4 address", async () => {
+    const { m, fleetIn } = await controller(["tag:servers"]);
+    const ipv6 = "fd7a::5";
+    const tailscale = fakeTailscale(m.root, {
+      ...status([peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5", ipv6] })]),
+      CurrentTailnet: { MagicDNSEnabled: false },
+    });
+    const env = {
+      ...initShims(m, { [ipv6]: join(m.root, "web") }),
+      SKILLFLEET_TAILSCALE: tailscale,
+    };
+    const run = await m.runWith({ env }, "fleet", "init", ipv6, "--no-hooks", "--json");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject([{ host: ipv6, setup: "set up" }]);
     expect(run.stderr).toContain("the fleet already has them");
     expect(fleetIn()).toEqual(["tag:servers"]);
   });

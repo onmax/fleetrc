@@ -708,7 +708,7 @@ describe("CX12. links to files count toward the copy limits", () => {
     await init(m, manifest);
     const tool = m.at(".claude", "skills", "tool", "SKILL.md");
     const before = read(tool);
-    const files: Files = {
+    const files: Record<string, string> = {
       "skills/tool/SKILL.md": skillMd("tool", "too wide"),
       "skills/other/SKILL.md": skillMd("other", "still updates"),
     };
@@ -1009,17 +1009,21 @@ describe("CX17. a team manifest's extends follows the team source rules", () => 
 
   it("CX17. a team repository's manifest may extend another file in it, and a remote one", async () => {
     const m = machine();
-    const vendor = remote(m, "vendor", skills("skills/", "tool"));
-    const other = remote(m, "other", skills("skills/", "extra"));
-    const otherTeam = remote(m, "otherteam", {
-      ".skillfleet/manifest.json": JSON.stringify({ sources: [{ id: "other", git: other.https }] }),
-    });
+    const otherTeam = remote(m, "otherteam", (url) => ({
+      ...skills("tools/", "tool"),
+      ...skills("extras/", "extra"),
+      ".skillfleet/manifest.json": JSON.stringify({
+        sources: [{ id: "other", git: url, skills: "extras/*" }],
+      }),
+    }));
     const team = remote(m, "team", {
       ".skillfleet/manifest.json": JSON.stringify({
         extends: ["../more.json", otherTeam.https],
         sources: [],
       }),
-      "more.json": JSON.stringify({ sources: [{ id: "vendor", git: vendor.https }] }),
+      "more.json": JSON.stringify({
+        sources: [{ id: "vendor", git: otherTeam.https, skills: "tools/*" }],
+      }),
     });
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team.https], sources: [] });
     const run = await init(m, manifest);
