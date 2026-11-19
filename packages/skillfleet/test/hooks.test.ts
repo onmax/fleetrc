@@ -439,11 +439,33 @@ describe("hook install and remove", () => {
     }
     expect((await install()).code).toBe(0);
     expect(read(file)).toBe(installed);
+    // Removing keeps the no-ops where the user's hook comes after them, so it keeps its place.
     expect((await m.runWith({ env }, "hook", "remove", "codex")).code).toBe(0);
     expect(JSON.parse(read(file)).hooks).toEqual({ UserPromptSubmit: groups });
     const removed = read(file);
     expect((await m.runWith({ env }, "hook", "remove", "codex")).code).toBe(0);
     expect(read(file)).toBe(removed);
+  });
+
+  it("replaces an older Codex SessionStart entry where it stands, so a hook after it keeps its place", async () => {
+    const m = machine();
+    const file = m.at(".codex", "hooks.json");
+    const older = { type: "command", command: "npx -y skillfleet hook prompt" };
+    const custom = { type: "command", command: "echo mine" };
+    writeFileSync(
+      file,
+      JSON.stringify({ hooks: { SessionStart: [{ hooks: [older] }, { hooks: [custom] }] } }),
+    );
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    const groups = (JSON.parse(read(file)).hooks as { SessionStart: { hooks: Entry[] }[] })
+      .SessionStart;
+    expect(groups).toHaveLength(2);
+    expect(line(groups[0]!.hooks[0]!)).toMatch(/hook run codex/);
+    expect(groups[1]!.hooks).toEqual([custom]);
+    // Run again, it changes nothing.
+    const once = read(file);
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    expect(read(file)).toBe(once);
   });
 
   it("on Windows writes Claude Code's entry in exec form, and Codex's for cmd, with % kept from cmd", () => {
@@ -877,11 +899,12 @@ describe("the hooks on shared and upgraded machines", () => {
     expect({ code: run.status, out: run.stdout + run.stderr }).toEqual({ code: 0, out: "" });
     expect(read(join(state, "logs", "skillfleet-sync.log"))).toContain("starting a sync");
     expect(existsSync(m.at(".local", "state", "skillfleet"))).toBe(false);
-    // The installed copy keeps node's compile cache beside itself, and nowhere else.
-    expect(existsSync(join(state, "app", "compile"))).toBe(true);
-    expect(existsSync(m.at(".cache"))).toBe(false);
+    // A hook writes no compile cache.
+    expect(existsSync(join(state, "app", "compile"))).toBe(false);
 
-    // A runtime calling list --json from the same environment reads the same state.
+    // A runtime calling list --json from the same environment reads the same state, without the
+    // hook-env.json that only hook install saves.
+    rmSync(join(state, "hook-env.json"), { force: true });
     const statePath = join(state, "state.json");
     const saved = JSON.parse(read(statePath)) as { skills?: Record<string, unknown> };
     const dir = join(m.root, "old");
@@ -896,6 +919,9 @@ describe("the hooks on shared and upgraded machines", () => {
     expect((JSON.parse(list.stdout) as { skills: unknown[] }).skills).toEqual([
       { name: "old", source: "mine", dir, changedAt: "2026-01-02T00:00:00.000Z" },
     ]);
+    // The installed copy keeps node's compile cache beside itself, and nowhere else.
+    expect(existsSync(join(state, "app", "compile"))).toBe(true);
+    expect(existsSync(m.at(".cache"))).toBe(false);
   });
 
   describe("the shell-form command", () => {

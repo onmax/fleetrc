@@ -15,13 +15,15 @@ if (major < MAJOR || (major === MAJOR && minor < MINOR)) {
 }
 // The installed copy, `<state>/app/cli.mjs`, which hooks, the timer and the launcher run, keeps its
 // compiled bundle in `<state>/app/compile`, so a run after the first skips most of its parse. Any
-// other copy (npx, a checkout), and a dry run of any copy, writes nothing for it.
+// other copy (npx, a checkout), a dry run and a session hook write nothing for it.
 const args = process.argv.slice(2);
 const script = process.argv[1] ?? "";
 if (
   basename(script) === "cli.mjs" &&
   basename(dirname(script)) === "app" &&
-  !args.includes("--dry-run")
+  !args.includes("--dry-run") &&
+  // A hook loads little, and runs on machines skillfleet may not have set up.
+  args[0] !== "hook"
 )
   try {
     // Node 22.1 and newer; a folder that can't be made leaves the cache off.

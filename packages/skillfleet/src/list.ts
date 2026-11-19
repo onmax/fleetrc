@@ -3,7 +3,8 @@
 // the CLI. The shape is a contract: a later version only adds fields, and bumps `version` for any
 // other change.
 import { isRecord, readJsonOrNothing } from "./fs.ts";
-import { adoptInstalledPlaces, paths } from "./paths.ts";
+import { basename, dirname, join } from "node:path";
+import { paths } from "./paths.ts";
 import { skillRecord } from "./skill-record.ts";
 
 export interface ListedSkill {
@@ -24,10 +25,20 @@ export interface SkillList {
   skills: ListedSkill[];
 }
 
+/**
+ * The state.json to read: beside the installed copy (`<state>/app/cli.mjs`) when that is what runs,
+ * whatever XDG variables the caller has, else where the environment puts it.
+ */
+function stateFile(): string {
+  const script = process.argv[1] ?? "";
+  return basename(script) === "cli.mjs" && basename(dirname(script)) === "app"
+    ? join(dirname(dirname(script)), "state.json")
+    : paths.state();
+}
+
 /** The skills state.json records. A state.json that is missing or does not read lists none. */
 export function skillList(): SkillList {
-  adoptInstalledPlaces();
-  const raw = readJsonOrNothing(paths.state());
+  const raw = readJsonOrNothing(stateFile());
   const state = isRecord(raw) && raw.version === 1 ? raw : {};
   const skills = isRecord(state.skills) ? state.skills : {};
   return {
