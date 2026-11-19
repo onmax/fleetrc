@@ -166,8 +166,7 @@ function timerWanted(): boolean {
 }
 
 /** What starts a sync on this machine: the session hooks, the timer, both, or nothing. */
-function triggerCheck(timer: boolean): Check {
-  const hooks = installedHooks();
+function triggerCheck(hooks: ReturnType<typeof installedHooks>, timer: boolean, runs?: Check): Check {
   const legacy = promptOnlyHooks().map((hook) => hook.note);
   const name = "sync trigger";
   const launcher = launcherPath();
@@ -178,7 +177,9 @@ function triggerCheck(timer: boolean): Check {
       detail: `the session hooks run ${tildify(launcher)}, which is missing; run \`npx skillfleet@latest self-install\``,
     };
   const detail = [describeTrigger(hooks, timer), ...legacy].join("; ");
-  return (hooks.length > 0 || timer) && legacy.length === 0
+  const onlyUnverifiedCodex =
+    !timer && hooks.length === 1 && hooks[0]?.agent === "codex" && runs?.warn;
+  return (hooks.length > 0 || timer) && legacy.length === 0 && !onlyUnverifiedCodex
     ? { name, ok: true, detail }
     : { name, ok: true, warn: true, detail };
 }
@@ -295,8 +296,9 @@ export async function doctor(manifest?: string): Promise<Check[]> {
   });
   await adoptTimer();
   const timer = timerWanted();
-  checks.push(triggerCheck(timer));
-  const runs = hookRunsCheck(installedHooks());
+  const hooks = installedHooks();
+  const runs = hookRunsCheck(hooks);
+  checks.push(triggerCheck(hooks, timer, runs));
   if (runs) checks.push(runs);
   if (timer) {
     const { noSystemd, ...check } = await timerCheck();
