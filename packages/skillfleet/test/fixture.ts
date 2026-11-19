@@ -428,7 +428,11 @@ export interface Remote {
 }
 
 /** A bare git remote with an initial commit of `files`. */
-export function remote(m: Machine, name: string, files: Files | ((https: string) => Files)): Remote {
+export function remote(
+  m: Machine,
+  name: string,
+  files: Files | ((https: string) => Files),
+): Remote {
   const url = join(m.root, "remotes", `${name}.git`);
   const https = `${HTTPS_REMOTES}${name}.git`;
   const work = join(m.root, "upstream", name);
