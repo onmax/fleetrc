@@ -250,14 +250,14 @@ describe("merge while a sync runs", () => {
       // records a conflict in tool, with the file it is waiting on.
       const script = join(m.root, "writer.mjs");
       const state = join(m.stateDir, "state.json");
+      const armed = join(m.root, "writer.armed");
       writeFileSync(
         script,
         [
-          `import { readFileSync, writeFileSync } from "node:fs";`,
+          `import { existsSync, readFileSync, writeFileSync } from "node:fs";`,
           `import { join } from "node:path";`,
+          `if (!existsSync(${JSON.stringify(armed)})) process.exit(0);`,
           `const state = JSON.parse(readFileSync(${JSON.stringify(state)}, "utf8"));`,
-          // init's sync, which records the skill only as it ends, has no copy to point at yet.
-          `if (!state.skills.tool) process.exit(0);`,
           `const dir = state.skills.tool.dir;`,
           `writeFileSync(join(dir, "notes.md.upstream"), "theirs\\n");`,
           `state.conflicts = { tool: { dir, files: ["notes.md"], markers: { "notes.md": "notes.md.upstream" } } };`,
@@ -270,6 +270,7 @@ describe("merge while a sync runs", () => {
         hooks: [{ name: "writer", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
       });
       await init(m, manifest);
+      writeFileSync(armed, "");
       vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
       const report = await m.json("sync");
       expect(report.hooks.map((hook) => hook.code)).toEqual([0]);
