@@ -32,13 +32,6 @@ export const version = pkg.version;
 export const cli = resolve(pkg.bin.skillfleet);
 export const isWindows = process.platform === "win32";
 
-/**
- * The machine's XDG cache folder (`<home>/.cache`, a path relative to its root), which holds only
- * node's compile cache (entry.ts): node writes it whenever skillfleet runs, dry run or not, so
- * what a dry run must leave as it was does not include it.
- */
-export const isCompileCache = (path: string) => basename(path) === ".cache";
-
 const made: string[] = [];
 const servers: Server[] = [];
 /** Machines made by the running test, checked for scheduler calls when it ends. */

@@ -4,14 +4,15 @@
 // other change.
 import { isRecord, readJsonOrNothing } from "./fs.ts";
 import { paths } from "./paths.ts";
+import { skillRecord } from "./skill-record.ts";
 
 export interface ListedSkill {
   name: string;
   /** The manifest source it comes from. */
   source: string;
-  /** The skill's real folder, which holds its SKILL.md. */
+  /** The recorded skill folder. Its SKILL.md may be missing or unreadable. */
   dir: string;
-  /** When a sync last linked a change to it, as an ISO time. */
+  /** Sync-recorded ISO time; may advance for unchanged skills in a changed local or clone source. */
   changedAt: string;
 }
 
@@ -34,13 +35,10 @@ export function skillList(): SkillList {
     skills: Object.keys(skills)
       .sort()
       .flatMap((name) => {
-        const record = skills[name];
-        return isRecord(record) &&
-          typeof record.source === "string" &&
-          typeof record.dir === "string" &&
-          typeof record.changedAt === "string"
-          ? [{ name, source: record.source, dir: record.dir, changedAt: record.changedAt }]
-          : [];
+        const record = skillRecord(skills[name]);
+        if (!record) return [];
+        const { source, dir, changedAt } = record;
+        return [{ name, source, dir, changedAt }];
       }),
   };
 }

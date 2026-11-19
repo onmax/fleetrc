@@ -187,7 +187,7 @@ skillfleet fetches sources through Vercel's [`skills`](https://github.com/vercel
 
 Other runtimes, such as ViteHub agents or a script of yours, can use the skills skillfleet keeps on a machine without running a sync themselves.
 
-- **Ask skillfleet once.** Run `skillfleet list --json` when your runtime starts, and read each skill's `<dir>/SKILL.md`. It reads this machine's state only, with no manifest and no network, and prints the skills sorted by name:
+- **Ask skillfleet once.** Run `skillfleet list --json` when your runtime starts. It reads this machine's state only, with no manifest and no network, and prints the skills sorted by name:
 
   ```json
   {
@@ -204,7 +204,7 @@ Other runtimes, such as ViteHub agents or a script of yours, can use the skills 
   }
   ```
 
-  `dir` is the skill's real folder, whether or not any agent folder links it. `lastChange` is `null` before the first sync. Later versions only add fields.
+  `dir` is the skill's recorded folder, whether or not any agent folder links it. When reading `<dir>/SKILL.md`, handle a missing or unreadable file. `changedAt` is recorded by sync and can advance for unchanged skills when their local or clone source changes. `lastChange` is `null` before the first sync. Later versions only add fields.
 
 - **Or read the folder, with no dependency.** `~/.agents/skills` holds one folder per skill, each with its `SKILL.md`, when the manifest's agents include one that reads it, such as Codex.
 - **Share the config.** The manifest is `.skillfleet/manifest.json` in a repository, and the published [`schema.json`](https://unpkg.com/skillfleet/schema.json) describes it, so a runtime can read the same file to pick the same sources.

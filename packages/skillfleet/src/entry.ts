@@ -23,14 +23,17 @@ function compileCacheDir(): string {
   if (process.platform === "win32") return join(tmpdir(), "skillfleet-compile");
   return join(homedir(), ".cache", "skillfleet", "compile");
 }
-try {
-  // Node 22.1 and newer; a folder that can't be made leaves the cache off.
-  module.enableCompileCache?.(compileCacheDir());
-} catch {}
+const args = process.argv.slice(2);
+if (!args.includes("--dry-run")) {
+  try {
+    // Node 22.1 and newer; a folder that can't be made leaves the cache off.
+    module.enableCompileCache?.(compileCacheDir());
+  } catch {}
+}
 // What an agent's session hook runs, when a session starts: hook.ts alone, without the rest of the
 // CLI. `hook prompt`, the per-prompt hook older versions documented, does nothing now; settings
 // files may still call it, so it exits 0 at once.
-const [command, action, agent] = process.argv.slice(2);
+const [command, action, agent] = args;
 if (command === "hook" && action === "prompt" && process.argv.length === 4) process.exitCode = 0;
 else if (
   command === "hook" &&

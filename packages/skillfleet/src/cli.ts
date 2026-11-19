@@ -172,7 +172,7 @@ const COMMANDS: Record<string, Command> = {
     usage: "list",
     summary: "Linked skills and where each comes from",
     details:
-      'With --json it prints {"version": 1, "lastChange", "skills": [{"name", "source", "dir", "changedAt"}]}, sorted by name, for programs built on skillfleet: each skill\'s SKILL.md is in its dir. It reads only this machine\'s state, with no network. A later version only adds fields.',
+      'With --json it prints {"version": 1, "lastChange", "skills": [{"name", "source", "dir", "changedAt"}]}, sorted by name. It reads only this machine\'s state, with no network. Each dir is a recorded folder; handle a missing or unreadable SKILL.md. The sync-recorded changedAt can advance for unchanged skills in a changed local or clone source. A later version only adds fields.',
     options: ["json"],
   },
   agents: {

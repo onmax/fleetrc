@@ -19,7 +19,6 @@ import { describe, expect, it } from "vite-plus/test";
 import { listedPath } from "../src/linker.ts";
 import {
   clone,
-  isCompileCache,
   isLink,
   isWindows,
   machine,
@@ -41,7 +40,6 @@ function snapshot(root: string): Record<string, string> {
       const key = relative(root, path);
       // The fake scheduler's own log of the calls it answered.
       if (key === "scheduler-calls.jsonl") continue;
-      if (isCompileCache(key)) continue;
       const stat = lstatSync(path);
       if (stat.isSymbolicLink()) out[key] = `link ${readlinkSync(path)}`;
       else if (stat.isDirectory()) {
@@ -319,8 +317,47 @@ describe("list --json, the API programs built on skillfleet read", () => {
       expect(read(join(skill.dir, "SKILL.md"))).toBe(skillMd(skill.name));
       expect(Date.parse(skill.changedAt)).not.toBeNaN();
     }
+    // Removing a skill file does not change the recorded snapshot.
+    rmSync(join(listed.skills[0]!.dir, "SKILL.md"));
+    expect(JSON.parse((await m.run("list", "--json")).stdout)).toEqual(listed);
     // The CLI's own path, which flags in another order take, prints the same document.
     expect(JSON.parse((await m.run("--json", "list")).stdout)).toEqual(listed);
+  });
+
+  it("keeps legacy version-1 skill records without changedAt in both list formats", async () => {
+    const m = machine({ agents: false });
+    const dir = m.at("mine");
+    const addedAt = "2026-11-19T07:00:00.000Z";
+    mkdirSync(m.stateDir, { recursive: true });
+    writeFileSync(
+      join(m.stateDir, "state.json"),
+      JSON.stringify({
+        version: 1,
+        sources: {},
+        skills: {
+          legacy: { source: "mine", dir, addedAt },
+          epoch: { source: "mine", dir },
+          invalid: { source: "", dir, changedAt: addedAt },
+        },
+      }),
+    );
+    for (const args of [["list", "--json"], ["--json", "list"]]) {
+      const run = await m.run(...args);
+      expect(run.code, run.stderr).toBe(0);
+      expect(JSON.parse(run.stdout)).toEqual({
+        version: 1,
+        lastChange: null,
+        skills: [
+          { name: "epoch", source: "mine", dir, changedAt: "1970-01-01T00:00:00.000Z" },
+          { name: "legacy", source: "mine", dir, changedAt: addedAt },
+        ],
+      });
+    }
+    const text = await m.run("list");
+    expect(text.code, text.stderr).toBe(0);
+    expect(text.stdout).toBe(
+      `epoch  mine  ${join("~", "mine")}\nlegacy  mine  ${join("~", "mine")}\n`,
+    );
   });
 });
 
