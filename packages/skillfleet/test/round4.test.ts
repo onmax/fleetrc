@@ -206,14 +206,16 @@ describe("the user's journey", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool", "other"));
     const team = remote(m, "team", {
-      "skills.json": JSON.stringify({ sources: [{ id: "vendor", git: vendor.https }] }),
+      ".skillfleet/manifest.json": JSON.stringify({
+        sources: [{ id: "vendor", git: vendor.https }],
+      }),
     });
     const manifest = m.manifest({ agents: ["claude-code"], extends: [team.https], sources: [] });
     await init(m, manifest);
     expect(names(m.at(".claude", "skills"))).toEqual(["other", "tool"]);
 
     const skill = await m.run("remove", "tool");
-    // It said: "tool comes from vendor in ~/.local/state/skillfleet/cache/manifests/<hash>/skills.json;
+    // It said: "tool comes from vendor in ~/.local/state/skillfleet/cache/manifests/<hash>/.skillfleet/manifest.json;
     // exclude it there", a cache copy the next sync overwrites.
     expect(skill.stdout + skill.stderr).not.toMatch(/cache[\\/]manifests/);
 
@@ -238,14 +240,14 @@ describe("the user's journey", () => {
     const m = machine({ scheduler: "empty" });
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const me = remote(m, "me", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
       }),
     });
     await init(m, me.url);
     me.commit({
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         timer: { cron: "0 * * * *" },
         sources: [{ id: "vendor", git: vendor.url }],
@@ -273,7 +275,7 @@ describe("the user's journey", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const extra = remote(m, "extra", skills("skills/", "lint"));
-    const file = join(m.root, "manifest", "skills.json");
+    const file = join(m.root, "manifest", ".skillfleet", "manifest.json");
     mkdirSync(dirname(file), { recursive: true });
     const text = `{\n  "agents": ["claude-code"],\n  "sources": [{ "id": "vendor", "git": ${JSON.stringify(vendor.url)} }]\n}\n`;
     writeFileSync(file, text);
@@ -522,7 +524,7 @@ describe("discovery containment and refused names", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const team = remote(m, "team", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         sources: [{ id: "vendor", git: vendor.https, followLinks: true }],
       }),
     });
@@ -569,7 +571,7 @@ describe("the team manifest's transport allowlist", () => {
         `[url "${other.served}"]\n\tinsteadOf = git://git.skillfleet.test/other.git\n`,
     );
     const team = remote(m, "team", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         sources: [
           { id: "vendor", git: "http://gitea.skillfleet.test/team/vendor.git" },
           { id: "other", git: "git://git.skillfleet.test/other.git" },

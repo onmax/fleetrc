@@ -124,6 +124,8 @@ export interface Manifest {
 
 export class ManifestError extends Error {}
 
+class ManifestBoundaryError extends ManifestError {}
+
 const SOURCE_KEYS = new Set([
   "id",
   "git",
@@ -434,7 +436,7 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
 
 /** This machine's settings, in config.json. The manifest is shared; these are not. */
 export interface Config {
-  /** A manifest path, or `<git repo>//<file>` such as `github:org/agents//skills.json`. */
+  /** A manifest path, or `<git repo>//<file>` such as `github:org/agents//team.json`. */
   manifest: string;
   /** Copy skill folders instead of linking them, on every sync (`--copy`, `--no-copy`). */
   copy?: boolean;
@@ -481,8 +483,14 @@ export interface LoadedManifest {
   failed?: string[];
 }
 
-/** The manifest file a repository holds when a spec names only the repository, as in `init owner/repo`. */
-export const DEFAULT_MANIFEST = "skills.json";
+/** The folder a repository or project keeps its manifest in. */
+const MANIFEST_DIR = ".skillfleet";
+
+/**
+ * The manifest file a repository or folder holds when a spec names only the repository or folder,
+ * as in `init owner/repo` or `init .`.
+ */
+export const DEFAULT_MANIFEST = `${MANIFEST_DIR}/manifest.json`;
 
 /** `owner/repo`, `github:owner/repo`, `gitlab:group/repo`, or a git URL ending in `.git`. */
 const isRepository = (spec: string) =>
@@ -539,7 +547,7 @@ function decoded(part: string): string {
   }
 }
 
-/** A `blob` link names a manifest file, a `tree` link a folder holding `skills.json`. */
+/** A `blob` link names a manifest file, a `tree` link a folder holding `.skillfleet/manifest.json`. */
 function webManifest(spec: string): RemoteManifest | undefined {
   const page = webPage(spec);
   if (!page) return undefined;
@@ -558,9 +566,9 @@ export interface RemoteManifest {
 
 /**
  * The repository and file of a manifest kept in git, or undefined for a file on this machine.
- * `<repo>//<file>` names both; a repository alone means its `skills.json`, and so does a GitHub or
- * GitLab page link. A path that exists on this machine, resolved against `base`, is local, unless
- * it is a bare repository.
+ * `<repo>//<file>` names both; a repository alone means its `.skillfleet/manifest.json`, and so does
+ * a GitHub or GitLab page link. A path that exists on this machine, resolved against `base`, is
+ * local, unless it is a bare repository.
  */
 export function remoteManifest(spec: string, base = process.cwd()): RemoteManifest | undefined {
   const local = expandPath(spec, base);
@@ -613,13 +621,18 @@ async function locate(
 ): Promise<{ file: string; root: string }> {
   const remote = remoteManifest(spec, base);
   if (!remote) {
-    // A folder, such as a clone of the manifest's repository, means its skills.json.
+    // A folder, such as a clone of the manifest's repository, means its .skillfleet/manifest.json.
     const path = expandPath(spec, base);
-    const file = statSync(path, { throwIfNoEntry: false })?.isDirectory()
-      ? join(path, DEFAULT_MANIFEST)
-      : path;
+    const folder = statSync(path, { throwIfNoEntry: false })?.isDirectory() === true;
+    const file = folder ? join(path, DEFAULT_MANIFEST) : path;
+    if (folder && !existsSync(file))
+      throw new ManifestError(
+        `${tildify(path)} has no ${DEFAULT_MANIFEST}; name the manifest file as ${join(tildify(path), "<file>")}`,
+      );
     if (team) within(team.within, file, spec);
-    return { file, root: team?.within ?? dirname(file) };
+    // Naming a folder, as a repository's checkout is, makes the whole folder the manifest's; a
+    // file named on its own, even one in a .skillfleet/ folder, has only its own folder.
+    return { file, root: team?.within ?? (folder ? path : dirname(file)) };
   }
   const url = gitUrl(remote.repo);
   const check = team ? teamGitProblem : undefined;
@@ -641,7 +654,7 @@ async function locate(
 function within(root: string, file: string, spec: string) {
   if (!existsSync(file)) return;
   if (!inside(realpathSync(root), realpathSync(file)))
-    throw new ManifestError(
+    throw new ManifestBoundaryError(
       `a team manifest names only manifests in its own repository or in a remote repository, not ${spec}, which is outside it`,
     );
 }
@@ -902,7 +915,8 @@ export async function loadManifest(
   const rootFile = await locateManifest(spec, options);
   const root = readManifestFile(rootFile);
   const warnings: string[] = [];
-  const failed: string[] = [];
+  const failures: { parent: string; refusedEntry?: string }[] = [];
+  const loadedEntries = new Set<string>();
   const sources = [...root.sources];
   const ids = new Set(sources.map((source) => nameKey(source.id)));
   // NPM_TOKEN goes to the registry the user configured and to registries the root manifest names.
@@ -922,8 +936,11 @@ export async function loadManifest(
     excludeSources: Set<string>;
   }
   /** Each manifest extended, once, with every path it was reached by, in the order first reached. */
-  const extended = new Map<string, { manifest: Manifest; parent: string; paths: Through[] }>();
-  /** Where each `extends` entry led, by the manifest that has it and its index; null when it failed. */
+  const extended = new Map<
+    string,
+    { manifest: Manifest; parent: string; paths: (Through & { within: string })[] }
+  >();
+  /** Where each `extends` entry led, by manifest, index and boundary; null when it failed. */
   const located = new Map<string, { file: string; root: string } | null>();
   const unreadable = new Set<string>();
   const sameThrough = (a: Through, b: Through) =>
@@ -950,7 +967,8 @@ export async function loadManifest(
           ...entry.excludeSources.map(nameKey),
         ]),
       };
-      const key = `${manifest.file}\0${i}`;
+      const entryKey = `${manifest.file}\0${i}`;
+      const key = `${entryKey}\0${within ?? ""}`;
       let at = located.get(key);
       if (at === undefined) {
         try {
@@ -962,13 +980,19 @@ export async function loadManifest(
           });
         } catch (error) {
           warnings.push(`extends ${parent}: ${(error as Error).message}`);
-          failed.push(parent);
+          failures.push({
+            parent,
+            ...(error instanceof ManifestBoundaryError ? { refusedEntry: entryKey } : {}),
+          });
           at = null;
         }
         located.set(key, at);
       }
-      if (!at || at.file === rootFile || path.includes(at.file) || unreadable.has(at.file))
+      if (!at || unreadable.has(at.file)) continue;
+      if (at.file === rootFile || path.includes(at.file)) {
+        loadedEntries.add(entryKey);
         continue;
+      }
       let known = extended.get(at.file);
       if (!known) {
         let team: Manifest;
@@ -988,7 +1012,7 @@ export async function loadManifest(
           });
         } catch (error) {
           warnings.push(`extends ${parent}: ${(error as Error).message}`);
-          failed.push(parent);
+          failures.push({ parent });
           unreadable.add(at.file);
           continue;
         }
@@ -1005,9 +1029,12 @@ export async function loadManifest(
         known = { manifest: team, parent, paths: [] };
         extended.set(at.file, known);
       }
-      if (known.paths.some((seen) => sameThrough(seen, filter))) continue;
-      known.paths.push(filter);
-      await visit(known.manifest, filter, at.root, [...path, at.file]);
+      loadedEntries.add(entryKey);
+      const boundary = at.root;
+      if (known.paths.some((seen) => seen.within === boundary && sameThrough(seen, filter)))
+        continue;
+      known.paths.push({ ...filter, within: boundary });
+      await visit(known.manifest, filter, boundary, [...path, at.file]);
     }
   };
   await visit(root, undefined, undefined, []);
@@ -1043,6 +1070,9 @@ export async function loadManifest(
       sources.push(source);
     }
   }
+  const failed = failures
+    .filter(({ refusedEntry }) => refusedEntry === undefined || !loadedEntries.has(refusedEntry))
+    .map(({ parent }) => parent);
   return { root, sources, warnings, failed };
 }
 

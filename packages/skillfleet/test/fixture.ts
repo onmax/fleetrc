@@ -313,7 +313,7 @@ export function machine({
         stdio: ["ignore", "pipe", "pipe"],
       }).trim(),
     manifest(content) {
-      const file = join(root, "manifest", "skills.json");
+      const file = join(root, "manifest", ".skillfleet", "manifest.json");
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, `${JSON.stringify(content, null, 2)}\n`);
       return file;

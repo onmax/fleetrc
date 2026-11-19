@@ -310,7 +310,10 @@ describe("fork with a manifest kept in a repository", () => {
   it("D7. records the fork in the working clone of the manifest, where a fetch can't reset it", async () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
-    const manifests = remote(m, "manifests", { "skills.json": "{}", ...skills("skills/", "mine") });
+    const manifests = remote(m, "manifests", {
+      ".skillfleet/manifest.json": "{}",
+      ...skills("skills/", "mine"),
+    });
     const work = clone(m, manifests, "code/manifests");
     const content = {
       agents: ["claude-code"],
@@ -319,15 +322,17 @@ describe("fork with a manifest kept in a repository", () => {
         { id: "vendor", git: vendor.url },
       ],
     };
-    manifests.commit({ "skills.json": JSON.stringify(content) });
+    manifests.commit({ ".skillfleet/manifest.json": JSON.stringify(content) });
     m.git(work, "pull", "--quiet");
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
+    expect(
+      (await m.run("init", `${manifests.url}//.skillfleet/manifest.json`, "--no-hooks")).code,
+    ).toBe(0);
     const fork = await m.run("fork", "tool");
     expect(fork.code, fork.stdout + fork.stderr).toBe(0);
     expect(fork.stdout).toContain(
-      `then commit and push ${join("~", "code", "manifests", "skills.json")}`,
+      `then commit and push ${join("~", "code", "manifests", ".skillfleet", "manifest.json")}`,
     );
-    const edited = JSON.parse(read(join(work, "skills.json"))) as {
+    const edited = JSON.parse(read(join(work, ".skillfleet", "manifest.json"))) as {
       forks: Record<string, { from: string }>;
       sources: { exclude?: string[] }[];
     };
@@ -349,7 +354,7 @@ describe("fork with a manifest kept in a repository", () => {
     const personal = remote(m, "personal", skills("skills/", "mine"));
     const work = clone(m, personal, "code/skills");
     const manifests = remote(m, "manifests", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         sources: [
           { id: "mine", git: personal.url, path: work, skills: "skills/*", adopt: true },
@@ -357,7 +362,9 @@ describe("fork with a manifest kept in a repository", () => {
         ],
       }),
     });
-    expect((await m.run("init", `${manifests.url}//skills.json`, "--no-hooks")).code).toBe(0);
+    expect(
+      (await m.run("init", `${manifests.url}//.skillfleet/manifest.json`, "--no-hooks")).code,
+    ).toBe(0);
     const before = snapshot(m.root);
     const fork = await m.run("fork", "tool");
     expect(fork.code).toBe(1);
@@ -532,6 +539,6 @@ describe("what users paste and how errors read (R2-13, R2-15, R2-16, R2-17)", ()
     writeFileSync(manifest, "{");
     const broken = await m.run("agents");
     expect(broken.code).toBe(1);
-    expect(broken.stderr).toContain("skills.json");
+    expect(broken.stderr).toContain("manifest.json");
   });
 });

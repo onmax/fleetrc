@@ -11,7 +11,7 @@
       "description": "This schema, for editors: https://unpkg.com/skillfleet/schema.json"
     },
     "extends": {
-      "description": "Team manifests, as paths or <repo>//<file> such as github:org/agents//skills.json. They add sources only; their hooks, fleet, hub and report are ignored. An entry may be an object that leaves some of the team's skills or sources out; `skillfleet remove` writes it.",
+      "description": "Team manifests, as paths or <repo>//<file> such as github:org/agents//team.json; a repository alone means its .skillfleet/manifest.json. They add sources only; their hooks, fleet, hub and report are ignored. An entry may be an object that leaves some of the team's skills or sources out; `skillfleet remove` writes it.",
       "type": "array",
       "items": {
         "oneOf": [

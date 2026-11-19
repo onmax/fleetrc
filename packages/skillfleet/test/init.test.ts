@@ -277,12 +277,12 @@ describe("init", () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const team = remote(m, "team", {
-      "skills.json": JSON.stringify({
+      ".skillfleet/manifest.json": JSON.stringify({
         agents: ["claude-code"],
         sources: [{ id: "vendor", git: vendor.url }],
       }),
     });
-    const spec = `${team.url}//skills.json`;
+    const spec = `${team.url}//.skillfleet/manifest.json`;
     const dry = await m.json<{ manifestFile: string; sync: { manifest: string } }>(
       "init",
       team.url,
@@ -304,7 +304,7 @@ describe("init", () => {
     function newMachine(m: Machine, { reachable = true } = {}) {
       const mine = remote(m, "mine", skills("skills/", "kept"));
       const team = remote(m, "team", {
-        "skills.json": JSON.stringify({
+        ".skillfleet/manifest.json": JSON.stringify({
           agents: ["claude-code"],
           sources: [
             { id: "mine", git: mine.url, path: "~/code/mine", skills: "skills/*", adopt: true },

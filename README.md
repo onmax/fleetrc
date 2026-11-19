@@ -42,9 +42,9 @@ skillfleet fleet sync            # sync every machine in the manifest over SSH
 
 No manifest yet? [Write one](#write-your-manifest) first. `<manifest>` is one of:
 
-- a repository, such as `my-team/agents`, `github:my-team/agents`, `gitlab:group/agents` or a git URL ending in `.git`. skillfleet reads `skills.json` at its root.
-- a file inside a repository, such as `github:my-team/agents//team/skills.json`.
-- a file or a folder on this machine. A folder means the `skills.json` in it.
+- a repository, such as `my-team/agents`, `github:my-team/agents`, `gitlab:group/agents`, a git URL ending in `.git`, or its GitHub or GitLab page. skillfleet reads its `.skillfleet/manifest.json`.
+- a file inside a repository, such as `github:my-team/agents//team.json`, when the manifest is anywhere else.
+- a file or a folder on this machine. A folder means its `.skillfleet/manifest.json`, so `init .` works in a clone.
 
 `init` copies skillfleet out of the npx cache into its state folder (`~/.local/state/skillfleet`, or `%LOCALAPPDATA%\skillfleet` on Windows), so the hooks and the timer never point at a folder npm may delete. If `~/.local/bin` is on your PATH, `init` links `skillfleet` there; if not, it prints the folder to add to PATH. `--no-hooks` skips the session hooks and still installs the command; `--timer` adds the timer. The launcher and the timer run node through a path that outlives a Node.js upgrade, such as `/opt/homebrew/bin/node`; if node moves anyway, `skillfleet doctor` says so and `npx skillfleet@latest self-install` repairs both.
 
@@ -57,7 +57,7 @@ No manifest yet? [Write one](#write-your-manifest) first. `<manifest>` is one of
 | Command                                 | What it does                                                                                                                                                                                                                                                                                                                                                                                     |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `sync [source]`                         | Fetches every source, or only `source`, and links the skills. Plain `skillfleet` runs it.                                                                                                                                                                                                                                                                                                        |
-| `init [manifest]`                       | Configures the manifest, moves aside or adopts what the agent folders hold now, syncs, installs the command and the session hooks. `--no-hooks` skips the hooks, `--timer` installs the timer too, `--force` goes ahead when a skill name would be lost. A machine that has the timer keeps it. Without a manifest, it uses the configured one again.                                            |
+| `init [manifest]`                       | Configures the manifest (a repo or folder's `.skillfleet/manifest.json`), moves aside or adopts what the agent folders hold now, syncs, installs the command and the session hooks. `--no-hooks` skips the hooks, `--timer` installs the timer too, `--force` goes ahead when a skill name would be lost. A machine that has the timer keeps it. Without one, it reuses the configured manifest. |
 | `status`                                | The last run, held and pending updates, edited skills, what starts the syncs, and Codex sessions to restart.                                                                                                                                                                                                                                                                                     |
 | `list`                                  | Linked skills and the source of each.                                                                                                                                                                                                                                                                                                                                                            |
 | `agents`                                | Every agent id, which agents are installed here, and the folder each one's skills go to.                                                                                                                                                                                                                                                                                                         |
@@ -98,7 +98,7 @@ Claude Code loads a skill that a sync links mid-session on the next turn, and th
 
 ### Write your manifest
 
-A manifest is a `skills.json` file in git. A team keeps one with the sources everyone shares:
+A manifest is a JSON file in git. A repository keeps its manifest in `.skillfleet/manifest.json`. A team keeps one with the sources everyone shares:
 
 ```json
 {
@@ -111,7 +111,7 @@ A manifest is a `skills.json` file in git. A team keeps one with the sources eve
 }
 ```
 
-Each person keeps their own manifest, in the repository of their own skills, that extends the team's:
+Each person keeps their own manifest, in `.skillfleet/manifest.json` of the repository of their own skills, that extends the team's:
 
 ```json
 {
@@ -136,6 +136,7 @@ Then `npx skillfleet init me/skills` on each machine. Your sources come first, s
 ### Fields
 
 - `$schema` points editors at the schema, for completion and checks.
+- Relative paths (`path`, `local`, `extends`) resolve against the manifest's own folder, `.skillfleet/`. To use the repository itself as a local source, add `{ "id": "mine", "local": ".." }` to `sources`.
 - A source is one of `git`, `index` (a site serving `/.well-known/agent-skills/index.json`), `npm` (with an optional `registry`) or `local` (a folder on this machine). `skills` is a glob of skill folders inside it, and `ref` pins a git branch, tag or commit, written in full or as its first 7 or more characters. A `"path"` clone pinned to a commit stays on it, since there is nothing to fast-forward, until the manifest names another commit.
 - An `index` site may serve the older v0.1 index at `/.well-known/skills/index.json` instead; skillfleet reads both.
 - `agents` is `"all"` (the default) or a list of agent ids. `"all"` means every agent installed on the machine: one whose folder is in your home, such as `~/.claude` for Claude Code or `~/.codex` for Codex. `skillfleet agents` lists the ids and which agents it found. A sync that links into no folder says so.

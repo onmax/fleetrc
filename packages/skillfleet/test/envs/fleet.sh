@@ -42,10 +42,10 @@ docker exec sf-u2-h-nonode sh -c 'rm -f /usr/local/bin/node /usr/local/bin/npm /
 # The installed host: its own manifest with one local skill, then init and the launcher.
 docker exec -u fleet sf-u2-h-ok sh -c '
 set -e
-cd ~ && mkdir -p .claude skills/host-skill
+cd ~ && mkdir -p .claude .skillfleet skills/host-skill
 printf -- "---\nname: host-skill\ndescription: d\n---\n" > skills/host-skill/SKILL.md
-echo "{\"sources\":[{\"id\":\"host\",\"local\":\"$HOME/skills\"}]}" > skills.json
-npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~/skills.json --no-hooks >/dev/null
+echo "{\"sources\":[{\"id\":\"host\",\"local\":\"$HOME/skills\"}]}" > .skillfleet/manifest.json
+npx -y --package /pkg/skillfleet.tgz -- skillfleet init ~ --no-hooks >/dev/null
 npx -y --package /pkg/skillfleet.tgz -- skillfleet self-install'
 
 # Wait for sshd.
@@ -84,12 +84,13 @@ exec ssh -F "$T/ssh_config" "\$@"
 EOF
 chmod +x "$T/ssh"
 
-cat >"$H/skills.json" <<EOF
+mkdir -p "$H/.skillfleet"
+cat >"$H/.skillfleet/manifest.json" <<EOF
 { "sources": [{ "id": "l", "local": "$H/l" }],
   "fleet": ["ssh://fleet@127.0.0.1:22221", "ssh://fleet@127.0.0.1:22222", "ssh://fleet@127.0.0.1:22223"] }
 EOF
 sf() { env -i PATH="$PATH" HOME="$H" SKILLFLEET_SSH="$T/ssh" DO_NOT_TRACK=1 node "$cli" "$@"; }
-sf init "$H/skills.json" --no-hooks >/dev/null
+sf init "$H" --no-hooks >/dev/null
 
 pass=0
 fail=0
@@ -129,10 +130,10 @@ want=1 cmd='sf fleet upgrade alias-ok --timeout 60'
 step "8. fleet upgrade from a development build" "development or preview build (0.0.0)"
 want=1 cmd='sf fleet add "fleet@127.0.0.1:22221"'
 step "9. fleet add with a port" "has a port; write it as ssh://fleet@127.0.0.1:22221"
-grep -A4 '"fleet"' "$H/skills.json"
+grep -A4 '"fleet"' "$H/.skillfleet/manifest.json"
 
 # A host whose sync fails for one source answers with its report: reachable, synced with errors.
-docker exec -u fleet sf-u2-h-ok sh -c 'cd ~ && echo "{\"sources\":[{\"id\":\"host\",\"local\":\"$HOME/skills\"},{\"id\":\"gone\",\"local\":\"$HOME/gone\"}]}" > skills.json'
+docker exec -u fleet sf-u2-h-ok sh -c 'cd ~ && echo "{\"sources\":[{\"id\":\"host\",\"local\":\"$HOME/skills\"},{\"id\":\"gone\",\"local\":\"$HOME/gone\"}]}" > .skillfleet/manifest.json'
 want=1 cmd='sf fleet sync alias-ok --timeout 30'
 step "10. a host with one failing source is reachable, with errors" "alias-ok: last run .*, 1 skills, with errors"
 want=1 cmd='sf fleet sync alias-ok --timeout 30 --json'

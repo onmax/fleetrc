@@ -26,7 +26,7 @@ const home = join(root, "home");
 const prefix = join(root, "prefix");
 const bare = join(root, "remotes", "vendor.git");
 const work = join(root, "upstream", "vendor");
-const manifestFile = join(root, "manifest", "skills.json");
+const manifestFile = join(root, "manifest", ".skillfleet", "manifest.json");
 const stateDir = join(home, ".local", "state", "skillfleet");
 const claudeSkills = join(home, ".claude", "skills");
 
