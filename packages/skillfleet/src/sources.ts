@@ -1694,19 +1694,17 @@ async function fetchVendored(
     const publishing = join(ctx.storeDir, "publishing", name);
     if (!existsSync(live)) continue;
     const now = hashDir(live);
-    if (existsSync(publishing)) {
-      if (sameTree(hashDir(publishing), now)) {
-        if (!ctx.dryRun) replaceDir(publishing, base);
-        copy.hashes = now;
-      }
-      if (!ctx.dryRun) rmSync(publishing, { recursive: true, force: true });
-    }
     const files = changedFiles(copy.hashes, now);
+    const published = existsSync(publishing) && sameTree(hashDir(publishing), now);
+    if (existsSync(publishing) && !ctx.dryRun) {
+      if (published) replaceDir(publishing, base);
+      rmSync(publishing, { recursive: true, force: true });
+    }
     if (files.length === 0) continue;
-    // A sync stopped after it put an update in place (the base first, then the copy) and before it
-    // saved state.json leaves both at the update and the record behind: the copy is that update,
-    // unedited, and the record takes its hashes.
-    if (existsSync(base) && sameTree(hashDir(base), now)) {
+    // If the witness was already retired, the matching base still proves publication until the
+    // source checkpoint saves the new hashes together with its change notifications.
+    if (published || (existsSync(base) && sameTree(hashDir(base), now))) {
+      reportVendoredUpdate(source, out, { name, path: copy.path }, files);
       copy.hashes = now;
       continue;
     }
@@ -2078,6 +2076,11 @@ const filesAt = (source: Source, skill: Found) =>
       ? ""
       : `${skill.path}/`;
 
+function reportVendoredUpdate(source: Source, out: SourceResult, skill: Found, files: string[]) {
+  if (!out.updated.includes(skill.name)) out.updated.push(skill.name);
+  out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
+}
+
 function applyVendored(
   source: VendoredSource,
   state: SourceState,
@@ -2200,8 +2203,7 @@ function applyVendored(
       }
       edited.delete(skill.name);
       out.edited = out.edited.filter((entry) => entry.skill !== skill.name);
-      out.updated.push(skill.name);
-      out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
+      reportVendoredUpdate(source, out, skill, files);
       continue;
     }
     const editedFiles = edited.get(skill.name);
@@ -2227,8 +2229,7 @@ function applyVendored(
       state.skills[skill.name] = { hashes: incoming, path: skill.path };
       delete state.pending[skill.name];
     }
-    out.updated.push(skill.name);
-    out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
+    reportVendoredUpdate(source, out, skill, files);
   }
   // A skill held back keeps the update it was already waiting on.
   for (const entry of out.pending)
