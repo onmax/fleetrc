@@ -106,9 +106,14 @@
       }
     },
     "fleet": {
-      "description": "SSH hosts for `skillfleet fleet`.",
+      "description": "SSH hosts for `skillfleet fleet`, and tag:<name> entries that stand for every machine on your tailnet with that Tailscale tag.",
       "type": "array",
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "if": { "pattern": "^tag:" },
+        "then": { "pattern": "^tag:[A-Za-z][A-Za-z0-9-]*$" }
+      }
     },
     "hub": {
       "type": "string",

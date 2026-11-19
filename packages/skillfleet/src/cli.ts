@@ -29,9 +29,12 @@ import { GitError } from "./exec.ts";
 import {
   fleet,
   type FleetAction,
+  fleetEntryProblem,
+  fleetSuggestions,
   formatFleet,
-  hostProblem,
-  tailscalePeers,
+  isTag,
+  resolveFleet,
+  tagProblem,
   unpublished,
 } from "./fleet.ts";
 import { isRecord, JsonFileError, readJsonOrNothing, writeJson } from "./fs.ts";
@@ -219,10 +222,10 @@ const COMMANDS: Record<string, Command> = {
     options: ["dry-run", "json", "manifest"],
   },
   fleet: {
-    usage: "fleet sync|status|upgrade|add [host...]",
+    usage: "fleet sync|status|upgrade|add [host|tag:<name>...]",
     summary: "Run on the manifest's machines over SSH, or add machines to it",
     details:
-      "fleet sync and fleet status take host names to run on fewer machines than the manifest lists. fleet add with no host suggests machines on your tailnet. fleet upgrade installs this version on every host with npx.",
+      "fleet sync and fleet status take host names to run on fewer machines than the manifest lists. A tag:<name> stands for every machine on your tailnet with that Tailscale tag, as `tailscale status` lists them when the command runs. fleet add with no host suggests machines and tags on your tailnet. fleet upgrade installs this version on every host with npx.",
     options: ["dry-run", "json", "manifest", "timeout"],
   },
   hook: {
@@ -1015,23 +1018,41 @@ async function fleetCommand(action: string | undefined) {
   if (action === "add") {
     const hosts = rest.slice(1);
     if (hosts.length === 0) {
-      const peers = await tailscalePeers();
-      const known = new Set(loaded.root.fleet);
-      const suggestions = peers.filter((peer) => !known.has(peer.host) && !known.has(peer.dns));
-      if (json) emit({ suggestions });
-      else if (suggestions.length === 0)
+      const { named, taggable } = await fleetSuggestions();
+      const known = new Set(loaded.root.fleet.map((entry) => entry.toLowerCase()));
+      const suggestions = named
+        .filter((peer) => !known.has(peer.host.toLowerCase()) && !known.has(peer.dns.toLowerCase()))
+        .map(({ host, dns, online }) => ({ host, dns, online }));
+      const counts = new Map<string, number>();
+      for (const peer of taggable)
+        for (const tag of peer.tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
+      const tags = [...counts]
+        .filter(([tag]) => !known.has(tag.toLowerCase()))
+        .sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([tag, machines]) => ({ tag, machines }));
+      if (json) emit({ suggestions, tags });
+      else if (suggestions.length === 0 && tags.length === 0)
         say("no tailnet machines to suggest; name hosts: skillfleet fleet add <host>...");
-      else
-        say(
-          "machines on your tailnet; add the ones you want with `skillfleet fleet add <host>...`:",
-          ...suggestions.map(
-            (peer) =>
-              `  ${peer.host}${peer.online ? "" : " (offline)"}${peer.dns ? `  ${peer.dns}` : ""}`,
-          ),
-        );
+      else {
+        if (suggestions.length > 0)
+          say(
+            "machines on your tailnet; add the ones you want with `skillfleet fleet add <host>...`:",
+            ...suggestions.map(
+              (peer) =>
+                `  ${peer.host}${peer.online ? "" : " (offline)"}${peer.dns ? `  ${peer.dns}` : ""}`,
+            ),
+          );
+        if (tags.length > 0)
+          say(
+            "tags on your tailnet; `skillfleet fleet add tag:<name>` adds every machine with the tag, now and later:",
+            ...tags.map(
+              ({ tag, machines }) => `  ${tag}  (${machines} machine${machines === 1 ? "" : "s"})`,
+            ),
+          );
+      }
       return 0;
     }
-    const problems = hosts.flatMap((host) => hostProblem(host) ?? []);
+    const problems = hosts.flatMap((host) => fleetEntryProblem(host) ?? []);
     if (problems.length > 0) throw new UserError(problems.join("\n"));
     const target = manifestToEdit(
       loaded,
@@ -1059,17 +1080,36 @@ async function fleetCommand(action: string | undefined) {
         ? "fleet status changes nothing, so it has no --dry-run"
         : "fleet upgrade has no --dry-run; `skillfleet fleet status` shows each host's version",
     );
-  const hosts = rest.length > 1 ? rest.slice(1) : loaded.root.fleet;
-  if (hosts.length === 0) usage("the manifest has no fleet; add hosts with `skillfleet fleet add`");
+  const entries = rest.length > 1 ? rest.slice(1) : loaded.root.fleet;
+  if (entries.length === 0)
+    usage("the manifest has no fleet; add hosts with `skillfleet fleet add`");
+  const bad = entries.filter(isTag).flatMap((entry) => tagProblem(entry) ?? []);
+  if (bad.length > 0) usage(bad.join("; "));
   if (action === "upgrade") {
     const reason = await unpublished(version);
     if (reason) throw new UserError(reason);
   }
   const timeout = values.timeout ? Number(values.timeout) * 1000 : 30_000;
   if (!Number.isFinite(timeout) || timeout <= 0) usage("--timeout takes seconds");
-  const results = await fleet(hosts, action satisfies FleetAction, version, timeout, { dryRun });
+  const { targets, warnings } = await resolveFleet(entries, undefined, timeout, {
+    action: action satisfies FleetAction,
+    version,
+    dryRun,
+  });
+  for (const warning of warnings) console.error(`skillfleet: warning: ${warning}`);
+  if (dryRun)
+    for (const tag of new Set(
+      targets.flatMap((target) => (target.error ? [] : (target.via ?? []))),
+    ))
+      say(
+        `${tag} expands to ${targets
+          .filter((target) => target.via === tag)
+          .map((target) => `${target.host}${target.offline ? " (offline)" : ""}`)
+          .join(", ")}`,
+      );
+  const results = await fleet(targets, action satisfies FleetAction, version, timeout, { dryRun });
   if (json) emit(results);
-  else say(formatFleet(results));
+  else if (results.length > 0) say(formatFleet(results));
   // A sync that ran with errors on a host fails here as it does there.
   const failed = (result: (typeof results)[number]) =>
     !result.reachable ||

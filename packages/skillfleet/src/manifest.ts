@@ -12,6 +12,7 @@ import { hostname, networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join, normalize, sep } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
+import { isTag, tagProblem } from "./fleet.ts";
 import { fetchClone, gitUrl, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
 import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { editJsonText } from "./jsonedit.ts";
@@ -164,6 +165,16 @@ function stringList(file: string, at: string, value: unknown): string[] | undefi
   if (!Array.isArray(value) || !value.every((item) => typeof item === "string"))
     fail(file, at, "must be an array of strings");
   return value;
+}
+
+/** SSH hosts, checked when fleet runs, and `tag:` entries, checked here. */
+function fleetList(file: string, value: unknown): string[] {
+  const fleet = stringList(file, "fleet", value) ?? [];
+  fleet.forEach((entry, i) => {
+    const problem = isTag(entry) ? tagProblem(entry) : undefined;
+    if (problem) fail(file, `fleet[${i}]`, problem);
+  });
+  return fleet;
 }
 
 function optionalString(file: string, at: string, value: unknown): string | undefined {
@@ -427,7 +438,7 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
     sources,
     forks,
     hooks,
-    fleet: stringList(file, "fleet", raw.fleet) ?? [],
+    fleet: fleetList(file, raw.fleet),
     hub: optionalString(file, "hub", raw.hub),
     report,
     timer,
@@ -1002,9 +1013,14 @@ export async function loadManifest(
       let known = extended.get(at.file);
       if (!known) {
         let team: Manifest;
+        let ignoredFleet = false;
         try {
           team = readManifestFile(at.file, (raw) => {
-            if (!isRecord(raw) || !Array.isArray(raw.sources)) return;
+            if (!isRecord(raw)) return;
+            ignoredFleet =
+              raw.fleet !== undefined && (!Array.isArray(raw.fleet) || raw.fleet.length > 0);
+            delete raw.fleet;
+            if (!Array.isArray(raw.sources)) return;
             for (const [i, source] of raw.sources.entries()) {
               if (!isRecord(source)) continue;
               for (const key of ROOT_ONLY_SOURCE_KEYS) {
@@ -1024,7 +1040,7 @@ export async function loadManifest(
         }
         const ignored = [
           team.hooks.length > 0 && "hooks",
-          team.fleet.length > 0 && "fleet",
+          ignoredFleet && "fleet",
           team.hub && "hub",
           team.report && "report",
         ].filter(Boolean);

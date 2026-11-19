@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import { exec } from "./exec.ts";
 import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
@@ -5,8 +7,12 @@ import type { Report } from "./report.ts";
 
 export type FleetAction = "status" | "sync" | "upgrade";
 
+type FleetInvocation = { action: FleetAction; version: string; dryRun?: boolean };
+
 export interface HostResult {
   host: string;
+  /** The Tailscale tag the host came from, for a host a `tag:` entry expanded to. */
+  via?: string;
   /** The host answered over ssh. */
   reachable: boolean;
   /** False when skillfleet could not try the host: ssh is not installed, or the name is not one ssh takes. */
@@ -139,12 +145,18 @@ export async function unpublished(version: string): Promise<string | undefined> 
 
 const quote = (script: string) => `'${script.replace(/'/g, `'\\''`)}'`;
 
-/** ssh, or `SKILLFLEET_SSH` (a program, or a .js/.mjs file run with node). */
-function sshCommand(): { command: string; prefix: string[] } {
-  const custom = process.env.SKILLFLEET_SSH;
-  if (!custom) return { command: "ssh", prefix: [] };
+/** `fallback`, or the program `variable` names (a .js/.mjs file runs with node). */
+function program(variable: string, fallback: string): { command: string; prefix: string[] } {
+  const custom = process.env[variable];
+  if (!custom) return { command: fallback, prefix: [] };
   if (/\.(m?js)$/.test(custom)) return { command: process.execPath, prefix: [custom] };
   return { command: custom, prefix: [] };
+}
+
+function notInstalled(command: string, fallback: string, variable: string): string {
+  return command === fallback
+    ? `${fallback} is not installed, or not on PATH`
+    : `${command}, which ${variable} names, is not installed or not on PATH`;
 }
 
 function summarize(raw: unknown): HostResult["lastRun"] {
@@ -188,37 +200,65 @@ function summarize(raw: unknown): HostResult["lastRun"] {
   };
 }
 
-function readCache(): Record<string, NonNullable<HostResult["lastRun"]>> {
+type CachedRun = {
+  run: NonNullable<HostResult["lastRun"]>;
+  destinations?: string[];
+  endpoint?: string;
+};
+
+function readCache(): Record<string, CachedRun> {
   const raw = readJsonOrNothing(paths.fleet());
-  const cache = dict<NonNullable<HostResult["lastRun"]>>();
+  const cache = dict<CachedRun>();
   if (isRecord(raw))
     for (const [host, entry] of Object.entries(raw)) {
       const run = summarize(entry);
-      if (run) cache[host] = run;
+      if (run && isRecord(entry)) {
+        const destinations = Array.isArray(entry.destinations)
+          ? entry.destinations.filter((value) => typeof value === "string")
+          : typeof entry.destination === "string"
+            ? [entry.destination]
+            : undefined;
+        cache[host] = {
+          run,
+          destinations,
+          endpoint: typeof entry.endpoint === "string" ? entry.endpoint : undefined,
+        };
+      }
     }
   return cache;
 }
 
+const sshOptions = (timeoutMs: number) => [
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  `ConnectTimeout=${Math.ceil(timeoutMs / 1000)}`,
+];
+
+function sshDestination(entry: string): string[] {
+  if (!entry.startsWith("ssh://") || !entry.includes("[")) return ["--", entry];
+  const { machine, user, port } = sshTarget(entry);
+  return [...(user ? ["-l", user] : []), ...(port ? ["-p", port] : []), "--", machine];
+}
+
+const sshRemoteCommand = (action: FleetAction, version: string, dryRun: boolean) =>
+  `sh -c ${quote(remoteScript(action, version, { dryRun }))}`;
+
 async function runOnHost(
   host: string,
   action: FleetAction,
-  version: string,
+  remoteCommand: string,
   timeoutMs: number,
-  dryRun: boolean,
 ) {
   const problem = hostProblem(host);
   if (problem) return { error: problem, reached: false, checked: false };
-  const { command, prefix } = sshCommand();
+  const { command, prefix } = program("SKILLFLEET_SSH", "ssh");
   const args = [
     ...prefix,
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    `ConnectTimeout=${Math.ceil(timeoutMs / 1000)}`,
+    ...sshOptions(timeoutMs),
     // hostProblem already refuses a leading "-"; this keeps ssh from reading any host as an option.
-    "--",
-    host,
-    `sh -c ${quote(remoteScript(action, version, { dryRun }))}`,
+    ...sshDestination(host),
+    remoteCommand,
   ];
   // The report is parsed whole, so it is not cut to the default tail. stdin stays open for `watched`.
   const run = await exec(command, args, {
@@ -229,10 +269,7 @@ async function runOnHost(
   });
   if (run.spawnError === "ENOENT")
     return {
-      error:
-        command === "ssh"
-          ? "ssh is not installed, or not on PATH"
-          : `${command}, which SKILLFLEET_SSH names, is not installed or not on PATH`,
+      error: notInstalled(command, "ssh", "SKILLFLEET_SSH"),
       reached: false,
       checked: false,
     };
@@ -292,30 +329,55 @@ function parseReport(stdout: string): unknown {
  * A dry run of `sync` runs `sync --dry-run` on each host, and its reports are not cached as runs.
  */
 export async function fleet(
-  hosts: readonly string[],
+  hosts: readonly (string | FleetTarget)[],
   action: FleetAction,
   version: string,
   timeoutMs = 30_000,
   { dryRun = false } = {},
 ): Promise<HostResult[]> {
   const cache = readCache();
+  const remoteCommand = sshRemoteCommand(action, version, dryRun);
   const results = await Promise.all(
-    hosts.map(async (host): Promise<HostResult> => {
-      const answer = await runOnHost(host, action, version, timeoutMs, dryRun);
-      // The host answered, but has no report to give.
-      if ("note" in answer && answer.note) {
-        const error = HOST_NOTES[answer.note];
+    hosts.map(async (target): Promise<HostResult> => {
+      const {
+        host,
+        via,
+        offline,
+        error,
+        cacheKey = host,
+        refreshPeer,
+      } = typeof target === "string" ? { host: target } : target;
+      const lastRun = cache[cacheKey]?.run;
+      const from = via ? { via } : {};
+      // A tag Tailscale could not expand.
+      if (error !== undefined)
+        return { host, ...from, reachable: false, checked: false, error, behind: [] };
+      if (offline)
         return {
           host,
+          ...from,
+          reachable: false,
+          checked: true,
+          lastRun,
+          error: "offline in Tailscale",
+          behind: [],
+        };
+      const answer = await runOnHost(host, action, remoteCommand, timeoutMs);
+      // The host answered, but has no report to give.
+      if ("note" in answer && answer.note) {
+        const note = HOST_NOTES[answer.note];
+        return {
+          host,
+          ...from,
           reachable: true,
           checked: true,
-          lastRun: cache[host],
-          ...(error ? { error } : {}),
+          lastRun,
+          ...(note ? { error: note } : {}),
           behind: [],
         };
       }
       const run = "report" in answer ? summarize(answer.report) : undefined;
-      const before = cache[host]?.skillfleet;
+      const before = lastRun?.skillfleet;
       // What the host runs once the upgrade went in, told before its sync, which may still fail.
       const to = ("now" in answer ? answer.now : undefined) || run?.skillfleet;
       const upgrade =
@@ -328,21 +390,75 @@ export async function fleet(
             }
           : {};
       if (run) {
-        if (!dryRun) cache[host] = run;
-        return { host, reachable: true, checked: true, lastRun: run, ...upgrade, behind: [] };
+        if (!dryRun) {
+          if (cacheKey !== host) {
+            const effective = stableCacheKey(cacheKey)
+              ? await effectiveDestination(host, remoteCommand, timeoutMs, Math.min(750, timeoutMs))
+              : undefined;
+            const endpoint =
+              effective && hostKey(effective.name) === hostKey(host)
+                ? endpointKey(effective)
+                : undefined;
+            const previous = cache[cacheKey];
+            const known = endpoint && previous?.endpoint === endpoint ? previous.destinations : [];
+            const destinations = endpoint ? [...new Set([host, ...(known ?? [])])] : undefined;
+            cache[cacheKey] = { run, destinations, endpoint };
+          } else {
+            cache[host] = { run };
+            if (refreshPeer) {
+              const previous = cache[refreshPeer.key];
+              const taggedHost = refreshPeer.taggedHost;
+              if (
+                previous
+                  ? (previous.destinations?.includes(host) || taggedHost) &&
+                    previous.endpoint === refreshPeer.endpoint
+                  : taggedHost
+              ) {
+                const destinations = new Set(previous?.destinations);
+                destinations.add(host);
+                if (taggedHost) destinations.add(taggedHost);
+                const latest =
+                  !previous || Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
+                    ? run
+                    : previous.run;
+                cache[refreshPeer.key] = {
+                  run: latest,
+                  destinations: [...destinations],
+                  endpoint: refreshPeer.endpoint,
+                };
+              }
+            }
+          }
+        }
+        return {
+          host,
+          ...from,
+          reachable: true,
+          checked: true,
+          lastRun: run,
+          ...upgrade,
+          behind: [],
+        };
       }
       return {
         host,
+        ...from,
         reachable: answer.reached ?? false,
         checked: answer.checked ?? true,
-        lastRun: cache[host],
+        lastRun,
         ...upgrade,
         error: answer.error ?? "no report",
         behind: [],
       };
     }),
   );
-  if (!dryRun) writeJson(paths.fleet(), cache);
+  if (!dryRun)
+    writeJson(
+      paths.fleet(),
+      Object.fromEntries(
+        Object.entries(cache).map(([key, { run, ...identity }]) => [key, { ...run, ...identity }]),
+      ),
+    );
   markBehind(results);
   return results;
 }
@@ -382,6 +498,8 @@ export function age(iso: string, now = Date.now()): string {
 export function formatFleet(results: readonly HostResult[]): string {
   return results
     .map((result) => {
+      // A tag entry Tailscale could not expand.
+      if (result.via === result.host) return `${result.host}: not expanded (${result.error})`;
       const run = result.lastRun;
       const last = run
         ? `last run ${age(run.finishedAt)} ago, ${run.skills} skills${run.ok ? "" : ", with errors"}`
@@ -393,7 +511,7 @@ export function formatFleet(results: readonly HostResult[]): string {
           : result.error
             ? `${result.error}; ${last}`
             : last;
-      return `${result.host}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
+      return `${result.host}${result.via ? ` (${result.via})` : ""}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
     })
     .join("\n");
 }
@@ -403,27 +521,441 @@ function upgraded({ from, to }: NonNullable<HostResult["upgrade"]>): string {
   return from === to ? `already on ${to}` : `${from} → ${to}`;
 }
 
-export interface TailscalePeer {
+/** A `tag:<name>` fleet entry: Tailscale's rule for a tag name, a letter and then letters, digits or dashes. */
+const TAG = /^tag:[A-Za-z][A-Za-z0-9-]*$/;
+
+export const isTag = (entry: string) => entry.startsWith("tag:");
+
+/** Why `entry`, which starts with `tag:`, is not a Tailscale tag, or undefined when it is one. */
+export function tagProblem(entry: string): string | undefined {
+  if (TAG.test(entry)) return undefined;
+  return `"${entry}" is not a Tailscale tag: write tag: and then a letter followed by letters, digits or dashes, such as "tag:servers"`;
+}
+
+/** Why a fleet entry, a host or a `tag:`, cannot be used, or undefined when it can. */
+export const fleetEntryProblem = (entry: string) =>
+  isTag(entry) ? tagProblem(entry) : hostProblem(entry);
+
+/** A host to run on: named in the fleet, or a machine a `tag:` entry expanded to. */
+export interface FleetTarget {
   host: string;
+  cacheKey?: string;
+  refreshPeer?: { key: string; endpoint: string; taggedHost?: string };
+  /** The tag the host came from. */
+  via?: string;
+  /** Tailscale says the machine is offline, so ssh is not tried. */
+  offline?: boolean;
+  /** Set on a `tag:` entry that could not be expanded: why. */
+  error?: string;
+}
+
+export interface TailscalePeer {
+  id?: string;
+  /** The first label of its MagicDNS name, which ssh and `fleet add` take on the tailnet. */
+  host: string;
+  /** Its MagicDNS name without the trailing dot, or "" when it has none. */
   dns: string;
+  ips: string[];
+  tags: string[];
   online: boolean;
 }
 
-/** Machines on the tailnet, for `fleet add` to suggest. */
-export async function tailscalePeers(): Promise<TailscalePeer[]> {
-  const run = await exec("tailscale", ["status", "--json"], {
-    timeoutMs: 10_000,
+/** What `tailscale status --json` says: the peers, and whether MagicDNS names reach them. */
+export interface Tailnet {
+  peers: TailscalePeer[];
+  /** False when the tailnet has MagicDNS off, so only a peer's Tailscale IP reaches it. */
+  magicDNS: boolean;
+}
+
+/** The machines on the tailnet other than this one, or why Tailscale could not list them. */
+export async function tailnet(timeoutMs = 10_000): Promise<Tailnet | { error: string }> {
+  const { command, prefix } = program("SKILLFLEET_TAILSCALE", "tailscale");
+  const run = await exec(command, [...prefix, "status", "--json"], {
+    timeoutMs,
     maxOutput: 64 * 1024 * 1024,
   });
-  if (run.code !== 0) return [];
-  const parsed: unknown = JSON.parse(run.stdout);
-  if (!isRecord(parsed) || !isRecord(parsed.Peer)) return [];
-  // HostName is the machine's own name, which can have spaces ("Maxi's MacBook Pro"); the first
-  // label of its MagicDNS name is the one ssh and `fleet add` take.
-  return Object.values(parsed.Peer).flatMap((peer) => {
+  if (run.spawnError === "ENOENT")
+    return { error: notInstalled(command, "tailscale", "SKILLFLEET_TAILSCALE") };
+  if (run.timedOut)
+    return { error: `\`tailscale status\` did not answer within ${timeoutMs / 1000} s` };
+  if (run.code !== 0) {
+    const said = run.stderr.trim().split("\n")[0] || `exit ${run.code}`;
+    return { error: `\`tailscale status\` failed: ${said}` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(run.stdout);
+  } catch {
+    return { error: "`tailscale status --json` printed something that is not JSON" };
+  }
+  if (!isRecord(parsed)) return { error: "`tailscale status --json` printed no status" };
+  if (parsed.BackendState === "NeedsLogin" || parsed.BackendState === "NoState")
+    return { error: "Tailscale is not logged in; run `tailscale up`" };
+  if (parsed.BackendState === "Stopped")
+    return { error: "Tailscale is stopped; run `tailscale up`" };
+  const self = isRecord(parsed.Self) ? parsed.Self : {};
+  const peers = Object.values(isRecord(parsed.Peer) ? parsed.Peer : {}).flatMap((peer) => {
     if (!isRecord(peer)) return [];
+    // Tailscale lists this machine under Self, not Peer; a Peer entry that is Self is skipped all the same.
+    if (peer.PublicKey !== undefined && peer.PublicKey === self.PublicKey) return [];
     const dns = typeof peer.DNSName === "string" ? peer.DNSName.replace(/\.$/, "") : "";
+    // HostName is the machine's own name, which can have spaces ("Maxi's MacBook Pro").
     const host = dns.split(".")[0] || (typeof peer.HostName === "string" ? peer.HostName : "");
-    return host && !hostProblem(host) ? [{ host, dns, online: peer.Online === true }] : [];
+    const strings = (value: unknown) =>
+      Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === "string" && item !== "")
+        : [];
+    return [
+      {
+        id: typeof peer.ID === "string" && peer.ID ? peer.ID : undefined,
+        host,
+        dns,
+        ips: strings(peer.TailscaleIPs),
+        tags: strings(peer.Tags),
+        online: peer.Online === true,
+      },
+    ];
   });
+  // Older Tailscale versions leave CurrentTailnet out; MagicDNS is on unless it says otherwise.
+  const current = isRecord(parsed.CurrentTailnet) ? parsed.CurrentTailnet : {};
+  return { peers, magicDNS: current.MagicDNSEnabled !== false };
+}
+
+/**
+ * Whether a name or address `tailscale status` gave is one to hand ssh: a DNS name or an IP
+ * address, nothing ssh reads as an option or a user (`-oProxyCommand=x`, `user@x`).
+ */
+const tailnetHost = (host: string) =>
+  !hostProblem(host) &&
+  (isIP(host) !== 0 ||
+    /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)*$/.test(
+      host,
+    ));
+
+function peerDestinations(peer: TailscalePeer, magicDNS: boolean) {
+  return {
+    dns: magicDNS && tailnetHost(peer.dns) ? peer.dns : undefined,
+    ips: peer.ips.filter((ip) => !hostProblem(ip) && isIP(ip) !== 0),
+  };
+}
+
+/** Named host suggestions and all peers with a possible tag destination, from one status query. */
+export async function fleetSuggestions() {
+  const answer = await tailnet();
+  if ("error" in answer) return { named: [], taggable: [] };
+  return {
+    named: answer.peers.filter((peer) => peer.host && tailnetHost(peer.host)),
+    taggable: answer.peers.filter((peer) => {
+      const { dns, ips } = peerDestinations(peer, answer.magicDNS);
+      return dns || ips.length > 0;
+    }),
+  };
+}
+
+/**
+ * A host name or address, normalised for comparing: lower case, no trailing dot, an IPv6 address
+ * in its shortest form (`fd7a:0::9` is `fd7a::9`). A short name and a MagicDNS name are one
+ * machine only when Tailscale says so: two tailnets can each have a `vps`.
+ */
+function hostKey(host: string): string {
+  const name = host.replace(/\.$/, "").toLowerCase();
+  if (name.includes(":")) {
+    const [address = "", zone] = name.split("%", 2);
+    let canonical = address;
+    try {
+      canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+    } catch {}
+    return zone === undefined ? canonical : `${canonical}%${zone}`;
+  }
+  return name;
+}
+
+const LOOKUP_ADDRESSES = `
+  const { lookup } = require('node:dns');
+  const { readFileSync } = require('node:fs');
+  const names = JSON.parse(readFileSync(0, 'utf8'));
+  for (const name of names) lookup(name, { all: true }, (error, answers) => {
+    if (!error) console.log(JSON.stringify([name, answers.map(({ address }) => address)]));
+  });
+`;
+
+/** Use the OS resolver (including split DNS), in a process we can stop on timeout. */
+async function localAddresses(names: string[], timeoutMs: number) {
+  const found = new Map<string, string[]>();
+  if (!names.length || timeoutMs <= 0) return found;
+  const run = await exec(process.execPath, ["-e", LOOKUP_ADDRESSES], {
+    input: JSON.stringify(names),
+    timeoutMs,
+  });
+  for (const line of run.stdout.split("\n")) {
+    if (!line) continue;
+    try {
+      const [name, ips] = JSON.parse(line) as [string, string[]];
+      found.set(name, ips);
+    } catch {}
+  }
+  return found;
+}
+
+async function verifyAddresses(
+  names: string[],
+  budget: number,
+  addresses?: (name: string) => Promise<string[]>,
+) {
+  if (!addresses) return localAddresses(names, budget);
+  const found = new Map<string, string[]>();
+  if (budget <= 0 || !names.length) return found;
+  const timer = new AbortController();
+  try {
+    await Promise.race([
+      delay(budget, undefined, { signal: timer.signal }),
+      Promise.all(
+        names.map(async (name) => {
+          try {
+            const ips = await addresses(name);
+            if (!timer.signal.aborted) found.set(name, ips);
+          } catch {}
+        }),
+      ),
+    ]);
+  } finally {
+    timer.abort();
+  }
+  return found;
+}
+
+async function effectiveDestination(
+  entry: string,
+  remoteCommand: string,
+  timeoutMs: number,
+  budget: number,
+) {
+  if (hostProblem(entry) || budget <= 0) return undefined;
+  const { command, prefix } = program("SKILLFLEET_SSH", "ssh");
+  const run = await exec(
+    command,
+    [...prefix, "-G", ...sshOptions(timeoutMs), ...sshDestination(entry), remoteCommand],
+    {
+      timeoutMs: budget,
+    },
+  );
+  if (run.code !== 0 || run.timedOut || run.truncated) return undefined;
+  if (/^proxy(?:command|jump) (?!none\r?$)/im.test(run.stdout)) return undefined;
+  const hostname = /^hostname (\S+)\r?$/m.exec(run.stdout)?.[1];
+  const name = hostname?.replace(/\.$/, "");
+  if (!name || !tailnetHost(name)) return undefined;
+  return {
+    name,
+    user: /^user (\S+)\r?$/m.exec(run.stdout)?.[1],
+    port: /^port (\d+)\r?$/m.exec(run.stdout)?.[1],
+    proxied: /^proxy(?:command|jump) (?!none\r?$)\S/m.test(run.stdout),
+  };
+}
+
+function endpointKey({
+  name,
+  user,
+  port,
+  proxied,
+}: NonNullable<Awaited<ReturnType<typeof effectiveDestination>>>) {
+  return !proxied && user && port ? JSON.stringify([hostKey(name), user, port]) : undefined;
+}
+
+const stablePeerKey = (peer: TailscalePeer) => (peer.id ? `tag-peer:id:${peer.id}` : undefined);
+const stableCacheKey = (key: string) => key.startsWith("tag-peer:id:");
+
+/**
+ * The machine, user and port a fleet entry names: `host`, `user@host`, a bare IP address (IPv6
+ * has no port there, so its last group stays), or `ssh://[user@]host[:port]` with the host in
+ * brackets for IPv6. A port is kept as written, since `~/.ssh/config` may give the bare name
+ * another one.
+ */
+function sshTarget(entry: string): { machine: string; user: string; port: string } {
+  const url = entry.startsWith("ssh://");
+  let rest = url ? entry.slice("ssh://".length) : entry;
+  const at = rest.lastIndexOf("@");
+  const user = at >= 0 ? rest.slice(0, at) : "";
+  rest = rest.slice(at + 1);
+  let port = "";
+  if (url) {
+    const parts = rest.match(/^(?:\[([^\]]*)\]|([^:]*))(?::([0-9]+))?$/);
+    if (parts) {
+      rest = parts[1] ?? parts[2] ?? rest;
+      port = parts[3] ?? "";
+    }
+  }
+  return { machine: rest, user, port };
+}
+
+/**
+ * The hosts to run on: the explicit ones as they are, and each `tag:` entry as every tailnet
+ * machine with that tag, by MagicDNS name, or its first usable Tailscale IP when the name is
+ * unavailable locally. Tailscale is asked once for tags or to verify a cached tagged destination.
+ * A machine named
+ * twice runs once. Entries are compared by the machine they reach: an IPv6 address in any
+ * spelling, a MagicDNS name or its short name, and, when Tailscale was asked, any name or IP of the
+ * same peer. Two explicit entries for one machine run once when they also have the same user and
+ * port; an explicit host wins over a tag's match for its machine, whatever its user or port, and
+ * the first tag wins over later ones. A tag that matches nothing gets a warning, and so does a
+ * machine whose name ssh can't take; a tag that can't be expanded comes back as a target with its
+ * `error`.
+ */
+export async function resolveFleet(
+  entries: readonly string[],
+  addresses?: (name: string) => Promise<string[]>,
+  timeoutMs = 30_000,
+  { action, version, dryRun = false }: FleetInvocation = { action: "status", version: "0.0.0" },
+): Promise<{ targets: FleetTarget[]; warnings: string[] }> {
+  const warnings: string[] = [];
+  const tagNames = new Set(entries.filter(isTag).map((entry) => entry.toLowerCase()));
+  const explicit = [...new Set(entries.filter((entry) => !isTag(entry)))];
+  const cachedDestinations = new Set(
+    explicit.length
+      ? Object.entries(readCache()).flatMap(([key, record]) =>
+          stableCacheKey(key) && record.endpoint ? (record.destinations ?? []) : [],
+        )
+      : [],
+  );
+  const probes = explicit.filter((entry) => cachedDestinations.has(entry));
+  const answer: Tailnet | { error: string } = tagNames.size
+    ? await tailnet()
+    : probes.length
+      ? await tailnet(Math.min(1500, timeoutMs))
+      : { peers: [], magicDNS: true };
+  const peerOf = new Map<
+    string,
+    { peer: TailscalePeer; index: number; user?: string; port?: string }
+  >();
+  const destination = new Map<TailscalePeer, { host: string; cacheKey: string }>();
+  const refresh = new Map<string, NonNullable<FleetTarget["refreshPeer"]>>();
+  if ("peers" in answer) {
+    const peers = answer.peers.map((peer, index) => ({
+      peer,
+      index,
+      ...peerDestinations(peer, answer.magicDNS),
+    }));
+    const tagged = peers.filter(({ peer }) =>
+      peer.tags.some((tag) => tagNames.has(tag.toLowerCase())),
+    );
+    const budget = Math.min(1500, timeoutMs);
+    const deadline = performance.now() + budget;
+    const remoteCommand = sshRemoteCommand(action, version, dryRun);
+    const effective = await Promise.all(
+      explicit.map(async (entry) =>
+        tagged.length || cachedDestinations.has(entry)
+          ? effectiveDestination(entry, remoteCommand, timeoutMs, budget / 2)
+          : undefined,
+      ),
+    );
+    const names = [
+      ...new Set([
+        ...tagged.flatMap(({ peer, dns, ips }) => (peer.online && dns && ips.length ? [dns] : [])),
+        ...effective.flatMap((target) => (target && !isIP(target.name) ? [target.name] : [])),
+      ]),
+    ];
+    const found = await verifyAddresses(
+      names,
+      Math.max(0, deadline - performance.now()),
+      addresses,
+    );
+    const matches = (name: string, { dns, ips }: (typeof peers)[number]) => {
+      if (!ips.length) return dns !== undefined && hostKey(name) === hostKey(dns);
+      const resolved = isIP(name) ? [name] : (found.get(name) ?? []);
+      const keys = ips.map(hostKey);
+      return resolved.length > 0 && resolved.every((ip) => keys.includes(hostKey(ip)));
+    };
+    for (const [index, target] of effective.entries()) {
+      const entry = explicit[index];
+      if (!target || entry === undefined) continue;
+      const candidates = peers.filter((candidate) => matches(target.name, candidate));
+      const candidate = candidates.length === 1 ? candidates[0] : undefined;
+      if (!candidate) continue;
+      if (tagged.length) peerOf.set(entry, { ...candidate, user: target.user, port: target.port });
+      const endpoint = endpointKey(target);
+      const key = stablePeerKey(candidate.peer);
+      if (cachedDestinations.has(entry) && candidate.ips.length && key && endpoint)
+        refresh.set(entry, { key, endpoint });
+    }
+    for (const candidate of tagged) {
+      const { peer, dns, ips } = candidate;
+      const overridden =
+        dns !== undefined &&
+        explicit.some((entry, index) => {
+          const name = effective[index]?.name;
+          return hostKey(entry) === hostKey(dns) && name !== undefined && !matches(name, candidate);
+        });
+      const useDNS =
+        dns && (!ips.length || !peer.online || (!overridden && matches(dns, candidate)));
+      const host = (useDNS ? dns : undefined) ?? ips[0];
+      if (!host) continue;
+      const cacheKey = stablePeerKey(peer) ?? `tag-peer:address:${hostKey(ips[0] ?? host)}`;
+      destination.set(peer, { host, cacheKey });
+    }
+    if (!dryRun) {
+      const tagEndpoints = new Map<string, ReturnType<typeof effectiveDestination>>();
+      await Promise.all(
+        explicit.map(async (entry, index) => {
+          const candidate = peerOf.get(entry);
+          const selected = candidate && destination.get(candidate.peer);
+          const target = effective[index];
+          if (!candidate || !selected || !target || !stableCacheKey(selected.cacheKey)) return;
+          if (!peers[candidate.index]?.ips.length) return;
+          const endpoint = endpointKey(target);
+          if (!endpoint || hostKey(target.name) !== hostKey(selected.host)) return;
+          if (entry !== selected.host) {
+            let probe = tagEndpoints.get(selected.host);
+            if (!probe) {
+              probe = effectiveDestination(
+                selected.host,
+                remoteCommand,
+                timeoutMs,
+                Math.max(0, deadline - performance.now()),
+              );
+              tagEndpoints.set(selected.host, probe);
+            }
+            const taggedTarget = await probe;
+            if (!taggedTarget || endpointKey(taggedTarget) !== endpoint) return;
+          }
+          refresh.set(entry, { key: selected.cacheKey, endpoint, taggedHost: selected.host });
+        }),
+      );
+    }
+  }
+  const explicitPeers = new Set([...peerOf.values()].map(({ peer }) => peer));
+  const seen = new Set<string>();
+  const targets: FleetTarget[] = [];
+  for (const entry of entries) {
+    if (!isTag(entry)) {
+      const target = sshTarget(entry);
+      const peer = peerOf.get(entry);
+      const machine = peer ? `peer:${peer.index}` : `host:${hostKey(target.machine)}`;
+      const key = [machine, target.user, target.port, peer?.user, peer?.port].join("\0");
+      const refreshPeer = refresh.get(entry);
+      if (!seen.has(key)) targets.push({ host: entry, ...(refreshPeer ? { refreshPeer } : {}) });
+      seen.add(key);
+      continue;
+    }
+    if ("error" in answer) {
+      targets.push({ host: entry, via: entry, error: answer.error });
+      continue;
+    }
+    const tag = entry.toLowerCase();
+    const matches = answer.peers.filter((peer) => peer.tags.some((t) => t.toLowerCase() === tag));
+    if (matches.length === 0)
+      warnings.push(`${entry} matches no machine on your tailnet besides this one`);
+    for (const peer of matches) {
+      const selected = destination.get(peer);
+      if (!selected) {
+        warnings.push(
+          `${entry}: skipped a machine Tailscale calls ${JSON.stringify(peer.dns || peer.host)}, which has no name or address ssh takes`,
+        );
+        continue;
+      }
+      const id = hostKey(selected.host);
+      if (explicitPeers.has(peer) || seen.has(id)) continue;
+      seen.add(id);
+      targets.push({ ...selected, via: entry, ...(peer.online ? {} : { offline: true }) });
+    }
+  }
+  return { targets, warnings };
 }
