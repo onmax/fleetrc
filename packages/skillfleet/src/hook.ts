@@ -180,8 +180,8 @@ function configured(): boolean {
 
 /**
  * `skillfleet hook run <agent>`, with the event the agent passes on stdin as `hook_event_name`. On
- * UserPromptSubmit, where older versions put the hook too, it does nothing: syncs start only with a
- * session. On a machine without skillfleet's config it does nothing and creates nothing.
+ * explicit events other than SessionStart it does nothing. Calls without an event can still run
+ * as a session hook. On a machine without skillfleet's config it does nothing and creates nothing.
  */
 export async function runHook(agent: HookAgent) {
   try {
@@ -195,16 +195,13 @@ export async function runHook(agent: HookAgent) {
     try {
       parsed = JSON.parse(input);
     } catch {}
-    const name =
-      isRecord(parsed) && typeof parsed.hook_event_name === "string"
-        ? parsed.hook_event_name
-        : "a session hook";
-    if (name === "UserPromptSubmit") return;
+    const name = isRecord(parsed) ? parsed.hook_event_name : undefined;
+    if (name !== undefined && name !== "SessionStart") return;
     try {
       markRan(agent);
     } catch {}
     try {
-      await syncIfStale(`${agent} ${name}`);
+      await syncIfStale(`${agent} ${name ?? "a session hook"}`);
     } catch {}
   } catch {
     // The agent shows a hook's failure to the user, and the hook is the agent's, not skillfleet's.

@@ -186,13 +186,30 @@ const sameHandler = (a: Record<string, unknown>, b: HookHandler) =>
 
 type Json = Record<string, unknown>;
 
-/** The handlers of `groups` (an event's matcher groups) that are not skillfleet's. */
-function withoutOwn(groups: unknown): { groups: unknown[]; removed: number } {
+/** Removes skillfleet's handlers, optionally keeping group and handler indices for Codex approval. */
+function withoutOwn(
+  groups: unknown,
+  preserveIndices = false,
+): { groups: unknown[]; removed: number } {
   if (!Array.isArray(groups)) return { groups: [], removed: 0 };
+  const lastOtherGroup = preserveIndices
+    ? groups.findLastIndex(
+        (group: unknown) =>
+          isRecord(group) &&
+          Array.isArray(group.hooks) &&
+          group.hooks.some((hook: unknown) => !isOwnHandler(hook)),
+      )
+    : -1;
   let removed = 0;
-  const kept = groups.flatMap((group: unknown) => {
+  const kept = groups.flatMap((group: unknown, index) => {
     if (!isRecord(group) || !Array.isArray(group.hooks)) return [group];
-    const hooks = group.hooks.filter((hook: unknown) => !isOwnHandler(hook));
+    const lastOther = preserveIndices
+      ? group.hooks.findLastIndex((hook: unknown) => !isOwnHandler(hook))
+      : -1;
+    if (index < lastOtherGroup && lastOther === -1) return [group];
+    const hooks = group.hooks.filter(
+      (hook: unknown, position: number) => position < lastOther || !isOwnHandler(hook),
+    );
     if (hooks.length === group.hooks.length) return [group];
     removed += group.hooks.length - hooks.length;
     // A group that held only skillfleet's handler goes with it.
@@ -345,13 +362,14 @@ function chosen(
 /**
  * Puts `handler` in `raw`'s SessionStart, in place of any entry of skillfleet's; an event that
  * already holds it, once, is left alone. skillfleet's entries under any other event, such as the
- * UserPromptSubmit older versions wrote, are taken out, with the groups and events they leave empty.
+ * UserPromptSubmit older versions wrote, are taken out unless removing them would shift another
+ * Codex hook's indices and invalidate its approval.
  */
-export function withHook(raw: Json, handler: HookHandler) {
+export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
   const hooks: Json = isRecord(raw.hooks) ? raw.hooks : {};
   for (const [event, groups] of Object.entries(hooks)) {
     if ((EVENTS as readonly string[]).includes(event)) continue;
-    const { groups: kept, removed } = withoutOwn(groups);
+    const { groups: kept, removed } = withoutOwn(groups, agent === "codex");
     if (removed === 0) continue;
     if (kept.length > 0) hooks[event] = kept;
     else delete hooks[event];
@@ -388,7 +406,7 @@ export function installHooks(
   return chosen(agents).map(({ agent, skipped }) => {
     if (skipped) return { agent, file: hookFile(agent), changed: false, skipped };
     const handler = hookHandler(agent, node === undefined ? {} : { node });
-    return changeFile(agent, (raw) => withHook(raw, handler), {
+    return changeFile(agent, (raw) => withHook(raw, handler, agent), {
       dryRun: options.dryRun ?? false,
       create: true,
     });

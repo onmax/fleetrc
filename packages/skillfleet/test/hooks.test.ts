@@ -254,6 +254,15 @@ describe("hook run", () => {
     expect(existsSync(join(m.stateDir, "hook-ran-claude-code"))).toBe(false);
   });
 
+  it("ignores an explicit Stop event without recording an attempt or a hook run", async () => {
+    const { m } = await hooked();
+    writeFileSync(join(m.stateDir, "sync.lock"), lockText());
+    const run = await hook(m, "codex", JSON.stringify({ hook_event_name: "Stop" }));
+    expect(run).toEqual({ code: 0, stdout: "", stderr: "" });
+    expect(existsSync(join(m.stateDir, "hook-attempt"))).toBe(false);
+    expect(existsSync(join(m.stateDir, "hook-ran-codex"))).toBe(false);
+  });
+
   it("runs the entry it wrote into settings.json as Claude Code does, from a parent that exits at once", async () => {
     const { m, mine } = await hooked();
     const before = lastRun(m).finishedAt;
@@ -379,6 +388,30 @@ describe("hook install and remove", () => {
     ]);
   });
 
+  it("cleans up legacy Codex prompt hooks without shifting other groups or handlers", async () => {
+    const m = machine();
+    const file = m.at(".codex", "hooks.json");
+    const legacy = { type: "command", command: '"/old/skillfleet" hook run codex' };
+    const custom = { type: "command", command: "echo mine" };
+    const first = { hooks: [legacy] };
+    writeFileSync(
+      file,
+      JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [first, { hooks: [legacy, custom, legacy] }, { hooks: [legacy] }],
+        },
+      }),
+    );
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    const installed = read(file);
+    expect(JSON.parse(installed).hooks.UserPromptSubmit).toEqual([
+      first,
+      { hooks: [legacy, custom] },
+    ]);
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    expect(read(file)).toBe(installed);
+  });
+
   it("on Windows writes Claude Code's entry in exec form, and Codex's for cmd, with % kept from cmd", () => {
     const profile = "C:\\Users\\Jo & Ann %PATH% x";
     const state = `${profile}\\AppData\\Local\\skillfleet`;
@@ -417,7 +450,7 @@ describe("hook install and remove", () => {
       hooks: { SessionStart: [{ hooks: [old] }], UserPromptSubmit: [{ hooks: [mine, old] }] },
     };
     const handler = hookHandler("claude-code", options);
-    withHook(raw, handler);
+    withHook(raw, handler, "claude-code");
     expect(raw).toEqual({
       hooks: {
         SessionStart: [{ hooks: [handler] }],
@@ -425,7 +458,7 @@ describe("hook install and remove", () => {
       },
     });
     const once = JSON.stringify(raw);
-    withHook(raw, handler);
+    withHook(raw, handler, "claude-code");
     expect(JSON.stringify(raw)).toBe(once);
     expect(isOwnHandler(handler)).toBe(true);
     // Another program's node script is not skillfleet's.
@@ -604,7 +637,11 @@ describe("the hooks on shared and upgraded machines", () => {
       return join(dir, "settings.json");
     };
     const addHook = (raw: Record<string, unknown>) =>
-      withHook(raw, { type: "command", command: '"/s/skillfleet" hook run claude-code' });
+      withHook(
+        raw,
+        { type: "command", command: '"/s/skillfleet" hook run claude-code' },
+        "claude-code",
+      );
     const stop = { Stop: [{ hooks: [{ type: "command", command: "echo stop" }] }] };
 
     it("keeps a handler added while it edits, by trying again on what is there now", () => {
