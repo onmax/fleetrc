@@ -74,7 +74,15 @@ it.each([true, false])(
   },
 );
 
-it.each(["command-specific user", "matching explicit IP", "different explicit user"])(
+const scenarios = [
+  "command-specific user",
+  "matching explicit IP",
+  "different explicit user",
+  "alias refresh",
+  "alias seed",
+];
+
+it.each(scenarios)(
   "attributes tagged reports to the actual SSH endpoint (%s)",
   async (scenario) => {
     const root = mkdtempSync(join(tmpdir(), "skillfleet-cache-"));
@@ -83,8 +91,11 @@ it.each(["command-specific user", "matching explicit IP", "different explicit us
     vi.stubEnv("SKILLFLEET_SSH", "ssh");
     const address = "100.64.0.5";
     const tag = "tag:servers";
+    const alias = "server-alias";
     const first = "2026-01-01T00:00:00Z";
     const second = "2026-01-01T00:01:00Z";
+    const third = "2026-01-01T00:02:00Z";
+    const fourth = "2026-01-01T00:03:00Z";
     const differentCommand = scenario === "command-specific user";
     const differentUser = scenario === "different explicit user";
     let online = true;
@@ -114,6 +125,7 @@ it.each(["command-specific user", "matching explicit IP", "different explicit us
       });
       return fleet(targets, action, "0.0.0");
     };
+    let latest = first;
     try {
       if (differentCommand) {
         expect(await run("sync", tag)).toMatchObject([
@@ -123,6 +135,30 @@ it.each(["command-specific user", "matching explicit IP", "different explicit us
         expect(await run("status", address)).toMatchObject([
           { lastRun: { finishedAt: second, host: "bob" } },
         ]);
+      } else if (scenario === "alias refresh" || scenario === "alias seed") {
+        if (scenario === "alias refresh") {
+          expect(await run("status", tag)).toMatchObject([
+            { host: address, via: tag, lastRun: { finishedAt: first } },
+          ]);
+        }
+        time = second;
+        expect(await run("status", alias, tag)).toMatchObject([
+          { host: alias, lastRun: { finishedAt: second } },
+        ]);
+        time = third;
+        expect(await run("status", address)).toMatchObject([
+          { host: address, lastRun: { finishedAt: third } },
+        ]);
+        online = false;
+        expect(await run("status", tag)).toMatchObject([
+          { host: address, error: "offline in Tailscale", lastRun: { finishedAt: third } },
+        ]);
+        online = true;
+        time = fourth;
+        expect(await run("status", alias)).toMatchObject([
+          { host: alias, lastRun: { finishedAt: fourth } },
+        ]);
+        latest = fourth;
       } else {
         const host = differentUser ? `bob@${address}` : address;
         const results = await run("status", host, tag);
@@ -133,7 +169,7 @@ it.each(["command-specific user", "matching explicit IP", "different explicit us
       const results = await run("status", tag);
       expect(results).toMatchObject([{ host: address, error: "offline in Tailscale" }]);
       expect(results[0]?.lastRun).toEqual(
-        differentUser ? undefined : expect.objectContaining({ finishedAt: first, host: "alice" }),
+        differentUser ? undefined : expect.objectContaining({ finishedAt: latest, host: "alice" }),
       );
     } finally {
       vi.unstubAllEnvs();

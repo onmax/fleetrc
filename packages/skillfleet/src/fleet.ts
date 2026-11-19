@@ -202,7 +202,7 @@ function summarize(raw: unknown): HostResult["lastRun"] {
 
 type CachedRun = {
   run: NonNullable<HostResult["lastRun"]>;
-  destination?: string;
+  destinations?: string[];
   endpoint?: string;
 };
 
@@ -213,9 +213,14 @@ function readCache(): Record<string, CachedRun> {
     for (const [host, entry] of Object.entries(raw)) {
       const run = summarize(entry);
       if (run && isRecord(entry)) {
+        const destinations = Array.isArray(entry.destinations)
+          ? entry.destinations.filter((value) => typeof value === "string")
+          : typeof entry.destination === "string"
+            ? [entry.destination]
+            : undefined;
         cache[host] = {
           run,
-          destination: typeof entry.destination === "string" ? entry.destination : undefined,
+          destinations,
           endpoint: typeof entry.endpoint === "string" ? entry.endpoint : undefined,
         };
       }
@@ -394,19 +399,31 @@ export async function fleet(
               effective && hostKey(effective.name) === hostKey(host)
                 ? endpointKey(effective)
                 : undefined;
-            cache[cacheKey] = { run, destination: host, endpoint };
+            const previous = cache[cacheKey];
+            const known = endpoint && previous?.endpoint === endpoint ? previous.destinations : [];
+            const destinations = endpoint ? [...new Set([host, ...(known ?? [])])] : undefined;
+            cache[cacheKey] = { run, destinations, endpoint };
           } else {
             cache[host] = { run };
             if (refreshPeer) {
               const previous = cache[refreshPeer.key];
+              const taggedHost = refreshPeer.taggedHost;
               if (
                 previous
-                  ? (previous.destination === host || refreshPeer.seed) &&
+                  ? (previous.destinations?.includes(host) || taggedHost) &&
                     previous.endpoint === refreshPeer.endpoint &&
                     Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
-                  : refreshPeer.seed
-              )
-                cache[refreshPeer.key] = { run, destination: host, endpoint: refreshPeer.endpoint };
+                  : taggedHost
+              ) {
+                const destinations = new Set(previous?.destinations);
+                destinations.add(host);
+                if (taggedHost) destinations.add(taggedHost);
+                cache[refreshPeer.key] = {
+                  run,
+                  destinations: [...destinations],
+                  endpoint: refreshPeer.endpoint,
+                };
+              }
             }
           }
         }
@@ -520,7 +537,7 @@ export const fleetEntryProblem = (entry: string) =>
 export interface FleetTarget {
   host: string;
   cacheKey?: string;
-  refreshPeer?: { key: string; endpoint: string; seed?: true };
+  refreshPeer?: { key: string; endpoint: string; taggedHost?: string };
   /** The tag the host came from. */
   via?: string;
   /** Tailscale says the machine is offline, so ssh is not tried. */
@@ -792,7 +809,7 @@ export async function resolveFleet(
   const cachedDestinations = new Set(
     explicit.length
       ? Object.entries(readCache()).flatMap(([key, record]) =>
-          stableCacheKey(key) && record.endpoint && record.destination ? [record.destination] : [],
+          stableCacheKey(key) && record.endpoint ? (record.destinations ?? []) : [],
         )
       : [],
   );
@@ -896,7 +913,7 @@ export async function resolveFleet(
             const taggedTarget = await probe;
             if (!taggedTarget || endpointKey(taggedTarget) !== endpoint) return;
           }
-          refresh.set(entry, { key: selected.cacheKey, endpoint, seed: true });
+          refresh.set(entry, { key: selected.cacheKey, endpoint, taggedHost: selected.host });
         }),
       );
     }
