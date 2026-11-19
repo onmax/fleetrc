@@ -632,7 +632,12 @@ export async function mergeSkill(
   const result = await mergeTrees(store.live, store.base, store.upstream, dryRun);
   if (dryRun) return { ...result, ...(resolved ? { resolved } : {}), into: store.live };
   copyDir(store.upstream, store.base);
-  sourceState.skills[name] = { ...sourceState.skills[name], hashes: hashDir(store.upstream) };
+  const pending = sourceState.pending[name];
+  sourceState.skills[name] = {
+    ...sourceState.skills[name],
+    hashes: hashDir(store.upstream),
+    ...(source.kind === "git" ? { path: pending?.path, commit: pending?.commit ?? null } : {}),
+  };
   rmSync(store.upstream, { recursive: true, force: true });
   delete sourceState.pending[name];
   saveState(state);
@@ -670,10 +675,16 @@ export async function forkSkill(
   if (!existsSync(store.live))
     throw new UserError(`${name} has no copy on this machine yet; run \`skillfleet sync\``);
   const sourceState = state.sources[source.id]!;
+  const installed = sourceState.skills[name];
+  const base = installed?.commit === undefined ? sourceState.commit : installed.commit;
+  if (!base || installed?.path === undefined)
+    throw new UserError(
+      `cannot verify the git base of ${name}; run \`skillfleet sync\` online before forking`,
+    );
   const fork: Fork = {
     from: source.git,
-    path: sourceState.skills[name]?.path ?? name,
-    base: sourceState.commit ?? "",
+    path: installed.path,
+    base,
   };
   const excluded = source.origin === loaded.root.file;
   const manifest = manifestToEdit(
