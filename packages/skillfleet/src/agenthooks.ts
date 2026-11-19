@@ -409,7 +409,20 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
   }
   for (const event of EVENTS) {
     const own = ownHandlers({ hooks: { [event]: hooks[event] } });
-    if (own.length === 1 && sameHandler(own[0]!.handler, handler)) continue;
+    // Already there once, in a group that runs for every session start: nothing to do.
+    const holder = Array.isArray(hooks[event])
+      ? (hooks[event] as unknown[]).find(
+          (group: unknown) =>
+            isRecord(group) && Array.isArray(group.hooks) && group.hooks.includes(own[0]?.handler),
+        )
+      : undefined;
+    if (
+      own.length === 1 &&
+      sameHandler(own[0]!.handler, handler) &&
+      isRecord(holder) &&
+      catchAll(holder)
+    )
+      continue;
     if (agent === "codex" && Array.isArray(hooks[event])) {
       // Codex keys a hook's approval to its place, so an older entry of skillfleet's is replaced
       // where it stands, and any others become no-ops where a hook after them would move.

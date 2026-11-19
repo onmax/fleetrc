@@ -488,6 +488,21 @@ describe("hook install and remove", () => {
     expect(groups[0]!.hooks[1]).toEqual(custom);
     expect(groups.at(-1)!.matcher).toBeUndefined();
     expect(line(groups.at(-1)!.hooks[0]!)).toMatch(/hook run codex/);
+    // The current entry under a matcher, as an edit by hand may leave it, moves out too.
+    const current = groups.at(-1)!.hooks[0]!;
+    writeFileSync(
+      file,
+      JSON.stringify({
+        hooks: { SessionStart: [{ matcher: "resume", hooks: [current, custom] }] },
+      }),
+    );
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    const moved = (
+      JSON.parse(read(file)).hooks as { SessionStart: { matcher?: string; hooks: Entry[] }[] }
+    ).SessionStart;
+    expect(moved[0]!.hooks[1]).toEqual(custom);
+    expect(moved.at(-1)!.matcher).toBeUndefined();
+    expect(moved.at(-1)!.hooks).toEqual([current]);
     // Once removed, the no-op left in its place starts nothing, so status lists no hook.
     expect((await m.run("hook", "remove", "codex")).code).toBe(0);
     expect(JSON.parse(read(file)).hooks.SessionStart[0].hooks[1]).toEqual(custom);
