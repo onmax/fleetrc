@@ -345,6 +345,7 @@ export async function fleet(
         offline,
         error,
         cacheKey = host,
+        endpoint,
         refreshPeer,
       } = typeof target === "string" ? { host: target } : target;
       const lastRun = cache[cacheKey]?.run;
@@ -392,13 +393,6 @@ export async function fleet(
       if (run) {
         if (!dryRun) {
           if (cacheKey !== host) {
-            const effective = stableCacheKey(cacheKey)
-              ? await effectiveDestination(host, remoteCommand, timeoutMs, Math.min(750, timeoutMs))
-              : undefined;
-            const endpoint =
-              effective && hostKey(effective.name) === hostKey(host)
-                ? endpointKey(effective)
-                : undefined;
             const previous = cache[cacheKey];
             const known = endpoint && previous?.endpoint === endpoint ? previous.destinations : [];
             const destinations = endpoint ? [...new Set([host, ...(known ?? [])])] : undefined;
@@ -540,6 +534,7 @@ export const fleetEntryProblem = (entry: string) =>
 export interface FleetTarget {
   host: string;
   cacheKey?: string;
+  endpoint?: string;
   refreshPeer?: { key: string; endpoint: string; taggedHost?: string };
   /** The tag the host came from. */
   via?: string;
@@ -741,14 +736,12 @@ async function effectiveDestination(
   );
   if (run.code !== 0 || run.timedOut || run.truncated) return undefined;
   if (/^proxy(?:command|jump) (?!none\r?$)/im.test(run.stdout)) return undefined;
-  const hostname = /^hostname (\S+)\r?$/m.exec(run.stdout)?.[1];
-  const name = hostname?.replace(/\.$/, "");
-  if (!name || !tailnetHost(name)) return undefined;
+  const name = /^hostname (\S+)\r?$/m.exec(run.stdout)?.[1];
+  if (!name || !tailnetHost(name.replace(/\.$/, ""))) return undefined;
   return {
     name,
     user: /^user (\S+)\r?$/m.exec(run.stdout)?.[1],
     port: /^port (\d+)\r?$/m.exec(run.stdout)?.[1],
-    proxied: /^proxy(?:command|jump) (?!none\r?$)\S/m.test(run.stdout),
   };
 }
 
@@ -756,9 +749,8 @@ function endpointKey({
   name,
   user,
   port,
-  proxied,
 }: NonNullable<Awaited<ReturnType<typeof effectiveDestination>>>) {
-  return !proxied && user && port ? JSON.stringify([hostKey(name), user, port]) : undefined;
+  return user && port ? JSON.stringify([hostKey(name), user, port]) : undefined;
 }
 
 const stablePeerKey = (peer: TailscalePeer) => (peer.id ? `tag-peer:id:${peer.id}` : undefined);
@@ -789,16 +781,13 @@ function sshTarget(entry: string): { machine: string; user: string; port: string
 
 /**
  * The hosts to run on: the explicit ones as they are, and each `tag:` entry as every tailnet
- * machine with that tag, by MagicDNS name, or its first usable Tailscale IP when the name is
- * unavailable locally. Tailscale is asked once for tags or to verify a cached tagged destination.
- * A machine named
- * twice runs once. Entries are compared by the machine they reach: an IPv6 address in any
- * spelling, a MagicDNS name or its short name, and, when Tailscale was asked, any name or IP of the
- * same peer. Two explicit entries for one machine run once when they also have the same user and
- * port; an explicit host wins over a tag's match for its machine, whatever its user or port, and
- * the first tag wins over later ones. A tag that matches nothing gets a warning, and so does a
- * machine whose name ssh can't take; a tag that can't be expanded comes back as a target with its
- * `error`.
+ * machine with that tag, preferring MagicDNS and falling back to a Tailscale IP. Online tag
+ * destinations must resolve to the peer after OpenSSH configuration is applied. Tailscale is
+ * asked once for tags or to verify a cached tagged destination. Explicit SSH names retain their
+ * spelling unless verified to reach the same peer with the same user and port. Numeric IPv6
+ * spellings are normalized separately. An explicit host wins over a tag's match for its machine,
+ * whatever its user or port, and the first tag wins over later ones. An empty tag or a peer with
+ * no usable name or address gets a warning; failures to expand or verify get an `error`.
  */
 export async function resolveFleet(
   entries: readonly string[],
@@ -826,7 +815,7 @@ export async function resolveFleet(
     string,
     { peer: TailscalePeer; index: number; user?: string; port?: string }
   >();
-  const destination = new Map<TailscalePeer, { host: string; cacheKey: string }>();
+  const destination = new Map<TailscalePeer, FleetTarget>();
   const refresh = new Map<string, NonNullable<FleetTarget["refreshPeer"]>>();
   if ("peers" in answer) {
     const peers = answer.peers.map((peer, index) => ({
@@ -840,33 +829,38 @@ export async function resolveFleet(
     const budget = Math.min(1500, timeoutMs);
     const deadline = performance.now() + budget;
     const remoteCommand = sshRemoteCommand(action, version, dryRun);
-    const effective = await Promise.all(
-      explicit.map(async (entry) =>
-        tagged.length || cachedDestinations.has(entry)
-          ? effectiveDestination(entry, remoteCommand, timeoutMs, budget / 2)
-          : undefined,
+    const entriesToProbe = new Set([
+      ...(tagged.length ? explicit : probes),
+      ...tagged.flatMap(({ peer, dns, ips }) => (peer.online ? [...(dns ? [dns] : []), ...ips] : [])),
+    ]);
+    const effective = new Map(
+      await Promise.all(
+        [...entriesToProbe].map(async (entry) => {
+          const target = await effectiveDestination(entry, remoteCommand, timeoutMs, budget / 2);
+          return [entry, target] as const;
+        }),
       ),
     );
     const names = [
-      ...new Set([
-        ...tagged.flatMap(({ peer, dns, ips }) => (peer.online && dns && ips.length ? [dns] : [])),
-        ...effective.flatMap((target) => (target && !isIP(target.name) ? [target.name] : [])),
-      ]),
+      ...new Set(
+        [...effective.values()].flatMap((target) =>
+          target && !isIP(target.name) ? [target.name] : [],
+        ),
+      ),
     ];
     const found = await verifyAddresses(
       names,
       Math.max(0, deadline - performance.now()),
       addresses,
     );
-    const matches = (name: string, { dns, ips }: (typeof peers)[number]) => {
-      if (!ips.length) return dns !== undefined && hostKey(name) === hostKey(dns);
+    const matches = (name: string, { ips }: (typeof peers)[number]) => {
       const resolved = isIP(name) ? [name] : (found.get(name) ?? []);
       const keys = ips.map(hostKey);
       return resolved.length > 0 && resolved.every((ip) => keys.includes(hostKey(ip)));
     };
-    for (const [index, target] of effective.entries()) {
-      const entry = explicit[index];
-      if (!target || entry === undefined) continue;
+    for (const entry of explicit) {
+      const target = effective.get(entry);
+      if (!target) continue;
       const candidates = peers.filter((candidate) => matches(target.name, candidate));
       const candidate = candidates.length === 1 ? candidates[0] : undefined;
       if (!candidate) continue;
@@ -878,47 +872,40 @@ export async function resolveFleet(
     }
     for (const candidate of tagged) {
       const { peer, dns, ips } = candidate;
-      const overridden =
-        dns !== undefined &&
-        explicit.some((entry, index) => {
-          const name = effective[index]?.name;
-          return hostKey(entry) === hostKey(dns) && name !== undefined && !matches(name, candidate);
-        });
-      const useDNS =
-        dns && (!ips.length || !peer.online || (!overridden && matches(dns, candidate)));
-      const host = (useDNS ? dns : undefined) ?? ips[0];
-      if (!host) continue;
-      const cacheKey = stablePeerKey(peer) ?? `tag-peer:address:${hostKey(ips[0] ?? host)}`;
-      destination.set(peer, { host, cacheKey });
+      const preferred = dns ?? ips[0];
+      if (!preferred) continue;
+      const cacheKey = stablePeerKey(peer) ?? `tag-peer:address:${hostKey(ips[0] ?? preferred)}`;
+      if (!peer.online) {
+        destination.set(peer, { host: preferred, cacheKey, offline: true });
+        continue;
+      }
+      const candidates = dns ? [dns, ...ips] : ips;
+      destination.set(peer, {
+        host: preferred,
+        cacheKey,
+        error: "could not verify an SSH route to the Tailscale peer",
+      });
+      for (const host of candidates) {
+        const target = effective.get(host);
+        if (!target || !matches(target.name, candidate)) continue;
+        const endpoint = stableCacheKey(cacheKey) ? endpointKey(target) : undefined;
+        destination.set(peer, { host, cacheKey, endpoint });
+        break;
+      }
     }
     if (!dryRun) {
-      const tagEndpoints = new Map<string, ReturnType<typeof effectiveDestination>>();
-      await Promise.all(
-        explicit.map(async (entry, index) => {
-          const candidate = peerOf.get(entry);
-          const selected = candidate && destination.get(candidate.peer);
-          const target = effective[index];
-          if (!candidate || !selected || !target || !stableCacheKey(selected.cacheKey)) return;
-          if (!peers[candidate.index]?.ips.length) return;
-          const endpoint = endpointKey(target);
-          if (!endpoint || hostKey(target.name) !== hostKey(selected.host)) return;
-          if (entry !== selected.host) {
-            let probe = tagEndpoints.get(selected.host);
-            if (!probe) {
-              probe = effectiveDestination(
-                selected.host,
-                remoteCommand,
-                timeoutMs,
-                Math.max(0, deadline - performance.now()),
-              );
-              tagEndpoints.set(selected.host, probe);
-            }
-            const taggedTarget = await probe;
-            if (!taggedTarget || endpointKey(taggedTarget) !== endpoint) return;
-          }
-          refresh.set(entry, { key: selected.cacheKey, endpoint, taggedHost: selected.host });
-        }),
-      );
+      for (const entry of explicit) {
+        const candidate = peerOf.get(entry);
+        const selected = candidate && destination.get(candidate.peer);
+        const target = effective.get(entry);
+        if (!selected?.cacheKey || !selected.endpoint || !target) continue;
+        if (endpointKey(target) !== selected.endpoint) continue;
+        refresh.set(entry, {
+          key: selected.cacheKey,
+          endpoint: selected.endpoint,
+          taggedHost: selected.host,
+        });
+      }
     }
   }
   const explicitPeers = new Set([...peerOf.values()].map(({ peer }) => peer));
@@ -928,7 +915,8 @@ export async function resolveFleet(
     if (!isTag(entry)) {
       const target = sshTarget(entry);
       const peer = peerOf.get(entry);
-      const machine = peer ? `peer:${peer.index}` : `host:${hostKey(target.machine)}`;
+      const name = isIP(target.machine) === 6 ? hostKey(target.machine) : target.machine;
+      const machine = peer ? `peer:${peer.index}` : `host:${name}`;
       const key = [machine, target.user, target.port, peer?.user, peer?.port].join("\0");
       const refreshPeer = refresh.get(entry);
       if (!seen.has(key)) targets.push({ host: entry, ...(refreshPeer ? { refreshPeer } : {}) });
@@ -951,10 +939,10 @@ export async function resolveFleet(
         );
         continue;
       }
-      const id = hostKey(selected.host);
+      const id = `tag:${selected.cacheKey}`;
       if (explicitPeers.has(peer) || seen.has(id)) continue;
       seen.add(id);
-      targets.push({ ...selected, via: entry, ...(peer.online ? {} : { offline: true }) });
+      targets.push({ ...selected, via: entry });
     }
   }
   return { targets, warnings };

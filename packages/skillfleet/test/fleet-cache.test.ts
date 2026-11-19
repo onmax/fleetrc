@@ -7,6 +7,74 @@ import { fleet, resolveFleet, type FleetAction } from "../src/fleet.ts";
 
 vi.mock("../src/exec.ts", () => ({ exec: vi.fn() }));
 
+it.each(["status", "sync", "upgrade"] as const)(
+  "verifies tag-only SSH routes before dispatching %s or attributing a report",
+  async (action) => {
+    const root = mkdtempSync(join(tmpdir(), "skillfleet-cache-"));
+    vi.stubEnv("XDG_STATE_HOME", root);
+    vi.stubEnv("SKILLFLEET_TAILSCALE", "tailscale");
+    vi.stubEnv("SKILLFLEET_SSH", "ssh");
+    const name = "server.tail.test";
+    const address = "100.64.0.5";
+    const tag = "tag:servers";
+    let online = true;
+    let redirectedIP = false;
+    const dispatched: string[] = [];
+    vi.mocked(exec).mockImplementation(async (command, args) => {
+      const host = args[args.indexOf("--") + 1] ?? "";
+      let stdout: string;
+      if (command === "tailscale") {
+        stdout = JSON.stringify({
+          Peer: {
+            server: {
+              ID: "server",
+              DNSName: `${name}.`,
+              TailscaleIPs: [address],
+              Tags: [tag],
+              Online: online,
+            },
+          },
+        });
+      } else if (args.includes("-G")) {
+        const destination = host === name || redirectedIP ? "100.64.0.6" : host;
+        stdout = `hostname ${destination}\nuser alice\nport 22\n`;
+      } else {
+        dispatched.push(host);
+        stdout = JSON.stringify({ finishedAt: "2026-01-01T00:00:00Z", ok: true, skills: 1, host });
+      }
+      return { stdout, stderr: "", code: 0, timedOut: false, truncated: false };
+    });
+    const run = async () => {
+      const { targets } = await resolveFleet([tag], async () => [address], 30_000, {
+        action,
+        version: "0.0.0",
+      });
+      return fleet(targets, action, "0.0.0");
+    };
+    try {
+      redirectedIP = true;
+      expect(await run()).toMatchObject([{ via: tag, reachable: false, checked: false }]);
+      expect(dispatched).toEqual([]);
+      online = false;
+      expect((await run())[0]?.lastRun).toBeUndefined();
+      online = true;
+      redirectedIP = false;
+      expect(await run()).toMatchObject([{ host: address, lastRun: { host: address } }]);
+      online = false;
+      expect(await run()).toMatchObject([{ host: name, lastRun: { host: address } }]);
+      expect(dispatched).toEqual([address]);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+it("preserves distinct spellings of unverified SSH aliases", async () => {
+  const { targets } = await resolveFleet(["localhost", "localhost.", "LOCALHOST", "localhost"]);
+  expect(targets).toEqual([{ host: "localhost" }, { host: "localhost." }, { host: "LOCALHOST" }]);
+});
+
 it.each([true, false])(
   "refreshes offline reports only for the same peer and endpoint (reassigned: %s)",
   async (reassigned) => {
