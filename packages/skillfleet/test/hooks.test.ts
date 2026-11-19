@@ -16,6 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import {
   editHooksFile,
@@ -922,6 +923,46 @@ describe("the hooks on shared and upgraded machines", () => {
     expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
     expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
     expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
+  });
+
+  it("announces a skill first linked after recovering an interrupted source checkpoint", async () => {
+    const { m, mine } = await hooked();
+    const stateFile = join(m.stateDir, "state.json");
+    const state = () => JSON.parse(read(stateFile));
+    const installed = m.at(".claude", "skills", "early", "SKILL.md");
+    const stop = join(m.root, "stop.mjs");
+    writeFileSync(
+      stop,
+      `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (to === ${JSON.stringify(stateFile)}) {
+          const state = JSON.parse(fs.readFileSync(to, "utf8"));
+          if (state.skillChanges?.mine?.all) process.exit(86);
+        }
+      };
+      syncBuiltinESMExports();
+    `,
+    );
+    writeFiles(mine, { "skills/early/SKILL.md": skillMd("early") });
+    const stopped = await m.runWith(
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
+      "sync",
+    );
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
+    const checkpoint = state().skillChanges.mine.all;
+    expect(existsSync(installed)).toBe(false);
+
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
+    expect((await m.run("sync")).code).toBe(0);
+    expect(existsSync(installed)).toBe(true);
+    expect(state().skills.early.changedAt).toBe(checkpoint);
+    expect((await hook(m, "claude-code", PROMPT)).stdout).toContain("available now: early");
+    expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
   });
 
   it("gives a session resumed after a week a fresh record on its start", async () => {
