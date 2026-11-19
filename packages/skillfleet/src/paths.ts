@@ -45,8 +45,6 @@ export const paths = {
   state: () => join(stateDir(), "state.json"),
   lastRun: () => join(stateDir(), "last-run.json"),
   fleet: () => join(stateDir(), "fleet.json"),
-  /** Claude Code sessions, one record each (sessions.ts). */
-  sessions: () => join(stateDir(), "sessions"),
   lock: () => join(stateDir(), "sync.lock"),
   store: (source: string) => join(stateDir(), "store", source),
   cache: () => join(stateDir(), "cache"),

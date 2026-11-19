@@ -3,7 +3,7 @@
 // through a shell, or for Claude Code's exec form on Windows as node and args with no shell, from
 // a parent process that exits as soon as the hook does. The sync each hook
 // starts must outlive both and link the skill that landed upstream. Then a fresh attempt starts no
-// second sync, and `hook remove` takes skillfleet's entries out.
+// second sync, init wrote no prompt hook, and `hook remove` takes skillfleet's entries out.
 //
 //   pnpm --filter skillfleet build
 //   (cd packages/skillfleet && pnpm pack --out ../../skillfleet.tgz)
@@ -170,7 +170,7 @@ try {
   assert.match(init.stdout, /^Codex: added skillfleet's hook/m);
   assert.doesNotMatch(init.stdout, /^installed a /m, "init installed a timer");
   const status = JSON.parse(skillfleet("status", "--json").stdout);
-  assert.deepEqual(status.trigger, { hooks: ["claude-code", "codex"], timer: false, promptOnly: [] });
+  assert.deepEqual(status.trigger, { hooks: ["claude-code", "codex"], timer: false });
 
   for (const [agent, file] of [
     ["Claude Code", join(home, ".claude", "settings.json")],
@@ -199,13 +199,12 @@ try {
     assert.equal(lastRun().ok, true, JSON.stringify(lastRun(), null, 2));
     assert.ok(existsSync(join(claudeSkills, name, "SKILL.md")), `${name} is not linked`);
 
-    step(`${agent}: a prompt right after starts no second sync`);
-    const said = await runAsAgent(hookEntry(file, "UserPromptSubmit"), "UserPromptSubmit");
-    // Claude Code's session started before its sync linked the skill, so its first prompt is told;
-    // Codex reads skills only when a session starts, and is told nothing.
-    if (agent === "Claude Code") assert.match(said, new RegExp(`available now: ${name}\\.`));
-    else assert.equal(said, "");
+    step(`${agent}: a second session right after starts no second sync`);
+    assert.equal(await runAsAgent(hookEntry(file, "SessionStart"), "SessionStart"), "");
     assert.equal(startedSyncs().length, syncs + 1, "a fresh attempt started another sync");
+    // Syncs start only with a session: nothing runs on each prompt.
+    const raw = JSON.parse(readFileSync(file, "utf8"));
+    assert.equal(raw.hooks.UserPromptSubmit, undefined, `${file} has a prompt hook`);
   }
 
   const removal = skillfleet("hook", "remove");
