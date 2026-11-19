@@ -490,6 +490,7 @@ export async function fleet(
         error,
         cacheKey = host,
         endpoint,
+        initRetryRoute,
         refreshPeer,
       } = typeof target === "string" ? { host: target } : target;
       const lastRun = cache[cacheKey]?.run;
@@ -520,7 +521,7 @@ export async function fleet(
           ...setup,
           expectedConfig: answer.has,
         });
-        if (cacheKey !== host || refreshPeer) {
+        if (initRetryRoute || refreshPeer) {
           const retryTarget = await effectiveDestination(
             host,
             retryCommand,
@@ -528,7 +529,8 @@ export async function fleet(
             Math.min(750, timeoutMs),
           );
           const retryEndpoint = retryTarget && endpointKey(retryTarget);
-          if (cacheKey !== host && (!retryEndpoint || retryEndpoint !== endpoint))
+          const retryRoute = retryTarget && retryRouteKey(retryTarget);
+          if (initRetryRoute && (!retryRoute || retryRoute !== initRetryRoute.key))
             return {
               host,
               ...from,
@@ -574,9 +576,7 @@ export async function fleet(
           const stableEndpoint = stableCacheKey(cacheKey) ? endpoint : undefined;
           const known =
             stableEndpoint && previous?.endpoint === stableEndpoint ? previous.destinations : [];
-          const destinations = stableEndpoint
-            ? [...new Set([host, ...(known ?? [])])]
-            : undefined;
+          const destinations = stableEndpoint ? [...new Set([host, ...(known ?? [])])] : undefined;
           cache[cacheKey] = { run, destinations, endpoint: stableEndpoint };
         } else {
           cache[host] = { run };
@@ -737,6 +737,7 @@ export interface FleetTarget {
   host: string;
   cacheKey?: string;
   endpoint?: string;
+  initRetryRoute?: { key?: string };
   refreshPeer?: { key: string; endpoint: string; taggedHost?: string };
   /** The tag the host came from. */
   via?: string;
@@ -950,15 +951,19 @@ async function effectiveDestination(
     name,
     user: /^user (\S+)\r?$/m.exec(run.stdout)?.[1],
     port: /^port (\d+)\r?$/m.exec(run.stdout)?.[1],
+    family: /^addressfamily (inet6?)\r?$/m.exec(run.stdout)?.[1],
   };
 }
 
-function endpointKey({
-  name,
-  user,
-  port,
-}: NonNullable<Awaited<ReturnType<typeof effectiveDestination>>>) {
+type EffectiveDestination = NonNullable<Awaited<ReturnType<typeof effectiveDestination>>>;
+
+function endpointKey({ name, user, port }: EffectiveDestination) {
   return user && port ? JSON.stringify([sshHostKey(name), user, port]) : undefined;
+}
+
+function retryRouteKey(target: EffectiveDestination) {
+  const endpoint = endpointKey(target);
+  return endpoint && JSON.stringify([endpoint, target.family]);
 }
 
 const stablePeerKey = (peer: TailscalePeer) => (peer.id ? `tag-peer:id:${peer.id}` : undefined);
@@ -1033,7 +1038,7 @@ export async function resolveFleet(
       : { peers: [], magicDNS: true };
   const peerOf = new Map<
     string,
-    { peer: TailscalePeer; index: number; user?: string; port?: string }
+    { peer: TailscalePeer; index: number; target: EffectiveDestination }
   >();
   const destination = new Map<TailscalePeer, FleetTarget>();
   const refresh = new Map<string, NonNullable<FleetTarget["refreshPeer"]>>();
@@ -1048,6 +1053,7 @@ export async function resolveFleet(
       peer.tags.some((tag) => tagNames.has(tag.toLowerCase())),
     );
     const budget = Math.min(1500, timeoutMs);
+    const probeTimeout = budget / 2;
     const deadline = performance.now() + budget;
     const remoteCommand = sshRemoteCommand(action, version, dryRun, setup);
     const entriesToProbe = new Set([
@@ -1055,30 +1061,31 @@ export async function resolveFleet(
       ...explicit.filter(
         (entry) => (variants.get(hostKey(sshTarget(entry).machine))?.size ?? 0) > 1,
       ),
-      ...tagged.flatMap(({ peer, dns, ips }) => (peer.online ? [...(dns ? [dns] : []), ...ips] : [])),
+      ...tagged.flatMap(({ peer, dns, ips }) =>
+        peer.online ? [...(dns ? [dns] : []), ...ips] : [],
+      ),
     ]);
-    const effective = new Map(
-      await Promise.all(
-        [...entriesToProbe].map(async (entry) => {
-          const target = await effectiveDestination(entry, remoteCommand, timeoutMs, budget / 2);
-          return [entry, target] as const;
-        }),
-      ),
+    const pending = entriesToProbe.values();
+    const effective = new Map<string, EffectiveDestination>();
+    await Promise.all(
+      Array.from({ length: Math.min(12, entriesToProbe.size) }, async () => {
+        for (const entry of pending) {
+          const target = await effectiveDestination(entry, remoteCommand, timeoutMs, probeTimeout);
+          if (target) effective.set(entry, target);
+        }
+      }),
     );
-    const names = [
-      ...new Set(
-        [...effective.values()].flatMap((target) =>
-          target && !isIP(target.name) ? [target.name] : [],
-        ),
-      ),
-    ];
+    const names = new Set<string>();
+    for (const { name } of effective.values()) if (!isIP(name)) names.add(name);
     const found = await verifyAddresses(
-      names,
-      Math.max(0, deadline - performance.now()),
+      [...names],
+      Math.max(probeTimeout, deadline - performance.now()),
       addresses,
     );
-    const matches = (name: string, { ips }: (typeof peers)[number]) => {
-      const resolved = isIP(name) ? [name] : (found.get(name) ?? []);
+    const matches = ({ name, family }: EffectiveDestination, { ips }: (typeof peers)[number]) => {
+      const resolved = (isIP(name) ? [name] : (found.get(name) ?? [])).filter(
+        (ip) => !family || isIP(ip) === (family === "inet" ? 4 : 6),
+      );
       const keys = ips.map(hostKey);
       return resolved.length > 0 && resolved.every((ip) => keys.includes(hostKey(ip)));
     };
@@ -1087,10 +1094,10 @@ export async function resolveFleet(
       if (!target) continue;
       const endpoint = endpointKey(target);
       if (endpoint) aliases.set(entry, endpoint);
-      const candidates = peers.filter((candidate) => matches(target.name, candidate));
+      const candidates = peers.filter((candidate) => matches(target, candidate));
       const candidate = candidates.length === 1 ? candidates[0] : undefined;
       if (!candidate) continue;
-      if (tagged.length) peerOf.set(entry, { ...candidate, user: target.user, port: target.port });
+      if (tagged.length) peerOf.set(entry, { ...candidate, target });
       const key = stablePeerKey(candidate.peer);
       if (cachedDestinations.has(entry) && candidate.ips.length && key && endpoint)
         refresh.set(entry, { key, endpoint });
@@ -1112,8 +1119,15 @@ export async function resolveFleet(
       });
       for (const host of candidates) {
         const target = effective.get(host);
-        if (!target || !matches(target.name, candidate)) continue;
-        destination.set(peer, { host, cacheKey, endpoint: endpointKey(target) });
+        if (!target || !matches(target, candidate)) continue;
+        const endpoint = stableCacheKey(cacheKey) ? endpointKey(target) : undefined;
+        const initRetryRoute = action === "init" ? { key: retryRouteKey(target) } : undefined;
+        destination.set(peer, {
+          host,
+          cacheKey,
+          endpoint,
+          ...(initRetryRoute && { initRetryRoute }),
+        });
         break;
       }
     }
@@ -1122,15 +1136,20 @@ export async function resolveFleet(
         const candidate = peerOf.get(entry);
         const selected = candidate && destination.get(candidate.peer);
         const target = effective.get(entry);
-        if (!selected?.cacheKey || !selected.endpoint || !target) continue;
+        if (!selected?.cacheKey || selected.error || selected.offline || !target) continue;
         const taggedTarget = effective.get(selected.host);
         const { user, port } = sshTarget(entry);
         if (
-          !user && !port && target.user === taggedTarget?.user && target.port === taggedTarget?.port
+          !user &&
+          !port &&
+          taggedTarget &&
+          endpointKey(taggedTarget) &&
+          target.user === taggedTarget.user &&
+          target.port === taggedTarget.port
         )
           coveredByTags?.add(entry);
         const canRefresh = !dryRun && stableCacheKey(selected.cacheKey);
-        if (canRefresh && aliases.get(entry) === selected.endpoint)
+        if (canRefresh && selected.endpoint && aliases.get(entry) === selected.endpoint)
           refresh.set(entry, {
             key: selected.cacheKey,
             endpoint: selected.endpoint,
@@ -1161,11 +1180,25 @@ export async function resolveFleet(
         : endpoint
           ? `endpoint:${endpoint}`
           : `host:${sshHostKey(target.machine)}`;
-      const key = [machine, target.user, target.port, peer?.user, peer?.port].join("\0");
+      const key = [machine, target.user, target.port, peer?.target.user, peer?.target.port].join(
+        "\0",
+      );
       const existing = seen.get(key);
       if (!existing) {
         const refreshPeer = refresh.get(entry);
-        targets.push({ host: entry, ...(refreshPeer ? { refreshPeer } : {}) });
+        const effectiveTarget = peer?.target;
+        const initRetryRoute =
+          action === "init" &&
+          peer &&
+          explicitPeers.get(peer.peer) === entry &&
+          destination.has(peer.peer)
+            ? { key: effectiveTarget && retryRouteKey(effectiveTarget) }
+            : undefined;
+        targets.push({
+          host: entry,
+          ...(refreshPeer && { refreshPeer }),
+          ...(initRetryRoute && { initRetryRoute }),
+        });
         seen.set(key, entry);
       }
       enroll(existing ?? entry, entry);

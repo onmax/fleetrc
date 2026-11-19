@@ -11,7 +11,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import * as execution from "../src/exec.ts";
 import { fleet, formatFleet, type InitSetup, remoteScript, resolveFleet } from "../src/fleet.ts";
 import { hostManifestSpec, loadManifest, sameManifest } from "../src/manifest.ts";
 import { launchers } from "../src/selfinstall.ts";
@@ -437,13 +438,27 @@ describe("fleet tags", () => {
     ]);
     // Without a tag, Tailscale isn't asked, so a short name and a MagicDNS name stay apart: two
     // tailnets can each have a vps2.
-    const plain = await resolveFleet(["vps2", "vps2.tail.ts.net", "vps2.other.ts.net"]);
-    expect(plain.targets).toEqual([
-      { host: "vps2" },
-      { host: "vps2.tail.ts.net" },
-      { host: "vps2.other.ts.net" },
-      { host: "VPS2" },
-    ]);
+    const config = vi.spyOn(execution, "exec").mockImplementation(async (_command, args) => {
+      const host = args[args.indexOf("--") + 1];
+      return {
+        stdout: `hostname ${host === "VPS2" ? "192.0.2.2" : "192.0.2.1"}\nuser alice\nport 22\n`,
+        stderr: "",
+        code: 0,
+        timedOut: false,
+        truncated: false,
+      };
+    });
+    try {
+      const plain = await resolveFleet(["vps2", "vps2.tail.ts.net", "vps2.other.ts.net", "VPS2"]);
+      expect(plain.targets).toEqual([
+        { host: "vps2" },
+        { host: "vps2.tail.ts.net" },
+        { host: "vps2.other.ts.net" },
+        { host: "VPS2" },
+      ]);
+    } finally {
+      config.mockRestore();
+    }
   });
 
   it("runs on a machine's Tailscale IP when the tailnet has MagicDNS off", async () => {
@@ -478,6 +493,47 @@ describe("fleet tags", () => {
     });
     const { targets } = await withTailscale(program, () => resolveFleet(["web", "tag:servers"]));
     expect(targets).toMatchObject([{ host: "web" }, { host: "100.64.0.5", via: "tag:servers" }]);
+  });
+
+  it("dispatches to all tagged peers through bounded, address-family-aware probes", async () => {
+    const peers = Array.from({ length: 20 }, (_, index) =>
+      peer(`peer${index}.invalid`, ["tag:servers"], {
+        ips: [`100.64.0.${index + 1}`, `fd7a::${index + 1}`],
+      }),
+    );
+    const mixedDns = "peer1.invalid";
+    const hosts = peers.map((entry, index) => (index === 1 ? mixedDns : entry.TailscaleIPs[1]));
+    const dispatched: string[] = [];
+    let active = 0;
+    const exec = vi.spyOn(execution, "exec").mockImplementation(async (_command, args) => {
+      const result = { code: 0, stdout: "", stderr: "", truncated: false, timedOut: false };
+      if (args.includes("--json")) return { ...result, stdout: JSON.stringify(status(peers)) };
+      const host = args[args.indexOf("--") + 1]!;
+      if (!args.includes("-G")) {
+        dispatched.push(host);
+        return {
+          ...result,
+          code: hosts.includes(host) ? 0 : 255,
+          stdout: hosts.includes(host) ? "skillfleet-fleet: never-synced" : "",
+        };
+      }
+      const saturated = ++active > 12;
+      await Promise.resolve();
+      active--;
+      if (saturated) return { ...result, code: null, spawnError: "EMFILE" };
+      const record = peers.find(({ DNSName }) => DNSName === `${host}.`);
+      const name = host === mixedDns ? host : (record?.TailscaleIPs[0] ?? host);
+      return { ...result, stdout: `hostname ${name}\nuser alice\nport 22\naddressfamily inet6\n` };
+    });
+    try {
+      const addresses = async () => ["192.0.2.10", "fd7a::2"];
+      const { targets } = await resolveFleet(["tag:servers"], addresses);
+      const results = await fleet(targets, "status", "0.0.0", 30_000, { dryRun: true });
+      expect(dispatched).toEqual(hosts);
+      expect(results.every(({ reachable }) => reachable)).toBe(true);
+    } finally {
+      exec.mockRestore();
+    }
   });
 
   it("deduplicates an explicit SSH alias by its effective destination, not its name", async () => {

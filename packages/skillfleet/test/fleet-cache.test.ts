@@ -17,8 +17,7 @@ it("recognizes a tagged peer alias after a DNS timeout", async () => {
   const server = { DNSName: `${name}.`, TailscaleIPs: [address], Tags: [tag], Online: true };
   vi.mocked(exec).mockImplementation(async (command, args, options) => {
     const result = { stderr: "", code: 0, timedOut: false, truncated: false };
-    if (command === "tailscale")
-      return { ...result, stdout: JSON.stringify({ Peer: { server } }) };
+    if (command === "tailscale") return { ...result, stdout: JSON.stringify({ Peer: { server } }) };
     if (command === process.execPath) {
       await delay((options?.timeoutMs ?? 0) + 1);
       return { ...result, stdout: "", timedOut: true };
@@ -53,6 +52,7 @@ it.each([false, true])("only refreshes on the same retry route (%s)", async (cha
     same: (spec: string) => spec === observed,
   };
   let online = true;
+  let retries = 0;
   vi.mocked(exec).mockImplementation(async (command, args) => {
     const remote = args.at(-1) ?? "";
     const init = remote.includes(setup.spec);
@@ -73,6 +73,7 @@ it.each([false, true])("only refreshes on the same retry route (%s)", async (cha
         stderr: `skillfleet-fleet: has ${observed}\n`,
         stdout: "skillfleet-fleet: other-manifest\n",
       };
+    if (retry) retries++;
     return {
       ...result,
       stdout: JSON.stringify(
@@ -80,20 +81,30 @@ it.each([false, true])("only refreshes on the same retry route (%s)", async (cha
       ),
     };
   });
-  const run = async (action: FleetAction, entry: string) => {
+  const run = async (action: FleetAction, ...entries: string[]) => {
     const invocation = { action, version: "0.0.0", setup: action === "init" ? setup : undefined };
-    const { targets } = await resolveFleet([entry], undefined, 30_000, invocation);
-    return fleet(targets, action, invocation.version, 30_000, invocation);
+    const { targets, enrollment } = await resolveFleet(entries, undefined, 30_000, invocation);
+    const results = await fleet(targets, action, invocation.version, 30_000, invocation);
+    return { results, enrollment };
   };
   try {
-    expect(await run("status", tag)).toMatchObject([{ lastRun: { finishedAt: first } }]);
-    expect(await run("init", address)).toMatchObject([{ lastRun: { finishedAt: second } }]);
-    if (changed)
-      expect(await run("init", tag)).toMatchObject([
-        { error: "could not verify an unchanged SSH route to the Tailscale peer for the retry" },
-      ]);
+    expect((await run("status", tag)).results).toMatchObject([{ lastRun: { finishedAt: first } }]);
+    expect((await run("init", address)).results).toMatchObject([
+      { lastRun: { finishedAt: second } },
+    ]);
+    const rejected = {
+      error: "could not verify an unchanged SSH route to the Tailscale peer for the retry",
+    };
+    if (changed) expect((await run("init", tag)).results).toMatchObject([rejected]);
+    const named = await run("init", "alias", tag);
+    expect(named.enrollment.get("alias")).toEqual(["alias", tag]);
+    expect(named.results).toMatchObject([
+      changed ? rejected : { host: "alias", setup: "set up", lastRun: { finishedAt: second } },
+    ]);
+    expect(named.results[0]?.setup).toBe(changed ? undefined : "set up");
+    expect(retries).toBe(changed ? 1 : 2);
     online = false;
-    expect(await run("status", tag)).toMatchObject([
+    expect((await run("status", tag)).results).toMatchObject([
       { error: "offline in Tailscale", lastRun: { finishedAt: changed ? first : second } },
     ]);
   } finally {
