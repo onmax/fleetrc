@@ -159,12 +159,16 @@ const DISABLED_WINDOWS = "exit /b 0 & rem skillfleet: disabled legacy hook";
 const isDisabledCommand = (command: unknown) =>
   command === DISABLED_POSIX || command === DISABLED_WINDOWS;
 
+/** A matcher group that runs on every event of its kind: no matcher, or one that matches all. */
+const catchAll = (group: Record<string, unknown>) =>
+  group.matcher === undefined || group.matcher === "" || group.matcher === "*";
+
 /** One of the no-ops skillfleet leaves in place of an old Codex entry. */
 const isDisabled = (hook: unknown) =>
   isRecord(hook) &&
   hook.type === "command" &&
   hook.args === undefined &&
-  (hook.command === DISABLED_POSIX || hook.command === DISABLED_WINDOWS);
+  isDisabledCommand(hook.command);
 
 export const isOwnCommand = (command: unknown) =>
   typeof command === "string" && OWN_COMMAND.test(command.trim());
@@ -415,7 +419,9 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
           ? {
               ...group,
               hooks: group.hooks.map((hook: unknown) => {
-                if (placed || !isOwnHandler(hook) || isDisabled(hook)) return hook;
+                // Only a group that runs for every session start (no matcher) may hold it.
+                if (placed || !catchAll(group) || !isOwnHandler(hook) || isDisabled(hook))
+                  return hook;
                 placed = { ...handler };
                 return placed;
               }),

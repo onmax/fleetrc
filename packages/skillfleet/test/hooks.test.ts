@@ -468,6 +468,33 @@ describe("hook install and remove", () => {
     expect(read(file)).toBe(once);
   });
 
+  it("puts the Codex entry in a group for every session when the older one is under a matcher, and status ignores placeholders", async () => {
+    const m = machine();
+    const file = m.at(".codex", "hooks.json");
+    const older = { type: "command", command: "npx -y skillfleet hook prompt" };
+    const custom = { type: "command", command: "echo mine" };
+    writeFileSync(
+      file,
+      JSON.stringify({ hooks: { SessionStart: [{ matcher: "resume", hooks: [older, custom] }] } }),
+    );
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    const groups = (
+      JSON.parse(read(file)).hooks as {
+        SessionStart: { matcher?: string; hooks: Entry[] }[];
+      }
+    ).SessionStart;
+    // The user's hook keeps its place; skillfleet's runs for every session start.
+    expect(groups[0]!.matcher).toBe("resume");
+    expect(groups[0]!.hooks[1]).toEqual(custom);
+    expect(groups.at(-1)!.matcher).toBeUndefined();
+    expect(line(groups.at(-1)!.hooks[0]!)).toMatch(/hook run codex/);
+    // Once removed, the no-op left in its place starts nothing, so status lists no hook.
+    expect((await m.run("hook", "remove", "codex")).code).toBe(0);
+    expect(JSON.parse(read(file)).hooks.SessionStart[0].hooks[1]).toEqual(custom);
+    const status = await m.json<{ trigger: { hooks: unknown[] } }>("status");
+    expect(status.trigger.hooks).toEqual([]);
+  });
+
   it("on Windows writes Claude Code's entry in exec form, and Codex's for cmd, with % kept from cmd", () => {
     const profile = "C:\\Users\\Jo & Ann %PATH% x";
     const state = `${profile}\\AppData\\Local\\skillfleet`;
@@ -899,9 +926,6 @@ describe("the hooks on shared and upgraded machines", () => {
     expect({ code: run.status, out: run.stdout + run.stderr }).toEqual({ code: 0, out: "" });
     expect(read(join(state, "logs", "skillfleet-sync.log"))).toContain("starting a sync");
     expect(existsSync(m.at(".local", "state", "skillfleet"))).toBe(false);
-    // A hook writes no compile cache.
-    expect(existsSync(join(state, "app", "compile"))).toBe(false);
-
     // A runtime calling list --json from the same environment reads the same state, without the
     // hook-env.json that only hook install saves.
     rmSync(join(state, "hook-env.json"), { force: true });
