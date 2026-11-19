@@ -61,7 +61,7 @@ jobs:
   # Vitest against the built CLI, on Linux, macOS and Windows, with Node 22 and 24.
   test:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 15 }}
     strategy:
       fail-fast: false
       matrix:
