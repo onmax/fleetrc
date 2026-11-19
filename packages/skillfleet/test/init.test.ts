@@ -22,6 +22,7 @@ import {
   read,
   remote,
   skillMd,
+  isCompileCache,
   skills,
 } from "./fixture.ts";
 
@@ -35,6 +36,7 @@ function snapshot(dir: string): string[] {
       const path = join(current, name);
       const rel = relative(dir, path);
       if (rel === ".git" || rel.includes(`${join(".git", "")}`)) continue;
+      if (isCompileCache(rel)) continue;
       if (isLink(path)) out.push(`${rel} -> ${readlinkSync(path)}`);
       else if (statSync(path).isDirectory()) {
         out.push(`${rel}/`);

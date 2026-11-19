@@ -19,6 +19,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { listedPath } from "../src/linker.ts";
 import {
   clone,
+  isCompileCache,
   isLink,
   isWindows,
   machine,
@@ -40,6 +41,7 @@ function snapshot(root: string): Record<string, string> {
       const key = relative(root, path);
       // The fake scheduler's own log of the calls it answered.
       if (key === "scheduler-calls.jsonl") continue;
+      if (isCompileCache(key)) continue;
       const stat = lstatSync(path);
       if (stat.isSymbolicLink()) out[key] = `link ${readlinkSync(path)}`;
       else if (stat.isDirectory()) {
