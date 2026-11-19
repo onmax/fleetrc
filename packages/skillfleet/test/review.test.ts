@@ -704,7 +704,7 @@ describe("CX12. links to files count toward the copy limits", () => {
     await init(m, manifest);
     const tool = m.at(".claude", "skills", "tool", "SKILL.md");
     const before = read(tool);
-    const files: Files = {
+    const files: Record<string, string> = {
       "skills/tool/SKILL.md": skillMd("tool", "too wide"),
       "skills/other/SKILL.md": skillMd("other", "still updates"),
     };

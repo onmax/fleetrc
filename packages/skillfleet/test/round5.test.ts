@@ -47,17 +47,26 @@ async function init(m: Machine, manifest: string, ...args: string[]) {
 }
 
 describe("a sync stopped before it saved state.json", () => {
-  it("recovers a copy published just before a sync stopped", async () => {
+  it.each([false, true])("recovers a published copy (upstream moved: %s)", async (advanced) => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const manifest = m.manifest({
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url }],
+      hooks: [{ name: "changed", run: "echo changed", on: ["vendor:skills/tool/SKILL.md"] }],
     });
     await init(m, manifest);
+    const state = () =>
+      JSON.parse(read(join(m.stateDir, "state.json"))) as {
+        lastChange: string;
+        skills: { tool: { changedAt: string } };
+      };
+    const before = state();
     const live = join(m.stateDir, "store", "vendor", "live", "tool");
     const stop = join(m.root, "stop.mjs");
-    writeFileSync(stop, `
+    writeFileSync(
+      stop,
+      `
       import fs from "node:fs";
       import { syncBuiltinESMExports } from "node:module";
       import { normalize } from "node:path";
@@ -68,7 +77,8 @@ describe("a sync stopped before it saved state.json", () => {
           process.exit(86);
       };
       syncBuiltinESMExports();
-    `);
+    `,
+    );
     vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "published") });
     const stopped = await m.runWith(
       { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
@@ -76,11 +86,17 @@ describe("a sync stopped before it saved state.json", () => {
     );
     expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
     expect(read(join(live, "SKILL.md"))).toContain("published");
-    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "latest") });
+    if (advanced) vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "latest") });
     const report = await m.json("sync");
     expect(report.pending).toEqual([]);
     expect(report.edited).toEqual([]);
-    expect(read(join(live, "SKILL.md"))).toContain("latest");
+    expect(read(join(live, "SKILL.md"))).toContain(advanced ? "latest" : "published");
+    expect(report.skills.updated).toEqual(["tool"]);
+    expect(report.hooks.map((hook) => hook.code)).toEqual([0]);
+    const after = state();
+    expect(after.lastChange > before.lastChange).toBe(true);
+    expect(after.skills.tool.changedAt > before.skills.tool.changedAt).toBe(true);
+    expect((await m.json("sync")).hooks).toEqual([]);
   });
 
   it.skipIf(isWindows)(
@@ -111,10 +127,11 @@ describe("a sync stopped before it saved state.json", () => {
         hooks: [{ name: "hang", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
       });
       const copy = m.at(".claude", "skills", "tool", "SKILL.md");
-      const state = () => JSON.parse(read(join(m.stateDir, "state.json"))) as {
-        lastChange: string;
-        skills: { tool: { changedAt: string } };
-      };
+      const state = () =>
+        JSON.parse(read(join(m.stateDir, "state.json"))) as {
+          lastChange: string;
+          skills: { tool: { changedAt: string } };
+        };
       try {
         await init(m, manifest);
         const initial = state().lastChange;
@@ -246,14 +263,14 @@ describe("merge while a sync runs", () => {
       // records a conflict in tool, with the file it is waiting on.
       const script = join(m.root, "writer.mjs");
       const state = join(m.stateDir, "state.json");
+      const enabled = join(m.root, "writer.enabled");
       writeFileSync(
         script,
         [
-          `import { readFileSync, writeFileSync } from "node:fs";`,
+          `import { existsSync, readFileSync, writeFileSync } from "node:fs";`,
           `import { join } from "node:path";`,
+          `if (!existsSync(${JSON.stringify(enabled)})) process.exit(0);`,
           `const state = JSON.parse(readFileSync(${JSON.stringify(state)}, "utf8"));`,
-          // init's sync, which records the skill only as it ends, has no copy to point at yet.
-          `if (!state.skills.tool) process.exit(0);`,
           `const dir = state.skills.tool.dir;`,
           `writeFileSync(join(dir, "notes.md.upstream"), "theirs\\n");`,
           `state.conflicts = { tool: { dir, files: ["notes.md"], markers: { "notes.md": "notes.md.upstream" } } };`,
@@ -266,6 +283,7 @@ describe("merge while a sync runs", () => {
         hooks: [{ name: "writer", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
       });
       await init(m, manifest);
+      writeFileSync(enabled, "");
       vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
       const report = await m.json("sync");
       expect(report.hooks.map((hook) => hook.code)).toEqual([0]);
@@ -437,6 +455,24 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       "ssh://git@github.com/x.git",
     ])
       expect.soft(isRemoteGit(url), url).toBe(true);
+  });
+
+  it("uses the transport's config for the team Git redirect check", async () => {
+    const url = "https://example.com/team.git";
+    const redirects = `[http "${url}"]\n\tfollowRedirects = true\n`;
+    const alternate = write("alternate.gitconfig", redirects);
+    const previous = process.env.GIT_CONFIG;
+    process.env.GIT_CONFIG = alternate;
+    try {
+      expect(await teamGitProblem(url, root)).toBeUndefined();
+      write("gitconfig", redirects);
+      write("alternate.gitconfig", "");
+      expect(await teamGitProblem(url, root)).toMatch(/with Git redirects disabled/);
+    } finally {
+      if (previous === undefined) delete process.env.GIT_CONFIG;
+      else process.env.GIT_CONFIG = previous;
+      write("gitconfig", "");
+    }
   });
 
   describe("extends objects", () => {

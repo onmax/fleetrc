@@ -832,10 +832,7 @@ export async function teamGitProblem(spec: string, cwd = tmpdir()): Promise<stri
     const targets = new Set([fetched, `${fetched.replace(/\/$/, "")}/`]);
     for (const target of targets) {
       const config = ["config", "--type=bool", "--get-urlmatch", "http.followRedirects", target];
-      const redirects = await git(
-        [...NO_GIT_REDIRECTS, ...config],
-        { cwd, allowFail: true },
-      );
+      const redirects = await git([...NO_GIT_REDIRECTS, ...config], { cwd, allowFail: true });
       if (redirects.code !== 0 || redirects.stdout.trim() !== "false")
         return `cannot fetch team repository ${spec}${rewrite} with Git redirects disabled; check URL-specific http.followRedirects settings`;
     }
