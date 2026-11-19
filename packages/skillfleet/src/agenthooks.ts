@@ -154,16 +154,24 @@ const OWN_COMMAND = new RegExp(
   String.raw`^(?:test -x (${LAUNCHER}) && \1 hook run (?:claude-code|codex) 2>/dev/null; true|${LAUNCHER} hook run (?:claude-code|codex)(?: 2>/dev/null \|\| true)?|(?:npx (?:-y )?)?skillfleet hook prompt|${LAUNCHER} hook prompt)$`,
 );
 
+const DISABLED_POSIX = "exit 0 # skillfleet: disabled legacy hook";
+const DISABLED_WINDOWS = "exit /b 0 & rem skillfleet: disabled legacy hook";
+
 export const isOwnCommand = (command: unknown) =>
   typeof command === "string" && OWN_COMMAND.test(command.trim());
 
 /**
- * An entry skillfleet wrote: a command above, or exec form, node with skillfleet's installed copy
- * (`…/skillfleet/app/cli.mjs`) and `hook run <agent>`.
+ * An entry skillfleet wrote: a command above, a disabled placeholder, or exec form, node with
+ * skillfleet's installed copy (`…/skillfleet/app/cli.mjs`) and `hook run <agent>`.
  */
 export function isOwnHandler(hook: unknown): boolean {
   if (!isRecord(hook)) return false;
-  if (hook.args === undefined) return isOwnCommand(hook.command);
+  if (hook.args === undefined)
+    return (
+      isOwnCommand(hook.command) ||
+      (hook.type === "command" &&
+        (hook.command === DISABLED_POSIX || hook.command === DISABLED_WINDOWS))
+    );
   const args = hook.args;
   return (
     typeof hook.command === "string" &&
@@ -186,12 +194,12 @@ const sameHandler = (a: Record<string, unknown>, b: HookHandler) =>
 
 type Json = Record<string, unknown>;
 
-/** Removes skillfleet's handlers, optionally keeping group and handler indices for Codex approval. */
+/** Removes skillfleet's handlers, leaving no-ops where removal would shift Codex approvals. */
 function withoutOwn(
   groups: unknown,
   preserveIndices = false,
-): { groups: unknown[]; removed: number } {
-  if (!Array.isArray(groups)) return { groups: [], removed: 0 };
+): { groups: unknown[]; changed: boolean } {
+  if (!Array.isArray(groups)) return { groups: [], changed: false };
   const lastOtherGroup = preserveIndices
     ? groups.findLastIndex(
         (group: unknown) =>
@@ -200,25 +208,37 @@ function withoutOwn(
           group.hooks.some((hook: unknown) => !isOwnHandler(hook)),
       )
     : -1;
-  let removed = 0;
+  const disabled: HookHandler = {
+    type: "command",
+    command: process.platform === "win32" ? DISABLED_WINDOWS : DISABLED_POSIX,
+  };
+  let changed = false;
   const kept = groups.flatMap((group: unknown, index) => {
     if (!isRecord(group) || !Array.isArray(group.hooks)) return [group];
     const lastOther = preserveIndices
       ? group.hooks.findLastIndex((hook: unknown) => !isOwnHandler(hook))
       : -1;
-    if (index < lastOtherGroup && lastOther === -1) return [group];
-    const hooks = group.hooks.filter(
-      (hook: unknown, position: number) => position < lastOther || !isOwnHandler(hook),
-    );
-    if (hooks.length === group.hooks.length) return [group];
-    removed += group.hooks.length - hooks.length;
+    const keepGroup = index < lastOtherGroup && lastOther === -1;
+    let changedGroup = false;
+    const hooks = group.hooks.flatMap((hook: unknown, position: number) => {
+      if (!isRecord(hook) || !isOwnHandler(hook)) return [hook];
+      if (keepGroup || position < lastOther) {
+        if (hook.type === disabled.type && sameHandler(hook, disabled)) return [hook];
+        changedGroup = true;
+        return [disabled];
+      }
+      changedGroup = true;
+      return [];
+    });
+    if (!changedGroup) return [group];
+    changed = true;
     // A group that held only skillfleet's handler goes with it.
     return hooks.length === 0 ? [] : [{ ...group, hooks }];
   });
-  return { groups: kept, removed };
+  return { groups: kept, changed };
 }
 
-/** The events of `raw` that run skillfleet's hook, and its entries. */
+/** The events and handler entries that belong to skillfleet. */
 function ownHandlers(raw: unknown): { event: string; handler: Record<string, unknown> }[] {
   if (!isRecord(raw) || !isRecord(raw.hooks)) return [];
   return Object.entries(raw.hooks).flatMap(([event, groups]) =>
@@ -362,15 +382,15 @@ function chosen(
 /**
  * Puts `handler` in `raw`'s SessionStart, in place of any entry of skillfleet's; an event that
  * already holds it, once, is left alone. skillfleet's entries under any other event, such as the
- * UserPromptSubmit older versions wrote, are taken out unless removing them would shift another
- * Codex hook's indices and invalidate its approval.
+ * UserPromptSubmit older versions wrote, are removed or replaced with a no-op if removing them
+ * would shift another Codex hook's indices and invalidate its approval.
  */
 export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
   const hooks: Json = isRecord(raw.hooks) ? raw.hooks : {};
   for (const [event, groups] of Object.entries(hooks)) {
     if ((EVENTS as readonly string[]).includes(event)) continue;
-    const { groups: kept, removed } = withoutOwn(groups, agent === "codex");
-    if (removed === 0) continue;
+    const { groups: kept, changed } = withoutOwn(groups, agent === "codex");
+    if (!changed) continue;
     if (kept.length > 0) hooks[event] = kept;
     else delete hooks[event];
   }
@@ -386,8 +406,8 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
 export function withoutHooks(raw: Json) {
   if (!isRecord(raw.hooks)) return;
   for (const [event, groups] of Object.entries(raw.hooks)) {
-    const { groups: kept, removed } = withoutOwn(groups);
-    if (removed === 0) continue;
+    const { groups: kept, changed } = withoutOwn(groups);
+    if (!changed) continue;
     if (kept.length > 0) raw.hooks[event] = kept;
     else delete raw.hooks[event];
   }

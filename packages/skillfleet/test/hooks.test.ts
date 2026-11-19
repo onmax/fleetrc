@@ -388,28 +388,59 @@ describe("hook install and remove", () => {
     ]);
   });
 
-  it("cleans up legacy Codex prompt hooks without shifting other groups or handlers", async () => {
+  it("disables legacy Codex prompt hooks from another state directory without shifting other hooks", async () => {
     const m = machine();
     const file = m.at(".codex", "hooks.json");
-    const legacy = { type: "command", command: '"/old/skillfleet" hook run codex' };
-    const custom = { type: "command", command: "echo mine" };
-    const first = { hooks: [legacy] };
+    const launcher = join(m.stateDir, "bin", isWindows ? "skillfleet.cmd" : "skillfleet");
+    mkdirSync(dirname(launcher), { recursive: true });
+    writeFileSync(
+      launcher,
+      isWindows ? "@echo old launcher\r\n" : "#!/bin/sh\necho old launcher\n",
+      { mode: 0o755 },
+    );
+    const legacy = hookHandler("codex", { launcher, home: m.home });
+    const custom = { type: "command", command: "echo mine", timeout: 10 };
+    const runPrompt = (command: string) => {
+      const result = spawnSync(command, {
+        shell: true,
+        cwd: m.home,
+        env: m.env,
+        input: PROMPT,
+        encoding: "utf8",
+      });
+      return { code: result.status, stdout: result.stdout.trim(), stderr: result.stderr };
+    };
+    expect(runPrompt(legacy.command)).toEqual({ code: 0, stdout: "old launcher", stderr: "" });
     writeFileSync(
       file,
       JSON.stringify({
         hooks: {
-          UserPromptSubmit: [first, { hooks: [legacy, custom, legacy] }, { hooks: [legacy] }],
+          UserPromptSubmit: [
+            { hooks: [legacy] },
+            { hooks: [legacy, custom, legacy] },
+            { hooks: [legacy] },
+          ],
         },
       }),
     );
-    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    const env = { ...m.env, XDG_STATE_HOME: join(m.root, "new-state") };
+    const install = () => m.runWith({ env }, "hook", "install", "codex");
+    expect((await install()).code).toBe(0);
     const installed = read(file);
-    expect(JSON.parse(installed).hooks.UserPromptSubmit).toEqual([
-      first,
-      { hooks: [legacy, custom] },
-    ]);
-    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    const { UserPromptSubmit: groups } = JSON.parse(installed).hooks as {
+      UserPromptSubmit: { hooks: Entry[] }[];
+    };
+    expect(groups).toHaveLength(2);
+    expect(groups[0]!.hooks).toHaveLength(1);
+    expect(groups[1]!.hooks).toHaveLength(2);
+    expect(groups[1]!.hooks[1]).toEqual(custom);
+    for (const group of groups) {
+      expect(runPrompt(group.hooks[0]!.command)).toEqual({ code: 0, stdout: "", stderr: "" });
+    }
+    expect((await install()).code).toBe(0);
     expect(read(file)).toBe(installed);
+    expect((await m.runWith({ env }, "hook", "remove", "codex")).code).toBe(0);
+    expect(JSON.parse(read(file)).hooks).toEqual({ UserPromptSubmit: [{ hooks: [custom] }] });
   });
 
   it("on Windows writes Claude Code's entry in exec form, and Codex's for cmd, with % kept from cmd", () => {
