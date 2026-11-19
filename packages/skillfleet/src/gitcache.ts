@@ -271,7 +271,17 @@ async function fetchCommit(
   repo: string,
   config: readonly string[],
 ): Promise<string> {
-  const args = [...config, "fetch", "--quiet", "--depth", "1", "--no-tags", "--", url, ref ?? "HEAD"];
+  const args = [
+    ...config,
+    "fetch",
+    "--quiet",
+    "--depth",
+    "1",
+    "--no-tags",
+    "--",
+    url,
+    ref ?? "HEAD",
+  ];
   const fetched = await git(args, { cwd: repo, allowFail: true, timeoutMs: 600_000 });
   if (fetched.code === 0) {
     const commit = await gitOut(["rev-parse", "--verify", "FETCH_HEAD^{commit}"], repo);

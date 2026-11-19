@@ -181,6 +181,8 @@ export async function git(
   args: readonly string[],
   options: { cwd?: string; timeoutMs?: number; allowFail?: boolean; input?: string } = {},
 ): Promise<ExecResult> {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...GIT_ENV };
+  for (const key of Object.keys(env)) if (key.toUpperCase() === "GIT_CONFIG") delete env[key];
   // Git for Windows writes no path past 260 characters without core.longpaths, and skillfleet's
   // cache sits deep under HOME. Other systems ignore it.
   // A remote that stops sending: under 1 KB/s for a minute ends the transfer, over http(s). Other
@@ -189,7 +191,7 @@ export async function git(
     cwd: options.cwd,
     input: options.input,
     timeoutMs: options.timeoutMs ?? 120_000,
-    env: { ...process.env, ...GIT_ENV },
+    env,
     // File lists are parsed whole; a cut one would be wrong, not just short.
     maxOutput: Number.POSITIVE_INFINITY,
   });
