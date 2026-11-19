@@ -9,14 +9,17 @@ interface State {
   on: { test: (char: string) => boolean; to: number }[];
 }
 
-const anyChar = () => true;
+const dot = (char: string) =>
+  char !== "\n" && char !== "\r" && char !== "\u2028" && char !== "\u2029";
 const inSegment = (char: string) => char !== "/";
 
-function compile(glob: string): { states: State[]; accept: number } {
+export const MAX_GLOB_LENGTH = 8192;
+const MATCH_WORK_LIMIT = 10_000_000;
+
+function compile(chars: string): { states: State[]; accept: number } {
   const states: State[] = [];
   const add = () => states.push({ next: [], on: [] }) - 1;
   let at = add();
-  const chars = Array.from(glob);
   for (let i = 0; i < chars.length; i++) {
     const char = chars[i]!;
     if (char === "/" && chars.length === i + 3 && chars[i + 1] === "*" && chars[i + 2] === "*") {
@@ -25,7 +28,7 @@ function compile(glob: string): { states: State[]; accept: number } {
       const rest = add();
       states[at]!.next.push(end);
       states[at]!.on.push({ test: (c) => c === "/", to: rest });
-      states[rest]!.on.push({ test: anyChar, to: rest });
+      states[rest]!.on.push({ test: dot, to: rest });
       states[rest]!.next.push(end);
       at = end;
       break;
@@ -36,10 +39,10 @@ function compile(glob: string): { states: State[]; accept: number } {
         // `(?:.*/)?`: nothing, or anything that ends with `/`. `a/**/b` also matches `a/b`.
         const inner = add();
         states[at]!.next.push(end, inner);
-        states[inner]!.on.push({ test: anyChar, to: inner }, { test: (c) => c === "/", to: end });
+        states[inner]!.on.push({ test: dot, to: inner }, { test: (c) => c === "/", to: end });
         i += 2;
       } else {
-        states[at]!.on.push({ test: anyChar, to: at });
+        states[at]!.on.push({ test: dot, to: at });
         states[at]!.next.push(end);
         i += 1;
       }
@@ -59,16 +62,20 @@ function compile(glob: string): { states: State[]; accept: number } {
 }
 
 /**
- * Whether `path` matches `glob`. The automaton runs on every state at once, so a glob from a
- * manifest takes time in proportion to the path's length times the glob's, whatever its stars.
+ * Match all active states at once, with no backtracking. Each state has at most two edges of each
+ * kind, so counting state and target visits also bounds the time spent following edges.
  */
-function globMatches(glob: string, path: string): boolean {
-  const { states, accept } = compile(glob);
+function globMatches(
+  { states, accept }: ReturnType<typeof compile>,
+  path: string,
+  spend: (work: number) => void,
+): boolean {
   const seen = new Uint32Array(states.length);
   let round = 0;
   // The states `from` reach without a character, added to `into` once each per round: a worklist
   // shared by the whole round, so memory stays linear in the glob's length.
   const close = (from: readonly number[], into: number[]) => {
+    spend(from.length);
     const stack: number[] = [];
     for (const state of from)
       if (seen[state] !== round) {
@@ -77,6 +84,7 @@ function globMatches(glob: string, path: string): boolean {
       }
     while (stack.length > 0) {
       const state = stack.pop()!;
+      spend(1);
       into.push(state);
       for (const to of states[state]!.next)
         if (seen[to] !== round) {
@@ -88,8 +96,10 @@ function globMatches(glob: string, path: string): boolean {
   };
   round++;
   let current = close([0], []);
-  for (const char of path) {
+  for (let index = 0; index < path.length; index++) {
+    const char = path[index]!;
     round++;
+    spend(current.length);
     const targets: number[] = [];
     for (const state of current)
       for (const edge of states[state]!.on) if (edge.test(char)) targets.push(edge.to);
@@ -100,9 +110,25 @@ function globMatches(glob: string, path: string): boolean {
   return current.includes(accept);
 }
 
+/** Compile once and share a work budget across all candidate paths in this filter. */
+export function globFilter(glob: string, label = "glob"): (path: string) => boolean {
+  if (glob.length > MAX_GLOB_LENGTH)
+    throw new Error(`${label} exceeds ${MAX_GLOB_LENGTH} UTF-16 code units`);
+  const compiled = compile(glob.normalize("NFC"));
+  let remaining = MATCH_WORK_LIMIT;
+  const spend = (work: number) => {
+    remaining -= work;
+    if (remaining < 0)
+      throw new Error(`${label} exceeded the matching work limit; narrow the pattern`);
+  };
+  return (path) => {
+    spend(1 + path.length + compiled.states.length);
+    return globMatches(compiled, path.normalize("NFC"), spend);
+  };
+}
+
 /** Paths and globs compare in Unicode NFC: macOS lists names in NFD, keyboards type NFC. */
-export const matchesGlob = (path: string, glob: string) =>
-  globMatches(glob.normalize("NFC"), path.normalize("NFC"));
+export const matchesGlob = (path: string, glob: string) => globFilter(glob)(path);
 
 /** The folder part of a glob before its first wildcard: `skills/*` gives `skills`. */
 export function globBase(glob: string): string {

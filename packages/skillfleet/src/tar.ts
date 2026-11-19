@@ -39,29 +39,38 @@ const FILE_TYPES = new Set(["File", "OldFile", "ContiguousFile"]);
 const tooMany = () =>
   new Error(`the archive has more than ${ENTRY_LIMIT} entries, over skillfleet's limit`);
 
+/** Parser events omit empty metadata, so count at the header boundary instead. */
+const CONSUME_HEADER = Object.getOwnPropertySymbols(Parser.prototype).find(
+  (symbol) => symbol.description === "consumeHeader",
+);
+const END_BLOCK = Buffer.alloc(512);
+
 /**
  * Reads an unpacked tar as node-tar reads it, the way `skills` does: long names (pax `path`, GNU
  * `L`) applied, and an archive with a bad header checksum refused. Hands `onEntry` each entry
- * before its body, and throws past the entry limit. Entries node-tar reads or ignores count toward
- * it; metadata headers (pax, long names) aren't emitted, and the unpack limit bounds those.
+ * before its body, and throws past the entry limit. All headers count, including metadata and
+ * ignored entries, but not zero padding at the end of the archive.
  */
 function readTar(tar: Uint8Array, onEntry: (entry: ReadEntry) => void) {
   // node-tar unpacks a gzip it is given, which here would be a second one, past the unpack limit.
   if (tar[0] === 0x1f && tar[1] === 0x8b) throw new Error("the archive is gzipped twice");
+  if (!CONSUME_HEADER)
+    throw new Error("cannot enforce the tar header limit with this version of node-tar");
   let failed: Error | undefined;
-  let entries = 0;
-  const count = () => {
-    if (++entries > ENTRY_LIMIT) throw tooMany();
-  };
-  const parser = new Parser({
-    strict: true,
-    zstd: false,
-    onReadEntry: (entry) => {
-      count();
-      onEntry(entry);
+  const parser = new Parser({ strict: true, zstd: false, onReadEntry: onEntry });
+  const consume = (parser as unknown as Record<symbol, (chunk: Buffer, offset: number) => void>)[
+    CONSUME_HEADER
+  ];
+  if (typeof consume !== "function")
+    throw new Error("cannot enforce the tar header limit with this version of node-tar");
+  let headers = 0;
+  Object.defineProperty(parser, CONSUME_HEADER, {
+    value(this: Parser, chunk: Buffer, offset: number) {
+      if (!END_BLOCK.equals(chunk.subarray(offset, offset + 512)) && ++headers > ENTRY_LIMIT)
+        throw tooMany();
+      consume.call(this, chunk, offset);
     },
   });
-  parser.on("ignoredEntry", count);
   parser.on("error", (error) => (failed ??= error));
   // Given the whole archive at once, node-tar reads every entry before `end` returns.
   parser.end(Buffer.from(tar.buffer, tar.byteOffset, tar.byteLength));

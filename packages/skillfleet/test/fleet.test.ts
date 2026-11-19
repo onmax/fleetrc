@@ -766,6 +766,26 @@ async function controller(fleet: string[] = []) {
   return { m, spec, fleetIn };
 }
 
+it("rejects setup options before running any other fleet action", async () => {
+  const m = machine();
+  const manifest = m.manifest({ agents: ["claude-code"], sources: [], fleet: [] });
+  for (const [action, flag] of [
+    ["add", "--copy"],
+    ["add", "--no-copy"],
+    ["add", "--timer"],
+    ["add", "--no-hooks"],
+    ["add", "--force"],
+    ["sync", "--timer"],
+    ["status", "--no-hooks"],
+    ["upgrade", "--force"],
+  ] as const) {
+    const run = await m.run("fleet", action, "vps2", flag, "--manifest", manifest);
+    expect.soft(run.code, `${action} ${flag}`).toBe(2);
+    expect.soft(run.stderr, `${action} ${flag}`).toContain(`only fleet init takes ${flag}`);
+  }
+  expect(JSON.parse(readFileSync(manifest, "utf8")) as unknown).toMatchObject({ fleet: [] });
+});
+
 describe.skipIf(isWindows)("fleet init", () => {
   it("sets up a new host with this machine's manifest over ssh, and adds it to the fleet", async () => {
     const { m, spec, fleetIn } = await controller();
@@ -843,15 +863,31 @@ describe.skipIf(isWindows)("fleet init", () => {
     expect(forced.stdout).toMatch(/^other: set up; last run /m);
   });
 
-  it("takes the same manifest in another spelling as set up", async () => {
+  it("only syncs an installed host with the same manifest in another spelling", async () => {
     const { m, spec } = await controller();
     const env = initShims(m, { same: join(m.root, "same") });
     const run = await m.runWith({ env }, "fleet", "init", "same", "--no-hooks");
     expect(run.code, run.stdout + run.stderr).toBe(0);
-    // The host's config names the repository without .git, which is still this manifest, and its
+    const file = join(m.root, "same", ".config", "skillfleet", "config.json");
+    const alias = spec.replace("//.skillfleet/manifest.json", "");
+    writeFileSync(file, JSON.stringify({ manifest: alias }));
+    const again = await m.runWith({ env }, "fleet", "init", "same");
+    expect(again.code, again.stdout + again.stderr).toBe(0);
+    expect(again.stdout).toMatch(/^same: already set up; last run /m);
+    expect(npxCalls(m)).toHaveLength(1);
+    expect(JSON.parse(readFileSync(file, "utf8")) as unknown).toMatchObject({ manifest: alias });
+  });
+
+  it("repairs a missing launcher for the same manifest in another spelling", async () => {
+    const { m, spec } = await controller();
+    const env = initShims(m, { same: join(m.root, "same") });
+    const run = await m.runWith({ env }, "fleet", "init", "same", "--no-hooks");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    // The host's config omits the default file, which is still this manifest, and its
     // launcher is gone, so it is set up again (with the fake npx: the launcher's node has a real one).
     const file = join(m.root, "same", ".config", "skillfleet", "config.json");
-    writeFileSync(file, JSON.stringify({ manifest: spec.replace(".git//", "//") }));
+    const alias = spec.replace("//.skillfleet/manifest.json", "");
+    writeFileSync(file, JSON.stringify({ manifest: alias }));
     rmSync(join(m.root, "same", ".local", "state", "skillfleet", "bin"), { recursive: true });
     const again = await m.runWith({ env }, "fleet", "init", "same", "--no-hooks");
     expect(again.code, again.stdout + again.stderr).toBe(0);
@@ -1071,12 +1107,15 @@ describe.skipIf(isWindows)("fleet init", () => {
       [`me/skills${file}`, `https://github.com/me/skills.git${file}`],
       [`https://GitHub.com/me/skills${file}`, `git@github.com:me/skills.git${file}`],
       ["gitlab:group/skills", `https://gitlab.com/group/skills.git${file}`],
-      [`https://git.example.com/me/skills.git${file}`, `https://GIT.example.com/me/skills/${file}`],
+      [`https://git.example.com/me/skills.git${file}`, `https://GIT.example.com/me/skills.git${file}`],
     ])
       expect.soft(sameManifest(a!, b!), `${a} = ${b}`).toBe(true);
     for (const [a, b] of [
       // Repository paths are case-sensitive on many servers.
       [`https://git.example.com/Docs.git${file}`, `https://git.example.com/docs.git${file}`],
+      [`https://git.example.com/me/x.git${file}`, `https://git.example.com/me/x${file}`],
+      [`https://git.example.com/me/x.git${file}`, `http://git.example.com/me/x.git${file}`],
+      [`https://git.example.com/me/x.git${file}`, `https://www.git.example.com/me/x.git${file}`],
       [`me/Skills${file}`, `me/skills${file}`],
       // On a host that isn't GitHub or GitLab, host:path is relative to the user's home there.
       [`git@git.example.com:me/x.git${file}`, `ssh://git@git.example.com/me/x.git${file}`],

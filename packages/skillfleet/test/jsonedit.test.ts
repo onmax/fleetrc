@@ -13,6 +13,13 @@ function edit(text: string, change: (raw: Record<string, unknown>) => void) {
 }
 
 describe("editJsonText", () => {
+  it("returns undefined when valid JSON is too deeply nested for an offset tree", () => {
+    const depth = 12_000;
+    const text = `{"keep":${"[".repeat(depth)}0${"]".repeat(depth)},"remove":true}`;
+    const before = JSON.parse(text) as Record<string, unknown>;
+    expect(editJsonText(text, before, { keep: before.keep })).toBeUndefined();
+  });
+
   it("appends to a one-line array on the same line", () => {
     const text = `{\n  "agents": ["claude-code"],\n  "sources": [{ "id": "a", "git": "x" }]\n}\n`;
     expect(

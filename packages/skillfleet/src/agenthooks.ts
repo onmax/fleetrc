@@ -402,11 +402,11 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
   raw.hooks = hooks;
 }
 
-/** Takes every entry of skillfleet's out of `raw`, and the groups and events left empty by it. */
-export function withoutHooks(raw: Json) {
+/** Disables skillfleet's hooks, keeping placeholders only to preserve unrelated Codex approvals. */
+export function withoutHooks(raw: Json, agent?: HookAgent) {
   if (!isRecord(raw.hooks)) return;
   for (const [event, groups] of Object.entries(raw.hooks)) {
-    const { groups: kept, changed } = withoutOwn(groups);
+    const { groups: kept, changed } = withoutOwn(groups, agent === "codex");
     if (!changed) continue;
     if (kept.length > 0) raw.hooks[event] = kept;
     else delete raw.hooks[event];
@@ -440,7 +440,7 @@ export function removeHooks(
 ): HookChange[] {
   return chosen(agents).map(({ agent, skipped }) => {
     if (skipped) return { agent, file: hookFile(agent), changed: false, skipped };
-    return changeFile(agent, withoutHooks, {
+    return changeFile(agent, (raw) => withoutHooks(raw, agent), {
       dryRun: options.dryRun ?? false,
       create: false,
     });

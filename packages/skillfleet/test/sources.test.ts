@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vite-plus/test";
 import { globBase, matchesGlob } from "../src/glob.ts";
+import { parseManifest } from "../src/manifest.ts";
+import { select } from "../src/sources.ts";
 import { readTgz, tarFileSizes } from "../src/tar.ts";
 import {
   http,
@@ -34,6 +36,14 @@ describe("skills and hook globs", () => {
       ["**", ".hidden/x", true],
       ["skills/?", "skills/a", true],
       ["skills/?", "skills/ab", false],
+      ["??", "😀", true],
+      ["?", "😀", false],
+      ["😀", "😀", true],
+      ["**", "a\nb", false],
+      ["a/**/b", "a/\r/b", false],
+      ["a/**", "a/\u2028", false],
+      ["**b", "a\u2029b", false],
+      ["*", "a\nb", true],
       ["!x/*", "!x/a", true],
       ["!x/*", "y/a", false],
       ["{a,b}", "{a,b}", true],
@@ -50,6 +60,24 @@ describe("skills and hook globs", () => {
     for (const [glob, path, expected] of cases)
       expect.soft(matchesGlob(path, glob), `${glob} on ${path}`).toBe(expected);
     expect(globBase("{a,b}/[x]/*")).toBe("{a,b}/[x]");
+  });
+
+  it("rejects an oversized skills pattern when reading the manifest", () => {
+    expect(() =>
+      parseManifest("m.json", { sources: [{ local: ".", skills: "?".repeat(8193) }] }),
+    ).toThrow(/sources.*skills.*8192/);
+  });
+
+  it("bounds the total matching work across candidates in a source filter", () => {
+    const manifest = parseManifest("m.json", {
+      sources: [{ id: "many", local: ".", skills: "*?".repeat(128) + "b" }],
+    });
+    const found = Array.from({ length: 256 }, (_, index) => ({
+      name: `skill-${index}`,
+      dir: ".",
+      path: "a".repeat(512) + index,
+    }));
+    expect(() => select(manifest.sources[0]!, found, [])).toThrow(/many.*skills glob.*work limit/);
   });
 
   it("answers fast for a pathological glob on a long path that almost matches", () => {
@@ -94,6 +122,24 @@ describe("tar archives", () => {
       ...Array.from({ length: 50_001 }, (_, i) => tarHeader(`p/f${i}`, 0)),
       end,
     ]);
+    expect(() => readTgz(gzipSync(tar))).toThrow(/more than 50000 entries/);
+  });
+
+  it.each(["L", "x"])("counts %s metadata even with an empty body", (type) => {
+    const payload = Buffer.from(type === "L" ? "p/long\0" : "15 path=p/long\n");
+    const meta = Buffer.concat([
+      tarHeader("meta", payload.length, type),
+      payload,
+      Buffer.alloc(512 - payload.length),
+    ]);
+    const empty = tarHeader("meta", 0, type);
+    const headers = Array.from({ length: 49_999 }, (_, index) => (index % 2 ? empty : meta));
+    const last = tarHeader("p/a.md", 0);
+    expect(tarFileSizes(Buffer.concat([...headers, last, end]))).toEqual([
+      { name: "p/long", size: 0 },
+    ]);
+    const tar = Buffer.concat([...headers, empty, last, end]);
+    expect(() => tarFileSizes(tar)).toThrow(/more than 50000 entries/);
     expect(() => readTgz(gzipSync(tar))).toThrow(/more than 50000 entries/);
   });
 

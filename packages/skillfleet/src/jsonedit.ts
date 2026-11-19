@@ -56,8 +56,8 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 
 /**
  * Edits `text`, which parses to `before`, so it parses to `after`. Returns undefined when it can't
- * (the text is not plain JSON, or an object repeats a key, which `notes` then names); the caller
- * then writes the whole file.
+ * (for example, the offset tree is too deep or an object repeats a key); the caller then writes
+ * the whole file. Repeated keys are named in `notes`.
  */
 export function editJsonText(
   text: string,
@@ -68,7 +68,13 @@ export function editJsonText(
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   const unit = text.match(/\n([ \t]+)\S/)?.[1] ?? "  ";
   const duplicates: string[] = [];
-  const root = parse(text, duplicates);
+  let root: Node | undefined;
+  try {
+    root = parse(text, duplicates);
+  } catch (error) {
+    if (error instanceof RangeError) return undefined;
+    throw error;
+  }
   if (!root) return undefined;
   // JSON.parse keeps the last of a repeated key, which the text's first one does not match.
   if (duplicates.length > 0) {

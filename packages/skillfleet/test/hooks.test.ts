@@ -440,7 +440,10 @@ describe("hook install and remove", () => {
     expect((await install()).code).toBe(0);
     expect(read(file)).toBe(installed);
     expect((await m.runWith({ env }, "hook", "remove", "codex")).code).toBe(0);
-    expect(JSON.parse(read(file)).hooks).toEqual({ UserPromptSubmit: [{ hooks: [custom] }] });
+    expect(JSON.parse(read(file)).hooks).toEqual({ UserPromptSubmit: groups });
+    const removed = read(file);
+    expect((await m.runWith({ env }, "hook", "remove", "codex")).code).toBe(0);
+    expect(read(file)).toBe(removed);
   });
 
   it("on Windows writes Claude Code's entry in exec form, and Codex's for cmd, with % kept from cmd", () => {
