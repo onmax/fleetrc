@@ -324,8 +324,11 @@ export function selfInstall(): { cli: string; launcher: string; node: string; no
     const temp = join(app, `.cli.mjs.${process.pid}.tmp`);
     writeFileSync(temp, stub);
     renameOver(temp, entry);
-    // Node's compile cache (entry.ts) holds the build this one replaced, which no run reads now.
-    rmSync(join(app, "compile"), { recursive: true, force: true });
+    // Node's compile cache (entry.ts) holds the build this one replaced, which no run reads now. A
+    // run still writing to it may keep it from going; the next install tries again.
+    try {
+      rmSync(join(app, "compile"), { recursive: true, force: true });
+    } catch {}
   }
   retireBuilds(app, id);
   const bin = paths.bin();
