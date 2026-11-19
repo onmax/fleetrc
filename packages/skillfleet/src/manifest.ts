@@ -124,6 +124,8 @@ export interface Manifest {
 
 export class ManifestError extends Error {}
 
+class ManifestBoundaryError extends ManifestError {}
+
 const SOURCE_KEYS = new Set([
   "id",
   "git",
@@ -652,7 +654,7 @@ async function locate(
 function within(root: string, file: string, spec: string) {
   if (!existsSync(file)) return;
   if (!inside(realpathSync(root), realpathSync(file)))
-    throw new ManifestError(
+    throw new ManifestBoundaryError(
       `a team manifest names only manifests in its own repository or in a remote repository, not ${spec}, which is outside it`,
     );
 }
@@ -916,7 +918,8 @@ export async function loadManifest(
   const rootFile = await locateManifest(spec, options);
   const root = readManifestFile(rootFile);
   const warnings: string[] = [];
-  const failed: string[] = [];
+  const failures: { parent: string; refusedEntry?: string }[] = [];
+  const loadedEntries = new Set<string>();
   const sources = [...root.sources];
   const ids = new Set(sources.map((source) => nameKey(source.id)));
   // NPM_TOKEN goes to the registry the user configured and to registries the root manifest names.
@@ -967,7 +970,8 @@ export async function loadManifest(
           ...entry.excludeSources.map(nameKey),
         ]),
       };
-      const key = `${manifest.file}\0${i}\0${within ?? ""}`;
+      const entryKey = `${manifest.file}\0${i}`;
+      const key = `${entryKey}\0${within ?? ""}`;
       let at = located.get(key);
       if (at === undefined) {
         try {
@@ -979,13 +983,19 @@ export async function loadManifest(
           });
         } catch (error) {
           warnings.push(`extends ${parent}: ${(error as Error).message}`);
-          failed.push(parent);
+          failures.push({
+            parent,
+            ...(error instanceof ManifestBoundaryError ? { refusedEntry: entryKey } : {}),
+          });
           at = null;
         }
         located.set(key, at);
       }
-      if (!at || at.file === rootFile || path.includes(at.file) || unreadable.has(at.file))
+      if (!at || unreadable.has(at.file)) continue;
+      if (at.file === rootFile || path.includes(at.file)) {
+        loadedEntries.add(entryKey);
         continue;
+      }
       let known = extended.get(at.file);
       if (!known) {
         let team: Manifest;
@@ -1005,7 +1015,7 @@ export async function loadManifest(
           });
         } catch (error) {
           warnings.push(`extends ${parent}: ${(error as Error).message}`);
-          failed.push(parent);
+          failures.push({ parent });
           unreadable.add(at.file);
           continue;
         }
@@ -1022,6 +1032,7 @@ export async function loadManifest(
         known = { manifest: team, parent, paths: [] };
         extended.set(at.file, known);
       }
+      loadedEntries.add(entryKey);
       const boundary = at.root;
       if (known.paths.some((seen) => seen.within === boundary && sameThrough(seen, filter)))
         continue;
@@ -1062,6 +1073,9 @@ export async function loadManifest(
       sources.push(source);
     }
   }
+  const failed = failures
+    .filter(({ refusedEntry }) => refusedEntry === undefined || !loadedEntries.has(refusedEntry))
+    .map(({ parent }) => parent);
   return { root, sources, warnings, failed };
 }
 

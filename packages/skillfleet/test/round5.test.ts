@@ -502,8 +502,39 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
         expect(loaded.sources.map((source) => source.id)).toEqual(["team", "shared"]);
         expect(loaded.sources[0]!.exclude?.toSorted()).toEqual(["file-only", "folder-only"]);
         expect(loaded.sources[1]!.exclude).toEqual(["folder-only"]);
-        expect(loaded.failed).toEqual(["../shared.json"]);
+        expect(loaded.failed).toEqual([]);
         expect(loaded.warnings).toEqual([expect.stringContaining("outside it")]);
+      },
+    );
+
+    it.each([true, false])(
+      "retires a removed source only if the shared manifest is readable (%s)",
+      async (readable) => {
+        const m = machine();
+        const local = join(m.root, "local");
+        writeFiles(local, skills("", "old-skill"));
+        const manifest = m.manifest({
+          agents: ["claude-code"],
+          sources: [{ id: "old", local }],
+        });
+        await init(m, manifest);
+        const link = m.at(".claude", "skills", "old-skill");
+        expect(existsSync(link)).toBe(true);
+
+        const team = join(m.root, "team");
+        writeFiles(team, {
+          ".skillfleet/manifest.json": JSON.stringify({ extends: ["../shared.json"] }),
+          "shared.json": readable ? "{}" : "{",
+        });
+        m.manifest({
+          agents: ["claude-code"],
+          extends: [team, join(team, ".skillfleet", "manifest.json")],
+        });
+
+        const report = await m.json<Report>("sync");
+        expect(report.warnings).toContainEqual(expect.stringContaining("outside it"));
+        expect(report.warnings.some((warning) => warning.includes("did not load"))).toBe(!readable);
+        expect(existsSync(link)).toBe(!readable);
       },
     );
 
