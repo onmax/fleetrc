@@ -12,7 +12,7 @@ import { hostname, networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
-import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
+import { fetchClone, gitUrl, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
 import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
@@ -839,6 +839,18 @@ export async function teamGitProblem(spec: string, cwd = tmpdir()): Promise<stri
     return `a team manifest names only remote repositories (http, https, git, ssh or owner/repo), not ${spec}${rewrite}`;
   if (urls.some((each) => isLocalHost(each!)))
     return `a team manifest names only repositories on another machine, not ${spec}${rewrite}, which is this machine`;
+  if (fetched && /^https?:\/\//i.test(fetched)) {
+    const targets = new Set([fetched, `${fetched.replace(/\/$/, "")}/`]);
+    for (const target of targets) {
+      const config = ["config", "--type=bool", "--get-urlmatch", "http.followRedirects", target];
+      const redirects = await git(
+        [...NO_GIT_REDIRECTS, ...config],
+        { cwd, allowFail: true },
+      );
+      if (redirects.code !== 0 || redirects.stdout.trim() !== "false")
+        return `cannot fetch team repository ${spec}${rewrite} with Git redirects disabled; check URL-specific http.followRedirects settings`;
+    }
+  }
   return undefined;
 }
 

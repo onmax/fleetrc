@@ -470,6 +470,22 @@ describe("hook install and remove", () => {
 });
 
 describe("init, status and doctor with the hooks or the timer", () => {
+  it("reports a fresh Codex-only hook as configured, not active without approval", async () => {
+    const m = machine({ scheduler: "empty" });
+    const manifest = m.manifest({ agents: ["codex"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+
+    expect((await m.run("status")).stdout).toMatch(
+      /^syncs start from: the session hooks of Codex \(configured; requires approval in \/hooks\)$/m,
+    );
+    const doctor = (await m.run("doctor")).stdout;
+    expect(doctor).toMatch(
+      /^warn sync trigger: .*Codex \(configured; requires approval in \/hooks\)$/m,
+    );
+    expect(doctor).toMatch(/^warn session hooks: Codex's has not run yet/m);
+  });
+
   it("init installs the hooks and no timer; status and doctor report the hooks", async () => {
     const { m } = await hooked({ scheduler: "empty" });
     // init does not reach the scheduler; doctor asks it once whether a timer exists.
@@ -478,12 +494,12 @@ describe("init, status and doctor with the hooks or the timer", () => {
     expect(existsSync(m.at(".codex", "hooks.json"))).toBe(true);
     const status = await m.run("status");
     expect(status.stdout).toMatch(
-      /^syncs start from: the session hooks of Claude Code and Codex$/m,
+      /^syncs start from: the session hooks of Claude Code and Codex \(configured; requires approval in \/hooks\)$/m,
     );
     expect(status.stdout).not.toMatch(/^timer:/m);
     const doctor = await m.run("doctor");
     expect(doctor.stdout).toMatch(
-      /^ok {3}sync trigger: the session hooks of Claude Code and Codex$/m,
+      /^ok {3}sync trigger: the session hooks of Claude Code and Codex \(configured; requires approval in \/hooks\)$/m,
     );
     const json = await m.json<{ trigger: { hooks: string[]; timer: boolean } }>("status");
     expect(json.trigger).toEqual({
@@ -528,7 +544,7 @@ describe("init, status and doctor with the hooks or the timer", () => {
     );
     const status = await m.run("status");
     expect(status.stdout).toMatch(
-      /^syncs start from: the session hooks of Claude Code and Codex, and the timer$/m,
+      /^syncs start from: the session hooks of Claude Code and Codex \(configured; requires approval in \/hooks\), and the timer$/m,
     );
     expect(status.stdout).toMatch(/^timer: /m);
     const doctor = await m.run("doctor");
@@ -854,7 +870,7 @@ describe("the hooks on shared and upgraded machines", () => {
     // With Codex's session hook too, the old entry still gets its nudge.
     expect((await m.run("hook", "install", "codex")).code).toBe(0);
     expect((await m.run("doctor")).stdout).toMatch(
-      /^warn sync trigger: the session hooks of Codex; .*hook prompt` entry/m,
+      /^warn sync trigger: the session hooks of Codex \(configured; requires approval in \/hooks\); .*hook prompt` entry/m,
     );
   });
 
@@ -873,7 +889,7 @@ describe("the hooks on shared and upgraded machines", () => {
       // status alone does not ask.
       writeFileSync(config, JSON.stringify({ manifest }));
       expect((await m.runWith({ env: { PATH } }, "status")).stdout).toMatch(
-        /^syncs start from: the session hooks of Claude Code and Codex$/m,
+        /^syncs start from: the session hooks of Claude Code and Codex \(configured; requires approval in \/hooks\)$/m,
       );
       expect(JSON.parse(read(config))).toEqual({ manifest });
       // `timer: false` is the user's choice.

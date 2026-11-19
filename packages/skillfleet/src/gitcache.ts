@@ -26,6 +26,8 @@ export const repoKey = (spec: string) =>
 /** A ref that names a commit: a full id, or a prefix of one at least 7 hex digits long. */
 export const isCommitRef = (ref: string) => /^[0-9a-f]{7,40}$/i.test(ref);
 
+export const NO_GIT_REDIRECTS = ["-c", "http.followRedirects=false"];
+
 /** A path left out of a checkout because another path takes its folder on macOS and Windows. */
 export interface Collision {
   /** The path left out, up to the part that collides. */
@@ -170,7 +172,7 @@ export async function fetchClone(
     try {
       const problem = await check?.(url, cache.repo);
       if (problem) throw new UserError(problem);
-      commit = await fetchCommit(url, ref, cache.repo);
+      commit = await fetchCommit(url, ref, cache.repo, check ? NO_GIT_REDIRECTS : []);
     } catch (error) {
       // The network or the remote: a cache with a commit stays for --offline and later runs.
       if (fresh) rmSync(cache.repo, { recursive: true, force: true });
@@ -263,8 +265,13 @@ async function recoverTree(cache: CacheFiles, root: string, key: string) {
 }
 
 /** Fetches `ref` and returns its commit. A ref that is no branch or tag is read as a commit. */
-async function fetchCommit(url: string, ref: string | undefined, repo: string): Promise<string> {
-  const args = ["fetch", "--quiet", "--depth", "1", "--no-tags", "--", url, ref ?? "HEAD"];
+async function fetchCommit(
+  url: string,
+  ref: string | undefined,
+  repo: string,
+  config: readonly string[],
+): Promise<string> {
+  const args = [...config, "fetch", "--quiet", "--depth", "1", "--no-tags", "--", url, ref ?? "HEAD"];
   const fetched = await git(args, { cwd: repo, allowFail: true, timeoutMs: 600_000 });
   if (fetched.code === 0) {
     const commit = await gitOut(["rev-parse", "--verify", "FETCH_HEAD^{commit}"], repo);
@@ -279,6 +286,7 @@ async function fetchCommit(url: string, ref: string | undefined, repo: string): 
   const shallow = (await gitOut(["rev-parse", "--is-shallow-repository"], repo)) === "true";
   await git(
     [
+      ...config,
       "fetch",
       "--quiet",
       "--no-tags",

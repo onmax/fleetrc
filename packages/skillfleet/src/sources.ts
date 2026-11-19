@@ -1178,14 +1178,14 @@ function copyableSkill(
     return undefined;
   };
   const count = (at: string, files: number, bytes: number) => {
-    budget.files += files;
-    budget.bytes += bytes;
-    if (budget.files > SOURCE_LIMITS.files)
+    if (budget.files + files > SOURCE_LIMITS.files)
       return skip(`${source.id}'s skills hold more than ${SOURCE_LIMITS.files} files together`);
-    if (budget.bytes > SOURCE_LIMITS.bytes)
+    if (budget.bytes + bytes > SOURCE_LIMITS.bytes)
       return skip(
         `${source.id}'s skills hold more than ${SOURCE_LIMITS.bytes / 1024 ** 3} GB together`,
       );
+    budget.files += files;
+    budget.bytes += bytes;
     return at;
   };
   const one = skillBudget();
@@ -1370,7 +1370,8 @@ function recoverStore(storeDir: string) {
   if (!existsSync(storeDir)) return;
   for (const name of readdirSync(storeDir))
     if (STAGE.test(name)) rmSync(join(storeDir, name), { recursive: true, force: true });
-  for (const part of ["live", "base", "upstream"]) recoverReplaced(join(storeDir, part));
+  for (const part of ["live", "base", "upstream", "publishing"])
+    recoverReplaced(join(storeDir, part));
 }
 
 /**
@@ -1690,8 +1691,16 @@ async function fetchVendored(
   // Local edits are checked on every run, online or not.
   for (const [name, copy] of Object.entries(state.skills)) {
     const { live, base } = storePaths(ctx.storeDir, name);
+    const publishing = join(ctx.storeDir, "publishing", name);
     if (!existsSync(live)) continue;
     const now = hashDir(live);
+    if (existsSync(publishing)) {
+      if (sameTree(hashDir(publishing), now)) {
+        if (!ctx.dryRun) replaceDir(publishing, base);
+        copy.hashes = now;
+      }
+      if (!ctx.dryRun) rmSync(publishing, { recursive: true, force: true });
+    }
     const files = changedFiles(copy.hashes, now);
     if (files.length === 0) continue;
     // A sync stopped after it put an update in place (the base first, then the copy) and before it
@@ -1809,6 +1818,11 @@ async function fetchVendored(
     };
     // Each skill's folder is measured before `skills` copies it, which follows folder links.
     const budget = sourceBudget();
+    const retainRefused = (name: string) => {
+      if (!state.skills[name] || !existsSync(storePaths(ctx.storeDir, name).live)) return;
+      heldBack.add(name);
+      out.warnings.push(`${source.id}: ${name} keeps its last good copy`);
+    };
     const fanned: { skill: Found; dir: string }[] = [];
     const fromHandle = chosen.filter((skill) => {
       if (linked.includes(skill as LinkedFolder)) return false;
@@ -1823,6 +1837,7 @@ async function fetchVendored(
       );
       if (dir === join(opened.root, skill.path)) return true;
       if (dir) fanned.push({ skill, dir });
+      else retainRefused(skill.name);
       return false;
     });
     if (fromHandle.length > 0)
@@ -1844,7 +1859,10 @@ async function fetchVendored(
     for (const [i, link] of linked.entries()) {
       if (!chosen.includes(link)) continue;
       const dir = copyableSkill(source, link.name, link.real, staging, budget, out.warnings);
-      if (!dir) continue;
+      if (!dir) {
+        retainRefused(link.name);
+        continue;
+      }
       // Each from its own folder, which `skills` reads as a source of one skill.
       const handle =
         dir === link.real
@@ -2193,14 +2211,18 @@ function applyVendored(
     }
     if (write) {
       // Edits were looked for before the fetch; one saved since then is caught here.
-      const late = replaceUnchanged(from, paths.live, record.hashes);
+      const publishing = join(ctx.storeDir, "publishing", skill.name);
+      replaceDir(from, publishing);
+      const late = replaceUnchanged(publishing, paths.live, record.hashes);
       if (late.length > 0) {
+        rmSync(publishing, { recursive: true, force: true });
         edited.set(skill.name, late);
         out.edited.push({ skill: skill.name, files: late });
         hold(skill.name, from, "edited", files);
         continue;
       }
-      replaceDir(from, paths.base);
+      replaceDir(publishing, paths.base);
+      rmSync(publishing, { recursive: true, force: true });
       rmSync(paths.upstream, { recursive: true, force: true });
       state.skills[skill.name] = { hashes: incoming, path: skill.path };
       delete state.pending[skill.name];
