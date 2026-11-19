@@ -924,8 +924,11 @@ export async function loadManifest(
     excludeSources: Set<string>;
   }
   /** Each manifest extended, once, with every path it was reached by, in the order first reached. */
-  const extended = new Map<string, { manifest: Manifest; parent: string; paths: Through[] }>();
-  /** Where each `extends` entry led, by the manifest that has it and its index; null when it failed. */
+  const extended = new Map<
+    string,
+    { manifest: Manifest; parent: string; paths: (Through & { within: string })[] }
+  >();
+  /** Where each `extends` entry led, by manifest, index and boundary; null when it failed. */
   const located = new Map<string, { file: string; root: string } | null>();
   const unreadable = new Set<string>();
   const sameThrough = (a: Through, b: Through) =>
@@ -952,7 +955,7 @@ export async function loadManifest(
           ...entry.excludeSources.map(nameKey),
         ]),
       };
-      const key = `${manifest.file}\0${i}`;
+      const key = `${manifest.file}\0${i}\0${within ?? ""}`;
       let at = located.get(key);
       if (at === undefined) {
         try {
@@ -1007,9 +1010,11 @@ export async function loadManifest(
         known = { manifest: team, parent, paths: [] };
         extended.set(at.file, known);
       }
-      if (known.paths.some((seen) => sameThrough(seen, filter))) continue;
-      known.paths.push(filter);
-      await visit(known.manifest, filter, at.root, [...path, at.file]);
+      const boundary = at.root;
+      if (known.paths.some((seen) => seen.within === boundary && sameThrough(seen, filter)))
+        continue;
+      known.paths.push({ ...filter, within: boundary });
+      await visit(known.manifest, filter, boundary, [...path, at.file]);
     }
   };
   await visit(root, undefined, undefined, []);

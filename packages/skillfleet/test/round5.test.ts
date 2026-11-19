@@ -396,7 +396,7 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
     it("resolves relative paths against .skillfleet/; a team named by its file keeps its extends in the file's folder", async () => {
       write("r5-folder/.skillfleet/manifest.json", {
         extends: ["./team.json"],
-        sources: [{ id: "mine", local: "../skills" }],
+        sources: [{ id: "mine", local: ".." }],
       });
       write("r5-folder/.skillfleet/team.json", {
         extends: ["./shared.json", "../outside.json"],
@@ -412,7 +412,7 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       expect(loaded.root.file).toBe(join(root, "r5-folder", ".skillfleet", "manifest.json"));
       expect(loaded.sources.map((source) => source.id)).toEqual(["mine", "team", "shared"]);
       const mine = loaded.sources[0]!;
-      expect(mine.kind === "local" && mine.local).toBe(join(root, "r5-folder", "skills"));
+      expect(mine.kind === "local" && mine.local).toBe(join(root, "r5-folder"));
       expect(loaded.failed).toEqual(["../outside.json"]);
       expect(loaded.warnings.join("\n")).toMatch(/outside it/);
     });
@@ -434,6 +434,31 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       expect(loaded.failed).toEqual(["../private.json", "../private.json"]);
       expect(loaded.warnings.join("\n")).toMatch(/outside it/);
     });
+
+    it.each(["file", "folder"])(
+      "keeps each team's boundary when the %s is named first",
+      async (first) => {
+        write("r5-boundary/team/.skillfleet/manifest.json", {
+          extends: ["../shared.json"],
+          sources: [{ id: "team", npm: "team" }],
+        });
+        write("r5-boundary/team/shared.json", {
+          sources: [{ id: "shared", npm: "shared" }],
+        });
+        const fileEntry = { manifest: "./team/.skillfleet/manifest.json", exclude: ["file-only"] };
+        const folderEntry = { manifest: "./team", exclude: ["folder-only"] };
+        const file = write("r5-boundary/me.json", {
+          extends: first === "file" ? [fileEntry, folderEntry] : [folderEntry, fileEntry],
+        });
+
+        const loaded = await loadManifest(file, { offline: true });
+        expect(loaded.sources.map((source) => source.id)).toEqual(["team", "shared"]);
+        expect(loaded.sources[0]!.exclude?.toSorted()).toEqual(["file-only", "folder-only"]);
+        expect(loaded.sources[1]!.exclude).toEqual(["folder-only"]);
+        expect(loaded.failed).toEqual(["../shared.json"]);
+        expect(loaded.warnings).toEqual([expect.stringContaining("outside it")]);
+      },
+    );
 
     it("does not read a skills.json at the folder's root", async () => {
       write("r5-old/skills.json", { sources: [] });

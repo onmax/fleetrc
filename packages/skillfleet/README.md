@@ -132,7 +132,7 @@ Then `npx skillfleet init me/skills` on each machine. Your sources come first, s
 ### Fields
 
 - `$schema` points editors at the schema, for completion and checks.
-- Relative paths (`path`, `local`, `extends`) resolve against the manifest's own folder, `.skillfleet/`, so `"local": ".."` is the repository the manifest is in.
+- Relative paths (`path`, `local`, `extends`) resolve against the manifest's own folder, `.skillfleet/`. To use the repository itself as a local source, add `{ "id": "mine", "local": ".." }` to `sources`.
 - A source is one of `git`, `index` (a site serving `/.well-known/agent-skills/index.json`), `npm` (with an optional `registry`) or `local` (a folder on this machine). `skills` is a glob of skill folders inside it, and `ref` pins a git branch, tag or commit, written in full or as its first 7 or more characters. A `"path"` clone pinned to a commit stays on it, since there is nothing to fast-forward, until the manifest names another commit.
 - An `index` site may serve the older v0.1 index at `/.well-known/skills/index.json` instead; skillfleet reads both.
 - `agents` is `"all"` (the default) or a list of agent ids. `"all"` means every agent installed on the machine: one whose folder is in your home, such as `~/.claude` for Claude Code or `~/.codex` for Codex. `skillfleet agents` lists the ids and which agents it found. A sync that links into no folder says so.
