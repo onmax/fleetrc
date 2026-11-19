@@ -561,6 +561,8 @@ async function timer(action: string | undefined) {
       if (foreign) throw new UserError(`nothing removed: ${foreignTimer(TIMER_NAME, foreign)}`);
       forgetTimer();
       updateConfig({ timer: false });
+      const pending = paths.initPending();
+      if (pendingInitTimer(pending)) writeFileSync(pending, "");
       if (json) emit(removal);
       else if (!removal.existed) say("no timer installed");
       else say(`removed ${TIMER_NAME}`, ...removal.removed.map((file) => `  ${tildify(file)}`));
@@ -933,6 +935,15 @@ function addHooks(
   return { lines, changes, code: changes.some((change) => change.error) ? 1 : 0 };
 }
 
+function pendingInitTimer(path: string): boolean {
+  try {
+    return readFileSync(path, "utf8") === "timer\n";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return false;
+  }
+}
+
 async function init() {
   if (rest.length > 1) usage("init takes one manifest");
   copyMode();
@@ -942,13 +953,7 @@ async function init() {
       "init needs a manifest: a path, a repository such as owner/repo (its .skillfleet/manifest.json), or <repo>//<file> such as github:org/agents//team.json",
     );
   const pending = paths.initPending();
-  let pendingTimer = false;
-  try {
-    pendingTimer = readFileSync(pending, "utf8") === "timer\n";
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  const withTimer = pendingTimer || timerWanted();
+  const withTimer = pendingInitTimer(pending) || timerWanted();
   const withHooks = !values["no-hooks"];
   const plan = await planInit(canonicalManifestSpec(given), { offline: values.offline, dryRun });
   if (dryRun) {

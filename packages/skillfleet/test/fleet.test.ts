@@ -483,7 +483,15 @@ describe("fleet tags", () => {
       ssh,
       `const host = process.argv[process.argv.indexOf("--") + 1];
 if (process.argv.includes("-G")) {
-  console.log("hostname " + (host === "alias.invalid" ? "localhost" : "127.0.0.2"));
+  const aliases = {
+    "alias.invalid": ["alice", 2222],
+    "same.invalid": ["alice", 2222],
+    "other-user.invalid": ["bob", 2222],
+    "other-port.invalid": ["alice", 2223],
+  };
+  const config = aliases[host];
+  console.log("hostname " + (config ? "localhost" : "127.0.0.2"));
+  if (config) console.log("user " + config[0] + "\\nport " + config[1]);
 } else console.log('skillfleet-fleet: never-synced');`,
     );
     const tailscale = fakeTailscale(
@@ -496,10 +504,17 @@ if (process.argv.includes("-G")) {
       "fleet",
       "status",
       "alias.invalid",
+      "same.invalid",
+      "other-user.invalid",
+      "other-port.invalid",
       "tag:servers",
       "--json",
     );
-    expect((JSON.parse(run.stdout) as Hosts).map(({ host }) => host)).toEqual(["alias.invalid"]);
+    expect((JSON.parse(run.stdout) as Hosts).map(({ host }) => host)).toEqual([
+      "alias.invalid",
+      "other-user.invalid",
+      "other-port.invalid",
+    ]);
     const other = await m.runWith({ env }, "fleet", "status", "localhost", "tag:servers", "--json");
     expect(JSON.parse(other.stdout)).toMatchObject([
       { host: "localhost" },
@@ -507,7 +522,7 @@ if (process.argv.includes("-G")) {
     ]);
   });
 
-  it("preserves the cached report when an IP fallback peer goes offline", async () => {
+  it("keeps the newest report from the tagged destination when an IP fallback peer goes offline", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
     expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
@@ -517,25 +532,32 @@ if (process.argv.includes("-G")) {
       ssh,
       `import { appendFileSync } from "node:fs";
 appendFileSync(${JSON.stringify(log)}, process.argv[process.argv.indexOf("--") + 1] + "\\n");
-console.log(JSON.stringify({ finishedAt: "2026-01-01T00:00:00Z", ok: true, skills: 1 }));`,
+console.log(JSON.stringify({ finishedAt: process.env.REPORT_TIME, ok: true, skills: 1 }));`,
     );
     const online = peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] });
     const tailscale = fakeTailscale(m.root, status([online]));
     const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: tailscale };
-    const before = await m.runWith({ env }, "fleet", "status", "tag:servers", "--json");
+    const run = (host: string, time?: string) =>
+      m.runWith({ env: { ...env, REPORT_TIME: time } }, "fleet", "status", host, "--json");
+    const before = await run("tag:servers", "2026-01-01T00:00:00Z");
     expect(before.code, before.stderr).toBe(0);
     expect(JSON.parse(before.stdout)).toMatchObject([{ host: "100.64.0.5", reachable: true }]);
+    expect((await run("100.64.0.5", "2026-01-01T00:01:00Z")).code).toBe(0);
+    expect((await run("bob@100.64.0.5", "2026-01-01T00:02:00Z")).code).toBe(0);
+    expect((await run("ssh://100.64.0.5:2222", "2026-01-01T00:03:00Z")).code).toBe(0);
     fakeTailscale(m.root, status([{ ...online, Online: false }]));
-    const after = await m.runWith({ env }, "fleet", "status", "tag:servers", "--json");
+    const after = await run("tag:servers");
     expect(after.code, after.stderr).toBe(1);
     expect(JSON.parse(after.stdout)).toMatchObject([
       {
         host: "web.invalid",
         error: "offline in Tailscale",
-        lastRun: { finishedAt: "2026-01-01T00:00:00Z", skills: 1 },
+        lastRun: { finishedAt: "2026-01-01T00:01:00Z", skills: 1 },
       },
     ]);
-    expect(readFileSync(log, "utf8")).toBe("100.64.0.5\n");
+    expect(readFileSync(log, "utf8")).toBe(
+      "100.64.0.5\n100.64.0.5\nbob@100.64.0.5\nssh://100.64.0.5:2222\n",
+    );
   });
 
   it("falls back to IP without waiting for a slow DNS lookup", async () => {
@@ -1205,6 +1227,105 @@ describe.skipIf(isWindows)("fleet init", () => {
     expect(m.schedulerCalls().length).toBeGreaterThan(calls);
     expect(existsSync(join(state, "init-pending"))).toBe(true);
     expect(fleetIn()).toEqual([]);
+  });
+
+  it("does not retry a pending timer after explicit removal", async () => {
+    const m = machine({ scheduler: "refuse" });
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    const pending = join(m.stateDir, "init-pending");
+    expect((await m.run("init", manifest, "--timer", "--no-hooks")).code).toBe(1);
+    expect(readFileSync(pending, "utf8")).toBe("timer\n");
+
+    const remove = await m.runWith(
+      { env: { SKILLFLEET_TEST_SCHEDULER: "empty" } },
+      "timer",
+      "remove",
+    );
+    expect(remove.code, remove.stdout + remove.stderr).toBe(0);
+    expect(readFileSync(pending, "utf8")).toBe("");
+    const calls = m.schedulerCalls().length;
+    const retry = await m.run("init", manifest, "--no-hooks");
+    expect.soft(retry.code, retry.stdout + retry.stderr).toBe(0);
+    expect.soft(m.schedulerCalls()).toHaveLength(calls);
+    expect(existsSync(pending)).toBe(false);
+  });
+
+  it("compares equivalent named and tagged hosts without ignoring users or ports", async () => {
+    const { m } = await controller(["VPS2", "tag:servers"]);
+    const env = {
+      ...initShims(m, {}),
+      SKILLFLEET_TAILSCALE: fakeTailscale(
+        m.root,
+        status([peer("web.invalid", ["tag:servers"], { ips: ["fd7a::5"] })]),
+      ),
+    };
+    const run = await m.runWith(
+      { env },
+      "fleet",
+      "init",
+      "vps2",
+      "fd7a:0::5",
+      "root@vps2",
+      "ssh://[fd7a::5]:2222",
+      "--dry-run",
+    );
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(run.stdout).toContain("would add root@vps2, ssh://[fd7a::5]:2222 to the fleet");
+  });
+
+  it("retains tagged peer reports across init errors and offline status", async () => {
+    const { m, fleetIn } = await controller();
+    const ssh = join(m.root, "ssh.mjs");
+    const online = peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] });
+    const tailscale = fakeTailscale(m.root, status([online]));
+    writeFileSync(
+      ssh,
+      `
+const success = { finishedAt: "2026-01-01T00:00:00Z", ok: true };
+if (process.env.FAKE_ANSWER === "mismatch") {
+  console.error("skillfleet-fleet: has github:another/manifest");
+  console.log("skillfleet-fleet: other-manifest");
+} else if (process.env.FAKE_ANSWER === "failed") {
+  console.log(JSON.stringify({ sync: { ...success, finishedAt: "2026-01-01T00:01:00Z", ok: false } }));
+  process.exitCode = 1;
+} else console.log(JSON.stringify(success));
+`,
+    );
+    const run = (action: string, answer?: string) =>
+      m.runWith(
+        {
+          env: {
+            SKILLFLEET_SSH: ssh,
+            SKILLFLEET_TAILSCALE: tailscale,
+            SKILLFLEET_PACKAGE: "/pkg/skillfleet.tgz",
+            FAKE_ANSWER: answer,
+          },
+        },
+        "fleet",
+        action,
+        "tag:servers",
+        "--json",
+      );
+    expect((await run("status")).code).toBe(0);
+    const mismatch = await run("init", "mismatch");
+    expect(mismatch.code).toBe(1);
+    expect
+      .soft(JSON.parse(mismatch.stdout))
+      .toMatchObject([
+        { error: expect.stringContaining("another/manifest"), lastRun: { ok: true } },
+      ]);
+    const failed = await run("init", "failed");
+    expect(failed.code).toBe(1);
+    expect(JSON.parse(failed.stdout)).toMatchObject([
+      { error: expect.stringContaining("first sync had errors"), lastRun: { ok: false } },
+    ]);
+    expect(fleetIn()).toEqual([]);
+    fakeTailscale(m.root, status([{ ...online, Online: false }]));
+    const offline = await run("status");
+    expect(offline.code).toBe(1);
+    expect(JSON.parse(offline.stdout)).toMatchObject([
+      { error: "offline in Tailscale", lastRun: { finishedAt: "2026-01-01T00:01:00Z", ok: false } },
+    ]);
   });
 
   it("this machine is already set up; a host a tag of the fleet matches is not added again", async () => {
