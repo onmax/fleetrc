@@ -30,11 +30,11 @@ import {
   fleet,
   type FleetAction,
   fleetEntryProblem,
+  fleetSuggestions,
   formatFleet,
   isTag,
   resolveFleet,
   tagProblem,
-  tailscalePeers,
   unpublished,
 } from "./fleet.ts";
 import { isRecord, JsonFileError, readJsonOrNothing, writeJson } from "./fs.ts";
@@ -1018,13 +1018,13 @@ async function fleetCommand(action: string | undefined) {
   if (action === "add") {
     const hosts = rest.slice(1);
     if (hosts.length === 0) {
-      const peers = await tailscalePeers();
+      const { named, taggable } = await fleetSuggestions();
       const known = new Set(loaded.root.fleet.map((entry) => entry.toLowerCase()));
-      const suggestions = peers
+      const suggestions = named
         .filter((peer) => !known.has(peer.host.toLowerCase()) && !known.has(peer.dns.toLowerCase()))
         .map(({ host, dns, online }) => ({ host, dns, online }));
       const counts = new Map<string, number>();
-      for (const peer of peers)
+      for (const peer of taggable)
         for (const tag of peer.tags) counts.set(tag, (counts.get(tag) ?? 0) + 1);
       const tags = [...counts]
         .filter(([tag]) => !known.has(tag.toLowerCase()))

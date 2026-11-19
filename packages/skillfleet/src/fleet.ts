@@ -1,3 +1,4 @@
+import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { exec } from "./exec.ts";
 import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
@@ -531,14 +532,6 @@ export async function tailnet(): Promise<Tailnet | { error: string }> {
   return { peers, magicDNS: current.MagicDNSEnabled !== false };
 }
 
-/** Machines on the tailnet, for `fleet add` to suggest; none when Tailscale can't say. */
-export async function tailscalePeers(): Promise<TailscalePeer[]> {
-  const answer = await tailnet();
-  return "peers" in answer
-    ? answer.peers.filter((peer) => peer.host && !hostProblem(peer.host))
-    : [];
-}
-
 /**
  * Whether a name or address `tailscale status` gave is one to hand ssh: a DNS name or an IP
  * address, nothing ssh reads as an option or a user (`-oProxyCommand=x`, `user@x`).
@@ -549,6 +542,26 @@ const tailnetHost = (host: string) =>
     /^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)*$/.test(
       host,
     ));
+
+function peerDestinations(peer: TailscalePeer, magicDNS: boolean) {
+  return {
+    dns: magicDNS && tailnetHost(peer.dns) ? peer.dns : undefined,
+    ips: peer.ips.filter((ip) => !hostProblem(ip) && isIP(ip) !== 0),
+  };
+}
+
+/** Named host suggestions and all peers with a possible tag destination, from one status query. */
+export async function fleetSuggestions() {
+  const answer = await tailnet();
+  if ("error" in answer) return { named: [], taggable: [] };
+  return {
+    named: answer.peers.filter((peer) => peer.host && tailnetHost(peer.host)),
+    taggable: answer.peers.filter((peer) => {
+      const { dns, ips } = peerDestinations(peer, answer.magicDNS);
+      return dns || ips.length > 0;
+    }),
+  };
+}
 
 /**
  * A host name or address, normalised for comparing: lower case, no trailing dot, an IPv6 address
@@ -566,6 +579,13 @@ function hostKey(host: string): string {
     return zone === undefined ? canonical : `${canonical}%${zone}`;
   }
   return name;
+}
+
+async function localAddresses(name: string): Promise<string[]> {
+  return lookup(name, { all: true }).then(
+    (answers) => answers.map(({ address }) => address),
+    () => [],
+  );
 }
 
 /**
@@ -593,8 +613,8 @@ function sshTarget(entry: string): { machine: string; user: string; port: string
 
 /**
  * The hosts to run on: the explicit ones as they are, and each `tag:` entry as every tailnet
- * machine with that tag, by MagicDNS name, or its first Tailscale IP when it has none or the
- * tailnet has MagicDNS off. Tailscale is asked once, and only when there is a tag. A machine named
+ * machine with that tag, by MagicDNS name, or its first usable Tailscale IP when the name is
+ * unavailable locally. Tailscale is asked once, and only when there is a tag. A machine named
  * twice runs once. Entries are compared by the machine they reach: an IPv6 address in any
  * spelling, a MagicDNS name or its short name, and, when Tailscale was asked, any name or IP of the
  * same peer. Two explicit entries for one machine run once when they also have the same user and
@@ -605,24 +625,60 @@ function sshTarget(entry: string): { machine: string; user: string; port: string
  */
 export async function resolveFleet(
   entries: readonly string[],
+  addresses = localAddresses,
 ): Promise<{ targets: FleetTarget[]; warnings: string[] }> {
   const warnings: string[] = [];
   const answer: Tailnet | { error: string } = entries.some(isTag)
     ? await tailnet()
     : { peers: [], magicDNS: true };
-  // Every name and IP of a peer leads to the peer's first one, so they compare as one machine.
-  const peerOf = new Map<string, string>();
-  const names = (peer: TailscalePeer) =>
-    [peer.dns, peer.host, ...peer.ips].filter(Boolean).map(hostKey);
-  if ("peers" in answer)
-    for (const peer of answer.peers) {
-      const [id] = names(peer);
-      for (const name of names(peer)) if (id && !peerOf.has(name)) peerOf.set(name, id);
+  const peerOf = new Map<string, string | null>();
+  const destination = new Map<TailscalePeer, string>();
+  const tagNames = new Set(entries.filter(isTag).map((entry) => entry.toLowerCase()));
+  const explicitNames = entries
+    .filter((entry) => !isTag(entry))
+    .map((entry) => sshTarget(entry).machine);
+  const explicitKeys = new Set(explicitNames);
+  const matchesPeer = async (name: string, ips: string[]) => {
+    const found = await addresses(name);
+    return found.length > 0 && found.every((ip) => ips.includes(hostKey(ip)));
+  };
+  if ("peers" in answer) {
+    const peers = await Promise.all(
+      answer.peers.map(async (peer) => {
+        const { dns, ips } = peerDestinations(peer, answer.magicDNS);
+        const ipKeys = ips.map(hostKey);
+        const dnsKey = dns ? hostKey(dns) : undefined;
+        const shortKey = dns && tailnetHost(peer.host) ? hostKey(peer.host) : undefined;
+        const relevant =
+          peer.tags.some((tag) => tagNames.has(tag.toLowerCase())) ||
+          (dnsKey !== undefined && explicitKeys.has(dnsKey)) ||
+          (shortKey !== undefined && explicitKeys.has(shortKey));
+        const useDNS =
+          dns && (!peer.online || !ips.length || (relevant && (await matchesPeer(dns, ipKeys))));
+        const host = (useDNS ? dns : undefined) ?? ips[0];
+        const aliases = [...ipKeys];
+        if (useDNS && dnsKey) aliases.push(dnsKey);
+        if (
+          shortKey &&
+          explicitKeys.has(shortKey) &&
+          (!ips.length || (peer.online && (await matchesPeer(shortKey, ipKeys))))
+        )
+          aliases.push(shortKey);
+        return { peer, host, aliases };
+      }),
+    );
+    for (const { peer, host, aliases } of peers) {
+      if (!host) continue;
+      destination.set(peer, host);
+      const id = hostKey(host);
+      for (const alias of aliases) {
+        if (!peerOf.has(alias)) peerOf.set(alias, id);
+        else if (peerOf.get(alias) !== id) peerOf.set(alias, null);
+      }
     }
+  }
   const machine = (name: string) => peerOf.get(hostKey(name)) ?? hostKey(name);
-  const explicit = new Set(
-    entries.filter((entry) => !isTag(entry)).map((entry) => machine(sshTarget(entry).machine)),
-  );
+  const explicit = new Set(explicitNames.map(machine));
   const seen = new Set<string>();
   const targets: FleetTarget[] = [];
   for (const entry of entries) {
@@ -642,14 +698,14 @@ export async function resolveFleet(
     if (matches.length === 0)
       warnings.push(`${entry} matches no machine on your tailnet besides this one`);
     for (const peer of matches) {
-      const host = (answer.magicDNS && peer.dns) || peer.ips[0];
-      if (!host || !tailnetHost(host)) {
+      const host = destination.get(peer);
+      if (!host) {
         warnings.push(
           `${entry}: skipped a machine Tailscale calls ${JSON.stringify(peer.dns || peer.host)}, which has no name or address ssh takes`,
         );
         continue;
       }
-      const id = machine(host);
+      const id = hostKey(host);
       if (explicit.has(id) || seen.has(id)) continue;
       seen.add(id);
       targets.push({ host, via: entry, ...(peer.online ? {} : { offline: true }) });

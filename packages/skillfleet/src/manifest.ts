@@ -985,9 +985,14 @@ export async function loadManifest(
       let known = extended.get(at.file);
       if (!known) {
         let team: Manifest;
+        let ignoredFleet = false;
         try {
           team = readManifestFile(at.file, (raw) => {
-            if (!isRecord(raw) || !Array.isArray(raw.sources)) return;
+            if (!isRecord(raw)) return;
+            ignoredFleet =
+              raw.fleet !== undefined && (!Array.isArray(raw.fleet) || raw.fleet.length > 0);
+            delete raw.fleet;
+            if (!Array.isArray(raw.sources)) return;
             for (const [i, source] of raw.sources.entries()) {
               if (!isRecord(source)) continue;
               for (const key of ROOT_ONLY_SOURCE_KEYS) {
@@ -1007,7 +1012,7 @@ export async function loadManifest(
         }
         const ignored = [
           team.hooks.length > 0 && "hooks",
-          team.fleet.length > 0 && "fleet",
+          ignoredFleet && "fleet",
           team.hub && "hub",
           team.report && "report",
         ].filter(Boolean);
