@@ -159,10 +159,13 @@ const DISABLED_WINDOWS = "exit /b 0 & rem skillfleet: disabled legacy hook";
 const isDisabledCommand = (command: unknown) =>
   command === DISABLED_POSIX || command === DISABLED_WINDOWS;
 
-/** A matcher group that runs on every event of its kind: no matcher (Codex reads null as none), or one that matches all. */
-const catchAll = (group: Record<string, unknown>) =>
+/**
+ * A matcher group that runs on every event of its kind in `agent`: no matcher, or one that matches
+ * all. Codex reads a null matcher as none; Claude Code skips that group.
+ */
+const catchAll = (group: Record<string, unknown>, agent: HookAgent) =>
   group.matcher === undefined ||
-  group.matcher === null ||
+  (agent === "codex" && group.matcher === null) ||
   group.matcher === "" ||
   group.matcher === "*";
 
@@ -423,7 +426,7 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
       own.length === 1 &&
       sameHandler(own[0]!.handler, handler) &&
       isRecord(holder) &&
-      catchAll(holder)
+      catchAll(holder, agent)
     )
       continue;
     if (agent === "codex" && Array.isArray(hooks[event])) {
@@ -436,7 +439,7 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
               ...group,
               hooks: group.hooks.map((hook: unknown) => {
                 // Only a group that runs for every session start (no matcher) may hold it.
-                if (placed || !catchAll(group) || !isOwnHandler(hook) || isDisabled(hook))
+                if (placed || !catchAll(group, agent) || !isOwnHandler(hook) || isDisabled(hook))
                   return hook;
                 placed = { ...handler };
                 return placed;

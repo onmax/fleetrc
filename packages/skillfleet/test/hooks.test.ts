@@ -482,6 +482,24 @@ describe("hook install and remove", () => {
     expect(read(file)).toBe(before);
   });
 
+  it("moves Claude Code's entry out of a group with matcher null, which Claude Code skips", async () => {
+    const m = machine();
+    expect((await m.run("hook", "install", "claude-code")).code).toBe(0);
+    const file = m.at(".claude", "settings.json");
+    const current = settings(m).hooks!.SessionStart![0]!.hooks[0]!;
+    writeFileSync(
+      file,
+      JSON.stringify({ hooks: { SessionStart: [{ matcher: null, hooks: [current] }] } }),
+    );
+    expect((await m.run("hook", "install", "claude-code")).code).toBe(0);
+    const groups = (
+      JSON.parse(read(file)).hooks as { SessionStart: { matcher?: unknown; hooks: Entry[] }[] }
+    ).SessionStart;
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.matcher).toBeUndefined();
+    expect(groups[0]!.hooks).toEqual([current]);
+  });
+
   it("puts the Codex entry in a group for every session when the older one is under a matcher, and status ignores placeholders", async () => {
     const m = machine();
     const file = m.at(".codex", "hooks.json");
