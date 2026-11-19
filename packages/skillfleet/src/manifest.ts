@@ -335,7 +335,11 @@ function extendsList(file: string, value: unknown): Extends[] {
 }
 
 /** Validates a manifest file's JSON. `base` resolves relative paths. */
-export function parseManifest(file: string, raw: unknown, base = dirname(file)): Manifest {
+export function parseManifest(
+  file: string,
+  raw: unknown,
+  { base = dirname(file), extended = false } = {},
+): Manifest {
   if (!isRecord(raw)) fail(file, "the manifest", "must be a JSON object");
   for (const key of Object.keys(raw))
     if (!ROOT_KEYS.has(key)) fail(file, key, "is not a manifest field");
@@ -395,9 +399,15 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
       optionalString(file, `hooks[${i}].run`, hook.run) ??
       fail(file, `hooks[${i}].run`, "is required");
     const on = stringList(file, `hooks[${i}].on`, hook.on) ?? ["*:**"];
-    for (const [index, pattern] of on.entries())
-      if (splitHookPattern(pattern).glob.length > MAX_GLOB_LENGTH)
-        fail(file, `hooks[${i}].on[${index}]`, `glob exceeds ${MAX_GLOB_LENGTH} UTF-16 code units`);
+    if (!extended) {
+      for (const [index, pattern] of on.entries())
+        if (splitHookPattern(pattern).glob.length > MAX_GLOB_LENGTH)
+          fail(
+            file,
+            `hooks[${i}].on[${index}]`,
+            `glob exceeds ${MAX_GLOB_LENGTH} UTF-16 code units`,
+          );
+    }
     return {
       name: optionalString(file, `hooks[${i}].name`, hook.name) ?? run,
       run,
@@ -944,7 +954,10 @@ async function teamSourceProblem(source: VendoredSource): Promise<string | undef
 }
 
 /** Reads and validates a manifest file; `prepare` may change its JSON first. */
-function readManifestFile(file: string, prepare?: (raw: unknown) => void): Manifest {
+function readManifestFile(
+  file: string,
+  { extended = false, prepare }: { extended?: boolean; prepare?: (raw: unknown) => void } = {},
+): Manifest {
   if (!existsSync(file)) throw new ManifestError(`${file}: no such manifest`);
   let raw: unknown;
   try {
@@ -953,7 +966,7 @@ function readManifestFile(file: string, prepare?: (raw: unknown) => void): Manif
     throw new ManifestError(`${file}: ${(error as Error).message}`);
   }
   prepare?.(raw);
-  return parseManifest(file, raw);
+  return parseManifest(file, raw, { extended });
 }
 
 /** Fields a source may set only in the root manifest, which an extended one's sources lose. */
@@ -1042,18 +1055,21 @@ export async function loadManifest(
       if (!known) {
         let team: Manifest;
         try {
-          team = readManifestFile(at.file, (raw) => {
-            if (!isRecord(raw) || !Array.isArray(raw.sources)) return;
-            for (const [i, source] of raw.sources.entries()) {
-              if (!isRecord(source)) continue;
-              for (const key of ROOT_ONLY_SOURCE_KEYS) {
-                if (source[key] === undefined) continue;
-                delete source[key];
-                warnings.push(
-                  `extends ${parent}: ignored "${key}" of source "${typeof source.id === "string" ? source.id : `sources[${i}]`}"; only the root manifest can follow links out of a source`,
-                );
+          team = readManifestFile(at.file, {
+            extended: true,
+            prepare: (raw) => {
+              if (!isRecord(raw) || !Array.isArray(raw.sources)) return;
+              for (const [i, source] of raw.sources.entries()) {
+                if (!isRecord(source)) continue;
+                for (const key of ROOT_ONLY_SOURCE_KEYS) {
+                  if (source[key] === undefined) continue;
+                  delete source[key];
+                  warnings.push(
+                    `extends ${parent}: ignored "${key}" of source "${typeof source.id === "string" ? source.id : `sources[${i}]`}"; only the root manifest can follow links out of a source`,
+                  );
+                }
               }
-            }
+            },
           });
         } catch (error) {
           warnings.push(`extends ${parent}: ${(error as Error).message}`);

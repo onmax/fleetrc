@@ -565,7 +565,8 @@ describe("init, status and doctor with the hooks or the timer", () => {
     const handlers = removed.hooks.SessionStart[0]!.hooks;
     expect(handlers[0]?.command).toContain("skillfleet: disabled legacy hook");
     expect(handlers[1]).toEqual(custom);
-    expect((await m.json("status")).trigger).toEqual({ hooks: [], timer: false });
+    const json = await m.json<{ trigger: { hooks: string[]; timer: boolean } }>("status");
+    expect(json.trigger).toEqual({ hooks: [], timer: false });
     expect((await m.run("doctor")).stdout).toMatch(/^warn sync trigger: nothing starts a sync/m);
   });
 
