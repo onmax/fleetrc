@@ -20,6 +20,7 @@ import { checkForks, unresolvedFiles } from "./edits.ts";
 import { exec, stopAll } from "./exec.ts";
 import {
   changedFiles,
+  dict,
   hashDir,
   inside,
   isErrno,
@@ -622,49 +623,48 @@ function renamedFrom(
   );
 }
 
-function recordSkills(
-  state: State,
-  winners: Map<string, DesiredLink>,
-  results: SourceResult[],
-  now: string,
-): boolean {
-  let changed = false;
-  const touched = new Set(
-    results.flatMap((result) =>
-      [...result.updated, ...result.added].map((skill) => `${result.id}/${skill}`),
-    ),
-  );
-  const clonesChanged = new Set(
-    results
-      .filter(
-        (result) =>
-          result.changed.length > 0 && (result.kind === "clone" || result.kind === "local"),
-      )
-      .map((result) => result.id),
-  );
+function latestTime(previous?: string, next?: string): string | undefined {
+  return previous === undefined || (next !== undefined && next > previous) ? next : previous;
+}
+
+function checkpointSkillChanges(state: State, result: SourceResult, now: string) {
+  const all = result.changed.length > 0 && (result.kind === "clone" || result.kind === "local");
+  if (!all && result.updated.length === 0 && result.added.length === 0) return;
+  const changes = ((state.skillChanges ??= dict())[result.id] ??= { skills: dict() });
+  if (all) changes.all = latestTime(changes.all, now);
+  for (const name of [...result.updated, ...result.added])
+    changes.skills[name] = latestTime(changes.skills[name], now)!;
+}
+
+function recordSkills(state: State, winners: Map<string, DesiredLink>, now: string) {
+  let changed: string | undefined;
   for (const [name, link] of winners) {
     const record = state.skills[name];
+    const changes = state.skillChanges?.[link.source];
+    const touched = latestTime(changes?.skills[name], changes?.all);
     if (!record) {
       // Renamed only in case or Unicode form: the same skill, so it keeps when it arrived.
       const old = renamedFrom(state, winners, name);
-      const addedAt = old === undefined ? now : state.skills[old]!.addedAt;
-      state.skills[name] = { source: link.source, dir: link.target, addedAt, changedAt: now };
-      changed = true;
-    } else if (
-      record.dir !== link.target ||
-      touched.has(`${link.source}/${name}`) ||
-      clonesChanged.has(link.source)
-    ) {
-      Object.assign(record, { source: link.source, dir: link.target, changedAt: now });
-      changed = true;
+      const changedAt = touched ?? now;
+      const addedAt = old === undefined ? changedAt : state.skills[old]!.addedAt;
+      state.skills[name] = { source: link.source, dir: link.target, addedAt, changedAt };
+      changed = latestTime(changed, changedAt);
+    } else if (record.source !== link.source || record.dir !== link.target || touched) {
+      const changedAt =
+        record.source === link.source && record.dir === link.target
+          ? latestTime(record.changedAt, touched)!
+          : now;
+      Object.assign(record, { source: link.source, dir: link.target, changedAt });
+      changed = latestTime(changed, changedAt);
     }
   }
   for (const name of Object.keys(state.skills)) {
     if (winners.has(name)) continue;
     delete state.skills[name];
-    changed = true;
+    changed = latestTime(changed, now);
   }
-  return changed;
+  delete state.skillChanges;
+  if (changed !== undefined) state.lastChange = latestTime(state.lastChange, changed);
 }
 
 async function postToHub(hub: string, report: Report): Promise<string | undefined> {
@@ -768,6 +768,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       // in the store at a version state.json does not record. Its changes stay due to the hooks
       // until they run, so a sync stopped first leaves them to the next.
       if (!dryRun) {
+        checkpointSkillChanges(state, results.at(-1)!, startedAt);
         const changes = changesOf(results.at(-1)!);
         if (loaded.root.hooks.length > 0 && changes.length > 0)
           state.hooksDue = [...new Set([...(state.hooksDue ?? []), ...changes])];
@@ -970,6 +971,8 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         });
     }
     if (!dryRun) {
+      recordSkills(state, winners, startedAt);
+      stateFile.save();
       doing = "running hooks";
       report.hooks = await runHooks(
         loaded,
@@ -979,7 +982,6 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       delete state.hooksDue;
       for (const hook of report.hooks)
         if (hook.code !== 0) report.errors.push(`hook ${hook.name} exited with ${hook.code}`);
-      if (recordSkills(state, winners, results, startedAt)) state.lastChange = startedAt;
       stateFile.save();
     }
     report.ok = report.errors.length === 0;
