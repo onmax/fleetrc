@@ -1091,7 +1091,7 @@ async function fleetCommand(action: string | undefined) {
   }
   const timeout = values.timeout ? Number(values.timeout) * 1000 : 30_000;
   if (!Number.isFinite(timeout) || timeout <= 0) usage("--timeout takes seconds");
-  const { targets, warnings } = await resolveFleet(entries);
+  const { targets, warnings } = await resolveFleet(entries, undefined, timeout);
   for (const warning of warnings) console.error(`skillfleet: warning: ${warning}`);
   if (dryRun)
     for (const tag of new Set(

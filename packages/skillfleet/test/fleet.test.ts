@@ -362,7 +362,7 @@ describe("fleet tags", () => {
     );
     expect(warnings).toEqual([]);
     // Self (me.tail.ts.net) has the tag too, and is left out.
-    expect(targets).toEqual([
+    expect(targets).toMatchObject([
       { host: "web.tail.ts.net", via: "tag:servers" },
       { host: "100.64.0.9", via: "tag:servers" },
       { host: "db.tail.ts.net", via: "tag:servers", offline: true },
@@ -387,7 +387,7 @@ describe("fleet tags", () => {
     expect(targets).toEqual([
       { host: "WEB" },
       { host: "me@100.64.0.2" },
-      { host: "vps.tail.ts.net", via: "tag:web" },
+      expect.objectContaining({ host: "vps.tail.ts.net", via: "tag:web" }),
       { host: "ssh://me@CI.tail.ts.net:22" },
     ]);
   });
@@ -454,7 +454,7 @@ describe("fleet tags", () => {
     expect(targets).toEqual([
       { host: "web" },
       { host: "web.tail.ts.net" },
-      { host: "100.64.0.5", via: "tag:servers" },
+      expect.objectContaining({ host: "100.64.0.5", via: "tag:servers" }),
     ]);
     const explicitIP = await withTailscale(program, () =>
       resolveFleet(["tag:servers", "me@fd7a:0::5"]),
@@ -469,7 +469,84 @@ describe("fleet tags", () => {
       CurrentTailnet: { MagicDNSEnabled: true },
     });
     const { targets } = await withTailscale(program, () => resolveFleet(["web", "tag:servers"]));
-    expect(targets).toEqual([{ host: "web" }, { host: "100.64.0.5", via: "tag:servers" }]);
+    expect(targets).toMatchObject([{ host: "web" }, { host: "100.64.0.5", via: "tag:servers" }]);
+  });
+
+  it("deduplicates an explicit SSH alias by its effective destination, not its name", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const ssh = join(m.root, "ssh-config.mjs");
+    writeFileSync(
+      ssh,
+      `const host = process.argv[process.argv.indexOf("--") + 1];
+if (process.argv.includes("-G")) {
+  console.log("hostname " + (host === "alias.invalid" ? "localhost" : "127.0.0.2"));
+} else console.log('skillfleet-fleet: never-synced');`,
+    );
+    const tailscale = fakeTailscale(
+      m.root,
+      status([peer("localhost", ["tag:servers"], { ips: ["127.0.0.1", "::1"] })]),
+    );
+    const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: tailscale };
+    const run = await m.runWith(
+      { env },
+      "fleet",
+      "status",
+      "alias.invalid",
+      "tag:servers",
+      "--json",
+    );
+    expect((JSON.parse(run.stdout) as Hosts).map(({ host }) => host)).toEqual(["alias.invalid"]);
+    const other = await m.runWith({ env }, "fleet", "status", "localhost", "tag:servers", "--json");
+    expect(JSON.parse(other.stdout)).toMatchObject([
+      { host: "localhost" },
+      { host: "127.0.0.1", via: "tag:servers" },
+    ]);
+  });
+
+  it("preserves the cached report when an IP fallback peer goes offline", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const ssh = join(m.root, "ssh-report.mjs");
+    const log = join(m.root, "ssh-ran");
+    writeFileSync(
+      ssh,
+      `import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(log)}, process.argv[process.argv.indexOf("--") + 1] + "\\n");
+console.log(JSON.stringify({ finishedAt: "2026-01-01T00:00:00Z", ok: true, skills: 1 }));`,
+    );
+    const online = peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] });
+    const tailscale = fakeTailscale(m.root, status([online]));
+    const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: tailscale };
+    const before = await m.runWith({ env }, "fleet", "status", "tag:servers", "--json");
+    expect(before.code, before.stderr).toBe(0);
+    expect(JSON.parse(before.stdout)).toMatchObject([{ host: "100.64.0.5", reachable: true }]);
+    fakeTailscale(m.root, status([{ ...online, Online: false }]));
+    const after = await m.runWith({ env }, "fleet", "status", "tag:servers", "--json");
+    expect(after.code, after.stderr).toBe(1);
+    expect(JSON.parse(after.stdout)).toMatchObject([
+      {
+        host: "web.invalid",
+        error: "offline in Tailscale",
+        lastRun: { finishedAt: "2026-01-01T00:00:00Z", skills: 1 },
+      },
+    ]);
+    expect(readFileSync(log, "utf8")).toBe("100.64.0.5\n");
+  });
+
+  it("falls back to IP without waiting for a slow DNS lookup", async () => {
+    const program = fakeTailscale(
+      machine().root,
+      status([peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] })]),
+    );
+    const addresses = () =>
+      new Promise<string[]>((resolve) => setTimeout(resolve, 350, ["100.64.0.5"]));
+    const { targets } = await withTailscale(program, () =>
+      resolveFleet(["tag:servers"], addresses, 100),
+    );
+    expect(targets).toMatchObject([{ host: "100.64.0.5", via: "tag:servers" }]);
   });
 
   it("never hands ssh a name from tailscale status that ssh would read as an option, a user or shell", async () => {

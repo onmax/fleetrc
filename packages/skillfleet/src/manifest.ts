@@ -13,7 +13,7 @@ import { basename, dirname, join } from "node:path";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
-import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
+import { fetchClone, gitUrl, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
 import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
@@ -850,6 +850,15 @@ export async function teamGitProblem(spec: string, cwd = tmpdir()): Promise<stri
     return `a team manifest names only remote repositories (http, https, git, ssh or owner/repo), not ${spec}${rewrite}`;
   if (urls.some((each) => isLocalHost(each!)))
     return `a team manifest names only repositories on another machine, not ${spec}${rewrite}, which is this machine`;
+  if (fetched && /^https?:\/\//i.test(fetched)) {
+    const targets = new Set([fetched, `${fetched.replace(/\/$/, "")}/`]);
+    for (const target of targets) {
+      const config = ["config", "--type=bool", "--get-urlmatch", "http.followRedirects", target];
+      const redirects = await git([...NO_GIT_REDIRECTS, ...config], { cwd, allowFail: true });
+      if (redirects.code !== 0 || redirects.stdout.trim() !== "false")
+        return `cannot fetch team repository ${spec}${rewrite} with Git redirects disabled; check URL-specific http.followRedirects settings`;
+    }
+  }
   return undefined;
 }
 
@@ -935,8 +944,11 @@ export async function loadManifest(
     excludeSources: Set<string>;
   }
   /** Each manifest extended, once, with every path it was reached by, in the order first reached. */
-  const extended = new Map<string, { manifest: Manifest; parent: string; paths: Through[] }>();
-  /** Where each `extends` entry led, by the manifest that has it and its index; null when it failed. */
+  const extended = new Map<
+    string,
+    { manifest: Manifest; parent: string; paths: (Through & { within: string })[] }
+  >();
+  /** Where each `extends` entry led, by manifest, index and boundary; null when it failed. */
   const located = new Map<string, { file: string; root: string } | null>();
   const unreadable = new Set<string>();
   const sameThrough = (a: Through, b: Through) =>
@@ -963,7 +975,7 @@ export async function loadManifest(
           ...entry.excludeSources.map(nameKey),
         ]),
       };
-      const key = `${manifest.file}\0${i}`;
+      const key = `${manifest.file}\0${i}\0${within ?? ""}`;
       let at = located.get(key);
       if (at === undefined) {
         try {
@@ -1023,9 +1035,11 @@ export async function loadManifest(
         known = { manifest: team, parent, paths: [] };
         extended.set(at.file, known);
       }
-      if (known.paths.some((seen) => sameThrough(seen, filter))) continue;
-      known.paths.push(filter);
-      await visit(known.manifest, filter, at.root, [...path, at.file]);
+      const boundary = at.root;
+      if (known.paths.some((seen) => seen.within === boundary && sameThrough(seen, filter)))
+        continue;
+      known.paths.push({ ...filter, within: boundary });
+      await visit(known.manifest, filter, boundary, [...path, at.file]);
     }
   };
   await visit(root, undefined, undefined, []);

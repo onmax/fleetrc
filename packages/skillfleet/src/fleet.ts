@@ -1,5 +1,5 @@
-import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
 import { exec } from "./exec.ts";
 import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
@@ -209,6 +209,19 @@ function readCache(): Record<string, NonNullable<HostResult["lastRun"]>> {
   return cache;
 }
 
+const sshOptions = (timeoutMs: number) => [
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  `ConnectTimeout=${Math.ceil(timeoutMs / 1000)}`,
+];
+
+function sshDestination(entry: string): string[] {
+  if (!entry.startsWith("ssh://") || !entry.includes("[")) return ["--", entry];
+  const { machine, user, port } = sshTarget(entry);
+  return [...(user ? ["-l", user] : []), ...(port ? ["-p", port] : []), "--", machine];
+}
+
 async function runOnHost(
   host: string,
   action: FleetAction,
@@ -221,13 +234,9 @@ async function runOnHost(
   const { command, prefix } = program("SKILLFLEET_SSH", "ssh");
   const args = [
     ...prefix,
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    `ConnectTimeout=${Math.ceil(timeoutMs / 1000)}`,
+    ...sshOptions(timeoutMs),
     // hostProblem already refuses a leading "-"; this keeps ssh from reading any host as an option.
-    "--",
-    host,
+    ...sshDestination(host),
     `sh -c ${quote(remoteScript(action, version, { dryRun }))}`,
   ];
   // The report is parsed whole, so it is not cut to the default tail. stdin stays open for `watched`.
@@ -308,7 +317,14 @@ export async function fleet(
   const cache = readCache();
   const results = await Promise.all(
     hosts.map(async (target): Promise<HostResult> => {
-      const { host, via, offline, error } = typeof target === "string" ? { host: target } : target;
+      const {
+        host,
+        via,
+        offline,
+        error,
+        cacheKey = host,
+      } = typeof target === "string" ? { host: target } : target;
+      const lastRun = cache[cacheKey] ?? cache[host];
       const from = via ? { via } : {};
       // A tag Tailscale could not expand.
       if (error !== undefined)
@@ -319,7 +335,7 @@ export async function fleet(
           ...from,
           reachable: false,
           checked: true,
-          lastRun: cache[host],
+          lastRun,
           error: "offline in Tailscale",
           behind: [],
         };
@@ -332,13 +348,13 @@ export async function fleet(
           ...from,
           reachable: true,
           checked: true,
-          lastRun: cache[host],
+          lastRun,
           ...(note ? { error: note } : {}),
           behind: [],
         };
       }
       const run = "report" in answer ? summarize(answer.report) : undefined;
-      const before = cache[host]?.skillfleet;
+      const before = lastRun?.skillfleet;
       // What the host runs once the upgrade went in, told before its sync, which may still fail.
       const to = ("now" in answer ? answer.now : undefined) || run?.skillfleet;
       const upgrade =
@@ -351,7 +367,7 @@ export async function fleet(
             }
           : {};
       if (run) {
-        if (!dryRun) cache[host] = run;
+        if (!dryRun) cache[cacheKey] = run;
         return {
           host,
           ...from,
@@ -367,7 +383,7 @@ export async function fleet(
         ...from,
         reachable: answer.reached ?? false,
         checked: answer.checked ?? true,
-        lastRun: cache[host],
+        lastRun,
         ...upgrade,
         error: answer.error ?? "no report",
         behind: [],
@@ -455,6 +471,7 @@ export const fleetEntryProblem = (entry: string) =>
 /** A host to run on: named in the fleet, or a machine a `tag:` entry expanded to. */
 export interface FleetTarget {
   host: string;
+  cacheKey?: string;
   /** The tag the host came from. */
   via?: string;
   /** Tailscale says the machine is offline, so ssh is not tried. */
@@ -464,6 +481,7 @@ export interface FleetTarget {
 }
 
 export interface TailscalePeer {
+  id?: string;
   /** The first label of its MagicDNS name, which ssh and `fleet add` take on the tailnet. */
   host: string;
   /** Its MagicDNS name without the trailing dot, or "" when it has none. */
@@ -519,6 +537,7 @@ export async function tailnet(): Promise<Tailnet | { error: string }> {
         : [];
     return [
       {
+        id: typeof peer.ID === "string" && peer.ID ? peer.ID : undefined,
         host,
         dns,
         ips: strings(peer.TailscaleIPs),
@@ -581,11 +600,75 @@ function hostKey(host: string): string {
   return name;
 }
 
-async function localAddresses(name: string): Promise<string[]> {
-  return lookup(name, { all: true }).then(
-    (answers) => answers.map(({ address }) => address),
-    () => [],
+const LOOKUP_ADDRESSES = `
+  const { lookup } = require('node:dns');
+  const { readFileSync } = require('node:fs');
+  const names = JSON.parse(readFileSync(0, 'utf8'));
+  for (const name of names) lookup(name, { all: true }, (error, answers) => {
+    if (!error) console.log(JSON.stringify([name, answers.map(({ address }) => address)]));
+  });
+`;
+
+/** Use the OS resolver (including split DNS), in a process we can stop on timeout. */
+async function localAddresses(names: string[], timeoutMs: number) {
+  const found = new Map<string, string[]>();
+  if (!names.length || timeoutMs <= 0) return found;
+  const run = await exec(process.execPath, ["-e", LOOKUP_ADDRESSES], {
+    input: JSON.stringify(names),
+    timeoutMs,
+  });
+  for (const line of run.stdout.split("\n")) {
+    if (!line) continue;
+    try {
+      const [name, ips] = JSON.parse(line) as [string, string[]];
+      found.set(name, ips);
+    } catch {}
+  }
+  return found;
+}
+
+async function verifyAddresses(
+  names: string[],
+  budget: number,
+  addresses?: (name: string) => Promise<string[]>,
+) {
+  if (!addresses) return localAddresses(names, budget);
+  const found = new Map<string, string[]>();
+  if (budget <= 0 || !names.length) return found;
+  const timer = new AbortController();
+  try {
+    await Promise.race([
+      delay(budget, undefined, { signal: timer.signal }),
+      Promise.all(
+        names.map(async (name) => {
+          try {
+            const ips = await addresses(name);
+            if (!timer.signal.aborted) found.set(name, ips);
+          } catch {}
+        }),
+      ),
+    ]);
+  } finally {
+    timer.abort();
+  }
+  return found;
+}
+
+async function effectiveHostname(entry: string, timeoutMs: number, budget: number) {
+  if (hostProblem(entry) || budget <= 0) return undefined;
+  const { command, prefix } = program("SKILLFLEET_SSH", "ssh");
+  const run = await exec(
+    command,
+    [...prefix, "-G", ...sshOptions(timeoutMs), ...sshDestination(entry)],
+    {
+      timeoutMs: budget,
+    },
   );
+  if (run.code !== 0 || run.timedOut || run.truncated) return undefined;
+  if (/^proxy(?:command|jump) (?!none\r?$)/im.test(run.stdout)) return undefined;
+  const hostname = /^hostname (\S+)\r?$/m.exec(run.stdout)?.[1];
+  const name = hostname?.replace(/\.$/, "");
+  return name && tailnetHost(name) ? name : undefined;
 }
 
 /**
@@ -608,7 +691,7 @@ function sshTarget(entry: string): { machine: string; user: string; port: string
       port = parts[3] ?? "";
     }
   }
-  return { machine: hostKey(rest), user, port };
+  return { machine: rest, user, port };
 }
 
 /**
@@ -625,66 +708,81 @@ function sshTarget(entry: string): { machine: string; user: string; port: string
  */
 export async function resolveFleet(
   entries: readonly string[],
-  addresses = localAddresses,
+  addresses?: (name: string) => Promise<string[]>,
+  timeoutMs = 30_000,
 ): Promise<{ targets: FleetTarget[]; warnings: string[] }> {
   const warnings: string[] = [];
   const answer: Tailnet | { error: string } = entries.some(isTag)
     ? await tailnet()
     : { peers: [], magicDNS: true };
-  const peerOf = new Map<string, string | null>();
-  const destination = new Map<TailscalePeer, string>();
+  const peerOf = new Map<string, { peer: TailscalePeer; index: number }>();
+  const destination = new Map<TailscalePeer, { host: string; cacheKey: string }>();
   const tagNames = new Set(entries.filter(isTag).map((entry) => entry.toLowerCase()));
-  const explicitNames = entries
-    .filter((entry) => !isTag(entry))
-    .map((entry) => sshTarget(entry).machine);
-  const explicitKeys = new Set(explicitNames);
-  const matchesPeer = async (name: string, ips: string[]) => {
-    const found = await addresses(name);
-    return found.length > 0 && found.every((ip) => ips.includes(hostKey(ip)));
-  };
   if ("peers" in answer) {
-    const peers = await Promise.all(
-      answer.peers.map(async (peer) => {
-        const { dns, ips } = peerDestinations(peer, answer.magicDNS);
-        const ipKeys = ips.map(hostKey);
-        const dnsKey = dns ? hostKey(dns) : undefined;
-        const shortKey = dns && tailnetHost(peer.host) ? hostKey(peer.host) : undefined;
-        const relevant =
-          peer.tags.some((tag) => tagNames.has(tag.toLowerCase())) ||
-          (dnsKey !== undefined && explicitKeys.has(dnsKey)) ||
-          (shortKey !== undefined && explicitKeys.has(shortKey));
-        const useDNS =
-          dns && (!peer.online || !ips.length || (relevant && (await matchesPeer(dns, ipKeys))));
-        const host = (useDNS ? dns : undefined) ?? ips[0];
-        const aliases = [...ipKeys];
-        if (useDNS && dnsKey) aliases.push(dnsKey);
-        if (
-          shortKey &&
-          explicitKeys.has(shortKey) &&
-          (!ips.length || (peer.online && (await matchesPeer(shortKey, ipKeys))))
-        )
-          aliases.push(shortKey);
-        return { peer, host, aliases };
-      }),
+    const explicit = [...new Set(entries.filter((entry) => !isTag(entry)))];
+    const peers = answer.peers.map((peer, index) => ({
+      peer,
+      index,
+      ...peerDestinations(peer, answer.magicDNS),
+    }));
+    const tagged = peers.filter(({ peer }) =>
+      peer.tags.some((tag) => tagNames.has(tag.toLowerCase())),
     );
-    for (const { peer, host, aliases } of peers) {
+    const budget = Math.min(1500, timeoutMs);
+    const deadline = performance.now() + budget;
+    const effective = tagged.length
+      ? await Promise.all(explicit.map((entry) => effectiveHostname(entry, timeoutMs, budget / 2)))
+      : [];
+    const names = [
+      ...new Set([
+        ...tagged.flatMap(({ peer, dns, ips }) => (peer.online && dns && ips.length ? [dns] : [])),
+        ...effective.filter((name): name is string => name !== undefined && !isIP(name)),
+      ]),
+    ];
+    const found = await verifyAddresses(
+      names,
+      Math.max(0, deadline - performance.now()),
+      addresses,
+    );
+    const matches = (name: string, { dns, ips }: (typeof peers)[number]) => {
+      if (!ips.length) return dns !== undefined && hostKey(name) === hostKey(dns);
+      const resolved = isIP(name) ? [name] : (found.get(name) ?? []);
+      const keys = ips.map(hostKey);
+      return resolved.length > 0 && resolved.every((ip) => keys.includes(hostKey(ip)));
+    };
+    for (const [index, name] of effective.entries()) {
+      const entry = explicit[index];
+      if (!name || entry === undefined) continue;
+      const candidates = peers.filter((candidate) => matches(name, candidate));
+      if (candidates.length === 1 && candidates[0]) peerOf.set(entry, candidates[0]);
+    }
+    for (const candidate of tagged) {
+      const { peer, dns, ips } = candidate;
+      const overridden =
+        dns !== undefined &&
+        explicit.some((entry, index) => {
+          const name = effective[index];
+          return hostKey(entry) === hostKey(dns) && name !== undefined && !matches(name, candidate);
+        });
+      const useDNS =
+        dns && (!ips.length || !peer.online || (!overridden && matches(dns, candidate)));
+      const host = (useDNS ? dns : undefined) ?? ips[0];
       if (!host) continue;
-      destination.set(peer, host);
-      const id = hostKey(host);
-      for (const alias of aliases) {
-        if (!peerOf.has(alias)) peerOf.set(alias, id);
-        else if (peerOf.get(alias) !== id) peerOf.set(alias, null);
-      }
+      const cacheKey = peer.id
+        ? `tag-peer:id:${peer.id}`
+        : `tag-peer:address:${hostKey(ips[0] ?? host)}`;
+      destination.set(peer, { host, cacheKey });
     }
   }
-  const machine = (name: string) => peerOf.get(hostKey(name)) ?? hostKey(name);
-  const explicit = new Set(explicitNames.map(machine));
+  const explicitPeers = new Set([...peerOf.values()].map(({ peer }) => peer));
   const seen = new Set<string>();
   const targets: FleetTarget[] = [];
   for (const entry of entries) {
     if (!isTag(entry)) {
       const target = sshTarget(entry);
-      const key = [machine(target.machine), target.user, target.port].join("\0");
+      const peer = peerOf.get(entry);
+      const machine = peer ? `peer:${peer.index}` : `host:${hostKey(target.machine)}`;
+      const key = [machine, target.user, target.port].join("\0");
       if (!seen.has(key)) targets.push({ host: entry });
       seen.add(key);
       continue;
@@ -698,17 +796,17 @@ export async function resolveFleet(
     if (matches.length === 0)
       warnings.push(`${entry} matches no machine on your tailnet besides this one`);
     for (const peer of matches) {
-      const host = destination.get(peer);
-      if (!host) {
+      const selected = destination.get(peer);
+      if (!selected) {
         warnings.push(
           `${entry}: skipped a machine Tailscale calls ${JSON.stringify(peer.dns || peer.host)}, which has no name or address ssh takes`,
         );
         continue;
       }
-      const id = hostKey(host);
-      if (explicit.has(id) || seen.has(id)) continue;
+      const id = hostKey(selected.host);
+      if (explicitPeers.has(peer) || seen.has(id)) continue;
       seen.add(id);
-      targets.push({ host, via: entry, ...(peer.online ? {} : { offline: true }) });
+      targets.push({ ...selected, via: entry, ...(peer.online ? {} : { offline: true }) });
     }
   }
   return { targets, warnings };

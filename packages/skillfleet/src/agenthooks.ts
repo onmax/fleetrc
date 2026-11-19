@@ -478,7 +478,13 @@ export function formatHookChanges(
 
 /** What starts a sync here, in words, for `status` and `doctor`; with neither, how to add one. */
 export function describeTrigger(hooks: readonly { agent: HookAgent }[], timer: boolean): string {
-  const agents = hooks.map((hook) => AGENT_NAMES[hook.agent]).join(" and ");
+  const agents = hooks
+    .map(({ agent }) =>
+      agent === "codex"
+        ? `${AGENT_NAMES[agent]} (configured; requires approval in /hooks)`
+        : AGENT_NAMES[agent],
+    )
+    .join(" and ");
   if (hooks.length > 0 && timer) return `the session hooks of ${agents}, and the timer`;
   if (hooks.length > 0) return `the session hooks of ${agents}`;
   if (timer) return "the timer";
