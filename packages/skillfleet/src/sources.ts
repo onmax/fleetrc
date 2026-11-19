@@ -53,7 +53,7 @@ import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
 import { type FetchBudget, fetchNpm, guardedFetch, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
 import { tarEntries, zipEntries } from "./tar.ts";
-import type { SourceState } from "./state.ts";
+import type { PendingUpdate, SourceState } from "./state.ts";
 
 export interface SkillEntry {
   name: string;
@@ -1678,6 +1678,11 @@ const treeKey = (hashes: Hashes) =>
     ),
   );
 
+export function pendingGitBase(pending: PendingUpdate | undefined, hashes: Hashes) {
+  if (pending?.commit && pending.path !== undefined && pending.tree === treeKey(hashes))
+    return { path: pending.path, commit: pending.commit };
+}
+
 async function fetchVendored(
   source: VendoredSource,
   state: SourceState,
@@ -2166,7 +2171,12 @@ function applyVendored(
       else rmSync(paths.upstream, { recursive: true, force: true });
     }
     const since = upstreamChanged ? ctx.now : (state.pending[name]?.since ?? ctx.now);
-    if (write) state.pending[name] = { reason, since, ...(from && commit ? { path, commit } : {}) };
+    if (write)
+      state.pending[name] = {
+        reason,
+        since,
+        ...(from && commit ? { path, commit, tree: treeKey(incoming) } : {}),
+      };
     pending.set(name, { skill: name, reason, files });
   };
   // The base first: a kill between the two leaves a copy that matches its record or the update.

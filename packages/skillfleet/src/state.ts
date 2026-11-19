@@ -18,6 +18,7 @@ export interface PendingUpdate {
   since: string;
   path?: string;
   commit?: string;
+  tree?: string;
 }
 
 export interface SourceState {
@@ -197,7 +198,7 @@ function pendingUpdate(record: unknown): PendingUpdate | undefined {
   return {
     reason: record.reason,
     since: text(record.since) ?? new Date(0).toISOString(),
-    ...strings(record, "path", "commit"),
+    ...strings(record, "path", "commit", "tree"),
   };
 }
 
