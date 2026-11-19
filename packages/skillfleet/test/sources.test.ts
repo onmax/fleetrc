@@ -64,7 +64,7 @@ describe("skills and hook globs", () => {
 
   it("rejects an oversized skills pattern when reading the manifest", () => {
     expect(() =>
-      parseManifest("m.json", { sources: [{ local: ".", skills: "?".repeat(8193) }] }),
+      parseManifest("m.json", { sources: [{ id: "local", local: ".", skills: "?".repeat(8193) }] }),
     ).toThrow(/sources.*skills.*8192/);
   });
 

@@ -16,6 +16,15 @@ const inSegment = (char: string) => char !== "/";
 export const MAX_GLOB_LENGTH = 8192;
 const MATCH_WORK_LIMIT = 10_000_000;
 
+export class GlobWorkLimitError extends Error {}
+
+export function splitHookPattern(pattern: string): { id: string; glob: string } {
+  const at = pattern.indexOf(":");
+  return at < 0
+    ? { id: "*", glob: pattern }
+    : { id: pattern.slice(0, at), glob: pattern.slice(at + 1) };
+}
+
 function compile(chars: string): { states: State[]; accept: number } {
   const states: State[] = [];
   const add = () => states.push({ next: [], on: [] }) - 1;
@@ -119,7 +128,7 @@ export function globFilter(glob: string, label = "glob"): (path: string) => bool
   const spend = (work: number) => {
     remaining -= work;
     if (remaining < 0)
-      throw new Error(`${label} exceeded the matching work limit; narrow the pattern`);
+      throw new GlobWorkLimitError(`${label} exceeded the matching work limit; narrow the pattern`);
   };
   return (path) => {
     spend(1 + path.length + compiled.states.length);

@@ -156,6 +156,8 @@ const OWN_COMMAND = new RegExp(
 
 const DISABLED_POSIX = "exit 0 # skillfleet: disabled legacy hook";
 const DISABLED_WINDOWS = "exit /b 0 & rem skillfleet: disabled legacy hook";
+const isDisabledCommand = (command: unknown) =>
+  command === DISABLED_POSIX || command === DISABLED_WINDOWS;
 
 export const isOwnCommand = (command: unknown) =>
   typeof command === "string" && OWN_COMMAND.test(command.trim());
@@ -168,9 +170,7 @@ export function isOwnHandler(hook: unknown): boolean {
   if (!isRecord(hook)) return false;
   if (hook.args === undefined)
     return (
-      isOwnCommand(hook.command) ||
-      (hook.type === "command" &&
-        (hook.command === DISABLED_POSIX || hook.command === DISABLED_WINDOWS))
+      isOwnCommand(hook.command) || (hook.type === "command" && isDisabledCommand(hook.command))
     );
   const args = hook.args;
   return (
@@ -449,7 +449,7 @@ export function removeHooks(
 
 /**
  * The agents whose hooks file runs `skillfleet hook run` on SessionStart: what starts syncs. An
- * entry of skillfleet's under any other event, or the old `hook prompt`, starts none.
+ * entry under another event, an approval placeholder, or the old `hook prompt` starts none.
  */
 export function installedHooks(): { agent: HookAgent; file: string }[] {
   return HOOK_AGENTS.flatMap((agent) => {
@@ -463,6 +463,7 @@ export function installedHooks(): { agent: HookAgent; file: string }[] {
     const starts = ownHandlers(raw).some(
       ({ event, handler }) =>
         (EVENTS as readonly string[]).includes(event) &&
+        !isDisabledCommand(handler.command) &&
         !(typeof handler.command === "string" && handler.command.trim().endsWith(" hook prompt")),
     );
     return starts ? [{ agent, file }] : [];

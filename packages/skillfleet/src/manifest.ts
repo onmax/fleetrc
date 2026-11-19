@@ -16,7 +16,7 @@ import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
 import { fetchClone, gitUrl, splitRepoPath } from "./gitcache.ts";
 import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
-import { MAX_GLOB_LENGTH } from "./glob.ts";
+import { MAX_GLOB_LENGTH, splitHookPattern } from "./glob.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
 import { registryUrl, urlOrigin } from "./npm.ts";
@@ -394,10 +394,14 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
     const run =
       optionalString(file, `hooks[${i}].run`, hook.run) ??
       fail(file, `hooks[${i}].run`, "is required");
+    const on = stringList(file, `hooks[${i}].on`, hook.on) ?? ["*:**"];
+    for (const [index, pattern] of on.entries())
+      if (splitHookPattern(pattern).glob.length > MAX_GLOB_LENGTH)
+        fail(file, `hooks[${i}].on[${index}]`, `glob exceeds ${MAX_GLOB_LENGTH} UTF-16 code units`);
     return {
       name: optionalString(file, `hooks[${i}].name`, hook.name) ?? run,
       run,
-      on: stringList(file, `hooks[${i}].on`, hook.on) ?? ["*:**"],
+      on,
     };
   });
   let report: Manifest["report"];

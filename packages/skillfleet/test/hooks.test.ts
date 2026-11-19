@@ -549,6 +549,26 @@ describe("hook install and remove", () => {
 });
 
 describe("init, status and doctor with the hooks or the timer", () => {
+  it("does not count a removed Codex session hook kept as an approval placeholder", async () => {
+    const m = machine({ scheduler: "empty" });
+    const manifest = m.manifest({ agents: ["codex"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    const file = m.at(".codex", "hooks.json");
+    const raw = JSON.parse(read(file)) as { hooks: { SessionStart: { hooks: Entry[] }[] } };
+    const custom = { type: "command", command: "echo custom" };
+    raw.hooks.SessionStart[0]!.hooks.push(custom);
+    writeFileSync(file, JSON.stringify(raw));
+
+    expect((await m.run("hook", "remove", "codex")).code).toBe(0);
+    const removed = JSON.parse(read(file)) as typeof raw;
+    const handlers = removed.hooks.SessionStart[0]!.hooks;
+    expect(handlers[0]?.command).toContain("skillfleet: disabled legacy hook");
+    expect(handlers[1]).toEqual(custom);
+    expect((await m.json("status")).trigger).toEqual({ hooks: [], timer: false });
+    expect((await m.run("doctor")).stdout).toMatch(/^warn sync trigger: nothing starts a sync/m);
+  });
+
   it("init installs the hooks and no timer; status and doctor report the hooks", async () => {
     const { m } = await hooked({ scheduler: "empty" });
     // init does not reach the scheduler; doctor asks it once whether a timer exists.
