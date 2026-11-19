@@ -99,13 +99,13 @@ A mistake, such as a typo'd repository or agent id, prints one line that says wh
 
 ### Syncs from session hooks
 
-`init` adds a hook to Claude Code (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) and to Codex (`~/.codex/hooks.json`, or `$CODEX_HOME/hooks.json`), for each one whose folder exists. It runs `skillfleet hook run <agent>`, through the launcher's full path, when a session starts and on each prompt. On Windows, Claude Code's entry names node and skillfleet's installed copy instead of the `.cmd` launcher, which Claude Code would hand to Git Bash or PowerShell. If no sync started in the last 15 minutes and none is running, the hook starts one in the background and returns at once; the sync writes to `logs/skillfleet-sync.log` in the state folder, like the timer. The hook makes no network call and prints nothing about the sync, so the agent never waits on it.
+`init` adds a hook to Claude Code (`~/.claude/settings.json`, or `$CLAUDE_CONFIG_DIR/settings.json`) and to Codex (`~/.codex/hooks.json`, or `$CODEX_HOME/hooks.json`), for each one whose folder exists. It runs `skillfleet hook run <agent>`, through the launcher's full path, when a session starts, and on nothing else: nothing runs on each prompt. On Windows, Claude Code's entry names node and skillfleet's installed copy instead of the `.cmd` launcher, which Claude Code would hand to Git Bash or PowerShell. If the last sync started over 15 minutes ago and none is running, the hook starts one in the background and returns at once; the sync writes to `logs/skillfleet-sync.log` in the state folder, like the timer. The hook makes no network call and prints nothing about the sync, so the agent never waits on it.
 
-`skillfleet hook install` and `skillfleet hook remove` add or take out skillfleet's entry and leave your other hooks alone. Codex runs a new hook only after you trust it: open `/hooks` in Codex and approve it.
+`skillfleet hook install` and `skillfleet hook remove` add or take out skillfleet's entry and leave your other hooks alone; `hook install` and `init` also take out the prompt hooks older versions added. Codex runs a new hook only after you trust it: open `/hooks` in Codex and approve it.
 
 ### New skills in running sessions
 
-Claude Code loads a skill that a sync links mid-session on the next turn, and the hook tells its model once per skill that the skill arrived. Codex reads its skills when a session starts, and the sync that session's own hook starts usually lands after that, so the session sees the new skills at its next start. `skillfleet status` lists the Codex sessions to restart.
+A sync starts when a Claude Code or Codex session starts and the last sync is over 15 minutes old. Claude Code loads a skill that the sync links mid-session by itself, on the next turn. Codex reads its skills when a session starts, and the sync that session's own hook starts usually lands after that, so the session sees the new skills at its next start; `skillfleet status` lists the Codex sessions to restart. On a machine where no agent runs, `skillfleet init <manifest> --no-hooks --timer` syncs on a schedule instead.
 
 ## Manifest
 
