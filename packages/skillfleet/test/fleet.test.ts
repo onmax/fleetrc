@@ -432,7 +432,7 @@ describe("fleet tags", () => {
     ]);
     // Without a tag, Tailscale isn't asked, so a short name and a MagicDNS name stay apart: two
     // tailnets can each have a vps2.
-    const plain = await resolveFleet(["vps2", "vps2.tail.ts.net", "vps2.other.ts.net", "VPS2"]);
+    const plain = await resolveFleet(["vps2", "vps2.tail.ts.net", "vps2.other.ts.net"]);
     expect(plain.targets).toEqual([
       { host: "vps2" },
       { host: "vps2.tail.ts.net" },
@@ -531,10 +531,18 @@ if (process.argv.includes("-G")) {
     writeFileSync(
       ssh,
       `import { appendFileSync } from "node:fs";
-appendFileSync(${JSON.stringify(log)}, process.argv[process.argv.indexOf("--") + 1] + "\\n");
+const destination = process.argv[process.argv.indexOf("--") + 1];
+if (process.argv.includes("-G")) {
+  console.log("hostname " + destination + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
+appendFileSync(${JSON.stringify(log)}, destination + "\\n");
 console.log(JSON.stringify({ finishedAt: process.env.REPORT_TIME, ok: true, skills: 1 }));`,
     );
-    const online = peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] });
+    const online = {
+      ...peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] }),
+      ID: "server",
+    };
     const tailscale = fakeTailscale(m.root, status([online]));
     const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: tailscale };
     const run = (host: string, time?: string) =>
@@ -808,7 +816,11 @@ function alive(pid: number): boolean {
  * host hangs. A fake `npx` on PATH appends its arguments to `<root>/npx.jsonl` and runs the built
  * CLI with the words after `-- skillfleet`, as npx runs the package it installed.
  */
-function initShims(m: Machine, homes: Record<string, string>): NodeJS.ProcessEnv {
+function initShims(
+  m: Machine,
+  homes: Record<string, string>,
+  aliases: Record<string, string> = {},
+): NodeJS.ProcessEnv {
   const dir = join(m.root, "bin");
   mkdirSync(dir, { recursive: true });
   const machines = Object.fromEntries(
@@ -830,9 +842,11 @@ function initShims(m: Machine, homes: Record<string, string>): NodeJS.ProcessEnv
     join(dir, "ssh.mjs"),
     `import { spawnSync } from "node:child_process";
 const machines = ${JSON.stringify(machines)};
+const aliases = ${JSON.stringify(aliases)};
 const args = process.argv.slice(2);
 if (args[0] === "-G") {
-  console.log("hostname " + args[args.indexOf("--") + 1]);
+  const host = args[args.indexOf("--") + 1];
+  console.log("hostname " + (aliases[host] ?? host) + "\\nuser alice\\nport 22");
   process.exit(0);
 }
 while (args[0] === "-o") args.splice(0, 2);
@@ -1253,7 +1267,7 @@ describe.skipIf(isWindows)("fleet init", () => {
   it("compares equivalent named and tagged hosts without ignoring users or ports", async () => {
     const { m } = await controller(["VPS2", "tag:servers"]);
     const env = {
-      ...initShims(m, {}),
+      ...initShims(m, {}, { VPS2: "vps2" }),
       SKILLFLEET_TAILSCALE: fakeTailscale(
         m.root,
         status([peer("web.invalid", ["tag:servers"], { ips: ["fd7a::5"] })]),
@@ -1271,6 +1285,28 @@ describe.skipIf(isWindows)("fleet init", () => {
     );
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(run.stdout).toContain("would add root@vps2, ssh://[fd7a::5]:2222 to the fleet");
+  });
+
+  it("enrolls a distinct SSH alias even when a named or tagged host differs only by a dot", async () => {
+    const { m, fleetIn } = await controller(["build", "tag:servers"]);
+    const env = {
+      ...initShims(
+        m,
+        { "build.": join(m.root, "named"), "web.": join(m.root, "tagged") },
+        { build: "build-one.invalid", "build.": "build-two.invalid", "web.": "web-two.invalid" },
+      ),
+      SKILLFLEET_TAILSCALE: fakeTailscale(m.root, status([peer("web", ["tag:servers"])])),
+    };
+    const plan = await m.runWith({ env }, "fleet", "init", "build", "build.", "--dry-run", "--json");
+    expect(plan.code, plan.stdout + plan.stderr).toBe(0);
+    expect(JSON.parse(plan.stdout)).toMatchObject([{ host: "build" }, { host: "build." }]);
+    const run = await m.runWith({ env }, "fleet", "init", "build.", "web.", "--json");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject([
+      { host: "build.", setup: "set up" },
+      { host: "web.", setup: "set up" },
+    ]);
+    expect(fleetIn()).toEqual(["build", "tag:servers", "build.", "web."]);
   });
 
   it("retains tagged peer reports across init errors and offline status", async () => {
