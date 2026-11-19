@@ -44,6 +44,7 @@ export const paths = {
   config: () => join(configDir(), "config.json"),
   state: () => join(stateDir(), "state.json"),
   lastRun: () => join(stateDir(), "last-run.json"),
+  initPending: () => join(stateDir(), "init-pending"),
   fleet: () => join(stateDir(), "fleet.json"),
   lock: () => join(stateDir(), "sync.lock"),
   store: (source: string) => join(stateDir(), "store", source),

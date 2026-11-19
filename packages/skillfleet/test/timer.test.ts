@@ -129,7 +129,7 @@ describe("timer", () => {
       expect(said).not.toContain("ENOENT");
       // No timer went in, so status and doctor report the hooks, and the timer commands say why.
       const status = await m.run("status");
-      expect(status.stdout).toMatch(/^syncs start from: SessionStart in Claude Code/m);
+      expect(status.stdout).toMatch(/^syncs start from: the session hooks of Claude Code/m);
       const doctor = await m.run("doctor");
       expect(doctor.stdout).not.toMatch(/^\w+ +timer:/m);
       expect(doctor.stdout).not.toContain("ENOENT");

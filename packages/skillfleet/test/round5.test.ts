@@ -18,6 +18,7 @@ import {
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { crc32 } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { fleet, formatFleet } from "../src/fleet.ts";
@@ -46,6 +47,42 @@ async function init(m: Machine, manifest: string, ...args: string[]) {
 }
 
 describe("a sync stopped before it saved state.json", () => {
+  it("recovers a copy published just before a sync stopped", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    await init(m, manifest);
+    const live = join(m.stateDir, "store", "vendor", "live", "tool");
+    const stop = join(m.root, "stop.mjs");
+    writeFileSync(stop, `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      import { normalize } from "node:path";
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (normalize(to) === normalize(${JSON.stringify(live)}) && from.endsWith(".new"))
+          process.exit(86);
+      };
+      syncBuiltinESMExports();
+    `);
+    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "published") });
+    const stopped = await m.runWith(
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
+      "sync",
+    );
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
+    expect(read(join(live, "SKILL.md"))).toContain("published");
+    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "latest") });
+    const report = await m.json("sync");
+    expect(report.pending).toEqual([]);
+    expect(report.edited).toEqual([]);
+    expect(read(join(live, "SKILL.md"))).toContain("latest");
+  });
+
   it.skipIf(isWindows)(
     "R8-1. an update a stopped sync put in place is not taken for a local edit once upstream moves again",
     async () => {
@@ -74,8 +111,13 @@ describe("a sync stopped before it saved state.json", () => {
         hooks: [{ name: "hang", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
       });
       const copy = m.at(".claude", "skills", "tool", "SKILL.md");
+      const state = () => JSON.parse(read(join(m.stateDir, "state.json"))) as {
+        lastChange: string;
+        skills: { tool: { changedAt: string } };
+      };
       try {
         await init(m, manifest);
+        const initial = state().lastChange;
         rmSync(pass);
         let version = 1;
         // The limit counts from the start of the sync; on a loaded machine the fetch may use it up
@@ -92,7 +134,12 @@ describe("a sync stopped before it saved state.json", () => {
         expect(existsSync(started), "no sync reached its hooks").toBe(true);
         // The stopped sync replaced the copy: agents already read the update.
         expect(read(copy)).toContain(`v${version}`);
+        const checkpoint = state();
+        expect(checkpoint.skills.tool.changedAt > initial).toBe(true);
+        expect(checkpoint.lastChange).toBe(checkpoint.skills.tool.changedAt);
         writeFileSync(pass, "");
+        expect((await m.json("sync")).hooks).toHaveLength(1);
+        expect(state().lastChange).toBe(checkpoint.lastChange);
         // Upstream moves on before the next sync.
         vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "latest") });
         const report = await m.json("sync");
@@ -396,7 +443,7 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
     it("resolves relative paths against .skillfleet/; a team named by its file keeps its extends in the file's folder", async () => {
       write("r5-folder/.skillfleet/manifest.json", {
         extends: ["./team.json"],
-        sources: [{ id: "mine", local: "../skills" }],
+        sources: [{ id: "mine", local: ".." }],
       });
       write("r5-folder/.skillfleet/team.json", {
         extends: ["./shared.json", "../outside.json"],
@@ -412,7 +459,7 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       expect(loaded.root.file).toBe(join(root, "r5-folder", ".skillfleet", "manifest.json"));
       expect(loaded.sources.map((source) => source.id)).toEqual(["mine", "team", "shared"]);
       const mine = loaded.sources[0]!;
-      expect(mine.kind === "local" && mine.local).toBe(join(root, "r5-folder", "skills"));
+      expect(mine.kind === "local" && mine.local).toBe(join(root, "r5-folder"));
       expect(loaded.failed).toEqual(["../outside.json"]);
       expect(loaded.warnings.join("\n")).toMatch(/outside it/);
     });
@@ -434,6 +481,31 @@ describe("the manifest: extends objects, team git hosts, the in-place editor", (
       expect(loaded.failed).toEqual(["../private.json", "../private.json"]);
       expect(loaded.warnings.join("\n")).toMatch(/outside it/);
     });
+
+    it.each(["file", "folder"])(
+      "keeps each team's boundary when the %s is named first",
+      async (first) => {
+        write("r5-boundary/team/.skillfleet/manifest.json", {
+          extends: ["../shared.json"],
+          sources: [{ id: "team", npm: "team" }],
+        });
+        write("r5-boundary/team/shared.json", {
+          sources: [{ id: "shared", npm: "shared" }],
+        });
+        const fileEntry = { manifest: "./team/.skillfleet/manifest.json", exclude: ["file-only"] };
+        const folderEntry = { manifest: "./team", exclude: ["folder-only"] };
+        const file = write("r5-boundary/me.json", {
+          extends: first === "file" ? [fileEntry, folderEntry] : [folderEntry, fileEntry],
+        });
+
+        const loaded = await loadManifest(file, { offline: true });
+        expect(loaded.sources.map((source) => source.id)).toEqual(["team", "shared"]);
+        expect(loaded.sources[0]!.exclude?.toSorted()).toEqual(["file-only", "folder-only"]);
+        expect(loaded.sources[1]!.exclude).toEqual(["folder-only"]);
+        expect(loaded.failed).toEqual(["../shared.json"]);
+        expect(loaded.warnings).toEqual([expect.stringContaining("outside it")]);
+      },
+    );
 
     it("does not read a skills.json at the folder's root", async () => {
       write("r5-old/skills.json", { sources: [] });

@@ -447,12 +447,8 @@ export function removeHooks(
   });
 }
 
-/**
- * The agents whose hooks file runs `skillfleet hook run` on SessionStart: what starts syncs. An
- * entry under another event, an approval placeholder, or the old `hook prompt` starts none.
- */
-export function installedHooks(): { agent: HookAgent; file: string }[] {
-  return HOOK_AGENTS.flatMap((agent) => {
+function hookEntries() {
+  return HOOK_AGENTS.map((agent) => {
     const file = hookFile(agent);
     let raw: unknown;
     try {
@@ -460,14 +456,40 @@ export function installedHooks(): { agent: HookAgent; file: string }[] {
     } catch {
       raw = undefined;
     }
-    const starts = ownHandlers(raw).some(
+    return { agent, file, handlers: ownHandlers(raw) };
+  });
+}
+
+const isPromptHook = (handler: Record<string, unknown>) =>
+  typeof handler.command === "string" && handler.command.trim().endsWith(" hook prompt");
+
+/**
+ * The agents whose hooks file runs `skillfleet hook run` on SessionStart: what starts syncs. An
+ * entry under another event, an approval placeholder, or the old `hook prompt` starts none.
+ */
+export function installedHooks(): { agent: HookAgent; file: string }[] {
+  return hookEntries().flatMap(({ agent, file, handlers }) => {
+    const starts = handlers.some(
       ({ event, handler }) =>
         (EVENTS as readonly string[]).includes(event) &&
         !isDisabledCommand(handler.command) &&
-        !(typeof handler.command === "string" && handler.command.trim().endsWith(" hook prompt")),
+        !isPromptHook(handler),
     );
     return starts ? [{ agent, file }] : [];
   });
+}
+
+export function promptOnlyHooks(): { agent: HookAgent; note: string }[] {
+  return hookEntries().flatMap(({ agent, file, handlers }) =>
+    handlers.some(({ handler }) => isPromptHook(handler))
+      ? [
+          {
+            agent,
+            note: `${tildify(file)} holds the old \`skillfleet hook prompt\` entry, which starts no sync; \`skillfleet hook install ${agent}\` replaces it with the session hook`,
+          },
+        ]
+      : [],
+  );
 }
 
 /** One line for each agent, for `hook install`, `hook remove` and `init`. */
@@ -496,9 +518,15 @@ export function formatHookChanges(
 
 /** What starts a sync here, in words, for `status` and `doctor`; with neither, how to add one. */
 export function describeTrigger(hooks: readonly { agent: HookAgent }[], timer: boolean): string {
-  const agents = hooks.map((hook) => AGENT_NAMES[hook.agent]).join(" and ");
-  if (hooks.length > 0 && timer) return `SessionStart in ${agents}, and the timer`;
-  if (hooks.length > 0) return `SessionStart in ${agents}`;
+  const agents = hooks
+    .map(({ agent }) =>
+      agent === "codex"
+        ? `${AGENT_NAMES[agent]} (configured; requires approval in /hooks)`
+        : AGENT_NAMES[agent],
+    )
+    .join(" and ");
+  if (hooks.length > 0 && timer) return `the session hooks of ${agents}, and the timer`;
+  if (hooks.length > 0) return `the session hooks of ${agents}`;
   if (timer) return "the timer";
   return "nothing starts a sync on this machine; run `skillfleet hook install` where Claude Code or Codex runs, or `skillfleet timer install` on a machine where no agent runs";
 }

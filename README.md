@@ -14,7 +14,7 @@
 
 The same agent skills in Claude Code, Codex, Gemini CLI, OpenCode, Cursor and Copilot, on every machine you use, synced when you start an agent session.
 
-[![Watch the 90-second explainer](./.github/assets/explainer-poster.png)](./.github/assets/explainer.mp4)
+[![Download the 90-second explainer (MP4)](./.github/assets/explainer-poster.png)](./.github/assets/explainer.mp4?raw=true)
 
 You list where your skills come from in one manifest in git: your own repo, your team's, GitHub upstreams, skill indexes like Drop's, and npm. Each machine pulls them when a Claude Code or Codex session starts, links every skill into every agent's folder, and reports what changed. A skill you edited on that machine is never overwritten.
 
@@ -149,7 +149,7 @@ Then `npx skillfleet init me/skills` on each machine. Your sources come first, s
 ### Fields
 
 - `$schema` points editors at the schema, for completion and checks.
-- Relative paths (`path`, `local`, `extends`) resolve against the manifest's own folder, `.skillfleet/`, so `"local": ".."` is the repository the manifest is in.
+- Relative paths (`path`, `local`, `extends`) resolve against the manifest's own folder, `.skillfleet/`. To use the repository itself as a local source, add `{ "id": "mine", "local": ".." }` to `sources`.
 - A source is one of `git`, `index` (a site serving `/.well-known/agent-skills/index.json`), `npm` (with an optional `registry`) or `local` (a folder on this machine). `skills` is a glob of skill folders inside it, and `ref` pins a git branch, tag or commit, written in full or as its first 7 or more characters. A `"path"` clone pinned to a commit stays on it, since there is nothing to fast-forward, until the manifest names another commit.
 - Source and hook globs are limited to 8,192 UTF-16 code units. If matching a glob against many paths exceeds its work limit, skillfleet reports an error instead of skipping the remaining matches. Narrow the glob, for example by adding a fixed folder prefix.
 - An `index` site may serve the older v0.1 index at `/.well-known/skills/index.json` instead; skillfleet reads both.

@@ -1,14 +1,27 @@
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { homedir, userInfo } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { delimiter, dirname, join, sep } from "node:path";
-import { AGENT_NAMES, describeTrigger, type HookAgent, installedHooks } from "./agenthooks.ts";
+import {
+  AGENT_NAMES,
+  describeTrigger,
+  type HookAgent,
+  installedHooks,
+  promptOnlyHooks,
+} from "./agenthooks.ts";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { conflictLines } from "./edits.ts";
 import { exec, git } from "./exec.ts";
 import { isErrno, lstat } from "./fs.ts";
-import { gitUrl } from "./gitcache.ts";
+import { gitUrl, NO_GIT_REDIRECTS } from "./gitcache.ts";
 import { linkTarget } from "./linker.ts";
-import { loadManifest, readConfig, remoteManifest, type Source, updateConfig } from "./manifest.ts";
+import {
+  loadManifest,
+  readConfig,
+  remoteManifest,
+  type Source,
+  teamGitProblem,
+  updateConfig,
+} from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
 import { installedBuild, installedCli, launcherNode, launcherPath } from "./selfinstall.ts";
 import { loadState } from "./state.ts";
@@ -160,8 +173,12 @@ function timerWanted(): boolean {
 }
 
 /** What starts a sync on this machine: the session hooks, the timer, both, or nothing. */
-function triggerCheck(timer: boolean): Check {
-  const hooks = installedHooks();
+function triggerCheck(
+  hooks: ReturnType<typeof installedHooks>,
+  timer: boolean,
+  runs?: Check,
+): Check {
+  const legacy = promptOnlyHooks().map((hook) => hook.note);
   const name = "sync trigger";
   const launcher = launcherPath();
   if (hooks.length > 0 && !existsSync(launcher))
@@ -170,8 +187,10 @@ function triggerCheck(timer: boolean): Check {
       ok: false,
       detail: `the session hooks run ${tildify(launcher)}, which is missing; run \`npx skillfleet@latest self-install\``,
     };
-  const detail = describeTrigger(hooks, timer);
-  return hooks.length > 0 || timer
+  const detail = [describeTrigger(hooks, timer), ...legacy].join("; ");
+  const onlyUnverifiedCodex =
+    !timer && hooks.length === 1 && hooks[0]?.agent === "codex" && runs?.warn;
+  return (hooks.length > 0 || timer) && legacy.length === 0 && !onlyUnverifiedCodex
     ? { name, ok: true, detail }
     : { name, ok: true, warn: true, detail };
 }
@@ -288,8 +307,9 @@ export async function doctor(manifest?: string): Promise<Check[]> {
   });
   await adoptTimer();
   const timer = timerWanted();
-  checks.push(triggerCheck(timer));
-  const runs = hookRunsCheck(installedHooks());
+  const hooks = installedHooks();
+  const runs = hookRunsCheck(hooks);
+  checks.push(triggerCheck(hooks, timer, runs));
   if (runs) checks.push(runs);
   if (timer) {
     const { noSystemd, ...check } = await timerCheck();
@@ -329,7 +349,16 @@ export async function doctor(manifest?: string): Promise<Check[]> {
     reachable.map(async (source) => {
       const remote = remoteOf(source);
       if (!remote) return;
-      const run = await git(["ls-remote", "--exit-code", "--", remote, "HEAD"], {
+      const team = source.via !== undefined;
+      const cwd = team ? tmpdir() : undefined;
+      const problem = team ? await teamGitProblem(remote, cwd) : undefined;
+      if (problem) {
+        checks.push({ name: `git auth ${source.id}`, ok: false, detail: problem });
+        return;
+      }
+      const config = team ? NO_GIT_REDIRECTS : [];
+      const run = await git([...config, "ls-remote", "--exit-code", "--", remote, "HEAD"], {
+        cwd,
         allowFail: true,
         timeoutMs: 30_000,
       });

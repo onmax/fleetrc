@@ -10,9 +10,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "vite-plus/test";
 import { fleet, formatFleet, type InitSetup, remoteScript, resolveFleet } from "../src/fleet.ts";
-import { hostManifestSpec, sameManifest } from "../src/manifest.ts";
+import { hostManifestSpec, loadManifest, sameManifest } from "../src/manifest.ts";
 import { launchers } from "../src/selfinstall.ts";
 import { cli, isWindows, machine, type Machine, pathWith, remote, skills } from "./fixture.ts";
 
@@ -62,6 +63,15 @@ function status(peers: ReturnType<typeof peer>[], self = peer("me.tail.ts.net", 
     BackendState: "Running",
     Self: self,
     Peer: Object.fromEntries(peers.map((p) => [p.PublicKey, p])),
+  };
+}
+
+function peerAddresses(peers: ReturnType<typeof peer>[]) {
+  return async (name: string) => {
+    const match = peers.find(
+      ({ DNSName, HostName }) => DNSName === `${name}.` || HostName === name,
+    );
+    return match?.TailscaleIPs ?? [];
   };
 }
 
@@ -342,19 +352,19 @@ esac
 describe("fleet tags", () => {
   it("expands a tag to its tailnet machines by MagicDNS name, or IP without one, and skips this machine", async () => {
     const m = machine();
-    const program = fakeTailscale(
-      m.root,
-      status([
-        peer("web.tail.ts.net", ["tag:servers"]),
-        peer("", ["tag:servers"], { ips: ["100.64.0.9", "fd7a::9"] }),
-        peer("db.tail.ts.net", ["tag:Servers", "tag:db"], { online: false }),
-        peer("laptop.tail.ts.net", []),
-      ]),
+    const peers = [
+      peer("web.tail.ts.net", ["tag:servers"]),
+      peer("", ["tag:servers"], { ips: ["100.64.0.9", "fd7a::9"] }),
+      peer("db.tail.ts.net", ["tag:Servers", "tag:db"], { online: false }),
+      peer("laptop.tail.ts.net", []),
+    ];
+    const program = fakeTailscale(m.root, status(peers));
+    const { targets, warnings } = await withTailscale(program, () =>
+      resolveFleet(["tag:servers"], peerAddresses(peers)),
     );
-    const { targets, warnings } = await withTailscale(program, () => resolveFleet(["tag:servers"]));
     expect(warnings).toEqual([]);
     // Self (me.tail.ts.net) has the tag too, and is left out.
-    expect(targets).toEqual([
+    expect(targets).toMatchObject([
       { host: "web.tail.ts.net", via: "tag:servers" },
       { host: "100.64.0.9", via: "tag:servers" },
       { host: "db.tail.ts.net", via: "tag:servers", offline: true },
@@ -363,57 +373,52 @@ describe("fleet tags", () => {
 
   it("runs a machine named twice once: an explicit host wins, then the first tag", async () => {
     const m = machine();
-    const program = fakeTailscale(
-      m.root,
-      status([
-        peer("web.tail.ts.net", ["tag:servers", "tag:web"]),
-        peer("db.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.2"] }),
-        peer("ci.tail.ts.net", ["tag:servers"]),
-        peer("vps.tail.ts.net", ["tag:web"]),
-      ]),
-    );
+    const peers = [
+      peer("web.tail.ts.net", ["tag:servers", "tag:web"]),
+      peer("db.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.2"] }),
+      peer("ci.tail.ts.net", ["tag:servers"]),
+      peer("vps.tail.ts.net", ["tag:web"]),
+    ];
+    const program = fakeTailscale(m.root, status(peers));
     const { targets } = await withTailscale(program, () =>
-      resolveFleet([
-        "tag:servers",
-        "WEB",
-        "me@100.64.0.2",
-        "tag:web",
-        "ssh://me@CI.tail.ts.net:22",
-        "web",
-      ]),
+      resolveFleet(
+        ["tag:servers", "WEB", "me@100.64.0.2", "tag:web", "ssh://me@CI.tail.ts.net:22", "web"],
+        peerAddresses(peers),
+      ),
     );
     expect(targets).toEqual([
       { host: "WEB" },
       { host: "me@100.64.0.2" },
-      { host: "vps.tail.ts.net", via: "tag:web" },
+      expect.objectContaining({ host: "vps.tail.ts.net", via: "tag:web" }),
       { host: "ssh://me@CI.tail.ts.net:22" },
     ]);
   });
 
   it("compares entries by the machine they reach: IPv6 in any spelling, written ports, names Tailscale gives one peer", async () => {
     const m = machine();
-    const program = fakeTailscale(
-      m.root,
-      status([
-        peer("", ["tag:servers"], { ips: ["100.64.0.9", "fd7a:0:0::9"] }),
-        peer("", ["tag:servers"], { ips: ["fd7a::10"] }),
-        peer("web.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.7"] }),
-        peer("db.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.8"] }),
-      ]),
-    );
+    const peers = [
+      peer("", ["tag:servers"], { ips: ["100.64.0.9", "fd7a:0:0::9"] }),
+      peer("", ["tag:servers"], { ips: ["fd7a::10"] }),
+      peer("web.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.7"] }),
+      peer("db.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.8"] }),
+    ];
+    const program = fakeTailscale(m.root, status(peers));
     const { targets } = await withTailscale(program, () =>
-      resolveFleet([
-        // A bare IPv6 address has no port: fd7a::9 is not fd7a: on port 9.
-        "fd7a::9",
-        "ssh://me@[FD7A:0::10]:2222",
-        "tag:servers",
-        "100.64.0.7",
-        "web.tail.ts.net",
-        "me@db",
-        "ssh://me@db.tail.ts.net:22",
-        "ssh://me@db:2222",
-        "root@db",
-      ]),
+      resolveFleet(
+        [
+          // A bare IPv6 address has no port: fd7a::9 is not fd7a: on port 9.
+          "fd7a::9",
+          "ssh://me@[FD7A:0::10]:2222",
+          "tag:servers",
+          "100.64.0.7",
+          "web.tail.ts.net",
+          "me@db",
+          "ssh://me@db.tail.ts.net:22",
+          "ssh://me@db:2222",
+          "root@db",
+        ],
+        peerAddresses(peers),
+      ),
     );
     expect(targets).toEqual([
       { host: "fd7a::9" },
@@ -445,8 +450,127 @@ describe("fleet tags", () => {
         MagicDNSEnabled: false,
       },
     });
-    const { targets } = await withTailscale(program, () => resolveFleet(["tag:servers"]));
-    expect(targets).toEqual([{ host: "100.64.0.5", via: "tag:servers" }]);
+    const { targets } = await withTailscale(program, () =>
+      resolveFleet(["web", "web.tail.ts.net", "tag:servers"]),
+    );
+    expect(targets).toEqual([
+      { host: "web" },
+      { host: "web.tail.ts.net" },
+      expect.objectContaining({ host: "100.64.0.5", via: "tag:servers" }),
+    ]);
+    const explicitIP = await withTailscale(program, () =>
+      resolveFleet(["tag:servers", "me@fd7a:0::5"]),
+    );
+    expect(explicitIP.targets).toEqual([{ host: "me@fd7a:0::5" }]);
+  });
+
+  it("uses the peer IP when MagicDNS names cannot resolve locally", async () => {
+    const m = machine();
+    const program = fakeTailscale(m.root, {
+      ...status([peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] })]),
+      CurrentTailnet: { MagicDNSEnabled: true },
+    });
+    const { targets } = await withTailscale(program, () => resolveFleet(["web", "tag:servers"]));
+    expect(targets).toMatchObject([{ host: "web" }, { host: "100.64.0.5", via: "tag:servers" }]);
+  });
+
+  it("deduplicates an explicit SSH alias by its effective destination, not its name", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const ssh = join(m.root, "ssh-config.mjs");
+    writeFileSync(
+      ssh,
+      `const host = process.argv[process.argv.indexOf("--") + 1];
+if (process.argv.includes("-G")) {
+  const aliases = {
+    "alias.invalid": ["alice", 2222],
+    "same.invalid": ["alice", 2222],
+    "other-user.invalid": ["bob", 2222],
+    "other-port.invalid": ["alice", 2223],
+  };
+  const config = aliases[host];
+  console.log("hostname " + (config ? "localhost" : "127.0.0.2"));
+  if (config) console.log("user " + config[0] + "\\nport " + config[1]);
+} else console.log('skillfleet-fleet: never-synced');`,
+    );
+    const tailscale = fakeTailscale(
+      m.root,
+      status([peer("localhost", ["tag:servers"], { ips: ["127.0.0.1", "::1"] })]),
+    );
+    const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: tailscale };
+    const run = await m.runWith(
+      { env },
+      "fleet",
+      "status",
+      "alias.invalid",
+      "same.invalid",
+      "other-user.invalid",
+      "other-port.invalid",
+      "tag:servers",
+      "--json",
+    );
+    expect((JSON.parse(run.stdout) as Hosts).map(({ host }) => host)).toEqual([
+      "alias.invalid",
+      "other-user.invalid",
+      "other-port.invalid",
+    ]);
+    const other = await m.runWith({ env }, "fleet", "status", "localhost", "tag:servers", "--json");
+    expect(JSON.parse(other.stdout)).toMatchObject([
+      { host: "localhost" },
+      { host: "127.0.0.1", via: "tag:servers" },
+    ]);
+  });
+
+  it("keeps the newest report from the tagged destination when an IP fallback peer goes offline", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const ssh = join(m.root, "ssh-report.mjs");
+    const log = join(m.root, "ssh-ran");
+    writeFileSync(
+      ssh,
+      `import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(log)}, process.argv[process.argv.indexOf("--") + 1] + "\\n");
+console.log(JSON.stringify({ finishedAt: process.env.REPORT_TIME, ok: true, skills: 1 }));`,
+    );
+    const online = peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] });
+    const tailscale = fakeTailscale(m.root, status([online]));
+    const env = { SKILLFLEET_SSH: ssh, SKILLFLEET_TAILSCALE: tailscale };
+    const run = (host: string, time?: string) =>
+      m.runWith({ env: { ...env, REPORT_TIME: time } }, "fleet", "status", host, "--json");
+    const before = await run("tag:servers", "2026-01-01T00:00:00Z");
+    expect(before.code, before.stderr).toBe(0);
+    expect(JSON.parse(before.stdout)).toMatchObject([{ host: "100.64.0.5", reachable: true }]);
+    expect((await run("100.64.0.5", "2026-01-01T00:01:00Z")).code).toBe(0);
+    expect((await run("bob@100.64.0.5", "2026-01-01T00:02:00Z")).code).toBe(0);
+    expect((await run("ssh://100.64.0.5:2222", "2026-01-01T00:03:00Z")).code).toBe(0);
+    fakeTailscale(m.root, status([{ ...online, Online: false }]));
+    const after = await run("tag:servers");
+    expect(after.code, after.stderr).toBe(1);
+    expect(JSON.parse(after.stdout)).toMatchObject([
+      {
+        host: "web.invalid",
+        error: "offline in Tailscale",
+        lastRun: { finishedAt: "2026-01-01T00:01:00Z", skills: 1 },
+      },
+    ]);
+    expect(readFileSync(log, "utf8")).toBe(
+      "100.64.0.5\n100.64.0.5\nbob@100.64.0.5\nssh://100.64.0.5:2222\n",
+    );
+  });
+
+  it("falls back to IP without waiting for a slow DNS lookup", async () => {
+    const program = fakeTailscale(
+      machine().root,
+      status([peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] })]),
+    );
+    const addresses = () =>
+      new Promise<string[]>((resolve) => setTimeout(resolve, 350, ["100.64.0.5"]));
+    const { targets } = await withTailscale(program, () =>
+      resolveFleet(["tag:servers"], addresses, 100),
+    );
+    expect(targets).toMatchObject([{ host: "100.64.0.5", via: "tag:servers" }]);
   });
 
   it("never hands ssh a name from tailscale status that ssh would read as an option, a user or shell", async () => {
@@ -456,13 +580,13 @@ describe("fleet tags", () => {
     const program = fakeTailscale(
       m.root,
       status([
-        peer("-oProxyCommand=x", ["tag:servers"]),
-        peer("a;b.tail.ts.net", ["tag:servers"]),
-        peer("user@x", ["tag:servers"]),
-        peer("$(id).tail.ts.net", ["tag:servers"]),
+        peer("-oProxyCommand=x", ["tag:servers"], { ips: [] }),
+        peer("a;b.tail.ts.net", ["tag:servers"], { ips: [] }),
+        peer("user@x", ["tag:servers"], { ips: [] }),
+        peer("$(id).tail.ts.net", ["tag:servers"], { ips: [] }),
         { ...peer("", ["tag:servers"], { ips: ["-oProxyCommand=y"] }), HostName: "$(id)" },
         { ...peer("", ["tag:servers"], { ips: ["a;b"] }), HostName: "-oProxyCommand=z" },
-        peer("ok.tail.ts.net", ["tag:servers"]),
+        peer("localhost", ["tag:servers"], { ips: ["127.0.0.1", "::1"] }),
       ]),
     );
     const log = join(m.root, "ssh-argv.jsonl");
@@ -480,10 +604,10 @@ process.exit(255);`,
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    expect(calls.map((argv) => argv[argv.indexOf("--") + 1])).toEqual(["ok.tail.ts.net"]);
+    expect(calls.map((argv) => argv[argv.indexOf("--") + 1])).toEqual(["localhost"]);
     for (const hostile of ["ProxyCommand", "a;b", "user@x", "$(id)"])
       expect(calls.flat().slice(0, -1).join(" ")).not.toContain(hostile);
-    expect((JSON.parse(run.stdout) as Hosts).map((host) => host.host)).toEqual(["ok.tail.ts.net"]);
+    expect((JSON.parse(run.stdout) as Hosts).map((host) => host.host)).toEqual(["localhost"]);
     expect(run.stderr).toMatch(/skipped a machine Tailscale calls "-oProxyCommand=x"/);
   });
 
@@ -494,6 +618,7 @@ process.exit(255);`,
     expect(tagged).toEqual({
       targets: [{ host: "laptop" }],
       warnings: ["tag:servers matches no machine on your tailnet besides this one"],
+      enrollment: new Map([["laptop", ["laptop"]]]),
     });
     rmSync(join(m.root, "tailscale-ran"));
     await withTailscale(program, () => resolveFleet(["laptop"]));
@@ -556,7 +681,7 @@ process.exit(255);`,
     const program = fakeTailscale(
       m.root,
       status([
-        peer("localhost", ["tag:servers"]),
+        peer("localhost", ["tag:servers"], { ips: ["127.0.0.1", "::1"] }),
         peer("gone.tail.ts.net", ["tag:servers"], { online: false }),
       ]),
     );
@@ -608,12 +733,15 @@ process.exit(255);`,
         peer("web.tail.ts.net", ["tag:servers"]),
         peer("db.tail.ts.net", ["tag:servers", "tag:db"]),
         peer("laptop.tail.ts.net", []),
+        peer("", ["tag:servers", "tag:ip-only"], { ips: ["100.64.0.9"] }),
       ]),
     );
     const env = { SKILLFLEET_TAILSCALE: program };
     const listed = await m.runWith({ env }, "fleet", "add");
     expect(listed.code, listed.stderr).toBe(0);
-    expect(listed.stdout).toContain("  tag:db  (1 machine)\n  tag:servers  (2 machines)");
+    expect(listed.stdout).toContain(
+      "  tag:db  (1 machine)\n  tag:ip-only  (1 machine)\n  tag:servers  (3 machines)",
+    );
     expect(listed.stdout).toContain("  laptop  laptop.tail.ts.net");
 
     expect((await m.runWith({ env }, "fleet", "add", "tag:servers")).code).toBe(0);
@@ -623,7 +751,7 @@ process.exit(255);`,
     const after = JSON.parse((await m.runWith({ env }, "fleet", "add", "--json")).stdout) as {
       tags: { tag: string }[];
     };
-    expect(after.tags.map(({ tag }) => tag)).toEqual(["tag:db"]);
+    expect(after.tags.map(({ tag }) => tag)).toEqual(["tag:db", "tag:ip-only"]);
 
     const bad = await m.runWith({ env }, "fleet", "add", "tag:9lives");
     expect(bad.code).toBe(1);
@@ -634,7 +762,13 @@ process.exit(255);`,
     const m = machine();
     const team = join(m.root, "team", ".skillfleet", "manifest.json");
     mkdirSync(join(team, ".."), { recursive: true });
-    writeFileSync(team, JSON.stringify({ sources: [], fleet: ["tag:servers"] }));
+    writeFileSync(
+      team,
+      JSON.stringify({
+        sources: [{ id: "team", git: "https://example.org/team.git" }],
+        fleet: ["tag:servers", "tag:bad_tag"],
+      }),
+    );
     // A host fleet refuses at once, so the run needs no ssh.
     const manifest = m.manifest({
       agents: ["claude-code"],
@@ -642,6 +776,9 @@ process.exit(255);`,
       sources: [],
       fleet: ["-x"],
     });
+    const loaded = await loadManifest(manifest, { offline: true });
+    expect(loaded.sources.map(({ id }) => id)).toEqual(["team"]);
+    expect(loaded.warnings).toEqual([expect.stringContaining("ignored fleet; only the root")]);
     const program = fakeTailscale(m.root, status([peer("web.tail.ts.net", ["tag:servers"])]));
     const run = await m.runWith(
       { env: { SKILLFLEET_TAILSCALE: program } },
@@ -694,12 +831,17 @@ function initShims(m: Machine, homes: Record<string, string>): NodeJS.ProcessEnv
     `import { spawnSync } from "node:child_process";
 const machines = ${JSON.stringify(machines)};
 const args = process.argv.slice(2);
+if (args[0] === "-G") {
+  console.log("hostname " + args[args.indexOf("--") + 1]);
+  process.exit(0);
+}
 while (args[0] === "-o") args.splice(0, 2);
 if (args[0] === "--") args.shift();
 const [host, command] = args;
 if (host !== "localhost" && !machines[host]) setTimeout(() => {}, 1e9);
 else {
-  const run = spawnSync("sh", ["-c", command], { stdio: "inherit", env: { ...process.env, ...machines[host] } });
+  const env = { ...process.env, ...machines[host] };
+  const run = spawnSync("sh", ["-c", command], { cwd: env.HOME, stdio: "inherit", env });
   process.exit(run.status ?? 1);
 }`,
   );
@@ -740,8 +882,8 @@ const npxCalls = (m: Machine): string[][] =>
  * A machine set up with a manifest kept in a repository, as `fleet init` needs: one vendored
  * skill, and the manifest's repository as a source with a working clone in ~/code/manifests.
  */
-async function controller(fleet: string[] = []) {
-  const m = machine();
+async function controller(fleet: string[] = [], options?: Parameters<typeof machine>[0]) {
+  const m = machine(options);
   const vendor = remote(m, "vendor", skills("skills/", "fleet-skill"));
   const manifests = remote(m, "manifests", { ".skillfleet/manifest.json": "{}" });
   manifests.commit({
@@ -846,7 +988,7 @@ describe.skipIf(isWindows)("fleet init", () => {
     mkdirSync(join(other, ".config", "skillfleet"), { recursive: true });
     writeFileSync(
       join(other, ".config", "skillfleet", "config.json"),
-      JSON.stringify({ manifest: "github:someone/else//.skillfleet/manifest.json" }),
+      `\uFEFF${JSON.stringify({ manifest: "github:someone/else//.skillfleet/manifest.json" })}`,
     );
     const env = initShims(m, { other });
     const run = await m.runWith({ env }, "fleet", "init", "other");
@@ -876,6 +1018,129 @@ describe.skipIf(isWindows)("fleet init", () => {
     expect(again.stdout).toMatch(/^same: already set up; last run /m);
     expect(npxCalls(m)).toHaveLength(1);
     expect(JSON.parse(readFileSync(file, "utf8")) as unknown).toMatchObject({ manifest: alias });
+  });
+
+  it("refuses an alias shadowed by a local file in the host's login directory", async () => {
+    const m = machine();
+    const home = join(m.root, "box");
+    const env = initShims(m, { box: home });
+    const alias = "me/skills//.skillfleet/manifest.json";
+    const spec = `github:${alias}`;
+    const config = join(home, ".config", "skillfleet");
+    const bin = join(home, ".local", "state", "skillfleet", "bin");
+    mkdirSync(config, { recursive: true });
+    mkdirSync(bin, { recursive: true });
+    const contents = JSON.stringify({ manifest: alias });
+    writeFileSync(join(config, "config.json"), contents);
+    mkdirSync(join(home, "me", "skills", ".skillfleet"), { recursive: true });
+    writeFileSync(join(home, alias), "{}");
+    const launcher = join(bin, "skillfleet");
+    writeFileSync(launcher, `#!/bin/sh\ntouch "${m.root}/synced"\n`, { mode: 0o755 });
+    const savedPath = process.env.PATH;
+    process.env.PATH = env.PATH;
+    try {
+      const [result] = await fleet(["box"], "init", "1.2.3", 30_000, {
+        setup: { spec, flags: [], force: false, same: (value) => sameManifest(value, spec) },
+      });
+      expect(result).toMatchObject({ reachable: true, error: expect.stringContaining(alias) });
+      expect(result?.setup).toBeUndefined();
+      expect(existsSync(join(m.root, "synced"))).toBe(false);
+      expect(readFileSync(join(config, "config.json"), "utf8")).toBe(contents);
+      expect(npxCalls(m)).toEqual([]);
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+    }
+  });
+
+  it("completes setup after a real hook installation failure", async () => {
+    const { m, fleetIn } = await controller();
+    const home = join(m.root, "vps2");
+    const env = initShims(m, { vps2: home });
+    const settings = join(home, ".claude", "settings.json");
+    writeFileSync(settings, "{ invalid JSON");
+    const failed = await m.runWith({ env }, "fleet", "init", "vps2");
+    expect(failed.code, failed.stdout + failed.stderr).toBe(1);
+    expect(fleetIn()).toEqual([]);
+    const launcher = join(home, ".local", "state", "skillfleet", "bin", "skillfleet");
+    const nodeOnly = join(m.root, "node-only");
+    mkdirSync(nodeOnly);
+    symlinkSync(process.execPath, join(nodeOnly, "node"));
+    writeFileSync(
+      launcher,
+      readFileSync(launcher, "utf8").replace(/^exec "[^"]*"/m, `exec "${join(nodeOnly, "node")}"`),
+    );
+    writeFileSync(settings, "{}");
+    const retry = await m.runWith({ env }, "fleet", "init", "vps2");
+    expect(retry.code, retry.stdout + retry.stderr).toBe(0);
+    expect(retry.stdout).toMatch(/^vps2: set up; /m);
+    expect(npxCalls(m)).toHaveLength(2);
+    expect(JSON.parse(readFileSync(settings, "utf8"))).toHaveProperty("hooks.SessionStart");
+    expect(fleetIn()).toEqual(["vps2"]);
+  });
+
+  it("returns one JSON document if enrollment fails after setup", async () => {
+    const { m } = await controller();
+    writeFileSync(m.at("code", "manifests", ".skillfleet", "manifest.json"), "{ invalid JSON");
+    const env = initShims(m, { vps2: join(m.root, "vps2") });
+    const run = await m.runWith({ env }, "fleet", "init", "vps2", "--json", "--no-hooks");
+    expect(run.code, run.stdout + run.stderr).toBe(1);
+    expect(JSON.parse(run.stdout)).toMatchObject({
+      hosts: [{ host: "vps2", setup: "set up" }],
+      error: expect.stringContaining("not valid JSON"),
+    });
+  });
+
+  it("rejects contradictory copy flags without calling SSH", async () => {
+    const { m } = await controller();
+    const env = initShims(m, { vps2: join(m.root, "vps2") });
+    const run = await m.runWith({ env }, "fleet", "init", "vps2", "--copy", "--no-copy");
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain("--copy and --no-copy contradict each other");
+    expect(npxCalls(m)).toEqual([]);
+    expect(existsSync(join(m.root, "vps2", ".config"))).toBe(false);
+  });
+
+  it("does not claim cancellation if an npx child survives the SSH timeout", async () => {
+    const { m, fleetIn } = await controller();
+    const env = initShims(m, { vps2: join(m.root, "vps2") });
+    writeFileSync(
+      join(m.root, "bin", "npx"),
+      `#!/bin/sh\n(sleep 3; touch "${m.root}/child-finished") &\nwait\n`,
+    );
+    const run = await m.runWith({ env }, "fleet", "init", "vps2", "--timeout", "2");
+    expect(run.code, run.stdout + run.stderr).toBe(1);
+    expect(run.stdout).toContain(
+      "setup did not finish before SSH disconnected and may still be running",
+    );
+    expect(fleetIn()).toEqual([]);
+    await delay(1800);
+    expect(existsSync(join(m.root, "child-finished"))).toBe(true);
+  });
+
+  it("enrolls overlapping tags even when a named peer takes precedence", async () => {
+    const { m, fleetIn } = await controller();
+    const host = "100.64.1.77";
+    const program = fakeTailscale(
+      m.root,
+      status([peer("vps2.tail.ts.net", ["tag:servers", "tag:workers"], { ips: [host] })]),
+    );
+    const env = {
+      ...initShims(m, { [host]: join(m.root, "vps2") }),
+      SKILLFLEET_TAILSCALE: program,
+    };
+    const run = await m.runWith(
+      { env },
+      "fleet",
+      "init",
+      "tag:servers",
+      host,
+      "tag:workers",
+      "--no-hooks",
+    );
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(npxCalls(m)).toHaveLength(1);
+    expect(fleetIn()).toEqual(["tag:servers", host, "tag:workers"]);
   });
 
   it("repairs a missing launcher for the same manifest in another spelling", async () => {
@@ -935,6 +1200,132 @@ describe.skipIf(isWindows)("fleet init", () => {
       readFileSync(join(m.root, "vps2", ".config", "skillfleet", "config.json"), "utf8"),
     ) as { copy?: boolean };
     expect(config.copy).toBe(true);
+  });
+
+  it("retries a refused timer installation before enrolling the host", async () => {
+    const { m, fleetIn } = await controller([], { scheduler: "refuse" });
+    const host = join(m.root, "vps2");
+    const env = initShims(m, { vps2: host });
+    const first = await m.runWith({ env }, "fleet", "init", "vps2", "--timer");
+    expect(first.code, first.stdout + first.stderr).toBe(1);
+    expect(fleetIn()).toEqual([]);
+    const calls = m.schedulerCalls().length;
+    expect(calls).toBeGreaterThan(0);
+
+    const state = join(host, ".local", "state", "skillfleet");
+    const nodeOnly = join(m.root, "node-only");
+    mkdirSync(nodeOnly);
+    symlinkSync(process.execPath, join(nodeOnly, "node"));
+    const launcher = join(state, "bin", "skillfleet");
+    writeFileSync(
+      launcher,
+      readFileSync(launcher, "utf8").replace(/^exec "[^"]*"/m, `exec "${join(nodeOnly, "node")}"`),
+    );
+    const retry = await m.runWith({ env }, "fleet", "init", "vps2");
+    expect(retry.code, retry.stdout + retry.stderr).toBe(1);
+    expect(npxCalls(m)).toHaveLength(2);
+    expect(m.schedulerCalls().length).toBeGreaterThan(calls);
+    expect(existsSync(join(state, "init-pending"))).toBe(true);
+    expect(fleetIn()).toEqual([]);
+  });
+
+  it("does not retry a pending timer after explicit removal", async () => {
+    const m = machine({ scheduler: "refuse" });
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    const pending = join(m.stateDir, "init-pending");
+    expect((await m.run("init", manifest, "--timer", "--no-hooks")).code).toBe(1);
+    expect(readFileSync(pending, "utf8")).toBe("timer\n");
+
+    const remove = await m.runWith(
+      { env: { SKILLFLEET_TEST_SCHEDULER: "empty" } },
+      "timer",
+      "remove",
+    );
+    expect(remove.code, remove.stdout + remove.stderr).toBe(0);
+    expect(readFileSync(pending, "utf8")).toBe("");
+    const calls = m.schedulerCalls().length;
+    const retry = await m.run("init", manifest, "--no-hooks");
+    expect.soft(retry.code, retry.stdout + retry.stderr).toBe(0);
+    expect.soft(m.schedulerCalls()).toHaveLength(calls);
+    expect(existsSync(pending)).toBe(false);
+  });
+
+  it("compares equivalent named and tagged hosts without ignoring users or ports", async () => {
+    const { m } = await controller(["VPS2", "tag:servers"]);
+    const env = {
+      ...initShims(m, {}),
+      SKILLFLEET_TAILSCALE: fakeTailscale(
+        m.root,
+        status([peer("web.invalid", ["tag:servers"], { ips: ["fd7a::5"] })]),
+      ),
+    };
+    const run = await m.runWith(
+      { env },
+      "fleet",
+      "init",
+      "vps2",
+      "fd7a:0::5",
+      "root@vps2",
+      "ssh://[fd7a::5]:2222",
+      "--dry-run",
+    );
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(run.stdout).toContain("would add root@vps2, ssh://[fd7a::5]:2222 to the fleet");
+  });
+
+  it("retains tagged peer reports across init errors and offline status", async () => {
+    const { m, fleetIn } = await controller();
+    const ssh = join(m.root, "ssh.mjs");
+    const online = peer("web.invalid", ["tag:servers"], { ips: ["100.64.0.5"] });
+    const tailscale = fakeTailscale(m.root, status([online]));
+    writeFileSync(
+      ssh,
+      `
+const success = { finishedAt: "2026-01-01T00:00:00Z", ok: true };
+if (process.env.FAKE_ANSWER === "mismatch") {
+  console.error("skillfleet-fleet: has github:another/manifest");
+  console.log("skillfleet-fleet: other-manifest");
+} else if (process.env.FAKE_ANSWER === "failed") {
+  console.log(JSON.stringify({ sync: { ...success, finishedAt: "2026-01-01T00:01:00Z", ok: false } }));
+  process.exitCode = 1;
+} else console.log(JSON.stringify(success));
+`,
+    );
+    const run = (action: string, answer?: string) =>
+      m.runWith(
+        {
+          env: {
+            SKILLFLEET_SSH: ssh,
+            SKILLFLEET_TAILSCALE: tailscale,
+            SKILLFLEET_PACKAGE: "/pkg/skillfleet.tgz",
+            FAKE_ANSWER: answer,
+          },
+        },
+        "fleet",
+        action,
+        "tag:servers",
+        "--json",
+      );
+    expect((await run("status")).code).toBe(0);
+    const mismatch = await run("init", "mismatch");
+    expect(mismatch.code).toBe(1);
+    expect
+      .soft(JSON.parse(mismatch.stdout))
+      .toMatchObject([
+        { error: expect.stringContaining("another/manifest"), lastRun: { ok: true } },
+      ]);
+    const failed = await run("init", "failed");
+    expect(failed.code).toBe(1);
+    expect(JSON.parse(failed.stdout)).toMatchObject([
+      { error: expect.stringContaining("first sync had errors"), lastRun: { ok: false } },
+    ]);
+    expect(fleetIn()).toEqual([]);
+    fakeTailscale(m.root, status([{ ...online, Online: false }]));
+    const offline = await run("status");
+    expect(offline.code).toBe(1);
+    expect(JSON.parse(offline.stdout)).toMatchObject([
+      { error: "offline in Tailscale", lastRun: { finishedAt: "2026-01-01T00:01:00Z", ok: false } },
+    ]);
   });
 
   it("this machine is already set up; a host a tag of the fleet matches is not added again", async () => {
@@ -1054,6 +1445,7 @@ describe.skipIf(isWindows)("fleet init", () => {
     writeFileSync(join(m.home, "me", "skills", "team.json"), "{}");
     const bin = join(m.root, "npx-bin");
     mkdirSync(bin);
+    symlinkSync(process.execPath, join(bin, "node"));
     writeFileSync(
       join(bin, "npx"),
       `#!/bin/sh\n{ pwd; printf '%s\\n' "$@"; } > "${m.root}/npx-ran"\n`,
@@ -1075,30 +1467,41 @@ describe.skipIf(isWindows)("fleet init", () => {
     expect(args).toEqual(expect.arrayContaining(["init", "github:me/skills//team.json"]));
   });
 
-  it("finds a relative SKILLFLEET_PACKAGE from the login folder, though init runs from /", () => {
-    const m = machine();
-    const bin = join(m.root, "npx-bin");
-    mkdirSync(bin);
-    writeFileSync(join(bin, "npx"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${m.root}/npx-ran"\n`);
-    chmodSync(join(bin, "npx"), 0o755);
-    const before = process.env.SKILLFLEET_PACKAGE;
-    process.env.SKILLFLEET_PACKAGE = "./preview.tgz";
-    try {
-      const script = remoteScript("init", "1.2.3", {
-        setup: { spec: "github:me/skills", flags: [], force: false, same: () => false },
-      });
-      spawnSync("/bin/sh", ["-c", script], {
-        cwd: m.home,
-        env: { HOME: m.home, PATH: `${bin}:/usr/bin:/bin` },
-        input: "",
-      });
-    } finally {
-      if (before === undefined) delete process.env.SKILLFLEET_PACKAGE;
-      else process.env.SKILLFLEET_PACKAGE = before;
-    }
-    const args = readFileSync(join(m.root, "npx-ran"), "utf8").trim().split("\n");
-    expect(args).toContain(`${realpathSync(m.home)}/./preview.tgz`);
-  });
+  it.each([
+    ["preview.tgz", true],
+    ["release.tar.gz", true],
+    ["release.tar", true],
+    ["./dist/preview.tgz", true],
+    ["owner/repo.tgz", false],
+    ["@scope/name.tgz", false],
+  ])(
+    "passes SKILLFLEET_PACKAGE %s without changing its meaning from the login folder",
+    (pkg, relative) => {
+      const m = machine();
+      const bin = join(m.root, "npx-bin");
+      mkdirSync(bin);
+      symlinkSync(process.execPath, join(bin, "node"));
+      writeFileSync(join(bin, "npx"), `#!/bin/sh\nprintf '%s\\n' "$@" > "${m.root}/npx-ran"\n`);
+      chmodSync(join(bin, "npx"), 0o755);
+      const before = process.env.SKILLFLEET_PACKAGE;
+      process.env.SKILLFLEET_PACKAGE = pkg;
+      try {
+        const script = remoteScript("init", "1.2.3", {
+          setup: { spec: "github:me/skills", flags: [], force: false, same: () => false },
+        });
+        spawnSync("/bin/sh", ["-c", script], {
+          cwd: m.home,
+          env: { HOME: m.home, PATH: `${bin}:/usr/bin:/bin` },
+          input: "",
+        });
+      } finally {
+        if (before === undefined) delete process.env.SKILLFLEET_PACKAGE;
+        else process.env.SKILLFLEET_PACKAGE = before;
+      }
+      const args = readFileSync(join(m.root, "npx-ran"), "utf8").trim().split("\n");
+      expect(args[2]).toBe(relative ? `${realpathSync(m.home)}/${pkg}` : pkg);
+    },
+  );
 
   it("takes two manifest specs as the same only when their repository surely is", () => {
     const file = "//.skillfleet/manifest.json";
@@ -1107,7 +1510,11 @@ describe.skipIf(isWindows)("fleet init", () => {
       [`me/skills${file}`, `https://github.com/me/skills.git${file}`],
       [`https://GitHub.com/me/skills${file}`, `git@github.com:me/skills.git${file}`],
       ["gitlab:group/skills", `https://gitlab.com/group/skills.git${file}`],
-      [`https://git.example.com/me/skills.git${file}`, `https://GIT.example.com/me/skills.git${file}`],
+      [
+        `https://git.example.com/me/skills.git${file}`,
+        `https://GIT.example.com/me/skills.git${file}`,
+      ],
+      [`git@GIT.example.com:me/skills.git${file}`, `git@git.example.com:me/skills.git${file}`],
     ])
       expect.soft(sameManifest(a!, b!), `${a} = ${b}`).toBe(true);
     for (const [a, b] of [
