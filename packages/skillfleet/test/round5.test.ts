@@ -47,57 +47,93 @@ async function init(m: Machine, manifest: string, ...args: string[]) {
 }
 
 describe("a sync stopped before it saved state.json", () => {
-  it.each([false, true])("recovers a published copy (upstream moved: %s)", async (advanced) => {
-    const m = machine();
-    const vendor = remote(m, "vendor", skills("skills/", "tool"));
-    const manifest = m.manifest({
-      agents: ["claude-code"],
-      sources: [{ id: "vendor", git: vendor.url }],
-      hooks: [{ name: "changed", run: "echo changed", on: ["vendor:skills/tool/SKILL.md"] }],
-    });
-    await init(m, manifest);
-    const state = () =>
-      JSON.parse(read(join(m.stateDir, "state.json"))) as {
-        lastChange: string;
-        skills: { tool: { changedAt: string } };
-      };
-    const before = state();
-    const live = join(m.stateDir, "store", "vendor", "live", "tool");
-    const stop = join(m.root, "stop.mjs");
-    writeFileSync(
-      stop,
-      `
+  it.each(["uninterrupted", "interrupted", "upstream advanced"])(
+    "reports the published path (%s)",
+    async (scenario) => {
+      const m = machine();
+      const vendor = remote(m, "vendor", skills("old/", "tool"));
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+        hooks: ["old", "new", "latest"].map((path) => ({
+          name: path,
+          run: "echo changed",
+          on: [`vendor:${path}/tool/SKILL.md`],
+        })),
+      });
+      await init(m, manifest);
+      const statePath = join(m.stateDir, "state.json");
+      const state = () =>
+        JSON.parse(read(statePath)) as {
+          lastChange: string;
+          skills: { tool: { changedAt: string } };
+        };
+      const before = state();
+      const live = join(m.stateDir, "store", "vendor", "live", "tool");
+      const stop = join(m.root, "stop.mjs");
+      writeFileSync(
+        stop,
+        `
       import fs from "node:fs";
       import { syncBuiltinESMExports } from "node:module";
       import { normalize } from "node:path";
       const rename = fs.renameSync;
       fs.renameSync = (from, to) => {
+        if (process.env.STOP_AT === "checkpoint" && normalize(to) === normalize(${JSON.stringify(statePath)}))
+          process.exit(87);
         rename(from, to);
-        if (normalize(to) === normalize(${JSON.stringify(live)}) && from.endsWith(".new"))
+        if (process.env.STOP_AT === "live" && normalize(to) === normalize(${JSON.stringify(live)}) && from.endsWith(".new"))
           process.exit(86);
       };
       syncBuiltinESMExports();
     `,
-    );
-    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "published") });
-    const stopped = await m.runWith(
-      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
-      "sync",
-    );
-    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
-    expect(read(join(live, "SKILL.md"))).toContain("published");
-    if (advanced) vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "latest") });
-    const report = await m.json("sync");
-    expect(report.pending).toEqual([]);
-    expect(report.edited).toEqual([]);
-    expect(read(join(live, "SKILL.md"))).toContain(advanced ? "latest" : "published");
-    expect(report.skills.updated).toEqual(["tool"]);
-    expect(report.hooks.map((hook) => hook.code)).toEqual([0]);
-    const after = state();
-    expect(after.lastChange > before.lastChange).toBe(true);
-    expect(after.skills.tool.changedAt > before.skills.tool.changedAt).toBe(true);
-    expect((await m.json("sync")).hooks).toEqual([]);
-  });
+      );
+      const interrupt = async (at: string, code: number) => {
+        const stopped = await m.runWith(
+          {
+            env: {
+              NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}`,
+              STOP_AT: at,
+            },
+          },
+          "sync",
+        );
+        expect(stopped.code, stopped.stdout + stopped.stderr).toBe(code);
+        expect(read(join(live, "SKILL.md"))).toContain("published");
+        expect(state()).toEqual(before);
+      };
+      vendor.commit({
+        "old/tool/SKILL.md": null,
+        "new/tool/SKILL.md": skillMd("tool", "published"),
+      });
+      if (scenario !== "uninterrupted") {
+        await interrupt("live", 86);
+        await interrupt("checkpoint", 87);
+      }
+      const advanced = scenario === "upstream advanced";
+      if (advanced)
+        vendor.commit({
+          "new/tool/SKILL.md": null,
+          "latest/tool/SKILL.md": skillMd("tool", "latest"),
+        });
+      const report = await m.json("sync");
+      expect(report.pending).toEqual([]);
+      expect(report.edited).toEqual([]);
+      expect(read(join(live, "SKILL.md"))).toContain(advanced ? "latest" : "published");
+      expect(report.skills.updated).toEqual(["tool"]);
+      expect(report.hooks.map(({ name, matched, code }) => ({ name, matched, code }))).toEqual(
+        (advanced ? ["new", "latest"] : ["new"]).map((name) => ({
+          name,
+          matched: [`vendor:${name}/tool/SKILL.md`],
+          code: 0,
+        })),
+      );
+      const after = state();
+      expect(after.lastChange > before.lastChange).toBe(true);
+      expect(after.skills.tool.changedAt > before.skills.tool.changedAt).toBe(true);
+      expect((await m.json("sync")).hooks).toEqual([]);
+    },
+  );
 
   it.skipIf(isWindows)(
     "R8-1. an update a stopped sync put in place is not taken for a local edit once upstream moves again",

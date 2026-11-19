@@ -26,15 +26,18 @@ import {
   inside,
   isRecord,
   listFiles,
+  readJsonOrNothing,
   recoverReplaced,
   removeUnchanged,
   renameFolder,
   replaceDir,
   replaceUnchanged,
   sameTree,
+  sha256,
   SKILL_LIMITS,
   skillBudget,
   SkillTooLargeError,
+  writeJson,
 } from "./fs.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
 import { globBase, matchesGlob } from "./glob.ts";
@@ -1659,6 +1662,18 @@ async function withDigestCheck<T>(work: () => Promise<T>, mismatched: Map<string
 const mismatchText = (name: string, digest: string) =>
   `the archive of "${name}" does not match the digest the index gives (received ${digest})`;
 
+const publicationPaths = (storeDir: string, name: string) =>
+  join(storeDir, "publication-paths", name);
+
+const treeKey = (hashes: Hashes) =>
+  sha256(
+    JSON.stringify(
+      Object.keys(hashes)
+        .sort()
+        .map((file) => [file, hashes[file]]),
+    ),
+  );
+
 async function fetchVendored(
   source: VendoredSource,
   state: SourceState,
@@ -1700,10 +1715,17 @@ async function fetchVendored(
       if (published) replaceDir(publishing, base);
       rmSync(publishing, { recursive: true, force: true });
     }
-    if (files.length === 0) continue;
+    const receipts = publicationPaths(ctx.storeDir, name);
+    if (files.length === 0) {
+      if (!ctx.dryRun) rmSync(receipts, { recursive: true, force: true });
+      continue;
+    }
     // If the witness was already retired, the matching base still proves publication until the
     // source checkpoint saves the new hashes together with its change notifications.
     if (published || (existsSync(base) && sameTree(hashDir(base), now))) {
+      const pathsByTree = readJsonOrNothing(join(receipts, "paths.json"));
+      const path = isRecord(pathsByTree) ? pathsByTree[treeKey(now)] : undefined;
+      copy.path = typeof path === "string" ? path : path === null ? undefined : copy.path;
       reportVendoredUpdate(source, out, { name, path: copy.path }, files);
       copy.hashes = now;
       continue;
@@ -2214,6 +2236,10 @@ function applyVendored(
     if (write) {
       // Edits were looked for before the fetch; one saved since then is caught here.
       const publishing = join(ctx.storeDir, "publishing", skill.name);
+      writeJson(join(publicationPaths(ctx.storeDir, skill.name), "paths.json"), {
+        [treeKey(record.hashes)]: record.path ?? null,
+        [treeKey(incoming)]: skill.path ?? null,
+      });
       replaceDir(from, publishing);
       const late = replaceUnchanged(publishing, paths.live, record.hashes);
       if (late.length > 0) {
@@ -2270,6 +2296,7 @@ function applyVendored(
         continue;
       }
       for (const dir of Object.values(paths)) rmSync(dir, { recursive: true, force: true });
+      rmSync(publicationPaths(ctx.storeDir, name), { recursive: true, force: true });
       delete state.skills[name];
       delete state.pending[name];
     }
