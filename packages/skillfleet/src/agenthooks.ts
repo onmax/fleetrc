@@ -159,9 +159,12 @@ const DISABLED_WINDOWS = "exit /b 0 & rem skillfleet: disabled legacy hook";
 const isDisabledCommand = (command: unknown) =>
   command === DISABLED_POSIX || command === DISABLED_WINDOWS;
 
-/** A matcher group that runs on every event of its kind: no matcher, or one that matches all. */
+/** A matcher group that runs on every event of its kind: no matcher (Codex reads null as none), or one that matches all. */
 const catchAll = (group: Record<string, unknown>) =>
-  group.matcher === undefined || group.matcher === "" || group.matcher === "*";
+  group.matcher === undefined ||
+  group.matcher === null ||
+  group.matcher === "" ||
+  group.matcher === "*";
 
 /** One of the no-ops skillfleet leaves in place of an old Codex entry. */
 const isDisabled = (hook: unknown) =>

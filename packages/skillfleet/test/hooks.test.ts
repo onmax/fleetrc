@@ -468,6 +468,20 @@ describe("hook install and remove", () => {
     expect(read(file)).toBe(once);
   });
 
+  it("reads a Codex group with matcher null as one for every session, and leaves its entry in place", async () => {
+    const m = machine();
+    const file = m.at(".codex", "hooks.json");
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    const current = (JSON.parse(read(file)).hooks as { SessionStart: { hooks: Entry[] }[] })
+      .SessionStart[0]!.hooks[0]!;
+    const custom = { type: "command", command: "echo mine" };
+    const layout = { hooks: { SessionStart: [{ matcher: null, hooks: [current, custom] }] } };
+    writeFileSync(file, JSON.stringify(layout));
+    const before = read(file);
+    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    expect(read(file)).toBe(before);
+  });
+
   it("puts the Codex entry in a group for every session when the older one is under a matcher, and status ignores placeholders", async () => {
     const m = machine();
     const file = m.at(".codex", "hooks.json");
