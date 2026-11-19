@@ -1,8 +1,8 @@
-// What an agent's session hook runs: `skillfleet hook run <agent>`, on every session start and
-// every prompt. It starts a sync in the background when the last one is stale, and for Claude Code
-// names skills that arrived mid-session. It runs before each prompt, so it loads only small modules
-// (entry.ts imports it without cli.ts), makes no network call, prints nothing about the sync, and
-// always exits 0.
+// What an agent's session hook runs: `skillfleet hook run <agent>`, when a session starts. It starts
+// a sync in the background when the last attempt is stale. The agent waits for it before the
+// session opens, so it loads only small modules (entry.ts imports it without cli.ts, and the
+// modules that start a sync load only when one starts), makes no network call, prints nothing,
+// and always exits 0.
 import { spawn } from "node:child_process";
 import {
   closeSync,
@@ -17,10 +17,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { isRecord, readJsonOrNothing } from "./fs.ts";
-import { lockText, readLock, syncRunning, takeLock } from "./lock.ts";
 import { paths, stateDir } from "./paths.ts";
-import { findOnPath, timerEnv } from "./selfinstall.ts";
-import { promptHook, sessionStarted } from "./sessions.ts";
 
 export const HOOK_AGENTS = ["claude-code", "codex"] as const;
 export type HookAgent = (typeof HOOK_AGENTS)[number];
@@ -55,7 +52,8 @@ function attemptedRecently(): boolean {
  * its holder, a claim whose holder is gone is broken by one breaker at a time, and it is let go
  * only while it is still this hook's. Returns the release, or undefined when another hook holds it.
  */
-function claim(file: string): (() => void) | undefined {
+function claim(file: string, lock: typeof import("./lock.ts")): (() => void) | undefined {
+  const { lockText, readLock, takeLock } = lock;
   const mine = lockText("hook");
   try {
     takeLock(file, mine);
@@ -72,7 +70,10 @@ function claim(file: string): (() => void) | undefined {
  * of the shell that installed it, so the agent's PATH and settings do not reach the manifest's
  * hooks. The ssh agent is the one running now.
  */
-function syncEnv(): Record<string, string> {
+function syncEnv({
+  findOnPath,
+  timerEnv,
+}: typeof import("./selfinstall.ts")): Record<string, string> {
   const saved = readJsonOrNothing(paths.hookEnv());
   const env: Record<string, string> = {};
   if (isRecord(saved))
@@ -91,7 +92,7 @@ function syncEnv(): Record<string, string> {
  * to the timer's log. It runs the installed copy with this node, as the launcher does; the hook was
  * started through the launcher, so this node is the launcher's.
  */
-function startSync(why: string) {
+function startSync(why: string, self: typeof import("./selfinstall.ts")) {
   const installed = join(paths.app(), "cli.mjs");
   const cli = existsSync(installed) ? installed : process.argv[1];
   if (!cli) return;
@@ -101,7 +102,7 @@ function startSync(why: string) {
     writeFileSync(log, `${new Date().toISOString()} ${why}: starting a sync\n`);
     const child = spawn(process.execPath, [cli, "sync"], {
       cwd: stateDir(),
-      env: syncEnv(),
+      env: syncEnv(self),
       detached: true,
       windowsHide: true,
       stdio: ["ignore", log, log],
@@ -123,11 +124,15 @@ function markRan(agent: HookAgent) {
   writeFileSync(file, String(Date.now()));
 }
 
-/** Starts a sync when none was attempted lately and none is running. */
-function syncIfStale(why: string) {
+/**
+ * Starts a sync when none was attempted lately and none is running. The modules that take the claim
+ * and start the sync load only past the first look at the stamp, which nearly every hook stops at.
+ */
+async function syncIfStale(why: string) {
   if (attemptedRecently()) return;
+  const [lock, self] = await Promise.all([import("./lock.ts"), import("./selfinstall.ts")]);
   mkdirSync(stateDir(), { recursive: true });
-  const release = claim(`${paths.hookAttempt()}.claim`);
+  const release = claim(`${paths.hookAttempt()}.claim`, lock);
   if (!release) return;
   try {
     // For tests: hold the claim a while, so hooks that started together meet it.
@@ -139,7 +144,7 @@ function syncIfStale(why: string) {
     writeFileSync(stamp, String(Date.now()));
     renameSync(stamp, paths.hookAttempt());
     // A running sync brings the skills up to date itself.
-    if (!syncRunning()) startSync(why);
+    if (!lock.syncRunning()) startSync(why, self);
   } finally {
     release();
   }
@@ -172,24 +177,12 @@ function configured(): boolean {
   return isRecord(config) && typeof config.manifest === "string";
 }
 
-/** The skills state.json lists and when each arrived, for the prompt hook. */
-function linkedSkills(): Record<string, { addedAt: string }> {
-  const state = readJsonOrNothing(paths.state());
-  const skills: Record<string, { addedAt: string }> = {};
-  if (isRecord(state) && isRecord(state.skills))
-    for (const [name, record] of Object.entries(state.skills))
-      if (isRecord(record) && typeof record.addedAt === "string")
-        skills[name] = { addedAt: record.addedAt };
-  return skills;
-}
-
 /**
- * `skillfleet hook run <agent>`, and `hook prompt` (Claude Code's UserPromptSubmit), which older
- * versions documented and which only names new skills: `sync: false`. `event` is the hook's event,
- * else the `hook_event_name` the agent passes on stdin. On a machine without skillfleet's config
- * it does nothing and creates nothing.
+ * `skillfleet hook run <agent>`, with the event the agent passes on stdin as `hook_event_name`. On
+ * UserPromptSubmit, where older versions put the hook too, it does nothing: syncs start only with a
+ * session. On a machine without skillfleet's config it does nothing and creates nothing.
  */
-export function runHook(agent: HookAgent, event?: string, options: { sync?: boolean } = {}) {
+export async function runHook(agent: HookAgent) {
   try {
     adoptInstalledPlaces();
     if (!configured()) return;
@@ -202,31 +195,16 @@ export function runHook(agent: HookAgent, event?: string, options: { sync?: bool
       parsed = JSON.parse(input);
     } catch {}
     const name =
-      event ??
-      (isRecord(parsed) && typeof parsed.hook_event_name === "string"
+      isRecord(parsed) && typeof parsed.hook_event_name === "string"
         ? parsed.hook_event_name
-        : "a session hook");
-    // Before the sync this hook may start, so a skill it links counts as new to the session.
-    if (agent === "claude-code" && name === "SessionStart")
-      try {
-        sessionStarted(input);
-      } catch {
-        // The record only lets the next prompt name new skills; the sync goes ahead without it.
-      }
-    if (options.sync !== false)
-      try {
-        markRan(agent);
-      } catch {}
-    if (options.sync !== false)
-      try {
-        syncIfStale(`${agent} ${name}`);
-      } catch {}
-    // Claude Code loads skills linked mid-session; Codex reads them only when a session starts.
-    if (agent === "claude-code" && name === "UserPromptSubmit") {
-      process.stdout.on("error", () => {});
-      const text = promptHook(input, { skills: linkedSkills() });
-      if (text) process.stdout.write(text);
-    }
+        : "a session hook";
+    if (name === "UserPromptSubmit") return;
+    try {
+      markRan(agent);
+    } catch {}
+    try {
+      await syncIfStale(`${agent} ${name}`);
+    } catch {}
   } catch {
     // The agent shows a hook's failure to the user, and the hook is the agent's, not skillfleet's.
   } finally {

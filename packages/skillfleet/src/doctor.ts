@@ -1,13 +1,7 @@
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join, sep } from "node:path";
-import {
-  AGENT_NAMES,
-  describeTrigger,
-  type HookAgent,
-  installedHooks,
-  promptOnlyHooks,
-} from "./agenthooks.ts";
+import { AGENT_NAMES, describeTrigger, type HookAgent, installedHooks } from "./agenthooks.ts";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { conflictLines } from "./edits.ts";
 import { exec, git } from "./exec.ts";
@@ -168,7 +162,6 @@ function timerWanted(): boolean {
 /** What starts a sync on this machine: the session hooks, the timer, both, or nothing. */
 function triggerCheck(timer: boolean): Check {
   const hooks = installedHooks();
-  const legacy = promptOnlyHooks().map((hook) => hook.note);
   const name = "sync trigger";
   const launcher = launcherPath();
   if (hooks.length > 0 && !existsSync(launcher))
@@ -177,8 +170,8 @@ function triggerCheck(timer: boolean): Check {
       ok: false,
       detail: `the session hooks run ${tildify(launcher)}, which is missing; run \`npx skillfleet@latest self-install\``,
     };
-  const detail = [describeTrigger(hooks, timer), ...legacy].join("; ");
-  return (hooks.length > 0 || timer) && legacy.length === 0
+  const detail = describeTrigger(hooks, timer);
+  return hooks.length > 0 || timer
     ? { name, ok: true, detail }
     : { name, ok: true, warn: true, detail };
 }

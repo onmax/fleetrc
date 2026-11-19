@@ -8,7 +8,6 @@ import {
   type HookChange,
   installedHooks,
   installHooks,
-  promptOnlyHooks,
   removeHooks,
 } from "./agenthooks.ts";
 import { agentRows } from "./agents.ts";
@@ -252,7 +251,7 @@ const COMMANDS: Record<string, Command> = {
     usage: "hook install|remove [agent]",
     summary: "Add or remove the hooks that sync when a Claude Code or Codex session starts",
     details:
-      "Without an agent (claude-code or codex), acts on each whose folder exists. The hooks run `skillfleet hook run <agent>` on session start and on each prompt: when no sync was started in the last 15 minutes and none is running, it starts one in the background, and in Claude Code it names skills that arrived after the session started. `hook prompt` is Claude Code's prompt hook alone.",
+      "Without an agent (claude-code or codex), acts on each whose folder exists. The hooks run `skillfleet hook run <agent>` when a session starts: when no sync was started in the last 15 minutes and none is running, it starts one in the background. Nothing runs on each prompt; `hook install` takes out the prompt hooks older versions added.",
     options: ["dry-run", "json"],
   },
   "self-install": {
@@ -607,7 +606,6 @@ async function status() {
       trigger: {
         hooks: hooks.map((hook) => hook.agent),
         timer: withTimer,
-        promptOnly: promptOnlyHooks().map((hook) => hook.agent),
       },
       timer:
         timerState === undefined
@@ -625,7 +623,6 @@ async function status() {
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
   for (const line of [...forkLines(state), ...conflictLines(state)]) say(line);
   say(`syncs start from: ${describeTrigger(hooks, withTimer)}`);
-  for (const hook of promptOnlyHooks()) say(`hooks: ${hook.note}`);
   if (timerState !== undefined)
     say(
       `timer: ${
@@ -1001,7 +998,7 @@ async function init() {
   );
 }
 
-/** `hook install|remove [agent]`, and `hook run <agent>` and `hook prompt`, which the agents run. */
+/** `hook install|remove [agent]`, `hook run <agent>`, which the agents run, and the old `hook prompt`. */
 async function hookCommand(action: string | undefined) {
   if (action === "run" || action === "prompt") {
     const agent = action === "prompt" ? "claude-code" : rest[1];
@@ -1009,9 +1006,8 @@ async function hookCommand(action: string | undefined) {
       usage(
         action === "prompt" ? "hook prompt takes nothing" : "hook run takes claude-code or codex",
       );
-    // `hook prompt` only names new skills; it starts no sync.
-    if (action === "prompt") runHook(agent, "UserPromptSubmit", { sync: false });
-    else runHook(agent);
+    // `hook prompt`, which older settings files may still call, does nothing.
+    if (action === "run") await runHook(agent);
     return 0;
   }
   if (action !== "install" && action !== "remove")

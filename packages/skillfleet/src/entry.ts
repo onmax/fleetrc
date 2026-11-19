@@ -10,19 +10,16 @@ if (major < MAJOR || (major === MAJOR && minor < MINOR)) {
   );
   process.exit(1);
 }
-// What an agent's session hook runs, before every prompt: hook.ts alone, without the rest of the CLI.
+// What an agent's session hook runs, when a session starts: hook.ts alone, without the rest of the
+// CLI. `hook prompt`, the per-prompt hook older versions documented, does nothing now; settings
+// files may still call it, so it exits 0 at once.
 const [command, action, agent] = process.argv.slice(2);
-const hook =
+if (command === "hook" && action === "prompt" && process.argv.length === 4) process.exitCode = 0;
+else if (
   command === "hook" &&
-  ((action === "prompt" && process.argv.length === 4) ||
-    (action === "run" &&
-      (agent === "claude-code" || agent === "codex") &&
-      process.argv.length === 5));
-if (hook)
-  void import("./hook.ts").then((module) =>
-    action === "prompt"
-      ? // The prompt hook older versions documented only names new skills; it starts no sync.
-        module.runHook("claude-code", "UserPromptSubmit", { sync: false })
-      : module.runHook(agent as "claude-code" | "codex"),
-  );
+  action === "run" &&
+  (agent === "claude-code" || agent === "codex") &&
+  process.argv.length === 5
+)
+  void import("./hook.ts").then((module) => module.runHook(agent));
 else void import("./cli.ts");

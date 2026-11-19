@@ -129,8 +129,8 @@ describe("hook run", () => {
     // The sync runs on after the hook has exited.
     await waitFor("the hook's sync", () => lastRun(m).finishedAt > before);
     expect(existsSync(m.at(".claude", "skills", "second", "SKILL.md"))).toBe(true);
-    // Fresh: the next prompts start nothing.
-    await hook(m, "claude-code", PROMPT);
+    // Fresh: the next sessions start nothing.
+    await hook(m, "claude-code");
     await hook(m, "codex");
     expect(started(m)).toHaveLength(1);
     // Stale again (the threshold is 0 here): one more.
@@ -238,20 +238,20 @@ describe("hook run", () => {
     expect(path.split(delimiter)).not.toContain(agentBin);
   });
 
-  it("names a skill that arrived mid-session to Claude Code, and never to Codex", async () => {
-    const { m, mine } = await hooked();
-    // The attempt is fresh, so these hooks start no sync that the one below would meet.
-    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
-    expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
-    expect((await hook(m, "codex", PROMPT)).stdout).toBe("");
-    writeFiles(mine, { "skills/late/SKILL.md": skillMd("late") });
-    expect((await m.run("sync")).code).toBe(0);
-    expect((await hook(m, "codex", PROMPT)).stdout).toBe("");
-    const said = await hook(m, "claude-code", PROMPT);
-    expect(said.stdout).toContain("a new skill arrived after this session started");
-    expect(said.stdout).toContain("late");
-    // `hook prompt`, the entry older settings hold, still says it once.
-    expect((await m.runWith({ input: PROMPT }, "hook", "prompt")).stdout).toBe("");
+  it("does nothing on a prompt: an old UserPromptSubmit entry and `hook prompt` start no sync and say nothing", async () => {
+    const { m } = await hooked();
+    rmSync(join(m.stateDir, "hook-attempt"), { force: true });
+    rmSync(join(m.stateDir, "hook-ran-claude-code"), { force: true });
+    const syncs = started(m).length;
+    for (const agent of ["claude-code", "codex"]) {
+      const run = await hook(m, agent, PROMPT);
+      expect({ code: run.code, out: run.stdout + run.stderr }).toEqual({ code: 0, out: "" });
+    }
+    const prompt = await m.runWith({ input: PROMPT }, "hook", "prompt");
+    expect({ code: prompt.code, out: prompt.stdout + prompt.stderr }).toEqual({ code: 0, out: "" });
+    expect(started(m)).toHaveLength(syncs);
+    expect(existsSync(join(m.stateDir, "hook-attempt"))).toBe(false);
+    expect(existsSync(join(m.stateDir, "hook-ran-claude-code"))).toBe(false);
   });
 
   it("runs the entry it wrote into settings.json as Claude Code does, from a parent that exits at once", async () => {
@@ -306,7 +306,7 @@ describe("hook install and remove", () => {
         .hooks![event]!.flatMap((group) => group.hooks.map(line))
         .filter((text) => text.includes(" hook run claude-code"));
     expect(ours("SessionStart")).toHaveLength(1);
-    expect(ours("UserPromptSubmit")).toHaveLength(1);
+    expect(after.hooks!.UserPromptSubmit!.flatMap((group) => group.hooks)).toHaveLength(1);
     // Windows: node, through bin/'s link, and the installed copy, in exec form.
     expect(ours("SessionStart")[0]).toContain(
       process.platform === "win32"
@@ -332,7 +332,7 @@ describe("hook install and remove", () => {
     expect((await m.run("hook", "remove")).stdout).toContain("Claude Code: no skillfleet hook in");
   });
 
-  it("replaces an older entry of skillfleet's instead of adding a second", async () => {
+  it("replaces an older entry of skillfleet's instead of adding a second, and takes out its prompt hooks", async () => {
     const m = machine();
     writeFileSync(
       m.at(".claude", "settings.json"),
@@ -352,6 +352,16 @@ describe("hook install and remove", () => {
           ],
           UserPromptSubmit: [
             { hooks: [{ type: "command", command: "npx skillfleet hook prompt" }] },
+            {
+              hooks: [
+                { type: "command", command: "echo mine" },
+                {
+                  type: "command",
+                  command:
+                    'test -x "$HOME/.local/state/skillfleet/bin/skillfleet" && "$HOME/.local/state/skillfleet/bin/skillfleet" hook run claude-code 2>/dev/null; true',
+                },
+              ],
+            },
           ],
         },
       }),
@@ -360,11 +370,13 @@ describe("hook install and remove", () => {
     const start = settings(m).hooks!.SessionStart!;
     expect(start).toHaveLength(1);
     expect(line(start[0]!.hooks[0]!)).not.toContain("|| true");
-    const prompt = settings(m).hooks!.UserPromptSubmit!;
-    expect(prompt).toHaveLength(1);
-    expect(line(prompt[0]!.hooks[0]!)).toMatch(
+    expect(line(start[0]!.hooks[0]!)).toMatch(
       isWindows ? / hook run claude-code$/ : / hook run claude-code 2>\/dev\/null; true$/,
     );
+    // The user's own prompt hook stays; skillfleet's two are gone.
+    expect(settings(m).hooks!.UserPromptSubmit).toEqual([
+      { hooks: [{ type: "command", command: "echo mine" }] },
+    ]);
   });
 
   it("on Windows writes Claude Code's entry in exec form, and Codex's for cmd, with % kept from cmd", () => {
@@ -409,7 +421,7 @@ describe("hook install and remove", () => {
     expect(raw).toEqual({
       hooks: {
         SessionStart: [{ hooks: [handler] }],
-        UserPromptSubmit: [{ hooks: [mine] }, { hooks: [handler] }],
+        UserPromptSubmit: [{ hooks: [mine] }],
       },
     });
     const once = JSON.stringify(raw);
@@ -477,20 +489,12 @@ describe("init, status and doctor with the hooks or the timer", () => {
     expect(settings(m).hooks!.SessionStart).toHaveLength(1);
     expect(existsSync(m.at(".codex", "hooks.json"))).toBe(true);
     const status = await m.run("status");
-    expect(status.stdout).toMatch(
-      /^syncs start from: the session hooks of Claude Code and Codex$/m,
-    );
+    expect(status.stdout).toMatch(/^syncs start from: SessionStart in Claude Code and Codex$/m);
     expect(status.stdout).not.toMatch(/^timer:/m);
     const doctor = await m.run("doctor");
-    expect(doctor.stdout).toMatch(
-      /^ok {3}sync trigger: the session hooks of Claude Code and Codex$/m,
-    );
+    expect(doctor.stdout).toMatch(/^ok {3}sync trigger: SessionStart in Claude Code and Codex$/m);
     const json = await m.json<{ trigger: { hooks: string[]; timer: boolean } }>("status");
-    expect(json.trigger).toEqual({
-      hooks: ["claude-code", "codex"],
-      timer: false,
-      promptOnly: [],
-    });
+    expect(json.trigger).toEqual({ hooks: ["claude-code", "codex"], timer: false });
     // init again: unchanged.
     const text = read(m.at(".claude", "settings.json"));
     const again = await m.run("init");
@@ -528,7 +532,7 @@ describe("init, status and doctor with the hooks or the timer", () => {
     );
     const status = await m.run("status");
     expect(status.stdout).toMatch(
-      /^syncs start from: the session hooks of Claude Code and Codex, and the timer$/m,
+      /^syncs start from: SessionStart in Claude Code and Codex, and the timer$/m,
     );
     expect(status.stdout).toMatch(/^timer: /m);
     const doctor = await m.run("doctor");
@@ -616,7 +620,7 @@ describe("the hooks on shared and upgraded machines", () => {
       expect(result).toEqual({ changed: true });
       const raw = JSON.parse(read(settings)) as { hooks: Record<string, unknown> };
       expect(raw.hooks.Stop).toEqual(stop.Stop);
-      expect(Object.keys(raw.hooks)).toEqual(["Stop", "SessionStart", "UserPromptSubmit"]);
+      expect(Object.keys(raw.hooks)).toEqual(["Stop", "SessionStart"]);
     });
 
     it("writes nothing and says so when the file keeps changing", () => {
@@ -813,7 +817,7 @@ describe("the hooks on shared and upgraded machines", () => {
       /^warn session hooks: Claude Code's has not run yet, .*; Codex's has not run yet, .*open \/hooks in Codex/m,
     );
     // Only Claude Code's hook runs: Codex's is the one doctor warns about.
-    await hook(m, "claude-code", PROMPT);
+    await hook(m, "claude-code");
     const mixed = (await m.run("doctor")).stdout;
     expect(mixed).toMatch(
       /^warn session hooks: Claude Code's ran within the last day; Codex's has not run yet, .*open \/hooks in Codex/m,
@@ -829,7 +833,7 @@ describe("the hooks on shared and upgraded machines", () => {
     );
   });
 
-  it("the old hook prompt entry is no sync trigger: status and doctor say to run hook install", async () => {
+  it("the old hook prompt entry is no sync trigger, and hook install takes it out", async () => {
     const m = machine({ scheduler: "empty" });
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
     expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
@@ -840,21 +844,15 @@ describe("the hooks on shared and upgraded machines", () => {
     );
     const status = await m.run("status");
     expect(status.stdout).toMatch(/^syncs start from: nothing starts a sync on this machine/m);
-    expect(status.stdout).toMatch(
-      /^hooks: .*settings\.json holds the old `skillfleet hook prompt` entry, .*`skillfleet hook install claude-code` replaces it/m,
-    );
     expect((await m.json<{ trigger: object }>("status")).trigger).toEqual({
       hooks: [],
       timer: false,
-      promptOnly: ["claude-code"],
     });
-    const doctor = (await m.run("doctor")).stdout;
-    expect(doctor).toMatch(/^warn sync trigger: nothing starts a sync.*; .*hook prompt` entry/m);
-    expect(doctor).not.toMatch(/session hooks:/);
-    // With Codex's session hook too, the old entry still gets its nudge.
-    expect((await m.run("hook", "install", "codex")).code).toBe(0);
+    expect((await m.run("doctor")).stdout).toMatch(/^warn sync trigger: nothing starts a sync/m);
+    expect((await m.run("hook", "install", "claude-code")).code).toBe(0);
+    expect(settings(m).hooks!.UserPromptSubmit).toBeUndefined();
     expect((await m.run("doctor")).stdout).toMatch(
-      /^warn sync trigger: the session hooks of Codex; .*hook prompt` entry/m,
+      /^ok {3}sync trigger: SessionStart in Claude Code$/m,
     );
   });
 
@@ -873,7 +871,7 @@ describe("the hooks on shared and upgraded machines", () => {
       // status alone does not ask.
       writeFileSync(config, JSON.stringify({ manifest }));
       expect((await m.runWith({ env: { PATH } }, "status")).stdout).toMatch(
-        /^syncs start from: the session hooks of Claude Code and Codex$/m,
+        /^syncs start from: SessionStart in Claude Code and Codex$/m,
       );
       expect(JSON.parse(read(config))).toEqual({ manifest });
       // `timer: false` is the user's choice.
@@ -891,81 +889,4 @@ describe("the hooks on shared and upgraded machines", () => {
       expect(JSON.parse(read(config))).toEqual({ manifest });
     },
   );
-
-  it("names a skill linked between SessionStart and the first prompt, and rewrites the session's record only on a change", async () => {
-    const { m, mine } = await hooked();
-    // A sync this session's hook did not start: the attempt is fresh.
-    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
-    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
-    await new Promise((done) => setTimeout(done, 20));
-    writeFiles(mine, { "skills/early/SKILL.md": skillMd("early") });
-    expect((await m.run("sync")).code).toBe(0);
-    const said = await hook(m, "claude-code", PROMPT);
-    expect(said.stdout).toContain("available now: early");
-    const sessions = join(m.stateDir, "sessions", "s1.json");
-    const { mtimeMs } = statSync(sessions);
-    await new Promise((done) => setTimeout(done, 50));
-    expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
-    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
-    expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
-  });
-
-  it("gives a session resumed after a week a fresh record on its start", async () => {
-    const { m } = await hooked();
-    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
-    const file = join(m.stateDir, "sessions", "s1.json");
-    mkdirSync(dirname(file), { recursive: true });
-    const old = new Date(Date.now() - 8 * 24 * 3600_000);
-    writeFileSync(file, JSON.stringify({ startedAt: old.toISOString(), announced: [] }));
-    utimesSync(file, old, old);
-    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
-    const record = JSON.parse(read(file));
-    expect(Date.now() - Date.parse(record.startedAt)).toBeLessThan(60_000);
-  });
-
-  it("records a session start even when an old sessions.json can't be removed", async () => {
-    const { m } = await hooked();
-    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
-    // A folder where the old file was: removing it fails.
-    mkdirSync(join(m.stateDir, "sessions.json", "x"), { recursive: true });
-    expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
-    expect(existsSync(join(m.stateDir, "sessions", "s1.json"))).toBe(true);
-  });
-
-  it("keeps the record of each of 12 sessions that start together", async () => {
-    const { m } = await hooked();
-    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
-    // What older versions kept all sessions in: left alone by the prompt hook, removed on a start.
-    writeFileSync(join(m.stateDir, "sessions.json"), "{");
-    const ids = Array.from({ length: 12 }, (_, i) => `session-${i}`);
-    await Promise.all(
-      ids.map((id) =>
-        hook(m, "claude-code", JSON.stringify({ session_id: id, hook_event_name: "SessionStart" })),
-      ),
-    );
-    const dir = join(m.stateDir, "sessions");
-    expect(readdirSync(dir).sort()).toEqual(ids.map((id) => `${id}.json`).sort());
-    for (const id of ids)
-      expect(JSON.parse(read(join(dir, `${id}.json`)))).toMatchObject({ announced: [] });
-    expect(existsSync(join(m.stateDir, "sessions.json"))).toBe(false);
-  });
-
-  it("starts the sync even when the session can't be recorded", async () => {
-    const { m } = await hooked();
-    // A file where the sessions folder goes: the record can't be made.
-    writeFileSync(join(m.stateDir, "sessions"), "");
-    const run = await hook(m, "claude-code", SESSION);
-    expect(run).toEqual({ code: 0, stdout: "", stderr: "" });
-    expect(started(m)).toHaveLength(1);
-  });
-
-  it("hook prompt, the entry older versions documented, names new skills but starts no sync", async () => {
-    const m = machine();
-    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
-    const run = await m.runWith({ input: PROMPT }, "hook", "prompt");
-    expect(run).toEqual({ code: 0, stdout: "", stderr: "" });
-    expect(started(m)).toEqual([]);
-    expect(existsSync(join(m.stateDir, "hook-attempt"))).toBe(false);
-  });
 });
