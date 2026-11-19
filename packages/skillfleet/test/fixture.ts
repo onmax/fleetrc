@@ -428,21 +428,22 @@ export interface Remote {
 }
 
 /** A bare git remote with an initial commit of `files`. */
-export function remote(m: Machine, name: string, files: Files): Remote {
+export function remote(m: Machine, name: string, files: Files | ((https: string) => Files)): Remote {
   const url = join(m.root, "remotes", `${name}.git`);
+  const https = `${HTTPS_REMOTES}${name}.git`;
   const work = join(m.root, "upstream", name);
   mkdirSync(url, { recursive: true });
   m.git(url, "init", "--quiet", "--bare");
   mkdirSync(work, { recursive: true });
   m.git(work, "init", "--quiet");
-  writeFiles(work, files);
+  writeFiles(work, typeof files === "function" ? files(https) : files);
   m.git(work, "add", "-A");
   m.git(work, "commit", "--quiet", "-m", "init");
   m.git(work, "remote", "add", "origin", url);
   m.git(work, "push", "--quiet", "-u", "origin", "main");
   const self: Remote = {
     url,
-    https: `${HTTPS_REMOTES}${name}.git`,
+    https,
     served: `${GIT_SERVER}/${basename(m.root)}/remotes/${name}.git`,
     work,
     commit(changes, message = "change") {

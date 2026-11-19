@@ -48,6 +48,86 @@ async function init(m: Machine, manifest: string, ...args: string[]) {
 }
 
 describe("a sync stopped before it saved state.json", () => {
+  async function reviewableFork() {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("old/", "tool"));
+    const personal = remote(m, "personal", skills("skills/", "mine"));
+    const work = clone(m, personal, "code/personal");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        { id: "vendor", git: vendor.url, update: "review" },
+        { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+      ],
+    });
+    await init(m, manifest);
+    return { m, vendor, work, manifest };
+  }
+
+  it("requires merging a held upstream move before forking", async () => {
+    const { m, vendor, work, manifest } = await reviewableFork();
+    const revision = vendor.commit({
+      "old/tool/SKILL.md": null,
+      "new/Tool/SKILL.md": skillMd("Tool", "moved"),
+    });
+    expect((await m.json("sync")).pending).toMatchObject([{ skill: "Tool", reason: "review" }]);
+    const rejected = await m.run("fork", "Tool");
+    expect(rejected.code).not.toBe(0);
+    expect(rejected.stderr).toContain("moved upstream to new/Tool");
+    expect(existsSync(join(work, "skills", "Tool"))).toBe(false);
+    expect((await m.run("merge", "Tool")).code).toBe(0);
+    expect((await m.run("fork", "Tool")).code).toBe(0);
+    expect(JSON.parse(read(manifest)).forks.Tool).toEqual({
+      from: vendor.url,
+      path: "new/Tool",
+      base: revision,
+    });
+    expect(read(join(work, "skills", "Tool", "SKILL.md"))).toBe(skillMd("Tool", "moved"));
+  });
+
+  it("does not promote a stale pending revision after offline recovery", async () => {
+    const { m, vendor, work, manifest } = await reviewableFork();
+    const earlier = vendor.commit({ "old/tool/SKILL.md": skillMd("tool", "earlier") });
+    expect((await m.json("sync")).pending).toHaveLength(1);
+    const latest = skillMd("tool", "latest");
+    const revision = vendor.commit({ "old/tool/SKILL.md": latest });
+    const stateFile = join(m.stateDir, "state.json");
+    const upstream = join(m.stateDir, "store", "vendor", "upstream", "tool");
+    const stop = join(m.root, "stop.mjs");
+    writeFileSync(
+      stop,
+      `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      import { normalize } from "node:path";
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (normalize(to) === normalize(${JSON.stringify(upstream)}) && from.endsWith(".new"))
+          process.exit(86);
+      };
+      syncBuiltinESMExports();
+    `,
+    );
+    const stopped = await m.runWith(
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
+      "sync",
+    );
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
+    expect(read(join(upstream, "SKILL.md"))).toBe(latest);
+    expect(JSON.parse(read(stateFile)).sources.vendor.pending.tool.commit).toBe(earlier);
+    expect((await m.json("sync", "--offline")).pending).toHaveLength(1);
+    expect((await m.run("merge", "tool")).code).toBe(0);
+    expect(JSON.parse(read(stateFile)).sources.vendor.skills.tool.commit).toBeNull();
+    const rejected = await m.run("fork", "tool");
+    expect(rejected.code).not.toBe(0);
+    expect(rejected.stderr).toContain("cannot verify the git base");
+    expect((await m.json("sync")).pending).toEqual([]);
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    expect(JSON.parse(read(manifest)).forks.tool.base).toBe(revision);
+    expect(read(join(work, "skills", "tool", "SKILL.md"))).toBe(latest);
+  });
+
   it.each(["uninterrupted", "interrupted", "upstream advanced", "offline fork"])(
     "reports the published path (%s)",
     async (scenario) => {
