@@ -57,7 +57,9 @@ describe("a sync stopped before it saved state.json", () => {
     await init(m, manifest);
     const live = join(m.stateDir, "store", "vendor", "live", "tool");
     const stop = join(m.root, "stop.mjs");
-    writeFileSync(stop, `
+    writeFileSync(
+      stop,
+      `
       import fs from "node:fs";
       import { syncBuiltinESMExports } from "node:module";
       import { normalize } from "node:path";
@@ -68,7 +70,8 @@ describe("a sync stopped before it saved state.json", () => {
           process.exit(86);
       };
       syncBuiltinESMExports();
-    `);
+    `,
+    );
     vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "published") });
     const stopped = await m.runWith(
       { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
@@ -111,10 +114,11 @@ describe("a sync stopped before it saved state.json", () => {
         hooks: [{ name: "hang", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
       });
       const copy = m.at(".claude", "skills", "tool", "SKILL.md");
-      const state = () => JSON.parse(read(join(m.stateDir, "state.json"))) as {
-        lastChange: string;
-        skills: { tool: { changedAt: string } };
-      };
+      const state = () =>
+        JSON.parse(read(join(m.stateDir, "state.json"))) as {
+          lastChange: string;
+          skills: { tool: { changedAt: string } };
+        };
       try {
         await init(m, manifest);
         const initial = state().lastChange;

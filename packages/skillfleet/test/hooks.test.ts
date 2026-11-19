@@ -105,6 +105,22 @@ describe("hook run", () => {
     expect(existsSync(m.stateDir)).toBe(false);
   });
 
+  it("writes no compile cache from the installed copy's hook, even on a configured machine", async () => {
+    const { m } = await hooked();
+    // A fresh attempt, so the hook starts no sync, whose own run may write the cache.
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    rmSync(join(m.stateDir, "app", "compile"), { recursive: true, force: true });
+    const syncs = started(m).length;
+    const run = spawnSync(
+      process.execPath,
+      [join(m.stateDir, "app", "cli.mjs"), "hook", "run", "claude-code"],
+      { env: m.env, cwd: m.home, input: SESSION, encoding: "utf8" },
+    );
+    expect({ code: run.status, out: run.stdout + run.stderr }).toEqual({ code: 0, out: "" });
+    expect(started(m)).toHaveLength(syncs);
+    expect(existsSync(join(m.stateDir, "app", "compile"))).toBe(false);
+  });
+
   it("stays quiet and exits 0 with a broken config.json", async () => {
     const { m } = await hooked();
     rmSync(join(m.stateDir, "hook-attempt"), { force: true });
