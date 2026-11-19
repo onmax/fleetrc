@@ -25,6 +25,7 @@ import { fleet, formatFleet } from "../src/fleet.ts";
 import { editJsonText } from "../src/jsonedit.ts";
 import { editManifest, isRemoteGit, loadManifest, teamGitProblem } from "../src/manifest.ts";
 import {
+  clone,
   isWindows,
   machine,
   type Machine,
@@ -47,14 +48,20 @@ async function init(m: Machine, manifest: string, ...args: string[]) {
 }
 
 describe("a sync stopped before it saved state.json", () => {
-  it.each(["uninterrupted", "interrupted", "upstream advanced"])(
+  it.each(["uninterrupted", "interrupted", "upstream advanced", "offline fork"])(
     "reports the published path (%s)",
     async (scenario) => {
       const m = machine();
       const vendor = remote(m, "vendor", skills("old/", "tool"));
+      const initial = vendor.head();
+      const personal = remote(m, "personal", skills("skills/", "mine"));
+      const work = clone(m, personal, "code/personal");
       const manifest = m.manifest({
         agents: ["claude-code"],
-        sources: [{ id: "vendor", git: vendor.url }],
+        sources: [
+          { id: "vendor", git: vendor.url },
+          { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+        ],
         hooks: ["old", "new", "latest"].map((path) => ({
           name: path,
           run: "echo changed",
@@ -67,6 +74,7 @@ describe("a sync stopped before it saved state.json", () => {
         JSON.parse(read(statePath)) as {
           lastChange: string;
           skills: { tool: { changedAt: string } };
+          sources: { vendor: { commit: string } };
         };
       const before = state();
       const live = join(m.stateDir, "store", "vendor", "live", "tool");
@@ -102,10 +110,12 @@ describe("a sync stopped before it saved state.json", () => {
         expect(read(join(live, "SKILL.md"))).toContain("published");
         expect(state()).toEqual(before);
       };
+      const published = "published\nfirst\nsecond\nthird\nlast";
       vendor.commit({
         "old/tool/SKILL.md": null,
-        "new/tool/SKILL.md": skillMd("tool", "published"),
+        "new/tool/SKILL.md": skillMd("tool", published),
       });
+      const revision = vendor.head();
       if (scenario !== "uninterrupted") {
         await interrupt("live", 86);
         await interrupt("checkpoint", 87);
@@ -116,7 +126,8 @@ describe("a sync stopped before it saved state.json", () => {
           "new/tool/SKILL.md": null,
           "latest/tool/SKILL.md": skillMd("tool", "latest"),
         });
-      const report = await m.json("sync");
+      const offline = scenario === "offline fork";
+      const report = await m.json("sync", ...(offline ? ["--offline"] : []));
       expect(report.pending).toEqual([]);
       expect(report.edited).toEqual([]);
       expect(read(join(live, "SKILL.md"))).toContain(advanced ? "latest" : "published");
@@ -131,6 +142,27 @@ describe("a sync stopped before it saved state.json", () => {
       const after = state();
       expect(after.lastChange > before.lastChange).toBe(true);
       expect(after.skills.tool.changedAt > before.skills.tool.changedAt).toBe(true);
+      if (offline) {
+        expect(after.sources.vendor.commit).toBe(initial);
+        const fork = await m.run("fork", "tool");
+        expect(fork.code, fork.stdout + fork.stderr).toBe(0);
+        const savedFork = JSON.parse(read(manifest)).forks.tool;
+        const file = join(work, "skills", "tool", "SKILL.md");
+        writeFileSync(file, skillMd("tool", published.replace("first", "local edit")));
+        vendor.commit({
+          "new/tool/SKILL.md": skillMd("tool", published.replace("last", "upstream edit")),
+        });
+        const merge = await m.run("merge", "tool");
+        expect(merge.code, merge.stdout + merge.stderr).toBe(0);
+        expect(read(file)).toBe(
+          skillMd(
+            "tool",
+            published.replace("first", "local edit").replace("last", "upstream edit"),
+          ),
+        );
+        expect(savedFork).toEqual({ from: vendor.url, path: "new/tool", base: revision });
+        return;
+      }
       expect((await m.json("sync")).hooks).toEqual([]);
     },
   );
