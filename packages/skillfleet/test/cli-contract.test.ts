@@ -288,6 +288,7 @@ describe("list --json, the API programs built on skillfleet read", () => {
     expect(empty.code, empty.stderr).toBe(0);
     expect(JSON.parse(empty.stdout)).toEqual({ version: 1, lastChange: null, skills: [] });
     expect(existsSync(fresh.stateDir)).toBe(false);
+    expect(existsSync(fresh.at(".cache"))).toBe(false);
 
     // No agent folder here: state.json still records each skill's folder.
     const m = machine({ agents: false });

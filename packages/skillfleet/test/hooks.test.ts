@@ -877,6 +877,25 @@ describe("the hooks on shared and upgraded machines", () => {
     expect({ code: run.status, out: run.stdout + run.stderr }).toEqual({ code: 0, out: "" });
     expect(read(join(state, "logs", "skillfleet-sync.log"))).toContain("starting a sync");
     expect(existsSync(m.at(".local", "state", "skillfleet"))).toBe(false);
+    // The installed copy keeps node's compile cache beside itself, and nowhere else.
+    expect(existsSync(join(state, "app", "compile"))).toBe(true);
+    expect(existsSync(m.at(".cache"))).toBe(false);
+
+    // A runtime calling list --json from the same environment reads the same state.
+    const statePath = join(state, "state.json");
+    const saved = JSON.parse(read(statePath)) as { skills?: Record<string, unknown> };
+    const dir = join(m.root, "old");
+    saved.skills = { old: { source: "mine", dir, changedAt: "2026-01-02T00:00:00.000Z" } };
+    writeFileSync(statePath, JSON.stringify(saved));
+    const list = spawnSync(process.execPath, [join(state, "app", "cli.mjs"), "list", "--json"], {
+      env: agent,
+      cwd: m.home,
+      encoding: "utf8",
+    });
+    expect(list.status, list.stderr).toBe(0);
+    expect((JSON.parse(list.stdout) as { skills: unknown[] }).skills).toEqual([
+      { name: "old", source: "mine", dir, changedAt: "2026-01-02T00:00:00.000Z" },
+    ]);
   });
 
   describe("the shell-form command", () => {

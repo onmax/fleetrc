@@ -3,8 +3,7 @@
 // the bundle with a SyntaxError that names no version. Keep this file to syntax old versions read:
 // no top-level await. MAJOR.MINOR matches `engines` in package.json.
 import module from "node:module";
-import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 const [MAJOR, MINOR] = [22, 12];
 const [major = 0, minor = 0] = process.versions.node.split(".").map(Number);
@@ -14,22 +13,20 @@ if (major < MAJOR || (major === MAJOR && minor < MINOR)) {
   );
   process.exit(1);
 }
-// Where node keeps the bundle compiled, so a run after the first skips most of its parse: the XDG
-// cache folder, else the user's temp folder on Windows, else ~/.cache. Never the state folder, which
-// a hook on a machine skillfleet never set up leaves uncreated.
-function compileCacheDir(): string {
-  const xdg = process.env.XDG_CACHE_HOME;
-  if (xdg && isAbsolute(xdg)) return join(xdg, "skillfleet", "compile");
-  if (process.platform === "win32") return join(tmpdir(), "skillfleet-compile");
-  return join(homedir(), ".cache", "skillfleet", "compile");
-}
+// The installed copy, `<state>/app/cli.mjs`, which hooks, the timer and the launcher run, keeps its
+// compiled bundle in `<state>/app/compile`, so a run after the first skips most of its parse. Any
+// other copy (npx, a checkout), and a dry run of any copy, writes nothing for it.
 const args = process.argv.slice(2);
-if (!args.includes("--dry-run")) {
+const script = process.argv[1] ?? "";
+if (
+  basename(script) === "cli.mjs" &&
+  basename(dirname(script)) === "app" &&
+  !args.includes("--dry-run")
+)
   try {
     // Node 22.1 and newer; a folder that can't be made leaves the cache off.
-    module.enableCompileCache?.(compileCacheDir());
+    module.enableCompileCache?.(join(dirname(script), "compile"));
   } catch {}
-}
 // What an agent's session hook runs, when a session starts: hook.ts alone, without the rest of the
 // CLI. `hook prompt`, the per-prompt hook older versions documented, does nothing now; settings
 // files may still call it, so it exits 0 at once.

@@ -14,9 +14,9 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 import { isRecord, readJsonOrNothing } from "./fs.ts";
-import { paths, stateDir } from "./paths.ts";
+import { adoptInstalledPlaces, paths, stateDir } from "./paths.ts";
 
 export const HOOK_AGENTS = ["claude-code", "codex"] as const;
 export type HookAgent = (typeof HOOK_AGENTS)[number];
@@ -149,26 +149,6 @@ async function syncIfStale(why: string) {
   } finally {
     release();
   }
-}
-
-/** The variables that place skillfleet's config and state folders (paths.ts). */
-const PLACES = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"] as const;
-
-/**
- * Where skillfleet was installed, for an agent whose environment lacks the installing shell's
- * XDG_CONFIG_HOME or XDG_STATE_HOME. The hook runs the installed copy, `<state>/app/cli.mjs`, so
- * its own path names the state folder; the hook-env.json `hook install` saved there has the
- * variables that place the config and state folders, which this process takes before it looks.
- * Run from anywhere else (npx, a checkout), it keeps its own environment.
- */
-function adoptInstalledPlaces() {
-  const script = process.argv[1];
-  if (!script || basename(script) !== "cli.mjs" || basename(dirname(script)) !== "app") return;
-  const saved = readJsonOrNothing(join(dirname(dirname(script)), "hook-env.json"));
-  if (!isRecord(saved)) return;
-  for (const key of PLACES)
-    if (typeof saved[key] === "string") process.env[key] = saved[key];
-    else delete process.env[key];
 }
 
 /** Whether this machine has a config.json that names a manifest: `skillfleet init` ran. */

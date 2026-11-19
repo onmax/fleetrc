@@ -3,7 +3,7 @@
 // the CLI. The shape is a contract: a later version only adds fields, and bumps `version` for any
 // other change.
 import { isRecord, readJsonOrNothing } from "./fs.ts";
-import { paths } from "./paths.ts";
+import { adoptInstalledPlaces, paths } from "./paths.ts";
 import { skillRecord } from "./skill-record.ts";
 
 export interface ListedSkill {
@@ -26,6 +26,7 @@ export interface SkillList {
 
 /** The skills state.json records. A state.json that is missing or does not read lists none. */
 export function skillList(): SkillList {
+  adoptInstalledPlaces();
   const raw = readJsonOrNothing(paths.state());
   const state = isRecord(raw) && raw.version === 1 ? raw : {};
   const skills = isRecord(state.skills) ? state.skills : {};
