@@ -3,7 +3,6 @@
 // session opens, so it loads only small modules (entry.ts imports it without cli.ts, and the
 // modules that start a sync load only when one starts), makes no network call, prints nothing,
 // and always exits 0.
-import { spawn } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -100,6 +99,8 @@ function startSync(why: string, self: typeof import("./selfinstall.ts")) {
   const log = openSync(syncLog(), "a");
   try {
     writeFileSync(log, `${new Date().toISOString()} ${why}: starting a sync\n`);
+    // Loaded here, as the hook seldom starts a sync.
+    const { spawn } = process.getBuiltinModule("node:child_process");
     const child = spawn(process.execPath, [cli, "sync"], {
       cwd: stateDir(),
       env: syncEnv(self),
