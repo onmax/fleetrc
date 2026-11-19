@@ -80,6 +80,8 @@ const scenarios = [
   "different explicit user",
   "alias refresh",
   "alias seed",
+  "unchanged alias report",
+  "older alias report",
 ];
 
 it.each(scenarios)(
@@ -135,6 +137,27 @@ it.each(scenarios)(
         expect(await run("status", address)).toMatchObject([
           { lastRun: { finishedAt: second, host: "bob" } },
         ]);
+      } else if (scenario === "unchanged alias report" || scenario === "older alias report") {
+        time = second;
+        expect(await run("status", tag)).toMatchObject([
+          { host: address, via: tag, lastRun: { finishedAt: second } },
+        ]);
+        if (scenario === "older alias report") time = first;
+        expect(await run("status", alias, tag)).toMatchObject([
+          { host: alias, lastRun: { finishedAt: time } },
+        ]);
+        if (scenario === "older alias report") {
+          online = false;
+          expect(await run("status", tag)).toMatchObject([
+            { host: address, error: "offline in Tailscale", lastRun: { finishedAt: second } },
+          ]);
+          online = true;
+        }
+        time = third;
+        expect(await run("sync", alias)).toMatchObject([
+          { host: alias, lastRun: { finishedAt: third } },
+        ]);
+        latest = third;
       } else if (scenario === "alias refresh" || scenario === "alias seed") {
         if (scenario === "alias refresh") {
           expect(await run("status", tag)).toMatchObject([

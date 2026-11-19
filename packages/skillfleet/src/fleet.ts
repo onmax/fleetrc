@@ -411,15 +411,18 @@ export async function fleet(
               if (
                 previous
                   ? (previous.destinations?.includes(host) || taggedHost) &&
-                    previous.endpoint === refreshPeer.endpoint &&
-                    Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
+                    previous.endpoint === refreshPeer.endpoint
                   : taggedHost
               ) {
                 const destinations = new Set(previous?.destinations);
                 destinations.add(host);
                 if (taggedHost) destinations.add(taggedHost);
+                const latest =
+                  !previous || Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
+                    ? run
+                    : previous.run;
                 cache[refreshPeer.key] = {
-                  run,
+                  run: latest,
                   destinations: [...destinations],
                   endpoint: refreshPeer.endpoint,
                 };
