@@ -34,6 +34,7 @@ import {
   loadManifest,
   type LoadedManifest,
   remoteManifest,
+  teamGitProblem,
   type Source,
 } from "./manifest.ts";
 import { findName } from "./names.ts";
@@ -204,8 +205,10 @@ function gitFork(loaded: LoadedManifest, name: string, fork: Fork) {
 }
 
 /** The fork's folder in its upstream repository, which must not lead out of the repository. */
-async function forkUpstream(fork: { from: string; path: string }, ref?: string) {
-  const clone = await fetchClone(gitUrl(fork.from), ref, join(paths.cache(), "forks"));
+async function forkUpstream(fork: { from: string; path: string }, ref?: string, team = false) {
+  const clone = await fetchClone(gitUrl(fork.from), ref, join(paths.cache(), "forks"), {
+    check: team ? teamGitProblem : undefined,
+  });
   const dir = join(clone.dir, fork.path);
   confine(clone.dir, dir, `read it as the fork's upstream`);
   return { dir, commit: clone.commit };
@@ -251,7 +254,7 @@ export async function checkForks(
         const now = await fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
           offline: true,
         });
-        const base = await forkUpstream(fork, fork.base);
+        const base = await forkUpstream(fork, fork.base, source.via !== undefined);
         const dir = join(now.dir, fork.path);
         confine(now.dir, dir, "read it as the fork's upstream");
         const upstream = hashDir(dir);

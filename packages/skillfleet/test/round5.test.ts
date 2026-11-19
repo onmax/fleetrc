@@ -18,6 +18,7 @@ import {
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { crc32 } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { fleet, formatFleet } from "../src/fleet.ts";
@@ -46,6 +47,42 @@ async function init(m: Machine, manifest: string, ...args: string[]) {
 }
 
 describe("a sync stopped before it saved state.json", () => {
+  it("recovers a copy published just before a sync stopped", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    await init(m, manifest);
+    const live = join(m.stateDir, "store", "vendor", "live", "tool");
+    const stop = join(m.root, "stop.mjs");
+    writeFileSync(stop, `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      import { normalize } from "node:path";
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (normalize(to) === normalize(${JSON.stringify(live)}) && from.endsWith(".new"))
+          process.exit(86);
+      };
+      syncBuiltinESMExports();
+    `);
+    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "published") });
+    const stopped = await m.runWith(
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
+      "sync",
+    );
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
+    expect(read(join(live, "SKILL.md"))).toContain("published");
+    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "latest") });
+    const report = await m.json("sync");
+    expect(report.pending).toEqual([]);
+    expect(report.edited).toEqual([]);
+    expect(read(join(live, "SKILL.md"))).toContain("latest");
+  });
+
   it.skipIf(isWindows)(
     "R8-1. an update a stopped sync put in place is not taken for a local edit once upstream moves again",
     async () => {
@@ -74,8 +111,13 @@ describe("a sync stopped before it saved state.json", () => {
         hooks: [{ name: "hang", run: `"${process.execPath}" "${script}"`, on: ["vendor:**"] }],
       });
       const copy = m.at(".claude", "skills", "tool", "SKILL.md");
+      const state = () => JSON.parse(read(join(m.stateDir, "state.json"))) as {
+        lastChange: string;
+        skills: { tool: { changedAt: string } };
+      };
       try {
         await init(m, manifest);
+        const initial = state().lastChange;
         rmSync(pass);
         let version = 1;
         // The limit counts from the start of the sync; on a loaded machine the fetch may use it up
@@ -92,7 +134,12 @@ describe("a sync stopped before it saved state.json", () => {
         expect(existsSync(started), "no sync reached its hooks").toBe(true);
         // The stopped sync replaced the copy: agents already read the update.
         expect(read(copy)).toContain(`v${version}`);
+        const checkpoint = state();
+        expect(checkpoint.skills.tool.changedAt > initial).toBe(true);
+        expect(checkpoint.lastChange).toBe(checkpoint.skills.tool.changedAt);
         writeFileSync(pass, "");
+        expect((await m.json("sync")).hooks).toHaveLength(1);
+        expect(state().lastChange).toBe(checkpoint.lastChange);
         // Upstream moves on before the next sync.
         vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "latest") });
         const report = await m.json("sync");

@@ -694,6 +694,28 @@ describe("CX11. an upstream removal keeps an edit saved during the fetch", () =>
 });
 
 describe("CX12. links to files count toward the copy limits", () => {
+  it("keeps the last good copy of an oversized Git update", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool", "other"));
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    await init(m, manifest);
+    const tool = m.at(".claude", "skills", "tool", "SKILL.md");
+    const before = read(tool);
+    const files: Files = {
+      "skills/tool/SKILL.md": skillMd("tool", "too wide"),
+      "skills/other/SKILL.md": skillMd("other", "still updates"),
+    };
+    for (let i = 0; i < 10_000; i++) files[`skills/tool/f${i}`] = "";
+    vendor.commit(files);
+    const report = await m.json("sync");
+    expect(report.warnings.join("\n")).toMatch(/tool.*more than 10000 files/);
+    expect(read(tool)).toBe(before);
+    expect(read(m.at(".claude", "skills", "other", "SKILL.md"))).toContain("still updates");
+  });
+
   it.skipIf(isWindows).each([
     { what: "files", links: 10_001, size: 1, limit: /more than 10000 files/ },
     { what: "bytes", links: 201, size: 1024 * 1024, limit: /more than 200 MB/ },
