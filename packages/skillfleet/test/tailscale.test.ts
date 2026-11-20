@@ -145,6 +145,37 @@ describe("the manifest from the tailnet policy", () => {
     expect(names(m.at(".claude/skills"))).toEqual([]);
   });
 
+  it("preserves managed copy edits across policy aliases at the same commit", async () => {
+    const m = machine();
+    const tailscale = fakeTailscale(m);
+    const repository = remote(m, "bundled", {
+      ".skillfleet/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "bundled", local: "../skills" }],
+      }),
+      ...skills("skills/", "bundled"),
+    });
+    const url = "https://github.com/example/bundled.git";
+    m.git(m.root, "config", "--global", `url.${repository.served}.insteadOf`, url);
+    tailscale.policy([{ manifest: "github:example/bundled" }]);
+    const init = await m.runWith({ env: tailscale.env }, "init", "--no-hooks", "--copy");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+
+    const copy = m.at(".claude/skills/bundled/SKILL.md");
+    const edited = readFileSync(copy, "utf8") + "\nMy local edit.\n";
+    writeFileSync(copy, edited);
+    const alias = `${url}//.skillfleet/manifest.json`;
+    tailscale.policy([{ manifest: alias }]);
+    const switched = await m.runWith({ env: tailscale.env }, "sync");
+    expect(switched.code, switched.stdout + switched.stderr).toBe(0);
+    expect(config(m).manifest).toBe(alias);
+    expect(readFileSync(copy, "utf8")).toBe(edited);
+
+    const offline = await m.runWith({ env: tailscale.env }, "sync", "--offline");
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    expect(readFileSync(copy, "utf8")).toBe(edited);
+  });
+
   it("a dry-run sync names the new manifest without saving it", async () => {
     const m = machine();
     const tailscale = fakeTailscale(m);

@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { isIPv4 } from "node:net";
 import { hostname, networkInterfaces, tmpdir } from "node:os";
-import { basename, dirname, join, normalize, sep } from "node:path";
+import { basename, dirname, join, normalize, relative, sep } from "node:path";
 import { distance } from "fastest-levenshtein";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
@@ -706,6 +706,7 @@ interface LocateOptions {
   offline?: boolean;
   cacheRoot?: string;
   base?: string;
+  onCheckout?: (dir: string, commit: string) => void;
 }
 
 function policyCacheRoot(spec: string, base?: string): string {
@@ -721,12 +722,35 @@ function validatedCache(root: string): string | undefined {
   return typeof marker.spec === "string" ? root : undefined;
 }
 
-/** Loads a policy replacement and its extends into the inactive slot, even for an alias. */
-export function policyManifestCache(spec: string) {
+/** Validate separately, but keep the working checkout if an alias fetched the same revisions. */
+export async function stagePolicyManifest(spec: string, savedSpec: string) {
   const root = policyCacheRoot(spec);
   const slot = validatedCache(root) === join(root, "a") ? "b" : "a";
+  const cacheRoot = join(root, slot);
+  const revisions = new Map<string, string>();
+  const loaded = await loadManifest(spec, {
+    cacheRoot,
+    onCheckout: (dir, commit) => revisions.set(relative(cacheRoot, dir), commit),
+  });
+  if (root === policyCacheRoot(savedSpec) && !loaded.failed?.length) {
+    const active = manifestCache(savedSpec);
+    const previous = new Map<string, string>();
+    const current = await loadManifest(spec, {
+      cacheRoot: active,
+      offline: true,
+      onCheckout: (dir, commit) => previous.set(relative(active, dir), commit),
+    }).catch(() => undefined);
+    if (
+      current &&
+      !current.failed?.length &&
+      previous.size === revisions.size &&
+      [...revisions].every(([dir, commit]) => previous.get(dir) === commit)
+    ) {
+      return { loaded: current, accept() {} };
+    }
+  }
   return {
-    cacheRoot: join(root, slot),
+    loaded,
     accept: () => writeJson(join(root, "validated.json"), { slot }),
   };
 }
@@ -754,6 +778,7 @@ async function locate(
     offline = false,
     cacheRoot = join(paths.cache(), "manifests"),
     base = process.cwd(),
+    onCheckout,
     team,
   }: LocateOptions & { team?: { within: string } } = {},
 ): Promise<{ file: string; root: string }> {
@@ -785,6 +810,7 @@ async function locate(
     if (problem) throw new ManifestError(problem);
   }
   const clone = await fetchClone(url, remote.ref, cacheRoot, { offline, check });
+  onCheckout?.(clone.dir, clone.commit);
   const file = join(clone.dir, remote.path);
   if (!existsSync(file))
     throw new ManifestError(
@@ -1057,12 +1083,9 @@ const ROOT_ONLY_SOURCE_KEYS = ["followLinks"] as const;
  */
 export async function loadManifest(
   spec: string,
-  {
-    cacheRoot = manifestCache(spec),
-    offline = false,
-  }: { offline?: boolean; cacheRoot?: string } = {},
+  { cacheRoot = manifestCache(spec), offline = false, onCheckout }: LocateOptions = {},
 ): Promise<LoadedManifest> {
-  const options = { cacheRoot, offline };
+  const options = { cacheRoot, offline, onCheckout };
   const rootFile = await locateManifest(spec, options);
   const root = readManifestFile(rootFile);
   const warnings: string[] = [];

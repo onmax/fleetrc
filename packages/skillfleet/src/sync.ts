@@ -45,9 +45,9 @@ import {
   type LoadedManifest,
   loadManifest,
   ManifestError,
-  policyManifestCache,
   readConfig,
   remoteManifest,
+  stagePolicyManifest,
   tailnetManifestSpec,
   writeConfig,
 } from "./manifest.ts";
@@ -452,13 +452,14 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       options.loaded || options.manifest || offline
         ? savedSpec
         : await followTailnet(savedSpec, warnings);
-    const candidate = spec !== savedSpec && !dryRun ? policyManifestCache(spec) : undefined;
+    const candidate =
+      spec !== savedSpec && !dryRun ? await stagePolicyManifest(spec, savedSpec) : undefined;
     const loaded =
       options.loaded ??
+      candidate?.loaded ??
       (await loadManifest(spec, {
         offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
-        ...(candidate ? { cacheRoot: candidate.cacheRoot } : {}),
       }));
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
