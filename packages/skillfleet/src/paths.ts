@@ -40,9 +40,18 @@ function stateOverride(): string | undefined {
   return (process.platform === "win32" && process.env.LOCALAPPDATA) || undefined;
 }
 
-/** Per-machine state: XDG state, else %LOCALAPPDATA% on Windows, else ~/.local/state. */
+function installedStateDir(): string | undefined {
+  const script = process.argv[1];
+  if (script && basename(script) === "cli.mjs" && basename(dirname(script)) === "app")
+    return dirname(dirname(script));
+}
+
+/** Per-machine state: XDG state, %LOCALAPPDATA% on Windows, the installed copy, then ~/.local/state. */
 export function stateDir(): string {
-  return join(stateOverride() ?? join(homedir(), ".local", "state"), "skillfleet");
+  const override = stateOverride();
+  return override
+    ? join(override, "skillfleet")
+    : (installedStateDir() ?? join(homedir(), ".local", "state", "skillfleet"));
 }
 
 export const paths = {
@@ -79,9 +88,9 @@ const PLACES = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"] 
  * Run from anywhere else (npx, a checkout), it keeps its own environment.
  */
 export function adoptInstalledPlaces() {
-  const script = process.argv[1];
-  if (!script || basename(script) !== "cli.mjs" || basename(dirname(script)) !== "app") return;
-  const saved = readJsonOrNothing(join(dirname(dirname(script)), "hook-env.json"));
+  const installed = installedStateDir();
+  if (!installed) return;
+  const saved = readJsonOrNothing(join(installed, "hook-env.json"));
   if (!isRecord(saved)) return;
   for (const key of PLACES)
     if (typeof saved[key] === "string") process.env[key] = saved[key];

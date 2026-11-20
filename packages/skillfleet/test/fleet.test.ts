@@ -1298,6 +1298,32 @@ describe.skipIf(isWindows)("fleet init", () => {
     expect(config.copy).toBe(true);
   });
 
+  it.skipIf(process.platform !== "linux")(
+    "rejects fleet setup without its requested timer",
+    async () => {
+      const { m, fleetIn } = await controller([], { scheduler: "absent" });
+      const env = initShims(m, { vps2: join(m.root, "vps2") });
+      const run = await m.runWith(
+        { env },
+        "fleet",
+        "init",
+        "vps2",
+        "--timer",
+        "--no-hooks",
+        "--json",
+      );
+      expect.soft(run.code, run.stdout + run.stderr).toBe(1);
+      const [host] = JSON.parse(run.stdout) as { setup?: string; error?: string }[];
+      expect.soft(host).toMatchObject({
+        reachable: true,
+        lastRun: { ok: true },
+        error: expect.stringContaining("this machine has no systemd user manager"),
+      });
+      expect.soft(host).not.toHaveProperty("setup");
+      expect(fleetIn()).toEqual([]);
+    },
+  );
+
   it("retries a refused timer installation before enrolling the host", async () => {
     const { m, fleetIn } = await controller([], { scheduler: "refuse" });
     const host = join(m.root, "vps2");
@@ -1397,6 +1423,39 @@ describe.skipIf(isWindows)("fleet init", () => {
       { host: "web.", setup: "set up" },
     ]);
     expect(fleetIn()).toEqual(["build", "tag:servers", "build.", "web."]);
+  });
+
+  it("enrolls successful named hosts but not tags with offline or unaddressable peers", async () => {
+    const { m, fleetIn } = await controller();
+    const active = peer("web.invalid", ["tag:servers", "tag:broken", "tag:ready"], {
+      ips: ["100.64.0.5"],
+    });
+    const offline = peer("offline.invalid", ["tag:servers"], { online: false });
+    const broken = peer("???", ["tag:broken"], { ips: [] });
+    const env = {
+      ...initShims(m, { "web.invalid": join(m.root, "web") }, { "web.invalid": "100.64.0.5" }),
+      SKILLFLEET_TAILSCALE: fakeTailscale(m.root, status([active, offline, broken])),
+    };
+    const run = await m.runWith(
+      { env },
+      "fleet",
+      "init",
+      "tag:servers",
+      "tag:broken",
+      "tag:ready",
+      "web.invalid",
+      "--no-hooks",
+      "--json",
+    );
+    expect(run.code, run.stdout + run.stderr).toBe(1);
+    expect(JSON.parse(run.stdout)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ host: "web.invalid", setup: "set up" }),
+        expect.objectContaining({ host: "offline.invalid", error: "offline in Tailscale" }),
+      ]),
+    );
+    expect(run.stderr).toContain("tag:broken: skipped a machine");
+    expect(fleetIn()).toEqual(["tag:ready", "web.invalid"]);
   });
 
   it("retains tagged peer reports across init errors and offline status", async () => {

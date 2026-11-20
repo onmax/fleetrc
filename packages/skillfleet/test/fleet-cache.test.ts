@@ -97,7 +97,8 @@ it.each([false, true])("only refreshes on the same retry route (%s)", async (cha
     };
     if (changed) expect((await run("init", tag)).results).toMatchObject([rejected]);
     const named = await run("init", "alias", tag);
-    expect(named.enrollment.get("alias")).toEqual(["alias", tag]);
+    expect(named.enrollment.get("alias")).toEqual(["alias"]);
+    expect(named.enrollment.get(tag)).toEqual(["alias"]);
     expect(named.results).toMatchObject([
       changed ? rejected : { host: "alias", setup: "set up", lastRun: { finishedAt: second } },
     ]);

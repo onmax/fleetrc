@@ -1182,7 +1182,7 @@ async function fleetTargets(
 /**
  * `fleet init <host|tag:...>...`: on each host, over ssh, `npx skillfleet init` with this machine's
  * manifest; a host that has it already syncs. Then the hosts set up go into the manifest's fleet,
- * unless it names them or a tag of theirs; a tag named here goes in as the tag.
+ * unless it names them or a tag of theirs; a tag goes in only if all its current peers are ready.
  */
 async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
   const entries = rest.slice(1);
@@ -1232,15 +1232,12 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
   }
   const results = await fleet(targets, "init", version, timeout, { setup });
   if (!json && results.length > 0) say(formatFleet(results));
-  // Hosts named here that are set up now, and tags named here with a machine set up.
-  const ready = new Set(
-    results.filter((result) => result.setup).flatMap(({ host }) => enrollment.get(host) ?? []),
-  );
+  const ready = new Set(results.filter((result) => result.setup).map(({ host }) => host));
   try {
     say(
       ...(await addToFleet(
         loaded,
-        entries.filter((entry) => ready.has(entry)),
+        entries.filter((entry) => enrollment.get(entry)?.every((host) => ready.has(host))),
         { dryRun: false, timeout, setup },
       )),
     );
@@ -1252,7 +1249,7 @@ async function fleetInit(loaded: Awaited<ReturnType<typeof loadManifest>>) {
   if (json) emit(results);
   const failed = (result: (typeof results)[number]) =>
     !result.reachable || result.error !== undefined || result.lastRun?.ok === false;
-  return results.some(failed) ? 1 : 0;
+  return results.some(failed) || entries.some((entry) => enrollment.get(entry) === null) ? 1 : 0;
 }
 
 /**
