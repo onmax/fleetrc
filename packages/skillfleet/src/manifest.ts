@@ -643,7 +643,11 @@ export function hostManifestSpec(spec: string): string {
 export async function tailnetManifestSpec(): Promise<{ spec: string } | { error: string }> {
   const found = await tailscaleManifest();
   if ("error" in found) return found;
-  const spec = found.manifest.startsWith("-") ? undefined : hostManifestSpec(found.manifest);
+  // GitHub's `owner/repo[//file]` shorthand, spelled so no folder of that name here can stand for it.
+  const value = /^[\w-][\w.-]*\/[\w.-]+(?:\/\/.*)?$/.test(found.manifest)
+    ? `github:${found.manifest}`
+    : found.manifest;
+  const spec = value.startsWith("-") ? undefined : hostManifestSpec(value);
   if (!spec || sharedManifestProblem(spec))
     return {
       error: `the tailnet policy names the manifest ${found.manifest}, which is not in a repository; name one such as owner/repo or github:owner/repo//<file>`,

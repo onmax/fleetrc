@@ -72,7 +72,7 @@ On Tailscale, your tailnet policy can name the manifest once for all your machin
 ],
 ```
 
-Then a bare `npx skillfleet init` on any of them uses that manifest. Each sync asks Tailscale again, so when you change it in the policy, every machine follows. If Tailscale can't answer, the machine keeps its last manifest and the sync says why. The value must name a repository, such as `me/skills` or `github:me/skills//<file>`. `init <manifest>` with a manifest of its own stops following the tailnet. Git stays the way your manifest itself gets to each machine; Tailscale only says where it is.
+Then a bare `npx skillfleet init` on a new machine, or on one already following the tailnet, uses that manifest. Each sync asks Tailscale again, so when you change it in the policy, every machine follows. If Tailscale can't answer, the machine keeps its last manifest and the sync says why. The value must name a repository, such as `me/skills` or `github:me/skills//<file>`. `init` with another manifest stops following the tailnet. Git stays the way your manifest itself gets to each machine; Tailscale only says where it is.
 
 ### Commands
 

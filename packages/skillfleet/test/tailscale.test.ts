@@ -132,6 +132,34 @@ describe("the manifest from the tailnet policy", () => {
     expect(existsSync(tailscale.ran)).toBe(false);
   });
 
+  it("owner/repo in the policy is GitHub's even beside a folder of that name", async () => {
+    const m = machine();
+    mkdirSync(m.at("me/skills/.skillfleet"), { recursive: true });
+    writeFileSync(m.at("me/skills/.skillfleet/manifest.json"), JSON.stringify({ sources: [] }));
+    const tailscale = fakeTailscale(m);
+    tailscale.policy([{ manifest: "me/skills" }]);
+    const run = await m.runWith(
+      { env: tailscale.env },
+      "init",
+      "--dry-run",
+      "--offline",
+      "--no-hooks",
+    );
+    expect(run.stdout + run.stderr).not.toContain("not in a repository");
+    expect(run.stdout + run.stderr).toContain("github.com/me/skills");
+  });
+
+  it("init that names the manifest the tailnet gave, with an option, keeps following it", async () => {
+    const m = machine();
+    const tailscale = fakeTailscale(m);
+    const home = team(m, "home", "first");
+    tailscale.policy([{ manifest: home.https }]);
+    expect((await m.runWith({ env: tailscale.env }, "init", "--no-hooks")).code).toBe(0);
+    const run = await m.runWith({ env: tailscale.env }, "init", home.https, "--no-hooks", "--copy");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(config(m)).toMatchObject({ tailscale: true, copy: true });
+  });
+
   it("bare init without Tailscale or without a policy entry says what init needs", async () => {
     const m = machine();
     const missing = await m.runWith(

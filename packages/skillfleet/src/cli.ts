@@ -1002,7 +1002,10 @@ async function init() {
   mkdirSync(dirname(pending), { recursive: true });
   writeFileSync(pending, withTimer ? "timer\n" : "");
   const applied = [...(await cloneBeforeAdopt(plan)), ...applyPlan(plan)];
-  updateConfig({ tailscale: fromTailnet || undefined });
+  // Naming the manifest the tailnet gave, as `fleet init --timer` does on a host, keeps following it.
+  const stillFollowing =
+    config?.tailscale === true && sameManifest(plan.manifestSpec, config.manifest);
+  updateConfig({ tailscale: fromTailnet || stillFollowing || undefined });
   if (fromTailnet)
     applied.push("the manifest is the one the tailnet policy names; each sync asks again");
   say(...applied.map((line) => `  ${line}`));
