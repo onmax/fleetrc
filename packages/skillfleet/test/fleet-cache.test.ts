@@ -1,11 +1,117 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { expect, it, vi } from "vite-plus/test";
 import { exec } from "../src/exec.ts";
-import { fleet, resolveFleet, type FleetAction } from "../src/fleet.ts";
+import { fleet, notInFleet, resolveFleet, type FleetAction } from "../src/fleet.ts";
 
 vi.mock("../src/exec.ts", () => ({ exec: vi.fn() }));
+
+it("recognizes a tagged peer alias after a DNS timeout", async () => {
+  vi.stubEnv("SKILLFLEET_TAILSCALE", "tailscale");
+  vi.stubEnv("SKILLFLEET_SSH", "ssh");
+  const name = "server.tail.test";
+  const address = "100.64.0.5";
+  const tag = "tag:servers";
+  const server = { DNSName: `${name}.`, TailscaleIPs: [address], Tags: [tag], Online: true };
+  vi.mocked(exec).mockImplementation(async (command, args, options) => {
+    const result = { stderr: "", code: 0, timedOut: false, truncated: false };
+    if (command === "tailscale") return { ...result, stdout: JSON.stringify({ Peer: { server } }) };
+    if (command === process.execPath) {
+      await delay((options?.timeoutMs ?? 0) + 1);
+      return { ...result, stdout: "", timedOut: true };
+    }
+    const host = args[args.indexOf("--") + 1];
+    return {
+      ...result,
+      stdout: `hostname ${host === name ? name : address}\nuser alice\nport 22\n`,
+    };
+  });
+  try {
+    expect(await notInFleet([tag], ["server-alias"], 100)).toEqual([]);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+it.each([false, true])("only refreshes on the same retry route (%s)", async (changed) => {
+  const root = mkdtempSync(join(tmpdir(), "skillfleet-cache-"));
+  vi.stubEnv("XDG_STATE_HOME", root);
+  vi.stubEnv("SKILLFLEET_TAILSCALE", "tailscale");
+  vi.stubEnv("SKILLFLEET_SSH", "ssh");
+  const address = "100.64.0.5";
+  const tag = "tag:servers";
+  const observed = "owner/manifest//manifest.json";
+  const first = "2026-01-01T00:00:00Z";
+  const second = "2026-01-01T00:01:00Z";
+  const setup = {
+    spec: "github:owner/manifest",
+    flags: [],
+    force: false,
+    same: (spec: string) => spec === observed,
+  };
+  let online = true;
+  let retries = 0;
+  vi.mocked(exec).mockImplementation(async (command, args) => {
+    const remote = args.at(-1) ?? "";
+    const init = remote.includes(setup.spec);
+    const retry = init && remote.includes(observed);
+    const result = { stderr: "", code: 0, timedOut: false, truncated: false };
+    if (command === "tailscale") {
+      const server = { ID: "server", TailscaleIPs: [address], Tags: [tag], Online: online };
+      return { ...result, stdout: JSON.stringify({ Peer: { server } }) };
+    }
+    if (args.includes("-G"))
+      return {
+        ...result,
+        stdout: `hostname ${address}\nuser alice\nport ${changed && retry ? 2222 : 22}\n`,
+      };
+    if (init && !retry)
+      return {
+        ...result,
+        stderr: `skillfleet-fleet: has ${observed}\n`,
+        stdout: "skillfleet-fleet: other-manifest\n",
+      };
+    if (retry) retries++;
+    return {
+      ...result,
+      stdout: JSON.stringify(
+        init ? { sync: { finishedAt: second, ok: true } } : { finishedAt: first, ok: true },
+      ),
+    };
+  });
+  const run = async (action: FleetAction, ...entries: string[]) => {
+    const invocation = { action, version: "0.0.0", setup: action === "init" ? setup : undefined };
+    const { targets, enrollment } = await resolveFleet(entries, undefined, 30_000, invocation);
+    const results = await fleet(targets, action, invocation.version, 30_000, invocation);
+    return { results, enrollment };
+  };
+  try {
+    expect((await run("status", tag)).results).toMatchObject([{ lastRun: { finishedAt: first } }]);
+    expect((await run("init", address)).results).toMatchObject([
+      { lastRun: { finishedAt: second } },
+    ]);
+    const rejected = {
+      error: "could not verify an unchanged SSH route to the Tailscale peer for the retry",
+    };
+    if (changed) expect((await run("init", tag)).results).toMatchObject([rejected]);
+    const named = await run("init", "alias", tag);
+    expect(named.enrollment.get("alias")).toEqual(["alias", tag]);
+    expect(named.results).toMatchObject([
+      changed ? rejected : { host: "alias", setup: "set up", lastRun: { finishedAt: second } },
+    ]);
+    expect(named.results[0]?.setup).toBe(changed ? undefined : "set up");
+    expect(retries).toBe(changed ? 1 : 2);
+    online = false;
+    expect((await run("status", tag)).results).toMatchObject([
+      { error: "offline in Tailscale", lastRun: { finishedAt: changed ? first : second } },
+    ]);
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 it.each(["status", "sync", "upgrade"] as const)(
   "verifies tag-only SSH routes before dispatching %s or attributing a report",

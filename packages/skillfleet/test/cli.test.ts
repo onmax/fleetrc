@@ -63,35 +63,6 @@ describe("skillfleet", () => {
     expect(list.stdout).toMatch(/^added {2}extra {2}/m);
   });
 
-  it("hook prompt announces skills that arrived after the session started, once", async () => {
-    const m = machine();
-    const vendor = remote(m, "vendor", skills("skills/", "first"));
-    const manifest = m.manifest({
-      agents: ["claude-code"],
-      sources: [{ id: "vendor", git: vendor.url }],
-    });
-    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
-    // A sync the hook started a moment ago: this one starts none, so the next sync meets no lock.
-    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
-    const prompt = () =>
-      m.runWith(
-        { input: JSON.stringify({ session_id: "abc", hook_event_name: "UserPromptSubmit" }) },
-        "hook",
-        "prompt",
-      );
-    expect((await prompt()).stdout).toBe("");
-    vendor.commit({ "skills/second/SKILL.md": "---\nname: second\ndescription: Second\n---\n" });
-    await m.run("sync");
-    const announced = await prompt();
-    expect(announced.code).toBe(0);
-    // Claude Code loads a skill linked mid-session on the next turn, so the model is told to use
-    // it, not that it is missing.
-    expect(announced.stdout).toBe(
-      "skillfleet: a new skill arrived after this session started and is available now: second. Use it like any other skill, with the Skill tool.",
-    );
-    expect((await prompt()).stdout).toBe("");
-  });
-
   it("status lists Codex sessions started before the last skill change, and not Claude Code's", async () => {
     const m = machine({ scheduler: "empty" });
     const vendor = remote(m, "vendor", skills("skills/", "first"));

@@ -477,7 +477,7 @@ export function clone(m: Machine, r: Remote, path: string): string {
 // ---------------------------------------------------------------------------
 // tar.gz archives, written by hand so tests can build unsafe ones too.
 
-function tarHeader(name: string, size: number, type = "0"): Buffer {
+export function tarHeader(name: string, size: number, type = "0", linkpath = ""): Buffer {
   const header = Buffer.alloc(512);
   const put = (value: string, offset: number, length: number) =>
     header.write(value.slice(0, length), offset, length, "utf8");
@@ -489,6 +489,7 @@ function tarHeader(name: string, size: number, type = "0"): Buffer {
   put("00000000000\0", 136, 12);
   put("        ", 148, 8);
   put(type, 156, 1);
+  put(linkpath, 157, 100);
   put("ustar\0", 257, 6);
   put("00", 263, 2);
   let sum = 0;

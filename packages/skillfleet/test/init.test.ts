@@ -96,6 +96,8 @@ describe("init", () => {
   it("9. migrates the legacy layout: a dry run changes nothing, the real run keeps every name and empties ~/.codex/skills", async () => {
     const m = machine();
     const { work, manifest, codex } = legacyLayout(m);
+    const cache = m.at(".cache");
+    expect(existsSync(cache)).toBe(false);
     const before = snapshot(m.root);
     const namesBefore = [
       ...new Set([
@@ -127,6 +129,7 @@ describe("init", () => {
     expect(dry.stdout).toContain(`remove the link ${join("~", ".codex", "skills", "unslop")}`);
     expect(dry.stdout).toContain("record fork council: t3dotgg/tstack skills/council at unknown");
     expect(dry.stdout).toContain("skill names: 6 before, 6 after; none lost");
+    expect(existsSync(cache)).toBe(false);
     expect(snapshot(m.root)).toEqual(before);
 
     const real = await m.run("init", manifest, "--no-hooks");

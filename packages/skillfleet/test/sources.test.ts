@@ -1,7 +1,12 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { describe, expect, it } from "vite-plus/test";
+import { globBase, matchesGlob } from "../src/glob.ts";
+import { parseManifest } from "../src/manifest.ts";
+import { select } from "../src/sources.ts";
+import { readTgz, tarFileSizes } from "../src/tar.ts";
 import {
   http,
   type Http,
@@ -14,9 +19,167 @@ import {
   serveIndexV1,
   serveIndexV2,
   skillMd,
+  tarHeader,
   tgz,
   sha256,
 } from "./fixture.ts";
+
+describe("skills and hook globs", () => {
+  it("reads only *, ** and ?; brackets, braces, parentheses and ! are the characters themselves", () => {
+    const cases: [string, string, boolean][] = [
+      ["skills/*", "skills/a", true],
+      ["skills/*", "skills/a/b", false],
+      ["skills/**", "skills", true],
+      ["skills/**", "skills/a/b", true],
+      ["a/**/b", "a/b", true],
+      ["a/**/b", "a/x/y/b", true],
+      ["**", ".hidden/x", true],
+      ["skills/?", "skills/a", true],
+      ["skills/?", "skills/ab", false],
+      ["??", "😀", true],
+      ["?", "😀", false],
+      ["😀", "😀", true],
+      ["**", "a\nb", false],
+      ["a/**/b", "a/\r/b", false],
+      ["a/**", "a/\u2028", false],
+      ["**b", "a\u2029b", false],
+      ["*", "a\nb", true],
+      ["!x/*", "!x/a", true],
+      ["!x/*", "y/a", false],
+      ["{a,b}", "{a,b}", true],
+      ["{a,b}", "a", false],
+      ["[ab]", "[ab]", true],
+      ["[ab]", "a", false],
+      ["+(a)", "+(a)", true],
+      ["+(a)", "a", false],
+      ["(a|b)*", "(a|b)x", true],
+      ["(a|b)*", "a", false],
+      ["(a|b)*", "b", false],
+      ["a.b", "axb", false],
+    ];
+    for (const [glob, path, expected] of cases)
+      expect.soft(matchesGlob(path, glob), `${glob} on ${path}`).toBe(expected);
+    expect(globBase("{a,b}/[x]/*")).toBe("{a,b}/[x]");
+  });
+
+  it("rejects an oversized skills pattern when reading the manifest", () => {
+    expect(() =>
+      parseManifest("m.json", { sources: [{ id: "local", local: ".", skills: "?".repeat(8193) }] }),
+    ).toThrow(/sources.*skills.*8192/);
+  });
+
+  it("bounds the total matching work across candidates in a source filter", () => {
+    const manifest = parseManifest("m.json", {
+      sources: [{ id: "many", local: ".", skills: "*?".repeat(128) + "b" }],
+    });
+    const found = Array.from({ length: 256 }, (_, index) => ({
+      name: `skill-${index}`,
+      dir: ".",
+      path: "a".repeat(512) + index,
+    }));
+    expect(() => select(manifest.sources[0]!, found, [])).toThrow(/many.*skills glob.*work limit/);
+  });
+
+  it("answers fast for a pathological glob on a long path that almost matches", () => {
+    const cases: [string, string][] = [
+      [`${"*a".repeat(30)}*b`, "a".repeat(2000)],
+      [`${"**/".repeat(30)}x`, `${"a/".repeat(1000)}y`],
+      [`${"**a".repeat(30)}**b`, "a".repeat(2000)],
+      [`${"*?".repeat(30)}/z`, "a".repeat(2000)],
+      ["(a+)+$".repeat(10), "a".repeat(2000)],
+      // A long chain of stars: closures per state would take memory in its length squared.
+      ["*".repeat(5_000) + "b", "a".repeat(200)],
+    ];
+    for (const [glob, path] of cases) {
+      const started = performance.now();
+      expect(matchesGlob(path, glob)).toBe(false);
+      // A backtracking matcher takes seconds on these; CI machines vary, so the bound is loose.
+      expect(performance.now() - started, glob).toBeLessThan(500);
+    }
+  });
+});
+
+describe("tar archives", () => {
+  const end = Buffer.alloc(1024);
+  const file = (name: string, body: string | Buffer) => {
+    const bytes = Buffer.from(body);
+    return [tarHeader(name, bytes.length), bytes, Buffer.alloc((512 - (bytes.length % 512)) % 512)];
+  };
+
+  it("counts entries node-tar ignores toward the entry limit", () => {
+    // An unknown type, which node-tar ignores instead of handing to onReadEntry.
+    const tar = Buffer.concat([
+      ...Array.from({ length: 50_001 }, (_, i) => tarHeader(`p/x${i}`, 0, "Z")),
+      end,
+    ]);
+    expect(tar.length).toBeLessThan(100 * 1024 * 1024);
+    expect(() => tarFileSizes(tar)).toThrow(/more than 50000 entries/);
+    expect(() => readTgz(gzipSync(tar))).toThrow(/more than 50000 entries/);
+  });
+
+  it("refuses more than 50,000 files", () => {
+    const tar = Buffer.concat([
+      ...Array.from({ length: 50_001 }, (_, i) => tarHeader(`p/f${i}`, 0)),
+      end,
+    ]);
+    expect(() => readTgz(gzipSync(tar))).toThrow(/more than 50000 entries/);
+  });
+
+  it.each(["L", "x"])("counts %s metadata even with an empty body", (type) => {
+    const payload = Buffer.from(type === "L" ? "p/long\0" : "15 path=p/long\n");
+    const meta = Buffer.concat([
+      tarHeader("meta", payload.length, type),
+      payload,
+      Buffer.alloc(512 - payload.length),
+    ]);
+    const empty = tarHeader("meta", 0, type);
+    const headers = Array.from({ length: 49_999 }, (_, index) => (index % 2 ? empty : meta));
+    const last = tarHeader("p/a.md", 0);
+    expect(tarFileSizes(Buffer.concat([...headers, last, end]))).toEqual([
+      { name: "p/long", size: 0 },
+    ]);
+    const tar = Buffer.concat([...headers, empty, last, end]);
+    expect(() => tarFileSizes(tar)).toThrow(/more than 50000 entries/);
+    expect(() => readTgz(gzipSync(tar))).toThrow(/more than 50000 entries/);
+  });
+
+  it("refuses a tar gzipped twice and a header with a bad checksum", () => {
+    const tar = Buffer.concat([...file("p/a.md", "a"), end]);
+    expect(() => readTgz(gzipSync(gzipSync(tar)))).toThrow(/gzipped twice/);
+    const bad = Buffer.from(tar);
+    bad[0] = "q".charCodeAt(0);
+    expect(() => readTgz(gzipSync(bad))).toThrow(/checksum/);
+    expect(() => tarFileSizes(bad)).toThrow(/checksum/);
+  });
+
+  it("refuses a link or a path out of the package before reading its body", () => {
+    const link = Buffer.concat([tarHeader("p/l", 0, "2", "/etc/passwd"), end]);
+    expect(() => readTgz(gzipSync(link))).toThrow(/archive entry p\/l is a link/);
+    const out = Buffer.concat([...file("../x.md", "x"), end]);
+    expect(() => readTgz(gzipSync(out))).toThrow(/would be written outside the package/);
+  });
+
+  it("reads files of every size, and only names and sizes for the index check", () => {
+    const big = Buffer.alloc(200_000, "b");
+    const tar = Buffer.concat([
+      ...file("p/empty.md", ""),
+      ...file("p/SKILL.md", "hello"),
+      ...file("p/big.bin", big),
+      tarHeader("p/dir/", 0, "5"),
+      end,
+    ]);
+    const files = readTgz(gzipSync(tar));
+    expect([...files.keys()]).toEqual(["p/empty.md", "p/SKILL.md", "p/big.bin"]);
+    expect(Buffer.from(files.get("p/empty.md")!).toString()).toBe("");
+    expect(Buffer.from(files.get("p/SKILL.md")!).toString()).toBe("hello");
+    expect(Buffer.from(files.get("p/big.bin")!).equals(big)).toBe(true);
+    expect(tarFileSizes(tar)).toEqual([
+      { name: "p/empty.md", size: 0 },
+      { name: "p/SKILL.md", size: 5 },
+      { name: "p/big.bin", size: 200_000 },
+    ]);
+  });
+});
 
 describe("well-known index", () => {
   it("6a. installs skills whose archive matches the digest, from v0.2.0 and v0.1 indexes", async () => {

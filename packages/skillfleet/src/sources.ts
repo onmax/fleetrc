@@ -40,7 +40,7 @@ import {
   writeJson,
 } from "./fs.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
-import { globBase, matchesGlob } from "./glob.ts";
+import { globBase, globFilter } from "./glob.ts";
 import {
   type CloneSource,
   type InPlaceSource,
@@ -52,7 +52,7 @@ import {
 import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
 import { type FetchBudget, fetchNpm, guardedFetch, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
-import { tarEntries, zipEntries } from "./tar.ts";
+import { tarFileSizes, zipEntries } from "./tar.ts";
 import type { PendingUpdate, SourceState } from "./state.ts";
 
 export interface SkillEntry {
@@ -174,8 +174,9 @@ function plainNames(source: Source, found: readonly Found[], warnings: string[])
 /** Applies a source's `skills` glob, `include` and `exclude` to what discovery found. */
 export function select(source: Source, found: readonly Found[], warnings: string[]): Found[] {
   const glob = source.kind === "index" ? undefined : source.skills;
+  const matches = glob ? globFilter(glob, `${source.id}: skills glob`) : undefined;
   let chosen = found.filter(
-    (skill) => !glob || (skill.path !== undefined && matchesGlob(skill.path, glob)),
+    (skill) => !matches || (skill.path !== undefined && matches(skill.path)),
   );
   // A name in the manifest finds its skill in any case or Unicode form, as a CLI argument does.
   const names = (list: readonly string[]) => new Set(list.map(nameKey));
@@ -349,7 +350,7 @@ interface LinkedFolder extends Found {
  */
 function skillPlace(source: Source, found: readonly Found[]): (path: string) => boolean {
   const glob = source.kind === "index" ? undefined : source.skills;
-  if (glob) return (path) => matchesGlob(path, glob);
+  if (glob) return globFilter(glob, `${source.id}: skills glob`);
   const parents = new Set(
     found.flatMap((skill) =>
       skill.path === undefined || skill.path === "." ? [] : [posix.dirname(skill.path)],
@@ -1588,9 +1589,7 @@ function* archiveFiles(
 ): Generator<{ name: string; size: number }> {
   const ustar = body.length >= 262 && new TextDecoder().decode(body.subarray(257, 262)) === "ustar";
   if (unpacked || ustar) {
-    for (const entry of tarEntries(unpacked ?? body))
-      if (entry.type === "0" || entry.type === "\0")
-        yield { name: entry.name, size: entry.body.byteLength };
+    yield* tarFileSizes(unpacked ?? body);
     return;
   }
   let path = "";

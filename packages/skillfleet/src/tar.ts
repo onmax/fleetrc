@@ -1,12 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gunzipSync } from "node:zlib";
-
-const text = (bytes: Uint8Array, start: number, length: number) => {
-  const slice = bytes.subarray(start, start + length);
-  const end = slice.indexOf(0);
-  return new TextDecoder().decode(end >= 0 ? slice.subarray(0, end) : slice);
-};
+import { Parser, type ReadEntry } from "tar";
 
 /** A relative `/`-separated path that stays inside the folder it is extracted to, or undefined. */
 export function safeRelativePath(raw: string): string | undefined {
@@ -38,50 +33,86 @@ export function gunzipCapped(gz: Uint8Array): Buffer {
   }
 }
 
-/** Each entry of an unpacked tar, long names (pax `path`, GNU `L`) applied. Throws past the entry limit. */
-export function* tarEntries(
-  tar: Uint8Array,
-): Generator<{ name: string; type: string; body: Uint8Array }> {
-  let offset = 0;
-  let longName: string | undefined;
-  let entries = 0;
-  while (offset + 512 <= tar.length) {
-    if (++entries > ENTRY_LIMIT)
-      throw new Error(`the archive has more than ${ENTRY_LIMIT} entries, over skillfleet's limit`);
-    const header = tar.subarray(offset, offset + 512);
-    if (header.every((byte) => byte === 0)) break;
-    const size = Number.parseInt(text(header, 124, 12).trim() || "0", 8);
-    if (!Number.isFinite(size) || size < 0) throw new Error("invalid tar entry size");
-    const type = String.fromCharCode(header[156] ?? 0);
-    const prefix = text(header, 345, 155);
-    const name = longName ?? (prefix ? `${prefix}/${text(header, 0, 100)}` : text(header, 0, 100));
-    const body = tar.subarray(offset + 512, offset + 512 + size);
-    offset += 512 + Math.ceil(size / 512) * 512;
-    longName = undefined;
-    if (type === "x") {
-      // pax header: "<length> path=<value>\n" records
-      const path = new TextDecoder().decode(body).match(/(?:^|\n)\d+ path=([^\n]*)\n/);
-      longName = path?.[1];
-      continue;
-    }
-    if (type === "L") {
-      longName = text(body, 0, body.length);
-      continue;
-    }
-    yield { name, type, body };
-  }
+/** Entry types that hold a file's bytes, as `skills` extracts them. */
+const FILE_TYPES = new Set(["File", "OldFile", "ContiguousFile"]);
+
+const tooMany = () =>
+  new Error(`the archive has more than ${ENTRY_LIMIT} entries, over skillfleet's limit`);
+
+/** Parser events omit empty metadata, so count at the header boundary instead. */
+const CONSUME_HEADER = Object.getOwnPropertySymbols(Parser.prototype).find(
+  (symbol) => symbol.description === "consumeHeader",
+);
+const END_BLOCK = Buffer.alloc(512);
+
+/**
+ * Reads an unpacked tar as node-tar reads it, the way `skills` does: long names (pax `path`, GNU
+ * `L`) applied, and an archive with a bad header checksum refused. Hands `onEntry` each entry
+ * before its body, and throws past the entry limit. All headers count, including metadata and
+ * ignored entries, but not zero padding at the end of the archive.
+ */
+function readTar(tar: Uint8Array, onEntry: (entry: ReadEntry) => void) {
+  // node-tar unpacks a gzip it is given, which here would be a second one, past the unpack limit.
+  if (tar[0] === 0x1f && tar[1] === 0x8b) throw new Error("the archive is gzipped twice");
+  if (!CONSUME_HEADER)
+    throw new Error("cannot enforce the tar header limit with this version of node-tar");
+  let failed: Error | undefined;
+  const parser = new Parser({ strict: true, zstd: false, onReadEntry: onEntry });
+  const consume = (parser as unknown as Record<symbol, (chunk: Buffer, offset: number) => void>)[
+    CONSUME_HEADER
+  ];
+  if (typeof consume !== "function")
+    throw new Error("cannot enforce the tar header limit with this version of node-tar");
+  let headers = 0;
+  Object.defineProperty(parser, CONSUME_HEADER, {
+    value(this: Parser, chunk: Buffer, offset: number) {
+      if (!END_BLOCK.equals(chunk.subarray(offset, offset + 512)) && ++headers > ENTRY_LIMIT)
+        throw tooMany();
+      consume.call(this, chunk, offset);
+    },
+  });
+  parser.on("error", (error) => (failed ??= error));
+  // Given the whole archive at once, node-tar reads every entry before `end` returns.
+  parser.end(Buffer.from(tar.buffer, tar.byteOffset, tar.byteLength));
+  if (failed) throw failed;
 }
 
-/** Regular files in a .tgz, keyed by path. Throws on links, on paths that leave the archive, and past the size limits. */
+/**
+ * The names and sizes of the regular files in an unpacked tar, without reading their bodies.
+ * Throws past the entry limit.
+ */
+export function tarFileSizes(tar: Uint8Array): { name: string; size: number }[] {
+  const files: { name: string; size: number }[] = [];
+  readTar(tar, (entry) => {
+    if (FILE_TYPES.has(entry.type)) files.push({ name: entry.path, size: entry.size });
+    entry.resume();
+  });
+  return files;
+}
+
+/**
+ * Regular files in a .tgz, keyed by path. Throws on links, on paths that leave the archive, and
+ * past the size limits, each before reading the entry's body.
+ */
 export function readTgz(gz: Uint8Array): Map<string, Uint8Array> {
   const files = new Map<string, Uint8Array>();
-  for (const { name, type, body } of tarEntries(gunzipCapped(gz))) {
-    if (type === "1" || type === "2") throw new Error(`archive entry ${name} is a link`);
-    if (type !== "0" && type !== "\0") continue;
+  readTar(gunzipCapped(gz), (entry) => {
+    const name = entry.path;
+    if (entry.type === "Link" || entry.type === "SymbolicLink")
+      throw new Error(`archive entry ${name} is a link`);
+    if (!FILE_TYPES.has(entry.type)) {
+      entry.resume();
+      return;
+    }
     const path = safeRelativePath(name);
     if (!path) throw new Error(`archive entry ${name} would be written outside the package`);
-    files.set(path, new Uint8Array(body));
-  }
+    const chunks: Buffer[] = [];
+    entry.on("data", (chunk: Buffer) => chunks.push(chunk));
+    // A body that came in one chunk is a view of the unpacked archive, kept without a copy.
+    entry.on("end", () =>
+      files.set(path, chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)),
+    );
+  });
   return files;
 }
 

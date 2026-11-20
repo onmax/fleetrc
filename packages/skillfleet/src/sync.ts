@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setImmediate as yieldToWatchdog } from "node:timers/promises";
 import { agentTargets, formerTargets } from "./agents.ts";
 import { UserError } from "./errors.ts";
 import { checkForks, unresolvedFiles } from "./edits.ts";
@@ -30,7 +31,7 @@ import {
   tempOwner,
   writeJson,
 } from "./fs.ts";
-import { matchesGlob } from "./glob.ts";
+import { globFilter, GlobWorkLimitError, splitHookPattern } from "./glob.ts";
 import {
   type DesiredLink,
   errorText,
@@ -193,13 +194,6 @@ function syncTimeoutMs(): number {
 /** Hooks run while the sync holds its lock, so a stuck one is stopped after this long. */
 const HOOK_TIMEOUT_MS = 5 * 60_000;
 
-const splitPattern = (pattern: string) => {
-  const at = pattern.indexOf(":");
-  return at < 0
-    ? { id: "*", glob: pattern }
-    : { id: pattern.slice(0, at), glob: pattern.slice(at + 1) };
-};
-
 /**
  * One warning for each hook pattern that matches no file of the sources it names, so a hook that
  * can never run is not silent. Changed paths start at the root of the source's repository.
@@ -214,7 +208,8 @@ async function unmatchedHooks(loaded: LoadedManifest, results: SourceResult[]): 
   };
   for (const hook of loaded.root.hooks)
     for (const pattern of hook.on) {
-      const { id, glob } = splitPattern(pattern);
+      await yieldToWatchdog();
+      const { id, glob } = splitHookPattern(pattern);
       const named = results.filter(
         (result) => (id === "*" || result.id === id) && !result.error && result.skills.length > 0,
       );
@@ -225,11 +220,18 @@ async function unmatchedHooks(loaded: LoadedManifest, results: SourceResult[]): 
       }
       let example: string | undefined;
       let matched = named.length === 0;
-      for (const result of named) {
-        const list = await filesOf(result);
-        if (list.some((file) => matchesGlob(file, glob))) matched = true;
-        example ??= list.find((file) => /(^|\/)SKILL\.md$/.test(file)) ?? list[0];
-        if (matched) break;
+      const matches = globFilter(glob, `hook ${hook.name}: glob`);
+      try {
+        for (const result of named) {
+          const list = await filesOf(result);
+          if (list.some(matches)) matched = true;
+          example ??= list.find((file) => /(^|\/)SKILL\.md$/.test(file)) ?? list[0];
+          if (matched) break;
+        }
+      } catch (error) {
+        if (!(error instanceof GlobWorkLimitError)) throw error;
+        warnings.push(`${error.message} (checking source files)`);
+        continue;
       }
       if (!matched && example)
         warnings.push(
@@ -288,14 +290,24 @@ async function runHooks(
   });
   const runs: HookRun[] = [];
   for (const hook of loaded.root.hooks) {
-    const matched = changed
-      .filter(({ source, file }) =>
-        hook.on.some((pattern) => {
-          const { id, glob } = splitPattern(pattern);
-          return (id === "*" || id === source) && matchesGlob(file, glob);
-        }),
-      )
-      .map(({ source, file }) => `${source}:${file}`);
+    if (changed.length === 0) break;
+    await yieldToWatchdog();
+    const filters = hook.on.map((pattern) => {
+      const { id, glob } = splitHookPattern(pattern);
+      return { id, matches: globFilter(glob, `hook ${hook.name}: glob`) };
+    });
+    let matched: string[];
+    try {
+      matched = changed
+        .filter(({ source, file }) =>
+          filters.some(({ id, matches }) => (id === "*" || id === source) && matches(file)),
+        )
+        .map(({ source, file }) => `${source}:${file}`);
+    } catch (error) {
+      if (!(error instanceof GlobWorkLimitError)) throw error;
+      report.errors.push(error.message);
+      continue;
+    }
     if (matched.length === 0) continue;
     const run = await exec(hook.run, [], {
       shell: true,
@@ -451,6 +463,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const backupRoot = join(paths.backup(), startedAt.replace(/[:.]/g, "-"));
     const results: SourceResult[] = [];
     for (const source of loaded.sources) {
+      await yieldToWatchdog();
       const before = state.sources[source.id];
       if (before && isVendoredKind(before.kind) && !isVendoredKind(source.kind)) {
         // Linked in place now: the vendored copies go, and edited ones are kept in the backup.

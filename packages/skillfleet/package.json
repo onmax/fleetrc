@@ -57,8 +57,11 @@
     "@types/node": "^26.6.6",
     "@vite-hub/schedule": "https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@6b1390a",
     "cron-schedule": "^6.0.0",
+    "fastest-levenshtein": "1.0.16",
+    "jsonc-parser": "3.3.1",
     "publint": "^0.3.25",
     "skills": "^1.9.0",
+    "tar": "^7.5.22",
     "tsrs": "0.20.1-ts7.1.0-beta",
     "typescript": "^7.0.2",
     "vite-plus": "^1.4.0"

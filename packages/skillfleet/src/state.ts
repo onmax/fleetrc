@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { dict, type Hashes, isRecord, JsonFileError, readJson, writeJson } from "./fs.ts";
 import { isVendoredKind, type Source } from "./manifest.ts";
 import { paths, tildify } from "./paths.ts";
+import { skillRecord, type SkillRecord } from "./skill-record.ts";
 
 /** A vendored skill as skillfleet last installed it: the merge base for local edits. */
 export interface InstalledCopy {
@@ -30,14 +31,6 @@ export interface SourceState {
   fetchedAt?: string;
   skills: Record<string, InstalledCopy>;
   pending: Record<string, PendingUpdate>;
-}
-
-/** When each skill name first appeared on this machine and last changed. */
-export interface SkillRecord {
-  source: string;
-  dir: string;
-  addedAt: string;
-  changedAt: string;
 }
 
 /** What the last sync found upstream of a fork (the manifest's `forks`). */
@@ -226,17 +219,6 @@ function conflictRecord(record: unknown): MergeConflict | undefined {
     dir: record.dir as string,
     files: record.files.filter((file): file is string => typeof file === "string"),
     ...(markers.length > 0 ? { markers: dict(markers) } : {}),
-  };
-}
-
-function skillRecord(record: unknown): SkillRecord | undefined {
-  if (!isRecord(record) || !text(record.source) || !text(record.dir)) return undefined;
-  const at = text(record.addedAt) ?? text(record.changedAt) ?? new Date(0).toISOString();
-  return {
-    source: record.source as string,
-    dir: record.dir as string,
-    addedAt: at,
-    changedAt: text(record.changedAt) ?? at,
   };
 }
 

@@ -361,6 +361,64 @@ console.log("pstack rebuilt");`,
     );
   });
 
+  it.each(["length", "work"])(
+    "handles a hook glob beyond its %s limit without replaying hooks",
+    async (limit) => {
+      const m = machine();
+      expect((await m.run("init", m.manifest({ sources: [] }), "--no-hooks")).code).toBe(0);
+      const stateFile = join(m.stateDir, "state.json");
+      const reportFile = join(m.stateDir, "last-run.json");
+      const state = {
+        ...JSON.parse(read(stateFile)),
+        hooksDue: [
+          "old:ready",
+          ...Array.from({ length: 256 }, (_, index) => `old:${"a".repeat(512)}${index}`),
+        ],
+      };
+      writeFileSync(stateFile, JSON.stringify(state));
+      const before = [read(stateFile), read(reportFile)];
+      const log = join(m.root, "hook.log");
+      const script = join(m.root, "hook.mjs");
+      writeFileSync(
+        script,
+        `import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(log)}, process.env.SKILLFLEET_HOOK + "\\n");`,
+      );
+      const run = `"${process.execPath}" "${script}"`;
+      m.manifest({
+        sources: [],
+        hooks: [
+          { name: "first", run, on: ["old:ready"] },
+          {
+            name: "second",
+            run,
+            on: [`old:${limit === "length" ? "?".repeat(8193) : "*?".repeat(128) + "b"}`],
+          },
+        ],
+      });
+
+      const failed = await m.run("sync", "--json");
+      expect(failed.code).not.toBe(0);
+      if (limit === "length") {
+        expect(failed.stderr + failed.stdout).toMatch(/hooks\[1\]\.on.*8192/);
+        expect([read(stateFile), read(reportFile)]).toEqual(before);
+        expect(existsSync(log)).toBe(false);
+        return;
+      }
+
+      const report = JSON.parse(failed.stdout);
+      expect(report).toMatchObject({
+        ok: false,
+        errors: [expect.stringMatching(/hook second: glob exceeded the matching work limit/)],
+        hooks: [{ name: "first", code: 0 }],
+      });
+      expect(JSON.parse(read(reportFile))).toEqual(report);
+      expect(JSON.parse(read(stateFile))).not.toHaveProperty("hooksDue");
+      expect((await m.json("sync")).hooks).toEqual([]);
+      expect(read(log)).toBe("first\n");
+    },
+  );
+
   it("names identical across agents after a sync with no agent folders but a listed agent", async () => {
     const m = machine({ agents: false });
     const vendor = remote(m, "vendor", skills("skills/", "one"));

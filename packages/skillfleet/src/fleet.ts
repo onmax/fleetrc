@@ -5,9 +5,14 @@ import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
 import type { Report } from "./report.ts";
 
-export type FleetAction = "status" | "sync" | "upgrade";
+export type FleetAction = "status" | "sync" | "upgrade" | "init";
 
-type FleetInvocation = { action: FleetAction; version: string; dryRun?: boolean };
+type FleetInvocation = {
+  action: FleetAction;
+  version: string;
+  dryRun?: boolean;
+  setup?: InitSetup;
+};
 
 export interface HostResult {
   host: string;
@@ -26,6 +31,8 @@ export interface HostResult {
   };
   /** `fleet upgrade`: the version the host ran before, when known, and the one it runs now. */
   upgrade?: { from?: string; to: string };
+  /** `fleet init`: the host was set up now, or already had this manifest and only synced. */
+  setup?: "set up" | "already set up";
   error?: string;
   behind: string[];
 }
@@ -41,6 +48,14 @@ const HOST_NOTES = {
     "skillfleet is installed there, but the node its launcher and timer run is gone, as after a Node.js upgrade; run `npx skillfleet@latest self-install` on it",
   "no-node":
     "skillfleet is not installed there, and node is not on the PATH ssh commands get; install Node.js 22.12 or newer, then run `npx skillfleet init <manifest>` on it",
+  "no-npx":
+    "node is there, but npx is not on the PATH ssh commands get; install Node.js 22.12 or newer with npm, then run `skillfleet fleet init` again",
+  "init-no-node":
+    "node is not on the PATH ssh commands get; install Node.js 22.12 or newer, then run `skillfleet fleet init` again",
+  /** `fleet init` says which manifest, from the host's `has` line. */
+  "other-manifest": "it has another manifest; pass --force to set it up with this one",
+  "unreadable-config": "could not read the host's skillfleet config; check config.json there",
+  "local-manifest": "the requested manifest resolves to a local path on the host",
 } as const;
 
 /**
@@ -74,14 +89,76 @@ const FIND = `f=${STATE}/bin/skillfleet; [ -x "$f" ] || f=$(command -v skillflee
  * the launcher names that is gone, as after a Node.js upgrade, is in `g`.
  */
 const LAUNCHER_NODE = `l=${STATE}/bin/skillfleet; n=; g=; if [ -f "$l" ]; then n=$(sed -n 's/^exec "\\([^"]*\\)" .*/\\1/p' "$l" | sed 's/\\\\\\(.\\)/\\1/g'); if [ -n "$n" ] && [ ! -x "$n" ]; then g=$n; n=; fi; fi`;
+/**
+ * npx in `x`: the one next to the launcher's node, with that node first on PATH for npx's own
+ * `#!/usr/bin/env node`, else the one on PATH.
+ */
+const NPX = `x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi`;
+/**
+ * Read the host's config into `m` with the launcher's Node or the one on PATH. Only a missing
+ * config or one without a manifest is treated as unconfigured.
+ */
+const CONFIGURED = `case "\${XDG_CONFIG_HOME:-}" in /*) c="$XDG_CONFIG_HOME";; *) c="$HOME/.config";; esac; k=\${n:-node}; m=$("$k" -e '
+  let text;
+  try { text = require("node:fs").readFileSync(process.argv[1], "utf8"); }
+  catch (error) { if (error.code === "ENOENT") process.exit(0); throw error; }
+  const config = JSON.parse(text.replace(/^\uFEFF/, ""));
+  if (!config || typeof config !== "object" || Array.isArray(config)) process.exit(1);
+  const spec = config.manifest;
+  if (spec !== undefined) {
+    if (typeof spec !== "string" || !spec || /[\\r\\n\\0]/.test(spec)) process.exit(1);
+    process.stdout.write(spec);
+  }
+' "$c/skillfleet/config.json" </dev/null 2>/dev/null)`;
+
+const NOT_SHADOWED = `const {statSync}=require("node:fs");
+const {join,resolve}=require("node:path");
+const {homedir}=require("node:os");
+const spec=process.argv[1];
+const local=(value)=>value==="~"?homedir():/^~[/\\\\]/.test(value)?join(homedir(),value.slice(2)):resolve(value);
+const stat=(path)=>{try{return statSync(path)}catch(error){if(!["ENOENT","ENOTDIR"].includes(error.code))throw error}};
+if(stat(local(spec)))process.exit(1);
+const scheme=spec.indexOf("://");
+const separator=spec.indexOf("//",scheme<0?0:scheme+3);
+if(separator>=0){const repo=local(spec.slice(0,separator));if(stat(repo)?.isDirectory() && stat(join(repo,"HEAD"))?.isFile() && stat(join(repo,"objects")) && stat(join(repo,"refs")))process.exit(1)}`;
 /** Prints why there is no skillfleet to run. */
 const MISSING = `if command -v node >/dev/null 2>&1; then echo "${NOTE} not-installed"; else echo "${NOTE} no-node"; fi`;
 
-/** The POSIX sh script each action runs on a host. A dry run asks the host's sync for one too. */
+/** What `fleet init` sets a host up with. */
+export interface InitSetup {
+  /** The manifest spec, as this machine's config.json keeps it. */
+  spec: string;
+  /** Options for the host's `init`: --copy, --no-copy, --timer, --no-hooks, --force. */
+  flags: readonly string[];
+  /** Set the host up even when its config.json names another manifest. */
+  force: boolean;
+  /** Whether a manifest spec a host's config.json names is `spec` in another spelling. */
+  same: (configured: string) => boolean;
+  /** An equivalent spelling already read from the host; it must still match on retry. */
+  expectedConfig?: string;
+}
+
+/**
+ * The npx arguments that run `skillfleet init` on a host: this version from npm, or the package
+ * SKILLFLEET_PACKAGE names (a tarball, a URL or a pkg.pr.new preview).
+ */
+export function initArgs(version: string, { spec, flags }: InitSetup): string[] {
+  const pkg = process.env.SKILLFLEET_PACKAGE || `skillfleet@${version}`;
+  return ["-y", "--package", pkg, "--", "skillfleet", "init", spec, ...flags];
+}
+
+/** `npx <args>` as a person would type it, quoting only the words a shell would split. */
+export const commandLine = (args: readonly string[]) =>
+  ["npx", ...args.map((arg) => (/^[\w@%+=:,./-]+$/.test(arg) ? arg : quote(arg)))].join(" ");
+
+/**
+ * The POSIX sh script each action runs on a host. A dry run asks the host's sync for one too.
+ * `init` needs `setup`.
+ */
 export function remoteScript(
   action: FleetAction,
   version: string,
-  { dryRun = false } = {},
+  { dryRun = false, setup }: { dryRun?: boolean; setup?: InitSetup } = {},
 ): string {
   switch (action) {
     case "status":
@@ -89,8 +166,28 @@ export function remoteScript(
     case "sync":
       return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then ${watched(`"$f" sync --json${dryRun ? " --dry-run" : ""}`)}; else ${MISSING}; fi`;
     case "upgrade":
-      // npx next to the launcher's node, with that node first on PATH for npx's own `#!/usr/bin/env node`.
-      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx"; PATH="\${n%/*}:$PATH"; export PATH; elif command -v npx >/dev/null 2>&1; then x=npx; fi; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${NOW} && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
+      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; ${NPX}; if [ -n "$x" ]; then "$x" -y skillfleet@${version} self-install </dev/null && ${NOW} && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
+    case "init": {
+      if (!setup) throw new Error("remoteScript: init needs a setup");
+      // A relative SKILLFLEET_PACKAGE is a path from the login folder, which `cd /` leaves.
+      const word = (arg: string, i: number) =>
+        i === 2 && (/^\.\.?\//.test(arg) || /^[^/:@]*\.(?:tgz|tar\.gz|tar)$/i.test(arg))
+          ? `"$o"/${quote(arg)}`
+          : quote(arg);
+      const init = ['"$x"', ...initArgs(version, setup).map(word), "--json"].join(" ");
+      const expected = quote(setup.expectedConfig ?? setup.spec);
+      const unshadowed = (spec: string) =>
+        `"$k" -e ${quote(NOT_SHADOWED)} -- ${spec} </dev/null 2>/dev/null`;
+      const already =
+        setup.flags.length === 0
+          ? `if [ "$m" = ${expected} ] && [ -n "$f" ] && [ -z "$g" ] && [ ! -e ${STATE}/init-pending ]; then echo "${NOTE} already" >&2; ${watched('"$f" sync --json')}; fi;`
+          : "";
+      const mismatch = `${setup.expectedConfig === undefined ? '[ -n "$m" ] && ' : ""}{ [ "$m" != ${expected} ] || ! ${unshadowed('"$m"')}; }`;
+      const other = setup.force
+        ? ""
+        : `if ${mismatch}; then printf '%s has %s\\n' "${NOTE}" "$m" >&2; echo "${NOTE} other-manifest"; exit; fi;`;
+      return `${ANSWERED}; case "\${XDG_STATE_HOME:-}" in /*) ;; *) unset XDG_STATE_HOME;; esac; ${LAUNCHER_NODE}; ${FIND}; ${NPX}; if [ -z "$n" ] && ! command -v node >/dev/null 2>&1; then echo "${NOTE} init-no-node"; exit; fi; if ! { ${CONFIGURED}; }; then echo "${NOTE} unreadable-config"; exit; fi; ${other} ${already} if [ -n "$x" ]; then o=$(pwd) && cd / || exit 1; if ! ${unshadowed(quote(setup.spec))}; then echo "${NOTE} local-manifest"; exit; fi; ${watched(init)}; else echo "${NOTE} no-npx"; fi`;
+    }
     default: {
       const exhaustive: never = action;
       return exhaustive;
@@ -126,8 +223,14 @@ export function hostProblem(host: string): string | undefined {
  * cannot be asked. 0.0.0 is the version in the repository, which development and preview builds
  * carry; any other version is looked up on the registry npm uses.
  */
-export async function unpublished(version: string): Promise<string | undefined> {
-  const fix = "run the upgrade from a release, such as `npx skillfleet@latest fleet upgrade`";
+export async function unpublished(
+  version: string,
+  command: "upgrade" | "init" = "upgrade",
+): Promise<string | undefined> {
+  const fix =
+    command === "upgrade"
+      ? "run the upgrade from a release, such as `npx skillfleet@latest fleet upgrade`"
+      : "run it from a release, such as `npx skillfleet@latest fleet init`, or name a package hosts can install in SKILLFLEET_PACKAGE";
   if (version === "0.0.0")
     return `this skillfleet is a development or preview build (0.0.0), which hosts cannot install from npm; ${fix}`;
   const registry = (process.env.npm_config_registry || "https://registry.npmjs.org").replace(
@@ -241,8 +344,12 @@ function sshDestination(entry: string): string[] {
   return [...(user ? ["-l", user] : []), ...(port ? ["-p", port] : []), "--", machine];
 }
 
-const sshRemoteCommand = (action: FleetAction, version: string, dryRun: boolean) =>
-  `sh -c ${quote(remoteScript(action, version, { dryRun }))}`;
+const sshRemoteCommand = (
+  action: FleetAction,
+  version: string,
+  dryRun: boolean,
+  setup?: InitSetup,
+) => `sh -c ${quote(remoteScript(action, version, { dryRun, setup }))}`;
 
 async function runOnHost(
   host: string,
@@ -278,13 +385,19 @@ async function runOnHost(
     run.stderr.match(new RegExp(`^${NOTE} ${what} (\\d+\\.\\d+\\.\\d+[\\w.+-]*)\r?$`, "m"))?.[1];
   const was = told("was");
   const now = told("now");
+  // `fleet init`: the host had this manifest and only synced, or has another one.
+  const already = new RegExp(`^${NOTE} already\r?$`, "m").test(run.stderr);
+  const has = run.stderr.match(new RegExp(`^${NOTE} has (.*?)\r?$`, "m"))?.[1];
   const stderr = run.stderr.replace(new RegExp(`^${NOTE} .*\r?\n?`, "gm"), "");
   if (run.timedOut) {
     const after = `${Math.round(timeoutMs / 1000)} s`;
     if (!answered) return { error: `no answer within ${after}`, reached: false };
-    // ssh is gone, so the host's `watched` sync stops.
     const tail =
-      action === "status" ? "but sent no report" : "but its run did not finish, so it was stopped";
+      action === "status"
+        ? "but sent no report"
+        : action === "init" && !already
+          ? "but setup did not finish before SSH disconnected and may still be running"
+          : "but its run did not finish, so it was stopped";
     return {
       error: `timed out after ${after} (the host answered, ${tail})`,
       reached: true,
@@ -294,10 +407,20 @@ async function runOnHost(
   }
   const note = run.stdout.match(new RegExp(`^${NOTE} ([\\w-]+)$`, "m"))?.[1];
   if (note !== undefined && Object.hasOwn(HOST_NOTES, note))
-    return { note: note as keyof typeof HOST_NOTES };
+    return { note: note as keyof typeof HOST_NOTES, has };
   // sync --json prints the report last, and exits 1 when a source failed; status prints the file.
-  const report = parseReport(run.stdout);
-  if (report !== undefined) return { report, was, now };
+  // init --json prints its sync's report under "sync", or {"ok": false, "error"} when it stopped.
+  const setUp = action === "init" && !already;
+  const report = parseReport(run.stdout, setUp);
+  if (report !== undefined && "error" in report) return { error: report.error, reached: true };
+  // init exits nonzero when its sync, the hooks or the timer failed: the host is not set up.
+  if (report !== undefined && setUp && run.code !== 0)
+    return {
+      report: report.report,
+      error: initFailure(report.report, run.code, stderr),
+      reached: true,
+    };
+  if (report !== undefined) return { report: report.report, was, now, already };
   if (run.code !== 0)
     return {
       error: (stderr || run.stdout).trim().split("\n").slice(-3).join(" ") || `exit ${run.code}`,
@@ -311,17 +434,38 @@ async function runOnHost(
   };
 }
 
-/** The skillfleet report a host printed, or undefined when its output holds none. */
-function parseReport(stdout: string): unknown {
+/** Why an init that printed its report and exited `code` did not set the host up. */
+function initFailure(report: unknown, code: number | null, stderr: string): string {
+  const why = summarize(report)?.ok === false ? ["its first sync had errors"] : [];
+  if (why.length === 0) {
+    const said = stderr.trim().split("\n").slice(-2).join(" ");
+    if (said) why.push(said);
+  }
+  return `skillfleet init exited ${code ?? "on a signal"}${why.length > 0 ? ` (${why.join("; ")})` : ""}, so the host is not set up`;
+}
+
+/**
+ * The skillfleet report a host printed, or undefined when its output holds none. From `init`, the
+ * report of the sync it ran, or the error it stopped with.
+ */
+function parseReport(
+  stdout: string,
+  init = false,
+): { report: unknown } | { error: string } | undefined {
   const text = stdout.trim();
   const start = text.indexOf("{");
   if (start < 0) return undefined;
+  let raw: unknown;
   try {
-    const raw: unknown = JSON.parse(text.slice(start));
-    return summarize(raw) ? raw : undefined;
+    raw = JSON.parse(text.slice(start));
   } catch {
     return undefined;
   }
+  if (init && isRecord(raw)) {
+    if (raw.ok === false && typeof raw.error === "string") return { error: raw.error };
+    raw = raw.sync;
+  }
+  return summarize(raw) ? { report: raw } : undefined;
 }
 
 /**
@@ -333,10 +477,10 @@ export async function fleet(
   action: FleetAction,
   version: string,
   timeoutMs = 30_000,
-  { dryRun = false } = {},
+  { dryRun = false, setup }: { dryRun?: boolean; setup?: InitSetup } = {},
 ): Promise<HostResult[]> {
   const cache = readCache();
-  const remoteCommand = sshRemoteCommand(action, version, dryRun);
+  const remoteCommand = sshRemoteCommand(action, version, dryRun, setup);
   const results = await Promise.all(
     hosts.map(async (target): Promise<HostResult> => {
       const {
@@ -346,6 +490,7 @@ export async function fleet(
         error,
         cacheKey = host,
         endpoint,
+        initRetryRoute,
         refreshPeer,
       } = typeof target === "string" ? { host: target } : target;
       const lastRun = cache[cacheKey]?.run;
@@ -363,7 +508,54 @@ export async function fleet(
           error: "offline in Tailscale",
           behind: [],
         };
-      const answer = await runOnHost(host, action, remoteCommand, timeoutMs);
+      let verifiedRefresh = refreshPeer;
+      let answer = await runOnHost(host, action, remoteCommand, timeoutMs);
+      if (
+        "note" in answer &&
+        answer.note === "other-manifest" &&
+        setup &&
+        answer.has &&
+        setup.same(answer.has)
+      ) {
+        const retryCommand = sshRemoteCommand("init", version, false, {
+          ...setup,
+          expectedConfig: answer.has,
+        });
+        if (initRetryRoute || refreshPeer) {
+          const retryTarget = await effectiveDestination(
+            host,
+            retryCommand,
+            timeoutMs,
+            Math.min(750, timeoutMs),
+          );
+          const retryEndpoint = retryTarget && endpointKey(retryTarget);
+          const retryRoute = retryTarget && retryRouteKey(retryTarget);
+          if (initRetryRoute && (!retryRoute || retryRoute !== initRetryRoute.key))
+            return {
+              host,
+              ...from,
+              reachable: true,
+              checked: true,
+              lastRun,
+              error: "could not verify an unchanged SSH route to the Tailscale peer for the retry",
+              behind: [],
+            };
+          if (retryEndpoint !== refreshPeer?.endpoint) verifiedRefresh = undefined;
+        }
+        answer = await runOnHost(host, "init", retryCommand, timeoutMs);
+      }
+      const already = "already" in answer && answer.already === true;
+      if ("note" in answer && answer.note === "other-manifest" && setup && answer.has) {
+        return {
+          host,
+          ...from,
+          reachable: true,
+          checked: true,
+          lastRun,
+          error: `it has the manifest ${answer.has}; pass --force to set it up with ${setup.spec}`,
+          behind: [],
+        };
+      }
       // The host answered, but has no report to give.
       if ("note" in answer && answer.note) {
         const note = HOST_NOTES[answer.note];
@@ -378,6 +570,37 @@ export async function fleet(
         };
       }
       const run = "report" in answer ? summarize(answer.report) : undefined;
+      if (run && !dryRun) {
+        if (cacheKey !== host) {
+          const previous = cache[cacheKey];
+          const stableEndpoint = stableCacheKey(cacheKey) ? endpoint : undefined;
+          const known =
+            stableEndpoint && previous?.endpoint === stableEndpoint ? previous.destinations : [];
+          const destinations = stableEndpoint ? [...new Set([host, ...(known ?? [])])] : undefined;
+          cache[cacheKey] = { run, destinations, endpoint: stableEndpoint };
+        } else {
+          cache[host] = { run };
+          if (verifiedRefresh) {
+            const { key, endpoint, taggedHost } = verifiedRefresh;
+            const previous = cache[key];
+            const known = previous?.destinations?.includes(host) || taggedHost;
+            if (known && (!previous || previous.endpoint === endpoint)) {
+              const destinations = new Set(previous?.destinations);
+              destinations.add(host);
+              if (taggedHost) destinations.add(taggedHost);
+              const latest =
+                !previous || Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
+                  ? run
+                  : previous.run;
+              cache[key] = {
+                run: latest,
+                destinations: [...destinations],
+                endpoint,
+              };
+            }
+          }
+        }
+      }
       const before = lastRun?.skillfleet;
       // What the host runs once the upgrade went in, told before its sync, which may still fail.
       const to = ("now" in answer ? answer.now : undefined) || run?.skillfleet;
@@ -390,40 +613,18 @@ export async function fleet(
               },
             }
           : {};
+      if (run && "error" in answer) {
+        return {
+          host,
+          ...from,
+          reachable: true,
+          checked: true,
+          lastRun: run,
+          error: answer.error,
+          behind: [],
+        };
+      }
       if (run) {
-        if (!dryRun) {
-          if (cacheKey !== host) {
-            const previous = cache[cacheKey];
-            const known = endpoint && previous?.endpoint === endpoint ? previous.destinations : [];
-            const destinations = endpoint ? [...new Set([host, ...(known ?? [])])] : undefined;
-            cache[cacheKey] = { run, destinations, endpoint };
-          } else {
-            cache[host] = { run };
-            if (refreshPeer) {
-              const previous = cache[refreshPeer.key];
-              const taggedHost = refreshPeer.taggedHost;
-              if (
-                previous
-                  ? (previous.destinations?.includes(host) || taggedHost) &&
-                    previous.endpoint === refreshPeer.endpoint
-                  : taggedHost
-              ) {
-                const destinations = new Set(previous?.destinations);
-                destinations.add(host);
-                if (taggedHost) destinations.add(taggedHost);
-                const latest =
-                  !previous || Date.parse(run.finishedAt) > Date.parse(previous.run.finishedAt)
-                    ? run
-                    : previous.run;
-                cache[refreshPeer.key] = {
-                  run: latest,
-                  destinations: [...destinations],
-                  endpoint: refreshPeer.endpoint,
-                };
-              }
-            }
-          }
-        }
         return {
           host,
           ...from,
@@ -431,6 +632,7 @@ export async function fleet(
           checked: true,
           lastRun: run,
           ...upgrade,
+          ...(action === "init" && run.ok ? { setup: already ? "already set up" : "set up" } : {}),
           behind: [],
         };
       }
@@ -505,7 +707,7 @@ export function formatFleet(results: readonly HostResult[]): string {
           : result.error
             ? `${result.error}; ${last}`
             : last;
-      return `${result.host}${result.via ? ` (${result.via})` : ""}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
+      return `${result.host}${result.via ? ` (${result.via})` : ""}: ${result.upgrade ? `${upgraded(result.upgrade)}; ` : ""}${result.setup ? `${result.setup}; ` : ""}${state}${result.behind.length ? `; behind: ${result.behind.join("; ")}` : ""}`;
     })
     .join("\n");
 }
@@ -535,6 +737,7 @@ export interface FleetTarget {
   host: string;
   cacheKey?: string;
   endpoint?: string;
+  initRetryRoute?: { key?: string };
   refreshPeer?: { key: string; endpoint: string; taggedHost?: string };
   /** The tag the host came from. */
   via?: string;
@@ -665,6 +868,12 @@ function hostKey(host: string): string {
   return name;
 }
 
+function sshHostKey(host: string): string {
+  const zone = host.indexOf("%");
+  if (zone >= 0 && isIP(host) === 6) return hostKey(host.slice(0, zone)) + host.slice(zone);
+  return isIP(host) ? hostKey(host) : host;
+}
+
 const LOOKUP_ADDRESSES = `
   const { lookup } = require('node:dns');
   const { readFileSync } = require('node:fs');
@@ -749,7 +958,12 @@ async function effectiveDestination(
 type EffectiveDestination = NonNullable<Awaited<ReturnType<typeof effectiveDestination>>>;
 
 function endpointKey({ name, user, port }: EffectiveDestination) {
-  return user && port ? JSON.stringify([hostKey(name), user, port]) : undefined;
+  return user && port ? JSON.stringify([sshHostKey(name), user, port]) : undefined;
+}
+
+function retryRouteKey(target: EffectiveDestination) {
+  const endpoint = endpointKey(target);
+  return endpoint && JSON.stringify([endpoint, target.family]);
 }
 
 const stablePeerKey = (peer: TailscalePeer) => (peer.id ? `tag-peer:id:${peer.id}` : undefined);
@@ -792,11 +1006,23 @@ export async function resolveFleet(
   entries: readonly string[],
   addresses?: (name: string) => Promise<string[]>,
   timeoutMs = 30_000,
-  { action, version, dryRun = false }: FleetInvocation = { action: "status", version: "0.0.0" },
-): Promise<{ targets: FleetTarget[]; warnings: string[] }> {
+  { action, version, dryRun = false, setup }: FleetInvocation = {
+    action: "status",
+    version: "0.0.0",
+  },
+  coveredByTags?: Set<string>,
+): Promise<{ targets: FleetTarget[]; warnings: string[]; enrollment: Map<string, string[]> }> {
   const warnings: string[] = [];
   const tagNames = new Set(entries.filter(isTag).map((entry) => entry.toLowerCase()));
   const explicit = [...new Set(entries.filter((entry) => !isTag(entry)))];
+  const variants = new Map<string, Set<string>>();
+  for (const entry of explicit) {
+    const { machine } = sshTarget(entry);
+    const folded = hostKey(machine);
+    const names = variants.get(folded) ?? new Set<string>();
+    names.add(sshHostKey(machine));
+    variants.set(folded, names);
+  }
   const cachedDestinations = new Set(
     explicit.length
       ? Object.entries(readCache()).flatMap(([key, record]) =>
@@ -812,10 +1038,11 @@ export async function resolveFleet(
       : { peers: [], magicDNS: true };
   const peerOf = new Map<
     string,
-    { peer: TailscalePeer; index: number; user?: string; port?: string }
+    { peer: TailscalePeer; index: number; target: EffectiveDestination }
   >();
   const destination = new Map<TailscalePeer, FleetTarget>();
   const refresh = new Map<string, NonNullable<FleetTarget["refreshPeer"]>>();
+  const aliases = new Map<string, string>();
   if ("peers" in answer) {
     const peers = answer.peers.map((peer, index) => ({
       peer,
@@ -828,9 +1055,12 @@ export async function resolveFleet(
     const budget = Math.min(1500, timeoutMs);
     const probeTimeout = budget / 2;
     const deadline = performance.now() + budget;
-    const remoteCommand = sshRemoteCommand(action, version, dryRun);
+    const remoteCommand = sshRemoteCommand(action, version, dryRun, setup);
     const entriesToProbe = new Set([
       ...(tagged.length ? explicit : probes),
+      ...explicit.filter(
+        (entry) => (variants.get(hostKey(sshTarget(entry).machine))?.size ?? 0) > 1,
+      ),
       ...tagged.flatMap(({ peer, dns, ips }) =>
         peer.online ? [...(dns ? [dns] : []), ...ips] : [],
       ),
@@ -862,11 +1092,12 @@ export async function resolveFleet(
     for (const entry of explicit) {
       const target = effective.get(entry);
       if (!target) continue;
+      const endpoint = endpointKey(target);
+      if (endpoint) aliases.set(entry, endpoint);
       const candidates = peers.filter((candidate) => matches(target, candidate));
       const candidate = candidates.length === 1 ? candidates[0] : undefined;
       if (!candidate) continue;
-      if (tagged.length) peerOf.set(entry, { ...candidate, user: target.user, port: target.port });
-      const endpoint = endpointKey(target);
+      if (tagged.length) peerOf.set(entry, { ...candidate, target });
       const key = stablePeerKey(candidate.peer);
       if (cachedDestinations.has(entry) && candidate.ips.length && key && endpoint)
         refresh.set(entry, { key, endpoint });
@@ -890,38 +1121,87 @@ export async function resolveFleet(
         const target = effective.get(host);
         if (!target || !matches(target, candidate)) continue;
         const endpoint = stableCacheKey(cacheKey) ? endpointKey(target) : undefined;
-        destination.set(peer, { host, cacheKey, endpoint });
+        const initRetryRoute = action === "init" ? { key: retryRouteKey(target) } : undefined;
+        destination.set(peer, {
+          host,
+          cacheKey,
+          endpoint,
+          ...(initRetryRoute && { initRetryRoute }),
+        });
         break;
       }
     }
-    if (!dryRun) {
+    if (!dryRun || coveredByTags) {
       for (const entry of explicit) {
         const candidate = peerOf.get(entry);
         const selected = candidate && destination.get(candidate.peer);
         const target = effective.get(entry);
-        if (!selected?.cacheKey || !selected.endpoint || !target) continue;
-        if (endpointKey(target) !== selected.endpoint) continue;
-        refresh.set(entry, {
-          key: selected.cacheKey,
-          endpoint: selected.endpoint,
-          taggedHost: selected.host,
-        });
+        if (!selected?.cacheKey || selected.error || selected.offline || !target) continue;
+        const taggedTarget = effective.get(selected.host);
+        const { user, port } = sshTarget(entry);
+        if (
+          !user &&
+          !port &&
+          taggedTarget &&
+          endpointKey(taggedTarget) &&
+          target.user === taggedTarget.user &&
+          target.port === taggedTarget.port
+        )
+          coveredByTags?.add(entry);
+        const canRefresh = !dryRun && stableCacheKey(selected.cacheKey);
+        if (canRefresh && selected.endpoint && aliases.get(entry) === selected.endpoint)
+          refresh.set(entry, {
+            key: selected.cacheKey,
+            endpoint: selected.endpoint,
+            taggedHost: selected.host,
+          });
       }
     }
   }
-  const explicitPeers = new Set([...peerOf.values()].map(({ peer }) => peer));
-  const seen = new Set<string>();
+  const explicitPeers = new Map<TailscalePeer, string>();
+  for (const [entry, { peer }] of peerOf) {
+    if (!explicitPeers.has(peer)) explicitPeers.set(peer, entry);
+  }
+  const seen = new Map<string, string>();
+  const enrollment = new Map<string, string[]>();
+  const enroll = (host: string, entry: string) => {
+    const known = enrollment.get(host);
+    if (known) known.push(entry);
+    else enrollment.set(host, [entry]);
+  };
   const targets: FleetTarget[] = [];
   for (const entry of entries) {
     if (!isTag(entry)) {
       const target = sshTarget(entry);
       const peer = peerOf.get(entry);
-      const name = isIP(target.machine) === 6 ? hostKey(target.machine) : target.machine;
-      const machine = peer ? `peer:${peer.index}` : `host:${name}`;
-      const key = [machine, target.user, target.port, peer?.user, peer?.port].join("\0");
-      const refreshPeer = refresh.get(entry);
-      if (!seen.has(key)) targets.push({ host: entry, ...(refreshPeer ? { refreshPeer } : {}) });
-      seen.add(key);
+      const endpoint = aliases.get(entry);
+      const machine = peer
+        ? `peer:${peer.index}`
+        : endpoint
+          ? `endpoint:${endpoint}`
+          : `host:${sshHostKey(target.machine)}`;
+      const key = [machine, target.user, target.port, peer?.target.user, peer?.target.port].join(
+        "\0",
+      );
+      const existing = seen.get(key);
+      if (!existing) {
+        const refreshPeer = refresh.get(entry);
+        const effectiveTarget = peer?.target;
+        const initRetryRoute =
+          action === "init" &&
+          peer &&
+          explicitPeers.get(peer.peer) === entry &&
+          destination.has(peer.peer)
+            ? { key: effectiveTarget && retryRouteKey(effectiveTarget) }
+            : undefined;
+        targets.push({
+          host: entry,
+          ...(refreshPeer && { refreshPeer }),
+          ...(initRetryRoute && { initRetryRoute }),
+        });
+        seen.set(key, entry);
+      }
+      enroll(existing ?? entry, entry);
       continue;
     }
     if ("error" in answer) {
@@ -941,10 +1221,94 @@ export async function resolveFleet(
         continue;
       }
       const id = `tag:${selected.cacheKey}`;
-      if (explicitPeers.has(peer) || seen.has(id)) continue;
-      seen.add(id);
+      const existing = explicitPeers.get(peer) ?? seen.get(id);
+      enroll(existing ?? selected.host, entry);
+      if (existing) continue;
+      seen.set(id, selected.host);
       targets.push({ ...selected, via: entry });
     }
   }
-  return { targets, warnings };
+  return { targets, warnings, enrollment };
+}
+
+/**
+ * The entries of `wanted` that `entries`, a manifest's fleet, does not cover yet: a host not named
+ * there and, unless it names a user or a port, not on the tailnet under one of its tags; and a tag
+ * not there. Tailscale is asked only when it could matter; when it can't say, a tag covers nothing.
+ */
+export async function notInFleet(
+  entries: readonly string[],
+  wanted: readonly string[],
+  timeoutMs = 30_000,
+  invocation: FleetInvocation = { action: "status", version: "0.0.0" },
+): Promise<string[]> {
+  const key = (entry: string) => {
+    const { machine, user, port } = sshTarget(entry);
+    return [sshHostKey(machine), user, port].join("\0");
+  };
+  const bare = (entry: string) => {
+    const { user, port } = sshTarget(entry);
+    return !user && !port;
+  };
+  const names = entries.filter((entry) => !isTag(entry));
+  const named = new Set(names.map(key));
+  const selectors = entries.filter(isTag);
+  const tags = new Set(selectors.map((tag) => tag.toLowerCase()));
+  const candidates = wanted.filter((entry) => !isTag(entry) && !named.has(key(entry)));
+  const tagged = new Set<string>();
+  if (selectors.length && candidates.some(bare))
+    await resolveFleet(
+      [...selectors, ...candidates.filter(bare)],
+      undefined,
+      timeoutMs,
+      { ...invocation, dryRun: true },
+      tagged,
+    );
+  const endpoints = new Map<string, Promise<string | undefined>>();
+  const endpoint = (entry: string) => {
+    let pending = endpoints.get(entry);
+    if (!pending) {
+      const remoteCommand = sshRemoteCommand(
+        invocation.action,
+        invocation.version,
+        invocation.dryRun ?? false,
+        invocation.setup,
+      );
+      pending = effectiveDestination(
+        entry,
+        remoteCommand,
+        timeoutMs,
+        Math.min(750, timeoutMs),
+      ).then((target) => (target ? endpointKey(target) : undefined));
+      endpoints.set(entry, pending);
+    }
+    return pending;
+  };
+  const compare = async (entry: string, others: string[]) => {
+    if (!others.length) return false;
+    const actual = await endpoint(entry);
+    return actual !== undefined && (await Promise.all(others.map(endpoint))).includes(actual);
+  };
+  const missing: string[] = [];
+  for (const entry of wanted) {
+    if (isTag(entry)) {
+      const tag = entry.toLowerCase();
+      if (!tags.has(tag)) missing.push(entry);
+      tags.add(tag);
+      continue;
+    }
+    if (named.has(key(entry)) || tagged.has(entry)) continue;
+    const { machine, user, port } = sshTarget(entry);
+    const variants = names.filter((name) => {
+      const other = sshTarget(name);
+      return (
+        user === other.user && port === other.port && hostKey(machine) === hostKey(other.machine)
+      );
+    });
+    if (await compare(entry, variants)) continue;
+    missing.push(entry);
+    names.push(entry);
+    named.add(key(entry));
+  }
+  return missing;
 }

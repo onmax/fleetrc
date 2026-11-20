@@ -1,7 +1,41 @@
 // schema.json documents the manifest for editors; the parser is what enforces it. They must agree.
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { parseManifest } from "../src/manifest.ts";
+import { loadManifest, parseManifest } from "../src/manifest.ts";
+
+it("limits root hook globs without dropping sources from extensions that ignore those hooks", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "skillfleet-hook-globs-"));
+  try {
+    const root = join(dir, "root.json");
+    const team = join(dir, "team.json");
+    writeFileSync(root, JSON.stringify({ extends: ["./team.json"] }));
+    writeFileSync(
+      team,
+      JSON.stringify({
+        extends: ["./nested.json"],
+        sources: [{ id: "team", npm: "team-skills" }],
+        hooks: [{ run: "true", on: [`*:${"?".repeat(8193)}`] }],
+      }),
+    );
+    writeFileSync(
+      join(dir, "nested.json"),
+      JSON.stringify({ sources: [{ id: "nested", npm: "nested-skills" }] }),
+    );
+
+    const loaded = await loadManifest(root, { offline: true });
+    expect(loaded.sources.map((source) => source.id)).toEqual(["team", "nested"]);
+    expect(loaded.root.hooks).toEqual([]);
+    expect(loaded.failed).toEqual([]);
+    expect(loaded.warnings).toEqual([expect.stringContaining("ignored hooks")]);
+    await expect(loadManifest(team, { offline: true })).rejects.toThrow(
+      /hooks\[0\]\.on\[0\].*8192/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 interface Schema {
   properties: Record<string, unknown> & {

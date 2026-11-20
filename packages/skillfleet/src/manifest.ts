@@ -10,11 +10,13 @@ import {
 import { isIPv4 } from "node:net";
 import { hostname, networkInterfaces, tmpdir } from "node:os";
 import { basename, dirname, join, normalize, sep } from "node:path";
+import { distance } from "fastest-levenshtein";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
 import { fetchClone, gitUrl, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
 import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
+import { MAX_GLOB_LENGTH, splitHookPattern } from "./glob.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
 import { registryUrl, urlOrigin } from "./npm.ts";
@@ -187,6 +189,8 @@ function optionalString(file: string, at: string, value: unknown): string | unde
 function skillsGlob(file: string, at: string, value: unknown): string | undefined {
   const glob = optionalString(file, at, value);
   if (glob === undefined) return undefined;
+  if (glob.length > MAX_GLOB_LENGTH)
+    fail(file, at, `must not exceed ${MAX_GLOB_LENGTH} UTF-16 code units`);
   if (/^[/\\]|^[A-Za-z]:/.test(glob)) fail(file, at, `"${glob}" must be relative to the source`);
   if (glob.split(/[/\\]/).includes("..")) fail(file, at, `"${glob}" must not leave the source`);
   return glob;
@@ -300,20 +304,6 @@ export const agentIds = () => getSupportedAgents().map((agent) => agent.id);
 
 /** The one of `known` closest to a mistyped `word`, or undefined when none is close. */
 export function closest(word: string, known: readonly string[]): string | undefined {
-  const distance = (a: string, b: string) => {
-    let row = Array.from({ length: b.length + 1 }, (_, i) => i);
-    for (let i = 1; i <= a.length; i++) {
-      const next = [i];
-      for (let j = 1; j <= b.length; j++)
-        next[j] = Math.min(
-          row[j]! + 1,
-          next[j - 1]! + 1,
-          row[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
-        );
-      row = next;
-    }
-    return row[b.length]!;
-  };
   const best = known
     .map((candidate) => ({ candidate, score: distance(word.toLowerCase(), candidate) }))
     .sort((a, b) => a.score - b.score)[0];
@@ -347,7 +337,11 @@ function extendsList(file: string, value: unknown): Extends[] {
 }
 
 /** Validates a manifest file's JSON. `base` resolves relative paths. */
-export function parseManifest(file: string, raw: unknown, base = dirname(file)): Manifest {
+export function parseManifest(
+  file: string,
+  raw: unknown,
+  { base = dirname(file), extended = false } = {},
+): Manifest {
   if (!isRecord(raw)) fail(file, "the manifest", "must be a JSON object");
   for (const key of Object.keys(raw))
     if (!ROOT_KEYS.has(key)) fail(file, key, "is not a manifest field");
@@ -406,10 +400,20 @@ export function parseManifest(file: string, raw: unknown, base = dirname(file)):
     const run =
       optionalString(file, `hooks[${i}].run`, hook.run) ??
       fail(file, `hooks[${i}].run`, "is required");
+    const on = stringList(file, `hooks[${i}].on`, hook.on) ?? ["*:**"];
+    if (!extended) {
+      for (const [index, pattern] of on.entries())
+        if (splitHookPattern(pattern).glob.length > MAX_GLOB_LENGTH)
+          fail(
+            file,
+            `hooks[${i}].on[${index}]`,
+            `glob exceeds ${MAX_GLOB_LENGTH} UTF-16 code units`,
+          );
+    }
     return {
       name: optionalString(file, `hooks[${i}].name`, hook.name) ?? run,
       run,
-      on: stringList(file, `hooks[${i}].on`, hook.on) ?? ["*:**"],
+      on,
     };
   });
   let report: Manifest["report"];
@@ -603,6 +607,67 @@ export function canonicalManifestSpec(spec: string): string {
   const remote = remoteManifest(spec);
   if (remote?.ref) return spec;
   return remote ? `${remote.repo}//${remote.path}` : expandPath(spec);
+}
+
+/**
+ * Why another machine can't init with the manifest `spec`, or undefined when it can: the manifest
+ * must be in a repository on another machine, not in a file, folder or repository on this one.
+ */
+export function sharedManifestProblem(spec: string): string | undefined {
+  const remote = remoteManifest(spec);
+  if (remote && isRemoteGit(remote.repo)) return undefined;
+  return `the manifest is ${spec}, on this machine, which other machines can't read; push it to a repository and run \`skillfleet init <repository>\` with that`;
+}
+
+/**
+ * `spec`, a manifest in a repository, as another machine is to read it from any folder: GitHub's
+ * `owner/repo` shorthand becomes `github:owner/repo`, which no path there can stand for, and the
+ * file is named. A GitHub or GitLab link that pins a branch stays the link, the one form that keeps
+ * the branch; `gitlab:` and git URLs already name the repository.
+ */
+export function hostManifestSpec(spec: string): string {
+  const remote = remoteManifest(spec);
+  if (!remote || remote.ref) return spec;
+  const shorthand = !remote.repo.startsWith(".") && /^[\w.-]+\/[\w.-]+$/.test(remote.repo);
+  return `${shorthand ? `github:${remote.repo}` : remote.repo}//${remote.path}`;
+}
+
+/**
+ * Whether two manifest specs surely name the same file in the same repository: the same host, in
+ * any case, and the same path, in the same case, since a server may tell `Docs.git` from
+ * `docs.git`. `owner/repo`, `github:`, an https link and `git@github.com:` are one repository on
+ * GitHub, as are their GitLab forms; on another host an scp-style `host:path` and a URL path may
+ * differ, so they don't match. When in doubt, two specs are not the same.
+ */
+export function sameManifest(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [x, y] = [remoteManifest(a), remoteManifest(b)];
+  if (!x || !y) return false;
+  const [rx, ry] = [repoIdentity(x.repo), repoIdentity(y.repo)];
+  const file = (path: string) => path.replace(/^\/+|\/+$/g, "");
+  return rx !== undefined && rx === ry && file(x.path) === file(y.path) && x.ref === y.ref;
+}
+
+/** Hosts where an scp-style `host:owner/repo` and `https://host/owner/repo` are one repository. */
+const FORGES = new Set(["github.com", "gitlab.com"]);
+
+/**
+ * A repository identity for `sameManifest`. Only known forges normalize repository suffixes or
+ * equate different transports. Elsewhere the account, transport and exact path matter.
+ */
+function repoIdentity(spec: string): string | undefined {
+  const url = gitUrl(spec);
+  const scheme = url.match(/^(https?|ssh|git|git\+ssh|ssh\+git):\/\/(?:([^@/]*)@)?([^/]+)(\/.*)$/i);
+  const scp = scheme ? undefined : url.match(/^(?:([^@/:]+)@)?([^/:]+):(?!\/\/)(.+)$/);
+  if (!scheme && !scp) return undefined;
+  const [, user, authority, path] = scheme ? scheme.slice(1) : scp!;
+  const host = authority!.toLowerCase();
+  // `https://host:443` and `ssh://host:22` stay apart from the bare host: a port is not guessed.
+  const forge = host.replace(/^www\./, "");
+  if (FORGES.has(forge)) return `${forge}/${path!.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "")}`;
+  return scheme
+    ? `${scheme[1]!.toLowerCase()}://${user ?? ""}@${host}${path}`
+    : `${user === undefined ? "" : `${user}@`}${host}:${path}`;
 }
 
 interface LocateOptions {
@@ -905,7 +970,10 @@ async function teamSourceProblem(source: VendoredSource): Promise<string | undef
 }
 
 /** Reads and validates a manifest file; `prepare` may change its JSON first. */
-function readManifestFile(file: string, prepare?: (raw: unknown) => void): Manifest {
+function readManifestFile(
+  file: string,
+  { extended = false, prepare }: { extended?: boolean; prepare?: (raw: unknown) => void } = {},
+): Manifest {
   if (!existsSync(file)) throw new ManifestError(`${file}: no such manifest`);
   let raw: unknown;
   try {
@@ -914,7 +982,7 @@ function readManifestFile(file: string, prepare?: (raw: unknown) => void): Manif
     throw new ManifestError(`${file}: ${(error as Error).message}`);
   }
   prepare?.(raw);
-  return parseManifest(file, raw);
+  return parseManifest(file, raw, { extended });
 }
 
 /** Fields a source may set only in the root manifest, which an extended one's sources lose. */
@@ -1015,22 +1083,25 @@ export async function loadManifest(
         let team: Manifest;
         let ignoredFleet = false;
         try {
-          team = readManifestFile(at.file, (raw) => {
-            if (!isRecord(raw)) return;
-            ignoredFleet =
-              raw.fleet !== undefined && (!Array.isArray(raw.fleet) || raw.fleet.length > 0);
-            delete raw.fleet;
-            if (!Array.isArray(raw.sources)) return;
-            for (const [i, source] of raw.sources.entries()) {
-              if (!isRecord(source)) continue;
-              for (const key of ROOT_ONLY_SOURCE_KEYS) {
-                if (source[key] === undefined) continue;
-                delete source[key];
-                warnings.push(
-                  `extends ${parent}: ignored "${key}" of source "${typeof source.id === "string" ? source.id : `sources[${i}]`}"; only the root manifest can follow links out of a source`,
-                );
+          team = readManifestFile(at.file, {
+            extended: true,
+            prepare: (raw) => {
+              if (!isRecord(raw)) return;
+              ignoredFleet =
+                raw.fleet !== undefined && (!Array.isArray(raw.fleet) || raw.fleet.length > 0);
+              delete raw.fleet;
+              if (!Array.isArray(raw.sources)) return;
+              for (const [i, source] of raw.sources.entries()) {
+                if (!isRecord(source)) continue;
+                for (const key of ROOT_ONLY_SOURCE_KEYS) {
+                  if (source[key] === undefined) continue;
+                  delete source[key];
+                  warnings.push(
+                    `extends ${parent}: ignored "${key}" of source "${typeof source.id === "string" ? source.id : `sources[${i}]`}"; only the root manifest can follow links out of a source`,
+                  );
+                }
               }
-            }
+            },
           });
         } catch (error) {
           warnings.push(`extends ${parent}: ${(error as Error).message}`);

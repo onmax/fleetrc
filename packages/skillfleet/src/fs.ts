@@ -1,4 +1,3 @@
-import { createHash, randomBytes } from "node:crypto";
 import {
   appendFileSync,
   constants,
@@ -66,8 +65,11 @@ export function listFiles(dir: string): string[] {
   return files;
 }
 
+/** node:crypto, loaded on first use: the session hook and `list --json` never hash. */
+const crypto = () => process.getBuiltinModule("node:crypto");
+
 export const sha256 = (data: string | Uint8Array) =>
-  createHash("sha256").update(data).digest("hex");
+  crypto().createHash("sha256").update(data).digest("hex");
 
 /** Whether `path` is `root` or inside it. */
 export const inside = (root: string, path: string) => {
@@ -490,7 +492,7 @@ export function tempOwner(): string {
 
 /** The temporary file `writeJson` writes `path` through. */
 export function jsonTemp(path: string, pid = process.pid): string {
-  return `${path}.${tempOwner()}.${pid}.${randomBytes(6).toString("hex")}.tmp`;
+  return `${path}.${tempOwner()}.${pid}.${crypto().randomBytes(6).toString("hex")}.tmp`;
 }
 
 /** Who wrote a temporary file named by `jsonTemp`, or undefined for any other name. */

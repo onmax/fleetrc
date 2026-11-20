@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { isRecord, readJsonOrNothing } from "./fs.ts";
 
 export const claudeHome = () => process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude");
 
@@ -33,19 +34,22 @@ export function configDir(): string {
   return join(homedir(), ".config", "skillfleet");
 }
 
+function stateOverride(): string | undefined {
+  const xdg = xdgDir("XDG_STATE_HOME");
+  if (xdg) return xdg;
+  return (process.platform === "win32" && process.env.LOCALAPPDATA) || undefined;
+}
+
 /** Per-machine state: XDG state, else %LOCALAPPDATA% on Windows, else ~/.local/state. */
 export function stateDir(): string {
-  const env = process.env;
-  const xdg = xdgDir("XDG_STATE_HOME");
-  if (xdg) return join(xdg, "skillfleet");
-  if (process.platform === "win32" && env.LOCALAPPDATA) return join(env.LOCALAPPDATA, "skillfleet");
-  return join(homedir(), ".local", "state", "skillfleet");
+  return join(stateOverride() ?? join(homedir(), ".local", "state"), "skillfleet");
 }
 
 export const paths = {
   config: () => join(configDir(), "config.json"),
   state: () => join(stateDir(), "state.json"),
   lastRun: () => join(stateDir(), "last-run.json"),
+  initPending: () => join(stateDir(), "init-pending"),
   fleet: () => join(stateDir(), "fleet.json"),
   /** Claude Code sessions, one record each (sessions.ts). */
   sessions: () => join(stateDir(), "sessions"),
@@ -63,3 +67,23 @@ export const paths = {
   /** The environment a sync started by a session hook runs with, saved by `hook install`. */
   hookEnv: () => join(stateDir(), "hook-env.json"),
 };
+
+/** The variables that place skillfleet's config and state folders (paths.ts). */
+const PLACES = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"] as const;
+
+/**
+ * Where skillfleet was installed, for an agent whose environment lacks the installing shell's
+ * XDG_CONFIG_HOME or XDG_STATE_HOME. Hooks and the launcher run the installed copy, `<state>/app/cli.mjs`, so
+ * its own path names the state folder; the hook-env.json `hook install` saved there has the
+ * variables that place the config and state folders, which this process takes before it looks.
+ * Run from anywhere else (npx, a checkout), it keeps its own environment.
+ */
+export function adoptInstalledPlaces() {
+  const script = process.argv[1];
+  if (!script || basename(script) !== "cli.mjs" || basename(dirname(script)) !== "app") return;
+  const saved = readJsonOrNothing(join(dirname(dirname(script)), "hook-env.json"));
+  if (!isRecord(saved)) return;
+  for (const key of PLACES)
+    if (typeof saved[key] === "string") process.env[key] = saved[key];
+    else delete process.env[key];
+}

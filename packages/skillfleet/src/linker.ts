@@ -125,7 +125,7 @@ export function linkTarget(path: string): string {
  * The same folder, also when one path reaches it another way: a Windows 8.3 name
  * (C:\Users\RUNNER~1), a subst drive or a link. A path that does not exist compares as written.
  */
-function samePath(a: string, b: string): boolean {
+export function samePath(a: string, b: string): boolean {
   const same = (x: string, y: string) =>
     process.platform === "win32" ? x.toLowerCase() === y.toLowerCase() : x === y;
   if (same(resolve(a), resolve(b))) return true;
