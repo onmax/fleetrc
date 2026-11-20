@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { isRecord, readJsonOrNothing } from "./fs.ts";
@@ -34,24 +35,23 @@ export function configDir(): string {
   return join(homedir(), ".config", "skillfleet");
 }
 
-function stateOverride(): string | undefined {
-  const xdg = xdgDir("XDG_STATE_HOME");
-  if (xdg) return xdg;
-  return (process.platform === "win32" && process.env.LOCALAPPDATA) || undefined;
-}
-
 function installedStateDir(): string | undefined {
   const script = process.argv[1];
   if (script && basename(script) === "cli.mjs" && basename(dirname(script)) === "app")
     return dirname(dirname(script));
 }
 
-/** Per-machine state: XDG state, %LOCALAPPDATA% on Windows, the installed copy, then ~/.local/state. */
+/** Per-machine state: explicit XDG state, existing Windows state or the installed copy, then the platform default. */
 export function stateDir(): string {
-  const override = stateOverride();
-  return override
-    ? join(override, "skillfleet")
-    : (installedStateDir() ?? join(homedir(), ".local", "state", "skillfleet"));
+  const xdg = xdgDir("XDG_STATE_HOME");
+  if (xdg) return join(xdg, "skillfleet");
+  const installed = installedStateDir();
+  const appData = process.platform === "win32" && process.env.LOCALAPPDATA;
+  if (appData) {
+    const local = join(appData, "skillfleet");
+    return !installed || existsSync(local) ? local : installed;
+  }
+  return installed ?? join(homedir(), ".local", "state", "skillfleet");
 }
 
 export const paths = {

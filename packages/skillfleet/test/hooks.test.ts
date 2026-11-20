@@ -996,7 +996,7 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(existsSync(m.at(".local", "state", "skillfleet"))).toBe(false);
   });
 
-  it("lists installed state without an override and syncs and lists under an explicit override", async () => {
+  it("syncs and lists installed state while honoring explicit and existing Windows state", async () => {
     const m = machine();
     const mine = join(m.root, "mine");
     writeFiles(mine, { "skills/first/SKILL.md": skillMd("first") });
@@ -1028,23 +1028,26 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(run("list")).toContain("first");
 
     writeFiles(mine, { "skills/second/SKILL.md": skillMd("second") });
-    caller.XDG_STATE_HOME = join(m.root, "alternate");
     run("sync");
     expect(names(run("list", "--json"))).toEqual(["first", "second"]);
-    expect(names(run("--json", "list"))).toEqual(["first", "second"]);
-    expect(run("list")).toContain("second");
+    expect(existsSync(join(caller.LOCALAPPDATA, "skillfleet"))).toBe(false);
+
+    writeFiles(mine, { "skills/third/SKILL.md": skillMd("third") });
+    caller.XDG_STATE_HOME = caller.LOCALAPPDATA;
+    expect(names(run("list", "--json"))).toEqual([]);
+    run("sync");
+    expect(names(run("list", "--json"))).toEqual(["first", "second", "third"]);
+    expect(names(run("--json", "list"))).toEqual(["first", "second", "third"]);
+    expect(run("list")).toContain("third");
     delete caller.XDG_STATE_HOME;
     if (isWindows) {
-      run("sync");
-      expect(names(run("list", "--json"))).toEqual(["first", "second"]);
-      expect(names(run("--json", "list"))).toEqual(["first", "second"]);
-      expect(run("list")).toContain("second");
+      expect(names(run("list", "--json"))).toEqual(["first", "second", "third"]);
       caller.XDG_STATE_HOME = join(m.root, "uninitialized");
       expect(names(run("list", "--json"))).toEqual([]);
       delete caller.XDG_STATE_HOME;
     }
     delete caller.LOCALAPPDATA;
-    expect(names(run("list", "--json"))).toEqual(["first"]);
+    expect(names(run("list", "--json"))).toEqual(["first", "second"]);
     // The installed copy keeps node's compile cache beside itself, and nowhere else.
     expect(existsSync(join(state, "app", "compile"))).toBe(true);
     expect(existsSync(m.at(".cache"))).toBe(false);

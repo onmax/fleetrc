@@ -708,7 +708,7 @@ process.exit(255);`,
     expect(tagged).toEqual({
       targets: [{ host: "laptop" }],
       warnings: ["tag:servers matches no machine on your tailnet besides this one"],
-      enrollment: new Map([["laptop", ["laptop"]]]),
+      enrollment: new Map([["laptop", [{ host: "laptop" }]]]),
     });
     rmSync(join(m.root, "tailscale-ran"));
     await withTailscale(program, () => resolveFleet(["laptop"]));
@@ -1299,7 +1299,7 @@ describe.skipIf(isWindows)("fleet init", () => {
   });
 
   it.skipIf(process.platform !== "linux")(
-    "rejects fleet setup without its requested timer",
+    "rejects fleet setup and a flagless retry without its requested timer",
     async () => {
       const { m, fleetIn } = await controller([], { scheduler: "absent" });
       const env = initShims(m, { vps2: join(m.root, "vps2") });
@@ -1320,6 +1320,14 @@ describe.skipIf(isWindows)("fleet init", () => {
         error: expect.stringContaining("this machine has no systemd user manager"),
       });
       expect.soft(host).not.toHaveProperty("setup");
+      const retry = await m.runWith({ env }, "fleet", "init", "vps2", "--json");
+      expect.soft(retry.code, retry.stdout + retry.stderr).toBe(1);
+      expect.soft(JSON.parse(retry.stdout)).toEqual([
+        expect.objectContaining({
+          error: expect.stringContaining("this machine has no systemd user manager"),
+        }),
+      ]);
+      expect.soft(npxCalls(m)).toHaveLength(2);
       expect(fleetIn()).toEqual([]);
     },
   );
@@ -1436,6 +1444,19 @@ describe.skipIf(isWindows)("fleet init", () => {
       ...initShims(m, { "web.invalid": join(m.root, "web") }, { "web.invalid": "100.64.0.5" }),
       SKILLFLEET_TAILSCALE: fakeTailscale(m.root, status([active, offline, broken])),
     };
+    const preview = await m.runWith(
+      { env },
+      "fleet",
+      "init",
+      "tag:servers",
+      "tag:broken",
+      "tag:ready",
+      "web.invalid",
+      "--dry-run",
+    );
+    expect.soft(preview.code, preview.stdout + preview.stderr).toBe(0);
+    expect.soft(preview.stdout).toContain("would add tag:ready, web.invalid to the fleet");
+    expect.soft(fleetIn()).toEqual([]);
     const run = await m.runWith(
       { env },
       "fleet",
@@ -1456,6 +1477,33 @@ describe.skipIf(isWindows)("fleet init", () => {
     );
     expect(run.stderr).toContain("tag:broken: skipped a machine");
     expect(fleetIn()).toEqual(["tag:ready", "web.invalid"]);
+  });
+
+  it("does not use a successful alias as setup for an unrelated peer with the same name", async () => {
+    const { m, fleetIn } = await controller();
+    const host = "web.invalid";
+    const env = {
+      ...initShims(m, { [host]: join(m.root, "alias") }, { [host]: "100.64.0.6" }),
+      SKILLFLEET_TAILSCALE: fakeTailscale(
+        m.root,
+        status([peer(host, ["tag:servers"], { ips: ["100.64.0.5"], online: false })]),
+      ),
+    };
+    const run = await m.runWith(
+      { env },
+      "fleet",
+      "init",
+      "tag:servers",
+      host,
+      "--no-hooks",
+      "--json",
+    );
+    expect(run.code, run.stdout + run.stderr).toBe(1);
+    expect(JSON.parse(run.stdout)).toMatchObject([
+      { host, via: "tag:servers", error: "offline in Tailscale" },
+      { host, setup: "set up" },
+    ]);
+    expect(fleetIn()).toEqual([host]);
   });
 
   it("retains tagged peer reports across init errors and offline status", async () => {
