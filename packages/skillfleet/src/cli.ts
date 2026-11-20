@@ -58,6 +58,7 @@ import {
   hostManifestSpec,
   sameManifest,
   sharedManifestProblem,
+  tailnetManifestSpec,
   updateConfig,
   webPage,
 } from "./manifest.ts";
@@ -626,7 +627,9 @@ async function status() {
     });
     return 0;
   }
-  say(`manifest: ${config?.manifest ?? "none; run `skillfleet init <manifest>`"}`);
+  say(
+    `manifest: ${config?.manifest ?? "none; run `skillfleet init <manifest>`"}${config?.tailscale ? " (from the tailnet policy)" : ""}`,
+  );
   if (!report) say("no sync has run on this machine yet");
   else
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
@@ -950,11 +953,24 @@ function pendingInitTimer(path: string): boolean {
 async function init() {
   if (rest.length > 1) usage("init takes one manifest");
   copyMode();
-  const given = rest[0] ?? values.manifest ?? readConfig()?.manifest;
-  if (!given)
-    usage(
-      "init needs a manifest: a path, a repository such as owner/repo (its .skillfleet/manifest.json), or <repo>//<file> such as github:org/agents//team.json",
-    );
+  const config = readConfig();
+  const named = rest[0] ?? values.manifest;
+  // With no manifest, a new machine, or one that took its manifest from the tailnet, asks the tailnet.
+  const fromTailnet = named === "tailscale:" || (!named && (!config || config.tailscale === true));
+  let given = fromTailnet ? undefined : (named ?? config?.manifest);
+  if (fromTailnet) {
+    const found = await tailnetManifestSpec();
+    if ("spec" in found) given = found.spec;
+    else if (named) throw new UserError(found.error);
+    else if (config) {
+      given = config.manifest;
+      say(`skillfleet: keeping ${given}: ${found.error}`);
+    } else
+      usage(
+        `init needs a manifest: a path, a repository such as owner/repo (its .skillfleet/manifest.json), or <repo>//<file> such as github:org/agents//team.json; with none, it asks the tailnet policy, but ${found.error}`,
+      );
+  }
+  if (!given) throw new UserError("init needs a manifest");
   const pending = paths.initPending();
   const withTimer = pendingInitTimer(pending) || timerWanted();
   const withHooks = !values["no-hooks"];
@@ -986,6 +1002,9 @@ async function init() {
   mkdirSync(dirname(pending), { recursive: true });
   writeFileSync(pending, withTimer ? "timer\n" : "");
   const applied = [...(await cloneBeforeAdopt(plan)), ...applyPlan(plan)];
+  updateConfig({ tailscale: fromTailnet || undefined });
+  if (fromTailnet)
+    applied.push("the manifest is the one the tailnet policy names; each sync asks again");
   say(...applied.map((line) => `  ${line}`));
   // init installs the timer from the manifest next, so the sync need not say it differs.
   const report = await syncReport({ skipTimerCheck: withTimer });

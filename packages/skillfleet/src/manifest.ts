@@ -21,6 +21,7 @@ import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
 import { registryUrl, urlOrigin } from "./npm.ts";
 import { expandPath, paths, tildify } from "./paths.ts";
+import { tailscaleManifest } from "./tailscale.ts";
 import { cronProblem, timeZoneProblem } from "./timer.ts";
 
 export type UpdateMode = "auto" | "review";
@@ -457,6 +458,8 @@ export interface Config {
   copy?: boolean;
   /** True once this machine has the timer (`init --timer`, `timer install`); false after `timer remove`. */
   timer?: boolean;
+  /** True when `manifest` came from the tailnet policy (`init` with no manifest), which each sync asks again. */
+  tailscale?: boolean;
 }
 
 export function readConfig(): Config | undefined {
@@ -464,13 +467,14 @@ export function readConfig(): Config | undefined {
   if (raw === undefined) return undefined;
   if (!isRecord(raw) || typeof raw.manifest !== "string")
     throw new ManifestError(`${paths.config()}: needs a "manifest" string`);
-  for (const key of ["copy", "timer"] as const)
+  for (const key of ["copy", "timer", "tailscale"] as const)
     if (raw[key] !== undefined && typeof raw[key] !== "boolean")
       throw new ManifestError(`${paths.config()}: "${key}" must be true or false`);
   return {
     manifest: raw.manifest,
     ...(raw.copy === undefined ? {} : { copy: raw.copy as boolean }),
     ...(raw.timer === undefined ? {} : { timer: raw.timer as boolean }),
+    ...(raw.tailscale === undefined ? {} : { tailscale: raw.tailscale as boolean }),
   };
 }
 
@@ -630,6 +634,21 @@ export function hostManifestSpec(spec: string): string {
   if (!remote || remote.ref) return spec;
   const shorthand = !remote.repo.startsWith(".") && /^[\w.-]+\/[\w.-]+$/.test(remote.repo);
   return `${shorthand ? `github:${remote.repo}` : remote.repo}//${remote.path}`;
+}
+
+/**
+ * The manifest the tailnet policy names for this machine, as config.json keeps it, or why there is
+ * none. It must be in a repository: `owner/repo` means GitHub's, never a folder of that name here.
+ */
+export async function tailnetManifestSpec(): Promise<{ spec: string } | { error: string }> {
+  const found = await tailscaleManifest();
+  if ("error" in found) return found;
+  const spec = found.manifest.startsWith("-") ? undefined : hostManifestSpec(found.manifest);
+  if (!spec || sharedManifestProblem(spec))
+    return {
+      error: `the tailnet policy names the manifest ${found.manifest}, which is not in a repository; name one such as owner/repo or github:owner/repo//<file>`,
+    };
+  return { spec: canonicalManifestSpec(spec) };
 }
 
 /**

@@ -62,6 +62,18 @@ skillfleet connects over SSH and runs `npx skillfleet init` there with the same 
 
 With Tailscale, tag the server and run `skillfleet fleet init tag:servers`: every machine with the tag gets set up, and `fleet` gets `tag:servers`, so the next server you tag is in the fleet too. A machine that already has the manifest only syncs, unless you pass an option for its `init`, such as `--timer`. One that has another manifest, or the same repository spelled in a way skillfleet can't be sure of, is left alone unless you pass `--force`. Hosts install the version of skillfleet you run; to set them up with a preview build, set `SKILLFLEET_PACKAGE` to what npx should install, such as a pkg.pr.new URL or a tarball path on the host.
 
+### Or take the manifest from your tailnet
+
+On Tailscale, your tailnet policy can name the manifest once for all your machines. Add this to the policy in the admin console:
+
+```jsonc
+"nodeAttrs": [
+  { "target": ["*"], "app": { "github.com/onmax/skillfleet": [{ "manifest": "me/skills" }] } },
+],
+```
+
+Then a bare `npx skillfleet init` on any of them uses that manifest. Each sync asks Tailscale again, so when you change it in the policy, every machine follows. If Tailscale can't answer, the machine keeps its last manifest and the sync says why. The value must name a repository, such as `me/skills` or `github:me/skills//<file>`. `init <manifest>` with a manifest of its own stops following the tailnet. Git stays the way your manifest itself gets to each machine; Tailscale only says where it is.
+
 ### Commands
 
 `skillfleet <command> --help` prints a command's options. Commands that read the manifest take `--manifest <m>` to use another one than the one `init` configured.
@@ -69,7 +81,7 @@ With Tailscale, tag the server and run `skillfleet fleet init tag:servers`: ever
 | Command                                 | What it does                                                                                                                                                                                                                                                                                                                                                                                     |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `sync [source]`                         | Fetches every source, or only `source`, and links the skills. Plain `skillfleet` runs it.                                                                                                                                                                                                                                                                                                        |
-| `init [manifest]`                       | Configures the manifest (a repo or folder's `.skillfleet/manifest.json`), moves aside or adopts what the agent folders hold now, syncs, installs the command and the session hooks. `--no-hooks` skips the hooks, `--timer` installs the timer too, `--force` goes ahead when a skill name would be lost. A machine that has the timer keeps it. Without one, it reuses the configured manifest. |
+| `init [manifest]`                       | Configures the manifest (a repo or folder's `.skillfleet/manifest.json`), moves aside or adopts what the agent folders hold now, syncs, installs the command and the session hooks. `--no-hooks` skips the hooks, `--timer` installs the timer too, `--force` goes ahead when a skill name would be lost. A machine that has the timer keeps it. Without one, it reuses the configured manifest, or on a new machine, the one your tailnet policy names. |
 | `status`                                | The last run, held and pending updates, edited skills, what starts the syncs, and Codex sessions to restart.                                                                                                                                                                                                                                                                                     |
 | `list`                                  | Linked skills and the source of each. With `--json`, the document in [Build on skillfleet](#build-on-skillfleet).                                                                                                                                                                                                                                                                                |
 | `agents`                                | Every agent id, which agents are installed here, and the folder each one's skills go to.                                                                                                                                                                                                                                                                                                         |

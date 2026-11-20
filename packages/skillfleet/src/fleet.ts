@@ -3,6 +3,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { exec } from "./exec.ts";
 import { dict, isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
 import { paths } from "./paths.ts";
+import { notInstalled, program } from "./program.ts";
+import { tailscaleStatus } from "./tailscale.ts";
 import type { Report } from "./report.ts";
 
 export type FleetAction = "status" | "sync" | "upgrade" | "init";
@@ -247,20 +249,6 @@ export async function unpublished(
 }
 
 const quote = (script: string) => `'${script.replace(/'/g, `'\\''`)}'`;
-
-/** `fallback`, or the program `variable` names (a .js/.mjs file runs with node). */
-function program(variable: string, fallback: string): { command: string; prefix: string[] } {
-  const custom = process.env[variable];
-  if (!custom) return { command: fallback, prefix: [] };
-  if (/\.(m?js)$/.test(custom)) return { command: process.execPath, prefix: [custom] };
-  return { command: custom, prefix: [] };
-}
-
-function notInstalled(command: string, fallback: string, variable: string): string {
-  return command === fallback
-    ? `${fallback} is not installed, or not on PATH`
-    : `${command}, which ${variable} names, is not installed or not on PATH`;
-}
 
 function summarize(raw: unknown): HostResult["lastRun"] {
   if (!isRecord(raw) || typeof raw.finishedAt !== "string") return undefined;
@@ -767,30 +755,9 @@ export interface Tailnet {
 
 /** The machines on the tailnet other than this one, or why Tailscale could not list them. */
 export async function tailnet(timeoutMs = 10_000): Promise<Tailnet | { error: string }> {
-  const { command, prefix } = program("SKILLFLEET_TAILSCALE", "tailscale");
-  const run = await exec(command, [...prefix, "status", "--json"], {
-    timeoutMs,
-    maxOutput: 64 * 1024 * 1024,
-  });
-  if (run.spawnError === "ENOENT")
-    return { error: notInstalled(command, "tailscale", "SKILLFLEET_TAILSCALE") };
-  if (run.timedOut)
-    return { error: `\`tailscale status\` did not answer within ${timeoutMs / 1000} s` };
-  if (run.code !== 0) {
-    const said = run.stderr.trim().split("\n")[0] || `exit ${run.code}`;
-    return { error: `\`tailscale status\` failed: ${said}` };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(run.stdout);
-  } catch {
-    return { error: "`tailscale status --json` printed something that is not JSON" };
-  }
-  if (!isRecord(parsed)) return { error: "`tailscale status --json` printed no status" };
-  if (parsed.BackendState === "NeedsLogin" || parsed.BackendState === "NoState")
-    return { error: "Tailscale is not logged in; run `tailscale up`" };
-  if (parsed.BackendState === "Stopped")
-    return { error: "Tailscale is stopped; run `tailscale up`" };
+  const found = await tailscaleStatus([], timeoutMs);
+  if ("error" in found) return found;
+  const parsed = found.status;
   const self = isRecord(parsed.Self) ? parsed.Self : {};
   const peers = Object.values(isRecord(parsed.Peer) ? parsed.Peer : {}).flatMap((peer) => {
     if (!isRecord(peer)) return [];

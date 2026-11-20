@@ -47,6 +47,8 @@ import {
   ManifestError,
   readConfig,
   remoteManifest,
+  tailnetManifestSpec,
+  writeConfig,
 } from "./manifest.ts";
 import { nameKey } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
@@ -407,6 +409,23 @@ async function postToHub(hub: string, report: Report): Promise<string | undefine
   }
 }
 
+/**
+ * `spec`, or on a machine that took its manifest from the tailnet, the one the tailnet policy names
+ * now, which config.json then keeps. When Tailscale can't say, the last one stays.
+ */
+async function followTailnet(spec: string, dryRun: boolean, warnings: string[]): Promise<string> {
+  if (readConfig()?.tailscale !== true) return spec;
+  const found = await tailnetManifestSpec();
+  if ("error" in found) {
+    warnings.push(`kept the manifest ${spec}: ${found.error}`);
+    return spec;
+  }
+  if (found.spec === spec) return spec;
+  if (!dryRun) writeConfig({ manifest: found.spec });
+  warnings.push(`the tailnet policy now names the manifest ${found.spec}, not ${spec}`);
+  return found.spec;
+}
+
 export async function sync(options: SyncOptions = {}): Promise<Report> {
   const startedAt = new Date().toISOString();
   const dryRun = options.dryRun ?? false;
@@ -430,7 +449,11 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   watchdog.unref();
   try {
     // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
-    const spec = options.loaded ? options.loaded.root.file : manifestSpec(options.manifest);
+    const spec = options.loaded
+      ? options.loaded.root.file
+      : options.manifest || offline
+        ? manifestSpec(options.manifest)
+        : await followTailnet(manifestSpec(), dryRun, warnings);
     const loaded =
       options.loaded ??
       (await loadManifest(spec, {
