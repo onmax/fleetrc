@@ -385,15 +385,15 @@ function reportText(report: Report): string {
 }
 
 async function syncReport(
-  options: { only?: string; apply?: string; skipTimerCheck?: boolean } = {},
+  options: { only?: string; apply?: string; skipTimerCheck?: boolean; manifest?: string } = {},
 ): Promise<Report> {
   const copy = copyMode();
   const report = await sync({
+    manifest: values.manifest,
     ...options,
     offline: values.offline,
     dryRun,
     copy,
-    manifest: values.manifest,
   });
   // Remembered, so the timer's next run copies too (or links again).
   if (!dryRun && (values.copy || values["no-copy"])) updateConfig({ copy });
@@ -1010,7 +1010,7 @@ async function init() {
     applied.push("the manifest is the one the tailnet policy names; each sync asks again");
   say(...applied.map((line) => `  ${line}`));
   // init installs the timer from the manifest next, so the sync need not say it differs.
-  const report = await syncReport({ skipTimerCheck: withTimer });
+  const report = await syncReport({ manifest: plan.manifestSpec, skipTimerCheck: withTimer });
   if (!json) console.log(reportText(report));
   // The copy that new shells, the hooks, the timer and `fleet` run.
   const installed = selfInstall();
