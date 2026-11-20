@@ -1200,7 +1200,10 @@ describe("the hooks on shared and upgraded machines", () => {
     writeFiles(mine, { "skills/first/SKILL.md": skillMd("first") });
     const linkType = isWindows ? "junction" : "dir";
     symlinkSync(mine, alias, linkType);
-    const manifest = m.manifest({ agents: ["claude-code"], sources: [{ id: "mine", local: alias }] });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "mine", local: alias }],
+    });
     expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
     expect((await hook(m, "claude-code", SESSION)).code).toBe(0);

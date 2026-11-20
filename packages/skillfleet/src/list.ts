@@ -33,7 +33,8 @@ export interface SkillList {
 function stateFile(): string {
   const current = paths.state();
   if (xdgDir("XDG_STATE_HOME")) return current;
-  if (process.platform === "win32" && process.env.LOCALAPPDATA && existsSync(current)) return current;
+  if (process.platform === "win32" && process.env.LOCALAPPDATA && existsSync(current))
+    return current;
   const script = process.argv[1] ?? "";
   return basename(script) === "cli.mjs" && basename(dirname(script)) === "app"
     ? join(dirname(dirname(script)), "state.json")
