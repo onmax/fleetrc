@@ -71,13 +71,24 @@ describe("the manifest from the tailnet policy", () => {
     tailscale.policy([{ manifest: team(m, "home", "first").https }]);
     expect((await m.runWith({ env: tailscale.env }, "init", "--no-hooks")).code).toBe(0);
 
-    tailscale.policy([{ manifest: team(m, "moved", "second").https }]);
+    const replacement = team(m, "moved", "second");
+    tailscale.policy([{ manifest: replacement.https }]);
     const moved = await m.runWith({ env: tailscale.env }, "sync");
     expect(moved.code, moved.stdout + moved.stderr).toBe(0);
     expect(moved.stdout + moved.stderr).toContain("the tailnet policy now names the manifest");
     expect(config(m).manifest).toBe(
       "https://git.skillfleet.test/moved.git//.skillfleet/manifest.json",
     );
+    expect(names(m.at(".claude/skills"))).toEqual(["second"]);
+
+    const offline = await m.runWith(
+      { env: tailscale.env },
+      "sync",
+      "--offline",
+      "--manifest",
+      replacement.https,
+    );
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["second"]);
 
     tailscale.policy();

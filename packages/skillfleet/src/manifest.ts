@@ -700,8 +700,14 @@ interface LocateOptions {
 }
 
 /** Isolates a policy replacement and its extends from the saved manifest's checkouts. */
-export function policyManifestCache(spec: string) {
-  const cacheRoot = join(paths.cache(), "tailnet-manifests", sha256(spec).slice(0, 32));
+export function policyManifestCache(spec: string, base?: string) {
+  const remote = remoteManifest(spec, base);
+  const identity = remote ? [gitUrl(remote.repo), remote.path, remote.ref] : [spec];
+  const cacheRoot = join(
+    paths.cache(),
+    "tailnet-manifests",
+    sha256(JSON.stringify(identity)).slice(0, 32),
+  );
   const marker = join(cacheRoot, "validated.json");
   return {
     cacheRoot,
@@ -710,17 +716,17 @@ export function policyManifestCache(spec: string) {
   };
 }
 
-function manifestCache(spec: string): string {
-  const policy = policyManifestCache(spec);
+function manifestCache(spec: string, base?: string): string {
+  const policy = policyManifestCache(spec, base);
   return policy.validated ? policy.cacheRoot : join(paths.cache(), "manifests");
 }
 
 /** Where a manifest spec lives on disk, fetching it when it is in a remote repository. */
 export async function locateManifest(
   spec: string,
-  { cacheRoot = manifestCache(spec), ...options }: LocateOptions = {},
+  { base, cacheRoot = manifestCache(spec, base), ...options }: LocateOptions = {},
 ) {
-  return (await locate(spec, { ...options, cacheRoot })).file;
+  return (await locate(spec, { ...options, base, cacheRoot })).file;
 }
 
 /**
@@ -1037,7 +1043,10 @@ const ROOT_ONLY_SOURCE_KEYS = ["followLinks"] as const;
  */
 export async function loadManifest(
   spec: string,
-  { cacheRoot = manifestCache(spec), offline = false }: { offline?: boolean; cacheRoot?: string } = {},
+  {
+    cacheRoot = manifestCache(spec),
+    offline = false,
+  }: { offline?: boolean; cacheRoot?: string } = {},
 ): Promise<LoadedManifest> {
   const options = { cacheRoot, offline };
   const rootFile = await locateManifest(spec, options);
