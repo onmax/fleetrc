@@ -41,7 +41,12 @@ function installedStateDir(): string | undefined {
     return dirname(dirname(script));
 }
 
-/** Per-machine state: explicit XDG state, existing Windows state or the installed copy, then the platform default. */
+let windowsInstalledState: string | undefined;
+
+/**
+ * Per-machine state: explicit XDG state, existing Windows state or the installed copy, then the
+ * platform default. The Windows installed choice stays fixed for the invocation.
+ */
 export function stateDir(): string {
   const xdg = xdgDir("XDG_STATE_HOME");
   if (xdg) return join(xdg, "skillfleet");
@@ -49,7 +54,8 @@ export function stateDir(): string {
   const appData = process.platform === "win32" && process.env.LOCALAPPDATA;
   if (appData) {
     const local = join(appData, "skillfleet");
-    return !installed || existsSync(join(local, "state.json")) ? local : installed;
+    if (!installed || installed === local) return local;
+    return (windowsInstalledState ??= existsSync(join(local, "state.json")) ? local : installed);
   }
   return installed ?? join(homedir(), ".local", "state", "skillfleet");
 }

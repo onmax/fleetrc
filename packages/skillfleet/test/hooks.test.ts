@@ -1057,6 +1057,20 @@ describe("the hooks on shared and upgraded machines", () => {
       caller.XDG_STATE_HOME = join(m.root, "uninitialized");
       expect(names(run("list", "--json"))).toEqual([]);
       delete caller.XDG_STATE_HOME;
+
+      const customState = read(join(state, "state.json"));
+      const customReport = read(join(state, "last-run.json"));
+      writeFileSync(join(local, "state.json"), "not JSON");
+      const recovered = run("sync", "--json");
+      expect(recovered).toContain("was corrupt");
+      expect(names(run("list", "--json"))).toEqual(["first", "second", "third"]);
+      expect(read(join(local, "last-run.json"))).toContain("was corrupt");
+      const backups = readdirSync(join(local, "backup"))
+        .filter((name) => name.startsWith("state-"))
+        .map((name) => read(join(local, "backup", name)));
+      expect(backups).toEqual(["not JSON"]);
+      expect(read(join(state, "state.json"))).toBe(customState);
+      expect(read(join(state, "last-run.json"))).toBe(customReport);
     }
     delete caller.LOCALAPPDATA;
     expect(names(run("list", "--json"))).toEqual(["first", "second"]);
