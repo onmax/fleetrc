@@ -34,7 +34,7 @@ export function configDir(): string {
   return join(homedir(), ".config", "skillfleet");
 }
 
-export function stateOverride(): string | undefined {
+function stateOverride(): string | undefined {
   const xdg = xdgDir("XDG_STATE_HOME");
   if (xdg) return xdg;
   return (process.platform === "win32" && process.env.LOCALAPPDATA) || undefined;

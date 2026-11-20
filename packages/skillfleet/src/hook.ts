@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { isRecord, readJsonOrNothing } from "./fs.ts";
+import { isRecord, lstat, readJsonOrNothing } from "./fs.ts";
 import { adoptInstalledPlaces, claudeHome, paths, stateDir } from "./paths.ts";
 
 export const HOOK_AGENTS = ["claude-code", "codex"] as const;
@@ -182,7 +182,7 @@ export async function runHook(agent: HookAgent, promptOnly = false) {
         : undefined;
     if (agent === "claude-code" && name === "UserPromptSubmit") {
       const { promptHook } = await import("./sessions.ts");
-      const { readTargetManifest } = await import("./linker.ts");
+      const { readTargetManifest, samePath } = await import("./linker.ts");
       const dir = join(claudeHome(), "skills");
       const { links } = readTargetManifest(dir);
       const state = readJsonOrNothing(paths.state());
@@ -191,14 +191,21 @@ export async function runHook(agent: HookAgent, promptOnly = false) {
         for (const [skill, record] of Object.entries(state.skills)) {
           const link = links[skill];
           if (
-            link &&
-            isRecord(record) &&
-            typeof record.addedAt === "string" &&
-            record.source === link.source &&
-            record.dir === link.target &&
-            existsSync(join(dir, skill, "SKILL.md"))
+            !link ||
+            !isRecord(record) ||
+            typeof record.addedAt !== "string" ||
+            typeof record.dir !== "string" ||
+            record.source !== link.source
           )
-            skills[skill] = { addedAt: record.addedAt };
+            continue;
+          const published = join(dir, skill);
+          if (!existsSync(join(published, "SKILL.md"))) continue;
+          const entry = lstat(published);
+          const matches =
+            link.kind === "copy"
+              ? entry?.isDirectory() && samePath(link.target, record.dir)
+              : entry?.isSymbolicLink() && samePath(published, record.dir);
+          if (matches) skills[skill] = { addedAt: record.addedAt };
         }
       const text = promptHook(input, { skills });
       if (text) {

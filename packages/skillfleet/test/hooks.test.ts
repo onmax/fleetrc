@@ -9,9 +9,11 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -1009,7 +1011,7 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(existsSync(join(state, "hook-env.json"))).toBe(false);
     const caller: NodeJS.ProcessEnv = { ...env };
     delete caller.XDG_STATE_HOME;
-    delete caller.LOCALAPPDATA;
+    caller.LOCALAPPDATA = join(m.root, "local-app-data");
     const run = (...args: string[]) => {
       const result = spawnSync(process.execPath, [join(state, "app", "cli.mjs"), ...args], {
         env: caller,
@@ -1022,6 +1024,8 @@ describe("the hooks on shared and upgraded machines", () => {
     const names = (output: string) =>
       (JSON.parse(output) as { skills: { name: string }[] }).skills.map(({ name }) => name);
     expect(names(run("list", "--json"))).toEqual(["first"]);
+    expect(names(run("--json", "list"))).toEqual(["first"]);
+    expect(run("list")).toContain("first");
 
     writeFiles(mine, { "skills/second/SKILL.md": skillMd("second") });
     caller.XDG_STATE_HOME = join(m.root, "alternate");
@@ -1031,13 +1035,15 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(run("list")).toContain("second");
     delete caller.XDG_STATE_HOME;
     if (isWindows) {
-      caller.LOCALAPPDATA = join(m.root, "alternate-local");
       run("sync");
       expect(names(run("list", "--json"))).toEqual(["first", "second"]);
       expect(names(run("--json", "list"))).toEqual(["first", "second"]);
       expect(run("list")).toContain("second");
-      delete caller.LOCALAPPDATA;
+      caller.XDG_STATE_HOME = join(m.root, "uninitialized");
+      expect(names(run("list", "--json"))).toEqual([]);
+      delete caller.XDG_STATE_HOME;
     }
+    delete caller.LOCALAPPDATA;
     expect(names(run("list", "--json"))).toEqual(["first"]);
     // The installed copy keeps node's compile cache beside itself, and nowhere else.
     expect(existsSync(join(state, "app", "compile"))).toBe(true);
@@ -1185,6 +1191,36 @@ describe("the hooks on shared and upgraded machines", () => {
     expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
     expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
     expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
+  });
+
+  it("announces a linked skill after switching its source to an equivalent path", async () => {
+    const m = machine();
+    const mine = join(m.root, "mine");
+    const alias = join(m.root, "alias");
+    writeFiles(mine, { "skills/first/SKILL.md": skillMd("first") });
+    const linkType = isWindows ? "junction" : "dir";
+    symlinkSync(mine, alias, linkType);
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [{ id: "mine", local: alias }] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    expect((await hook(m, "claude-code", SESSION)).code).toBe(0);
+    writeFiles(mine, { "skills/second/SKILL.md": skillMd("second") });
+    expect((await m.run("sync")).code).toBe(0);
+    writeFileSync(
+      manifest,
+      JSON.stringify({ agents: ["claude-code"], sources: [{ id: "mine", local: mine }] }),
+    );
+    expect((await m.run("sync")).code).toBe(0);
+
+    const published = m.at(".claude", "skills", "second");
+    expect(existsSync(join(published, "SKILL.md"))).toBe(true);
+    const saved = `${published}.saved`;
+    renameSync(published, saved);
+    symlinkSync(join(mine, "skills", "first"), published, linkType);
+    expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
+    unlinkSync(published);
+    renameSync(saved, published);
+    expect((await hook(m, "claude-code", PROMPT)).stdout).toContain("available now: second");
   });
 
   it("does not announce discovered skills that sync did not link for Claude Code", async () => {
