@@ -1027,10 +1027,22 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(names(run("--json", "list"))).toEqual(["first"]);
     expect(run("list")).toContain("first");
 
+    const local = join(caller.LOCALAPPDATA, "skillfleet");
+    if (isWindows) {
+      const install = await m.runWith(
+        { env: { ...caller, XDG_STATE_HOME: undefined } },
+        "self-install",
+      );
+      expect(install.code, install.stderr).toBe(0);
+      expect(existsSync(join(local, "bin", "skillfleet.cmd"))).toBe(true);
+      expect(existsSync(join(local, "state.json"))).toBe(false);
+      expect(names(run("list", "--json"))).toEqual(["first"]);
+    }
+
     writeFiles(mine, { "skills/second/SKILL.md": skillMd("second") });
     run("sync");
     expect(names(run("list", "--json"))).toEqual(["first", "second"]);
-    expect(existsSync(join(caller.LOCALAPPDATA, "skillfleet"))).toBe(false);
+    expect(existsSync(join(local, "state.json"))).toBe(false);
 
     writeFiles(mine, { "skills/third/SKILL.md": skillMd("third") });
     caller.XDG_STATE_HOME = caller.LOCALAPPDATA;

@@ -49,7 +49,7 @@ export function stateDir(): string {
   const appData = process.platform === "win32" && process.env.LOCALAPPDATA;
   if (appData) {
     const local = join(appData, "skillfleet");
-    return !installed || existsSync(local) ? local : installed;
+    return !installed || existsSync(join(local, "state.json")) ? local : installed;
   }
   return installed ?? join(homedir(), ".local", "state", "skillfleet");
 }

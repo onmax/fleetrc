@@ -974,6 +974,17 @@ const npxCalls = (m: Machine): string[][] =>
         .map((line) => JSON.parse(line) as string[])
     : [];
 
+function keepFakeNpxOnRetry(m: Machine, state: string) {
+  const nodeOnly = join(m.root, "node-only");
+  mkdirSync(nodeOnly);
+  symlinkSync(process.execPath, join(nodeOnly, "node"));
+  const launcher = join(state, "bin", "skillfleet");
+  writeFileSync(
+    launcher,
+    readFileSync(launcher, "utf8").replace(/^exec "[^"]*"/m, `exec "${join(nodeOnly, "node")}"`),
+  );
+}
+
 /**
  * A machine set up with a manifest kept in a repository, as `fleet init` needs: one vendored
  * skill, and the manifest's repository as a source with a working clone in ~/code/manifests.
@@ -1320,6 +1331,7 @@ describe.skipIf(isWindows)("fleet init", () => {
         error: expect.stringContaining("this machine has no systemd user manager"),
       });
       expect.soft(host).not.toHaveProperty("setup");
+      keepFakeNpxOnRetry(m, join(m.root, "vps2", ".local", "state", "skillfleet"));
       const retry = await m.runWith({ env }, "fleet", "init", "vps2", "--json");
       expect.soft(retry.code, retry.stdout + retry.stderr).toBe(1);
       expect.soft(JSON.parse(retry.stdout)).toEqual([
@@ -1343,14 +1355,7 @@ describe.skipIf(isWindows)("fleet init", () => {
     expect(calls).toBeGreaterThan(0);
 
     const state = join(host, ".local", "state", "skillfleet");
-    const nodeOnly = join(m.root, "node-only");
-    mkdirSync(nodeOnly);
-    symlinkSync(process.execPath, join(nodeOnly, "node"));
-    const launcher = join(state, "bin", "skillfleet");
-    writeFileSync(
-      launcher,
-      readFileSync(launcher, "utf8").replace(/^exec "[^"]*"/m, `exec "${join(nodeOnly, "node")}"`),
-    );
+    keepFakeNpxOnRetry(m, state);
     const retry = await m.runWith({ env }, "fleet", "init", "vps2");
     expect(retry.code, retry.stdout + retry.stderr).toBe(1);
     expect(npxCalls(m)).toHaveLength(2);
