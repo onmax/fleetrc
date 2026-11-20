@@ -1060,7 +1060,9 @@ describe("the hooks on shared and upgraded machines", () => {
 
       const customState = read(join(state, "state.json"));
       const customReport = read(join(state, "last-run.json"));
-      writeFileSync(join(local, "state.json"), "not JSON");
+      const localState = join(local, "state.json");
+      writeFileSync(localState, "not JSON");
+      chmodSync(localState, 0o444);
       const recovered = run("sync", "--json");
       expect(recovered).toContain("was corrupt");
       expect(names(run("list", "--json"))).toEqual(["first", "second", "third"]);
