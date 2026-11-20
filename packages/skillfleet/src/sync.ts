@@ -45,6 +45,7 @@ import {
   type LoadedManifest,
   loadManifest,
   ManifestError,
+  policyManifestCache,
   readConfig,
   remoteManifest,
   tailnetManifestSpec,
@@ -451,16 +452,21 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       options.loaded || options.manifest || offline
         ? savedSpec
         : await followTailnet(savedSpec, warnings);
+    const candidate = spec !== savedSpec && !dryRun ? policyManifestCache(spec) : undefined;
     const loaded =
       options.loaded ??
       (await loadManifest(spec, {
         offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
+        ...(candidate ? { cacheRoot: candidate.cacheRoot } : {}),
       }));
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
     if (spec !== savedSpec) {
-      if (!dryRun) writeConfig({ manifest: spec });
+      if (candidate) {
+        candidate.accept();
+        writeConfig({ manifest: spec });
+      }
       warnings.push(`the tailnet policy now names the manifest ${spec}, not ${savedSpec}`);
     }
     const stateFile = new StateFile(loadState(dryRun ? undefined : warnings));

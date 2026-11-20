@@ -125,6 +125,36 @@ describe("the manifest from the tailnet policy", () => {
     expect(names(m.at(".claude/skills"))).toEqual(["first"]);
   });
 
+  it("preserves the offline checkout after a rejected file switch in the same repository", async () => {
+    const m = machine();
+    const tailscale = fakeTailscale(m);
+    const home = team(m, "home", "first");
+    tailscale.policy([{ manifest: home.https }]);
+    expect((await m.runWith({ env: tailscale.env }, "init", "--no-hooks")).code).toBe(0);
+    const before = config(m);
+
+    home.commit({
+      ".skillfleet/manifest.json": null,
+      "new.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
+    });
+    tailscale.policy([{ manifest: `${home.https}//missing.json` }]);
+    const failed = await m.runWith({ env: tailscale.env }, "sync");
+    expect(failed.code, failed.stdout + failed.stderr).toBe(1);
+    expect(failed.stderr).toContain("has no missing.json");
+    expect(config(m)).toEqual(before);
+    const offline = await m.runWith({ env: tailscale.env }, "sync", "--offline");
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["first"]);
+
+    const replacement = `${home.https}//new.json`;
+    tailscale.policy([{ manifest: replacement }]);
+    const switched = await m.runWith({ env: tailscale.env }, "sync");
+    expect(switched.code, switched.stdout + switched.stderr).toBe(0);
+    expect(config(m).manifest).toBe(replacement);
+    const switchedOffline = await m.runWith({ env: tailscale.env }, "sync", "--offline");
+    expect(switchedOffline.code, switchedOffline.stdout + switchedOffline.stderr).toBe(0);
+  });
+
   it("accepts --manifest tailscale: for init", async () => {
     const m = machine();
     const tailscale = fakeTailscale(m);

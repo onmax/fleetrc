@@ -15,7 +15,7 @@ import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
 import { fetchClone, gitUrl, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
-import { dict, inside, isRecord, readJson, readJsonFile, writeJson } from "./fs.ts";
+import { dict, inside, isRecord, readJson, readJsonFile, sha256, writeJson } from "./fs.ts";
 import { MAX_GLOB_LENGTH, splitHookPattern } from "./glob.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
@@ -699,9 +699,28 @@ interface LocateOptions {
   base?: string;
 }
 
+/** Isolates a policy replacement and its extends from the saved manifest's checkouts. */
+export function policyManifestCache(spec: string) {
+  const cacheRoot = join(paths.cache(), "tailnet-manifests", sha256(spec).slice(0, 32));
+  const marker = join(cacheRoot, "validated.json");
+  return {
+    cacheRoot,
+    validated: existsSync(marker),
+    accept: () => writeJson(marker, { spec }),
+  };
+}
+
+function manifestCache(spec: string): string {
+  const policy = policyManifestCache(spec);
+  return policy.validated ? policy.cacheRoot : join(paths.cache(), "manifests");
+}
+
 /** Where a manifest spec lives on disk, fetching it when it is in a remote repository. */
-export async function locateManifest(spec: string, options: LocateOptions = {}) {
-  return (await locate(spec, options)).file;
+export async function locateManifest(
+  spec: string,
+  { cacheRoot = manifestCache(spec), ...options }: LocateOptions = {},
+) {
+  return (await locate(spec, { ...options, cacheRoot })).file;
 }
 
 /**
@@ -1018,8 +1037,9 @@ const ROOT_ONLY_SOURCE_KEYS = ["followLinks"] as const;
  */
 export async function loadManifest(
   spec: string,
-  options: { offline?: boolean; cacheRoot?: string } = {},
+  { cacheRoot = manifestCache(spec), offline = false }: { offline?: boolean; cacheRoot?: string } = {},
 ): Promise<LoadedManifest> {
+  const options = { cacheRoot, offline };
   const rootFile = await locateManifest(spec, options);
   const root = readManifestFile(rootFile);
   const warnings: string[] = [];
