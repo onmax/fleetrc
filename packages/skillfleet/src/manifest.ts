@@ -644,7 +644,7 @@ export async function tailnetManifestSpec(): Promise<{ spec: string } | { error:
   const found = await tailscaleManifest();
   if ("error" in found) return found;
   // GitHub's `owner/repo[//file]` shorthand, spelled so no folder of that name here can stand for it.
-  const value = /^[\w-][\w.-]*\/[\w.-]+(?:\/\/.*)?$/.test(found.manifest)
+  const value = /^\w[\w.-]*\/[\w.-]+(?:\/\/.*)?$/.test(found.manifest)
     ? `github:${found.manifest}`
     : found.manifest;
   const spec = value.startsWith("-") ? undefined : hostManifestSpec(value);

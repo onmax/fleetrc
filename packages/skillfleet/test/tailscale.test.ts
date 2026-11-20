@@ -182,7 +182,7 @@ describe("the manifest from the tailnet policy", () => {
   it("a policy that names a folder on this machine, or an option, is refused", async () => {
     const m = machine();
     const tailscale = fakeTailscale(m);
-    for (const manifest of [m.root, "./skills", "-oProxyCommand=x"]) {
+    for (const manifest of [m.root, "./skills", "-oProxyCommand=x", "-o/x"]) {
       tailscale.policy([{ manifest }]);
       const run = await m.runWith({ env: tailscale.env }, "init", "tailscale:", "--no-hooks");
       expect(run.code, manifest).toBe(1);
