@@ -1030,6 +1030,14 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(names(run("--json", "list"))).toEqual(["first", "second"]);
     expect(run("list")).toContain("second");
     delete caller.XDG_STATE_HOME;
+    if (isWindows) {
+      caller.LOCALAPPDATA = join(m.root, "alternate-local");
+      run("sync");
+      expect(names(run("list", "--json"))).toEqual(["first", "second"]);
+      expect(names(run("--json", "list"))).toEqual(["first", "second"]);
+      expect(run("list")).toContain("second");
+      delete caller.LOCALAPPDATA;
+    }
     expect(names(run("list", "--json"))).toEqual(["first"]);
     // The installed copy keeps node's compile cache beside itself, and nowhere else.
     expect(existsSync(join(state, "app", "compile"))).toBe(true);
@@ -1177,6 +1185,25 @@ describe("the hooks on shared and upgraded machines", () => {
     expect((await hook(m, "claude-code", PROMPT)).stdout).toBe("");
     expect((await hook(m, "claude-code", SESSION)).stdout).toBe("");
     expect(statSync(sessions).mtimeMs).toBe(mtimeMs);
+  });
+
+  it("does not announce discovered skills that sync did not link for Claude Code", async () => {
+    const m = machine();
+    const mine = join(m.root, "mine");
+    writeFiles(mine, { "skills/first/SKILL.md": skillMd("first") });
+    const manifest = m.manifest({ agents: [], sources: [{ id: "mine", local: mine }] });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    writeFileSync(join(m.stateDir, "hook-attempt"), String(Date.now()));
+    expect((await hook(m, "claude-code", SESSION)).code).toBe(0);
+    writeFiles(mine, { "skills/second/SKILL.md": skillMd("second") });
+    const report = await m.json("sync");
+    expect(report.skills.names).toContain("second");
+    expect(report.targets).toEqual([]);
+    expect(await m.runWith({ input: PROMPT }, "hook", "prompt")).toEqual({
+      code: 0,
+      stdout: "",
+      stderr: "",
+    });
   });
 
   it.each(["before", "after"])("recovers a sync interrupted %s linking", async (boundary) => {

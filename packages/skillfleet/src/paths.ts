@@ -34,13 +34,15 @@ export function configDir(): string {
   return join(homedir(), ".config", "skillfleet");
 }
 
+export function stateOverride(): string | undefined {
+  const xdg = xdgDir("XDG_STATE_HOME");
+  if (xdg) return xdg;
+  return (process.platform === "win32" && process.env.LOCALAPPDATA) || undefined;
+}
+
 /** Per-machine state: XDG state, else %LOCALAPPDATA% on Windows, else ~/.local/state. */
 export function stateDir(): string {
-  const env = process.env;
-  const xdg = xdgDir("XDG_STATE_HOME");
-  if (xdg) return join(xdg, "skillfleet");
-  if (process.platform === "win32" && env.LOCALAPPDATA) return join(env.LOCALAPPDATA, "skillfleet");
-  return join(homedir(), ".local", "state", "skillfleet");
+  return join(stateOverride() ?? join(homedir(), ".local", "state"), "skillfleet");
 }
 
 export const paths = {

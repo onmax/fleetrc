@@ -378,26 +378,37 @@ describe("fleet tags", () => {
   });
 
   it("runs a machine named twice once: an explicit host wins, then the first tag", async () => {
-    const m = machine();
     const peers = [
       peer("web.tail.ts.net", ["tag:servers", "tag:web"]),
       peer("db.tail.ts.net", ["tag:servers"], { ips: ["100.64.0.2"] }),
       peer("ci.tail.ts.net", ["tag:servers"]),
       peer("vps.tail.ts.net", ["tag:web"]),
     ];
-    const program = fakeTailscale(m.root, status(peers));
-    const { targets } = await withTailscale(program, () =>
-      resolveFleet(
+    const exec = vi.spyOn(execution, "exec").mockImplementation(async (_command, args) => {
+      const result = { code: 0, stderr: "", timedOut: false, truncated: false };
+      if (args.includes("--json")) return { ...result, stdout: JSON.stringify(status(peers)) };
+      expect(args).toContain("-G");
+      const host = args[args.indexOf("--") + 1]!;
+      const [, user, name, port] = /^(?:ssh:\/\/)?(?:([^@]+)@)?([^:]+)(?::(\d+))?$/.exec(host)!;
+      return {
+        ...result,
+        stdout: `hostname ${name!.toLowerCase()}\nuser ${user ?? "alice"}\nport ${port ?? "22"}\n`,
+      };
+    });
+    try {
+      const { targets } = await resolveFleet(
         ["tag:servers", "WEB", "me@100.64.0.2", "tag:web", "ssh://me@CI.tail.ts.net:22", "web"],
         peerAddresses(peers),
-      ),
-    );
-    expect(targets).toEqual([
-      { host: "WEB" },
-      { host: "me@100.64.0.2" },
-      expect.objectContaining({ host: "vps.tail.ts.net", via: "tag:web" }),
-      { host: "ssh://me@CI.tail.ts.net:22" },
-    ]);
+      );
+      expect(targets).toEqual([
+        { host: "WEB" },
+        { host: "me@100.64.0.2" },
+        expect.objectContaining({ host: "vps.tail.ts.net", via: "tag:web" }),
+        { host: "ssh://me@CI.tail.ts.net:22" },
+      ]);
+    } finally {
+      exec.mockRestore();
+    }
   });
 
   it("compares entries by the machine they reach: IPv6 in any spelling, written ports, names Tailscale gives one peer", async () => {

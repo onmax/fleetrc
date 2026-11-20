@@ -4,7 +4,7 @@
 // other change.
 import { isRecord, readJsonOrNothing } from "./fs.ts";
 import { basename, dirname, join } from "node:path";
-import { paths, xdgDir } from "./paths.ts";
+import { paths, stateOverride } from "./paths.ts";
 import { skillRecord } from "./skill-record.ts";
 
 export interface ListedSkill {
@@ -26,11 +26,11 @@ export interface SkillList {
 }
 
 /**
- * Honor an explicit XDG state directory, as sync does. Otherwise the installed copy can find its
+ * Honor an explicit state directory, as sync does. Otherwise the installed copy can find its
  * own state without the installer's environment or a hook-env.json.
  */
 function stateFile(): string {
-  if (xdgDir("XDG_STATE_HOME")) return paths.state();
+  if (stateOverride()) return paths.state();
   const script = process.argv[1] ?? "";
   return basename(script) === "cli.mjs" && basename(dirname(script)) === "app"
     ? join(dirname(dirname(script)), "state.json")
