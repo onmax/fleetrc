@@ -101,6 +101,50 @@ describe("the manifest from the tailnet policy", () => {
     expect(names(m.at(".claude/skills"))).toEqual(["second"]);
   });
 
+  it("preserves the validated checkout when a policy alias is rejected", async () => {
+    const m = machine();
+    const tailscale = fakeTailscale(m);
+    tailscale.policy([{ manifest: team(m, "home", "first").https }]);
+    expect((await m.runWith({ env: tailscale.env }, "init", "--no-hooks")).code).toBe(0);
+
+    const replacement = team(m, "replacement", "second");
+    const url = "https://github.com/example/replacement.git";
+    m.git(m.root, "config", "--global", `url.${replacement.served}.insteadOf`, url);
+    tailscale.policy([{ manifest: "github:example/replacement" }]);
+    const switched = await m.runWith({ env: tailscale.env }, "sync");
+    expect(switched.code, switched.stdout + switched.stderr).toBe(0);
+    const before = config(m);
+    expect(before.manifest).toBe("github:example/replacement//.skillfleet/manifest.json");
+
+    replacement.commit({ ".skillfleet/manifest.json": null, "README.md": "Manifest removed\n" });
+    const alias = `${url}//.skillfleet/manifest.json`;
+    tailscale.policy([{ manifest: alias }]);
+    const rejected = await m.runWith({ env: tailscale.env }, "sync");
+    expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
+    expect(rejected.stderr).toContain("has no .skillfleet/manifest.json");
+    expect(config(m)).toEqual(before);
+
+    const offline = await m.runWith({ env: tailscale.env }, "sync", "--offline");
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["second"]);
+
+    replacement.commit({
+      ".skillfleet/manifest.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
+    });
+    const accepted = await m.runWith({ env: tailscale.env }, "sync");
+    expect(accepted.code, accepted.stdout + accepted.stderr).toBe(0);
+    expect(config(m).manifest).toBe(alias);
+    const override = await m.runWith(
+      { env: tailscale.env },
+      "sync",
+      "--offline",
+      "--manifest",
+      "github:example/replacement",
+    );
+    expect(override.code, override.stdout + override.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual([]);
+  });
+
   it("a dry-run sync names the new manifest without saving it", async () => {
     const m = machine();
     const tailscale = fakeTailscale(m);

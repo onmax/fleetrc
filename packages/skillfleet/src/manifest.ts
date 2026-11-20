@@ -15,7 +15,16 @@ import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
 import { fetchClone, gitUrl, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
-import { dict, inside, isRecord, readJson, readJsonFile, sha256, writeJson } from "./fs.ts";
+import {
+  dict,
+  inside,
+  isRecord,
+  readJson,
+  readJsonFile,
+  readJsonOrNothing,
+  sha256,
+  writeJson,
+} from "./fs.ts";
 import { MAX_GLOB_LENGTH, splitHookPattern } from "./glob.ts";
 import { editJsonText } from "./jsonedit.ts";
 import { nameKey, sourceIdProblem } from "./names.ts";
@@ -699,26 +708,31 @@ interface LocateOptions {
   base?: string;
 }
 
-/** Isolates a policy replacement and its extends from the saved manifest's checkouts. */
-export function policyManifestCache(spec: string, base?: string) {
+function policyCacheRoot(spec: string, base?: string): string {
   const remote = remoteManifest(spec, base);
   const identity = remote ? [gitUrl(remote.repo), remote.path, remote.ref] : [spec];
-  const cacheRoot = join(
-    paths.cache(),
-    "tailnet-manifests",
-    sha256(JSON.stringify(identity)).slice(0, 32),
-  );
-  const marker = join(cacheRoot, "validated.json");
+  return join(paths.cache(), "tailnet-manifests", sha256(JSON.stringify(identity)).slice(0, 32));
+}
+
+function validatedCache(root: string): string | undefined {
+  const marker = readJsonOrNothing(join(root, "validated.json"));
+  if (!isRecord(marker)) return undefined;
+  if (marker.slot === "a" || marker.slot === "b") return join(root, marker.slot);
+  return typeof marker.spec === "string" ? root : undefined;
+}
+
+/** Loads a policy replacement and its extends into the inactive slot, even for an alias. */
+export function policyManifestCache(spec: string) {
+  const root = policyCacheRoot(spec);
+  const slot = validatedCache(root) === join(root, "a") ? "b" : "a";
   return {
-    cacheRoot,
-    validated: existsSync(marker),
-    accept: () => writeJson(marker, { spec }),
+    cacheRoot: join(root, slot),
+    accept: () => writeJson(join(root, "validated.json"), { slot }),
   };
 }
 
 function manifestCache(spec: string, base?: string): string {
-  const policy = policyManifestCache(spec, base);
-  return policy.validated ? policy.cacheRoot : join(paths.cache(), "manifests");
+  return validatedCache(policyCacheRoot(spec, base)) ?? join(paths.cache(), "manifests");
 }
 
 /** Where a manifest spec lives on disk, fetching it when it is in a remote repository. */
