@@ -238,6 +238,12 @@ Other runtimes, such as ViteHub agents or a script of yours, can use the skills 
 
 0.0.1 is the first release, so expect changes before 1.0. The commands and config fields above work as described. The hub that would show a team's machines in one place isn't built: today `hub` only receives each run's report.
 
+### Moving from skillfleet
+
+fleetrc was called skillfleet. The first `fleetrc init`, `sync`, `update` or `self-install` on a machine moves its install: the state and config folders, the links in each agent's folder and their records, the launcher, the session hooks (each in the place it had, so Codex asks you to approve it once in `/hooks`) and the timer. Your edits and pending updates stay as they were. `--dry-run` says what it would move and changes nothing. `fleetrc fleet upgrade` moves every host in the fleet the same way.
+
+For one release fleetrc still reads the old names, with a warning: the `github.com/onmax/skillfleet` capability in the tailnet policy, a manifest in `.skillfleet/manifest.json`, and `SKILLFLEET_HOOK` and `SKILLFLEET_CHANGED` in manifest hooks. Rename them before the next release.
+
 ## Develop
 
 ```sh
