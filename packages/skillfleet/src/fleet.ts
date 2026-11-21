@@ -30,6 +30,7 @@ export interface HostResult {
     held: string[];
     errors: string[];
     sources: Record<string, string | undefined>;
+    sourceStatuses?: Record<string, string | undefined>;
   };
   /** `fleet upgrade`: the version the host ran before, when known, and the one it runs now. */
   upgrade?: { from?: string; to: string };
@@ -272,13 +273,20 @@ function summarize(raw: unknown): HostResult["lastRun"] {
     ? raw.errors.filter((error): error is string => typeof error === "string")
     : [];
   const sources = dict<string | undefined>();
+  const sourceStatuses = dict<string>();
   if (Array.isArray(raw.sources)) {
-    for (const source of raw.sources)
-      if (isRecord(source) && typeof source.id === "string")
-        sources[source.id] = typeof source.to === "string" ? source.to : undefined;
-  } else if (isRecord(raw.sources))
+    for (const source of raw.sources) {
+      if (!isRecord(source) || typeof source.id !== "string") continue;
+      sources[source.id] = typeof source.to === "string" ? source.to : undefined;
+      if (typeof source.status === "string") sourceStatuses[source.id] = source.status;
+    }
+  } else if (isRecord(raw.sources)) {
     for (const [id, commit] of Object.entries(raw.sources))
       sources[id] = typeof commit === "string" ? commit : undefined;
+    if (isRecord(raw.sourceStatuses))
+      for (const [id, status] of Object.entries(raw.sourceStatuses))
+        if (typeof status === "string") sourceStatuses[id] = status;
+  }
   return {
     host: typeof raw.host === "string" ? raw.host : "",
     finishedAt: raw.finishedAt,
@@ -288,6 +296,7 @@ function summarize(raw: unknown): HostResult["lastRun"] {
     held,
     errors,
     sources,
+    ...(Object.keys(sourceStatuses).length ? { sourceStatuses } : {}),
   };
 }
 
@@ -660,11 +669,16 @@ export async function fleet(
   return results;
 }
 
+function heldSource(run: NonNullable<HostResult["lastRun"]>, source: string): boolean {
+  const status = run.sourceStatuses?.[source];
+  return status === undefined ? run.held.includes(source) : status === "held";
+}
+
 /**
  * A host is behind when its last run is over two hours old or a source sits at another commit than
- * on the freshest host that took that source's updates. A host holding a source stays on its commit
- * on purpose, so it sets no reference for the others and is reported as held instead. Only a host
- * that answered can be said to have never run.
+ * on the freshest host that synced that source online. An offline revision can be compared but
+ * cannot set the reference. A host holding a source is reported as held instead. Only a host that
+ * answered can be said to have never run.
  */
 export function markBehind(results: HostResult[], now = Date.now()) {
   const runs = results
@@ -672,9 +686,17 @@ export function markBehind(results: HostResult[], now = Date.now()) {
     .sort((a, b) => (a.finishedAt < b.finishedAt ? 1 : -1));
   const reference = new Map<string, string>();
   for (const run of runs)
-    for (const [source, commit] of Object.entries(run.sources))
-      if (commit && !run.held.includes(source) && !reference.has(source))
+    for (const [source, commit] of Object.entries(run.sources)) {
+      if (!commit || reference.has(source) || heldSource(run, source)) continue;
+      const status = run.sourceStatuses?.[source];
+      if (
+        status === undefined ||
+        status === "installed" ||
+        status === "updated" ||
+        status === "unchanged"
+      )
         reference.set(source, commit);
+    }
   for (const result of results) {
     const run = result.lastRun;
     if (!run) {
@@ -685,7 +707,7 @@ export function markBehind(results: HostResult[], now = Date.now()) {
       result.behind.push(`last run ${age(run.finishedAt, now)} ago`);
     for (const [source, commit] of reference) {
       const here = run.sources[source];
-      if (here && here !== commit && !run.held.includes(source))
+      if (here && here !== commit && !heldSource(run, source))
         result.behind.push(`${source} at ${here.slice(0, 7)}`);
     }
     if (run.held.length) result.behind.push(`held: ${run.held.join(", ")}`);

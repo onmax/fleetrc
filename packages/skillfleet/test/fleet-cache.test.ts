@@ -8,6 +8,59 @@ import { fleet, notInFleet, resolveFleet, type FleetAction } from "../src/fleet.
 
 vi.mock("../src/exec.ts", () => ({ exec: vi.fn() }));
 
+it.each([
+  {
+    name: "offline observations do not set the reference",
+    runs: [
+      { status: "updated", to: "8de87ca0" },
+      { status: "offline", to: "700ccfb0" },
+      { status: "held", to: "700ccfb0", reason: "local edits overlap" },
+    ],
+    behind: [[], ["vendor at 700ccfb"], ["held: vendor"]],
+  },
+  {
+    name: "a skill conflict does not hold the source revision",
+    runs: [
+      { status: "unchanged", to: "700ccfb0" },
+      { status: "updated", to: "8de87ca0", reason: "skill has unresolved merge conflicts" },
+    ],
+    behind: [["vendor at 700ccfb"], ["held: vendor"]],
+  },
+])("compares live and cached runs: $name", async ({ runs, behind }) => {
+  const root = mkdtempSync(join(tmpdir(), "skillfleet-cache-"));
+  vi.stubEnv("XDG_STATE_HOME", root);
+  vi.stubEnv("SKILLFLEET_SSH", "ssh");
+  const hosts = runs.map((_, index) => `host-${index}`);
+  const now = Date.now();
+  vi.mocked(exec).mockImplementation(async (_command, args) => {
+    const host = args.at(-2)!;
+    const index = hosts.indexOf(host);
+    const { status, to, reason } = runs[index]!;
+    return {
+      stderr: "",
+      code: 0,
+      timedOut: false,
+      truncated: false,
+      stdout: JSON.stringify({
+        host,
+        finishedAt: new Date(now - (runs.length - index) * 60_000).toISOString(),
+        ok: true,
+        sources: [{ id: "vendor", status, to }],
+        held: reason ? [{ source: "vendor", reason, files: [] }] : [],
+      }),
+    };
+  });
+  try {
+    const live = await fleet(hosts, "status", "0.0.0");
+    expect(live.map((result) => result.behind)).toEqual(behind);
+    const cached = await fleet(hosts.map((host) => ({ host, offline: true })), "status", "0.0.0");
+    expect(cached.map((result) => result.behind)).toEqual(behind);
+  } finally {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it("recognizes a tagged peer alias after a DNS timeout", async () => {
   vi.stubEnv("SKILLFLEET_TAILSCALE", "tailscale");
   vi.stubEnv("SKILLFLEET_SSH", "ssh");
