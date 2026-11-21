@@ -2553,9 +2553,7 @@ function vendoredFiles(
     const selected = () =>
       findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
     const approved =
-      source.update === "review"
-        ? approvedFileTargets(source, kind, records, ctx)
-        : undefined;
+      source.update === "review" ? approvedFileTargets(source, kind, records, ctx) : undefined;
     const found = root
       ? findFileItems(source, kind, treeLister(root), sub.warnings)
       : (approved ?? selected());
