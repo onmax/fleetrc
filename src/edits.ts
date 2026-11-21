@@ -26,6 +26,7 @@ import {
 import { fetchClone, gitUrl, repoKey } from "./gitcache.ts";
 import { globBase } from "./glob.ts";
 import {
+  checkedOutPath,
   defaultSourceId,
   editManifest,
   type InPlaceSource,
@@ -62,14 +63,16 @@ export function manifestToEdit(
 ): ManifestTarget {
   const remote = remoteManifest(spec);
   if (!remote) return { file: loaded.root.file, push: false };
+  // The file the manifest was read from, which may be the old name's default (legacy.ts).
+  const path = checkedOutPath(remote.path, loaded.root.file);
   const key = repoKey(remote.repo);
   for (const source of loaded.root.sources)
     if (source.kind === "clone" && repoKey(source.git) === key) {
-      const file = join(source.path, remote.path);
+      const file = join(source.path, path);
       if (existsSync(file)) return { file, push: true };
     }
   throw new UserError(
-    `the manifest is a copy of the repository ${gitUrl(remote.repo)}, which the next sync fetches again, so fleetrc does not change it. ${change} in ${remote.path} there and push it, or clone it as a source with a "path" to let fleetrc edit the clone.`,
+    `the manifest is a copy of the repository ${gitUrl(remote.repo)}, which the next sync fetches again, so fleetrc does not change it. ${change} in ${path} there and push it, or clone it as a source with a "path" to let fleetrc edit the clone.`,
   );
 }
 

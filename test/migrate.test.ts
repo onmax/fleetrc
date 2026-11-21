@@ -20,6 +20,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { remoteScript } from "../src/fleet.ts";
 import {
   cli,
+  clone,
   isLink,
   isWindows,
   machine,
@@ -498,5 +499,28 @@ process.exit(spawnSync("sh", ["-c", command], { stdio: "inherit", env }).status 
       expect(existsSync(join(machine.stateDir, "bin", "fleetrc"))).toBe(true);
     }
     expect(read(host.at(".claude/settings.json"))).not.toContain("skillfleet");
+  });
+
+  it("fleet add edits the old .skillfleet/manifest.json in the manifest's working clone", async () => {
+    const m = machine();
+    const manifests = remote(m, "manifests", { ".skillfleet/manifest.json": "{}" });
+    const work = clone(m, manifests, "code/manifests");
+    manifests.commit({
+      ".skillfleet/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "manifests", git: manifests.url, path: work, skills: "none/*" }],
+      }),
+    });
+    m.git(work, "pull", "--quiet");
+    const init = await m.run("init", manifests.url, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+
+    const added = await m.run("fleet", "add", "laptop");
+    expect(added.code, added.stdout + added.stderr).toBe(0);
+    expect(added.stdout).toContain(join("code", "manifests", ".skillfleet", "manifest.json"));
+    expect(
+      (JSON.parse(read(join(work, ".skillfleet", "manifest.json"))) as { fleet: string[] }).fleet,
+    ).toEqual(["laptop"]);
+    expect(existsSync(join(work, ".fleetrc"))).toBe(false);
   });
 });
