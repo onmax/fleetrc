@@ -696,7 +696,9 @@ export function hostManifestSpec(spec: string): string {
  * The manifest the tailnet policy names for this machine, as config.json keeps it, or why there is
  * none. It must be in a repository: `owner/repo` means GitHub's, never a folder of that name here.
  */
-export async function tailnetManifestSpec(): Promise<{ spec: string } | { error: string }> {
+export async function tailnetManifestSpec(): Promise<
+  { spec: string; defaultPath: boolean } | { error: string }
+> {
   const found = await tailscaleManifest();
   if ("error" in found) return found;
   // GitHub's `owner/repo[//file]` shorthand, spelled so no folder of that name here can stand for it.
@@ -708,7 +710,10 @@ export async function tailnetManifestSpec(): Promise<{ spec: string } | { error:
     return {
       error: `the tailnet policy names the manifest ${found.manifest}, which is not in a repository; name one such as owner/repo or github:owner/repo//<file>`,
     };
-  return { spec: canonicalManifestSpec(spec) };
+  // A repository alone means the default manifest file, which the old name kept elsewhere.
+  const defaultPath =
+    !found.manifest.includes(DEFAULT_MANIFEST) && spec.endsWith(`//${DEFAULT_MANIFEST}`);
+  return { spec: canonicalManifestSpec(spec), defaultPath };
 }
 
 /**

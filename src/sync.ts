@@ -50,6 +50,8 @@ import {
   readConfig,
   remoteManifest,
   stagePolicyManifest,
+  DEFAULT_MANIFEST,
+  sameManifest,
   tailnetManifestSpec,
   writeConfig,
 } from "./manifest.ts";
@@ -61,7 +63,7 @@ import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sour
 import { loadState, sourceState, type State, StateFile } from "./state.ts";
 import { scheduleDrift } from "./timer.ts";
 import { version } from "./version.ts";
-import { legacyHookEnv, legacyHookNote, legacyWarning } from "./legacy.ts";
+import { LEGACY_MANIFEST_DIR, legacyHookEnv, legacyHookNote, legacyWarning } from "./legacy.ts";
 
 export interface SyncOptions {
   /** Fetch only this source; the others are linked from what is already on disk. */
@@ -431,6 +433,12 @@ async function followTailnet(spec: string, warnings: string[]): Promise<string> 
   if ("error" in found) {
     warnings.push(`kept the manifest ${spec}: ${found.error}`);
     return spec;
+  }
+  // The policy names a repository alone, and this machine reads its manifest from the old name's
+  // default place: that is the same manifest, not a new one, until the repository moves it.
+  if (found.defaultPath) {
+    const legacy = `${found.spec.slice(0, -DEFAULT_MANIFEST.length)}${LEGACY_MANIFEST_DIR}/manifest.json`;
+    if (sameManifest(legacy, spec)) return spec;
   }
   return found.spec;
 }
