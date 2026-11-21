@@ -42,11 +42,13 @@ import {
 import {
   dropEmptyKind,
   type FileEntry,
+  type FileTarget,
   findFileItems,
   itemId,
   itemName,
   itemPath,
   pathsLister,
+  targetPath,
   treeLister,
 } from "./files.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
@@ -64,7 +66,7 @@ import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
 import { type FetchBudget, fetchNpm, guardedFetch, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
 import { tarFileSizes, zipEntries } from "./tar.ts";
-import type { PendingUpdate, SourceState } from "./state.ts";
+import type { PendingUpdate, SourceState, State } from "./state.ts";
 
 export interface SkillEntry {
   name: string;
@@ -121,6 +123,7 @@ export interface SourceContext {
   cacheDir: string;
   storeDir: string;
   now: string;
+  fileLinks?: State["links"];
 }
 
 const SKILLS_OPTIONS = { telemetry: false } as const;
@@ -2480,6 +2483,26 @@ function mergeItems(out: SourceResult, sub: SourceResult, kind: FileKind, names:
     out.status = "review";
 }
 
+function approvedFileTargets(
+  source: VendoredSource,
+  kind: FileKind,
+  ctx: SourceContext,
+): Map<string, FileTarget[]> {
+  const approved = new Map<string, FileTarget[]>();
+  for (const [destination, link] of Object.entries(ctx.fileLinks ?? {})) {
+    if (link.source !== source.id || link.kind !== kind) continue;
+    if (!link.item.startsWith(`${kind}/`)) continue;
+    const path = link.item.slice(kind.length + 1);
+    const targets = findFileItems(source, kind, pathsLister([path]), []).get(path) ?? [];
+    for (const target of targets) {
+      if (target.agent !== link.agent) continue;
+      if (targetPath(kind, target) === destination)
+        approved.set(path, [...(approved.get(path) ?? []), target]);
+    }
+  }
+  return approved;
+}
+
 /**
  * Keeps a vendored source's files in its store, each kind in `<store>/<kind>`, as its skills are
  * kept: an edited copy holds the update, review mode waits for `fleetrc update`, and an item the
@@ -2511,10 +2534,18 @@ function vendoredFiles(
     lookForEdits(source, view, kindCtx, sub);
     const selected = () =>
       findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
-    const found = root ? findFileItems(source, kind, treeLister(root), sub.warnings) : selected();
-    let targets = found;
+    const approved =
+      source.update === "review" ? approvedFileTargets(source, kind, ctx) : undefined;
+    const found = root
+      ? findFileItems(source, kind, treeLister(root), sub.warnings)
+      : (approved ?? selected());
+    const removals = new Map<string, FileTarget[]>();
     if (!root) sub.skills = keptSkills(view, kindCtx.storeDir);
     else {
+      if (reviewing && approved)
+        for (const [path, targets] of approved)
+          if (!lstatSync(join(root, ...path.split("/")), { throwIfNoEntry: false }))
+            removals.set(path, targets);
       const staging = ctx.dryRun
         ? mkdtempSync(join(tmpdir(), "fleetrc-stage-"))
         : join(kindCtx.storeDir, `.stage-${process.pid}`);
@@ -2546,16 +2577,9 @@ function vendoredFiles(
           firstRun,
           earlier: new Map(),
           heldBack,
-          reviewRemovals: reviewing ? new Set([...selected().keys()].map(itemName)) : undefined,
+          reviewRemovals: new Set([...removals.keys()].map(itemName)),
           commit: source.kind === "git" ? version : undefined,
         });
-        if (reviewing)
-          targets = findFileItems(
-            source,
-            kind,
-            pathsLister(sub.skills.map((item) => itemPath(item.name))),
-            [],
-          );
       } finally {
         rmSync(staging, { recursive: true, force: true });
       }
@@ -2567,7 +2591,7 @@ function vendoredFiles(
         kind,
         path,
         file: join(item.dir, posix.basename(path)),
-        agents: targets.get(path) ?? [],
+        agents: found.get(path) ?? removals.get(path) ?? [],
         ...(fresh.has(item.name) ? { updated: true } : {}),
       });
     }
