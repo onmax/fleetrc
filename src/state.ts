@@ -40,6 +40,8 @@ export interface SourceState {
 export interface FileItems {
   items: Record<string, InstalledCopy>;
   pending: Record<string, PendingUpdate>;
+  /** Validated agents for approved review-mode items, even if no link was made. */
+  selected?: Record<string, string[]>;
 }
 
 /** A file fleetrc linked (or copied) into an agent's folder, by the path it is at. */
@@ -184,6 +186,13 @@ function fileItems(record: unknown): FileItems | undefined {
   return {
     items: records(record.items, installedCopy),
     pending: records(record.pending, pendingUpdate),
+    ...(isRecord(record.selected)
+      ? {
+          selected: records(record.selected, (agents) =>
+            Array.isArray(agents) ? agents.filter((agent) => typeof agent === "string") : undefined,
+          ),
+        }
+      : {}),
   };
 }
 

@@ -48,6 +48,7 @@ import {
   itemName,
   itemPath,
   pathsLister,
+  sourcePathStat,
   targetPath,
   treeLister,
 } from "./files.ts";
@@ -2486,9 +2487,19 @@ function mergeItems(out: SourceResult, sub: SourceResult, kind: FileKind, names:
 function approvedFileTargets(
   source: VendoredSource,
   kind: FileKind,
+  selected: Record<string, string[]> | undefined,
   ctx: SourceContext,
 ): Map<string, FileTarget[]> {
   const approved = new Map<string, FileTarget[]>();
+  if (selected) {
+    for (const [name, agents] of Object.entries(selected)) {
+      const path = itemPath(name);
+      const targets = findFileItems(source, kind, pathsLister([path]), []).get(path) ?? [];
+      const retained = targets.filter((target) => agents.includes(target.agent));
+      if (retained.length > 0) approved.set(path, retained);
+    }
+    return approved;
+  }
   for (const [destination, link] of Object.entries(ctx.fileLinks ?? {})) {
     if (link.source !== source.id || link.kind !== kind) continue;
     if (!link.item.startsWith(`${kind}/`)) continue;
@@ -2522,6 +2533,7 @@ function vendoredFiles(
   const reviewing = source.update === "review" && !ctx.apply;
   for (const kind of fileKindsOf(source, state)) {
     const view = itemsView(state, kind);
+    const records = state.files![kind]!;
     const kindCtx = { ...ctx, storeDir: join(ctx.storeDir, kind) };
     const sub = result(source, "unchanged");
     for (const name of new Set([...Object.keys(view.skills), ...Object.keys(view.pending)]))
@@ -2535,7 +2547,9 @@ function vendoredFiles(
     const selected = () =>
       findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
     const approved =
-      source.update === "review" ? approvedFileTargets(source, kind, ctx) : undefined;
+      source.update === "review"
+        ? approvedFileTargets(source, kind, records.selected, ctx)
+        : undefined;
     const found = root
       ? findFileItems(source, kind, treeLister(root), sub.warnings)
       : (approved ?? selected());
@@ -2544,7 +2558,7 @@ function vendoredFiles(
     else {
       if (reviewing && approved)
         for (const [path, targets] of approved)
-          if (!lstatSync(join(root, ...path.split("/")), { throwIfNoEntry: false }))
+          if (!sourcePathStat(join(root, ...path.split("/")))?.isFile())
             removals.set(path, targets);
       const staging = ctx.dryRun
         ? mkdtempSync(join(tmpdir(), "fleetrc-stage-"))
@@ -2585,15 +2599,22 @@ function vendoredFiles(
       }
     }
     const fresh = new Set([...sub.added, ...sub.updated]);
+    const selectedAgents = dict<string[]>();
     for (const item of sub.skills) {
       const path = itemPath(item.name);
+      const agents = found.get(path) ?? removals.get(path) ?? [];
+      if (agents.length > 0) selectedAgents[item.name] = agents.map((target) => target.agent);
       out.files.push({
         kind,
         path,
         file: join(item.dir, posix.basename(path)),
-        agents: found.get(path) ?? removals.get(path) ?? [],
+        agents,
         ...(fresh.has(item.name) ? { updated: true } : {}),
       });
+    }
+    if (root && !ctx.dryRun) {
+      if (approved) records.selected = selectedAgents;
+      else delete records.selected;
     }
     mergeItems(out, sub, kind, [
       ...Object.keys(view.skills),

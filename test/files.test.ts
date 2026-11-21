@@ -249,6 +249,103 @@ describe("files across sources", () => {
     expect(sync.warnings.join("\n")).toContain("match 2 files");
     expect(sync.pending).toEqual([]);
     expect(existsSync(m.at(".claude/CLAUDE.md"))).toBe(false);
+    await m.json<Report>("sync", "--offline");
+    expect(existsSync(m.at(".claude/CLAUDE.md"))).toBe(false);
+  });
+
+  it("links a cached review-mode instruction offline when a foreign file is removed", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "AGENTS.md": "approved\n" });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url, update: "review", instructions: "AGENTS.md" }],
+    });
+    const destination = m.at(".claude/CLAUDE.md");
+    mkdirSync(m.at(".claude"), { recursive: true });
+    writeFileSync(destination, "foreign\n");
+    const { sync } = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
+    expect(sync.files.foreign).toEqual([destination]);
+    rmSync(destination);
+    await m.json<Report>("sync", "--offline");
+    expect(read(destination)).toBe("approved\n");
+  });
+
+  it("links a cached review-mode instruction offline when the winning source is removed", async () => {
+    const m = machine();
+    const first = remote(m, "first", { "AGENTS.md": "first\n" });
+    const second = remote(m, "second", { "AGENTS.md": "second\n" });
+    const write = (includeFirst: boolean) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          ...(includeFirst ? [{ id: "first", git: first.url, instructions: "AGENTS.md" }] : []),
+          { id: "second", git: second.url, update: "review", instructions: "AGENTS.md" },
+        ],
+      });
+    await m.json("init", write(true), "--no-hooks");
+    expect(read(m.at(".claude/CLAUDE.md"))).toBe("first\n");
+    write(false);
+    await m.json<Report>("sync", "--offline");
+    expect(read(m.at(".claude/CLAUDE.md"))).toBe("second\n");
+  });
+
+  it("holds deletions when upstream replaces a file or its parent with a different type", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "AGENTS.md": "approved\n", "commands/a.md": "a\n" });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        {
+          id: "vendor",
+          git: vendor.url,
+          update: "review",
+          instructions: "AGENTS.md",
+          commands: "commands/a.md",
+        },
+      ],
+    });
+    await m.json("init", manifest, "--no-hooks");
+    vendor.commit({ "AGENTS.md": null, "AGENTS.md/other.md": "replacement\n" });
+    vendor.commit({ "commands/a.md": null, commands: "replacement\n" });
+    const sync = await m.json<Report>("sync");
+    expect(sync.errors).toEqual([]);
+    expect(sync.pending.map((entry) => entry.skill).sort()).toEqual([
+      "commands/commands/a.md",
+      "instructions/AGENTS.md",
+    ]);
+    expect(read(m.at(".claude/CLAUDE.md"))).toBe("approved\n");
+    expect(read(m.at(".claude/commands/a.md"))).toBe("a\n");
+    expect((await m.run("update", "vendor")).code).toBe(0);
+    expect(existsSync(m.at(".claude/CLAUDE.md"))).toBe(false);
+    expect(existsSync(m.at(".claude/commands/a.md"))).toBe(false);
+  });
+
+  it("ignores unlinked in-place items when looking up a retained vendored edit", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", {
+      ...skills("skills/", "tool"),
+      "AGENTS.md": "approved\n",
+    });
+    const mine = m.at("mine");
+    mkdirSync(mine);
+    writeFileSync(join(mine, "AGENTS.md"), "local\n");
+    const write = (instructions: boolean) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          { id: "mine", local: mine, instructions: { codex: "AGENTS.md" } },
+          { id: "vendor", git: vendor.url, ...(instructions && { instructions: "AGENTS.md" }) },
+        ],
+      });
+    await m.json("init", write(true), "--no-hooks");
+    writeFileSync(m.at(".claude/CLAUDE.md"), "edited\n");
+    write(false);
+    const sync = await m.json<Report>("sync");
+    expect(sync.errors).toEqual([]);
+    expect(sync.files.total).toBe(0);
+    const diff = await m.run("diff", "instructions/AGENTS.md");
+    expect(diff.code, diff.stderr).toBe(0);
+    expect(diff.stdout).toContain("+edited");
   });
 
   it("finds retained edits by ID and rejects ambiguous retained copies", async () => {

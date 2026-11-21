@@ -111,8 +111,10 @@ function locateItem(loaded: LoadedManifest, state: State, typed: string): Locate
   );
   const active = loaded.sources.filter((source) => linked.has(source.id));
   const withRecord = (record: "pending" | "items") =>
-    loaded.sources.filter((source) =>
-      Object.hasOwn(state.sources[source.id]?.files?.[parsed.kind]?.[record] ?? {}, key),
+    loaded.sources.filter(
+      (source) =>
+        (source.kind === "git" || source.kind === "npm") &&
+        Object.hasOwn(state.sources[source.id]?.files?.[parsed.kind]?.[record] ?? {}, key),
     );
   const pending = active.length > 0 ? active : withRecord("pending");
   const candidates = pending.length > 0 ? pending : withRecord("items");

@@ -68,6 +68,15 @@ const MAX_FILES = 20_000;
 /** The files under a folder of a source, by `/`-separated path from the source's root. */
 export type FileLister = (base: string) => string[];
 
+export function sourcePathStat(path: string) {
+  try {
+    return lstat(path);
+  } catch (error) {
+    if (!isErrno(error, "ENOTDIR")) throw error;
+    return undefined;
+  }
+}
+
 /**
  * Lists the files of the tree at `root`, from a glob's base folder. A link counts only in a folder
  * linked in place (`inPlace`), where it leads to a file inside `root`, or anywhere when
@@ -107,7 +116,7 @@ export function treeLister(
       }
     };
     const start = base ? join(root, base) : root;
-    const stat = lstat(start);
+    const stat = sourcePathStat(start);
     if (stat?.isDirectory()) walk(start, base);
     else if (base && stat?.isFile()) files.push(base);
     listed.set(base, files);
