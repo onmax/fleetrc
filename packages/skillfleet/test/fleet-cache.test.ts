@@ -8,11 +8,7 @@ import { fleet, notInFleet, resolveFleet, type FleetAction } from "../src/fleet.
 
 vi.mock("../src/exec.ts", () => ({ exec: vi.fn() }));
 
-const revisionCases: {
-  name: string;
-  runs: { kind?: string; status: string; from?: string; to: string; reason?: string }[];
-  behind: string[][];
-}[] = [
+it.each([
   {
     name: "offline observations do not set the reference",
     runs: [
@@ -30,25 +26,7 @@ const revisionCases: {
     ],
     behind: [["vendor at 700ccfb"], ["held: vendor"]],
   },
-  {
-    name: "a vendored revision fetched for review sets the reference",
-    runs: [
-      { kind: "git", status: "unchanged", to: "700ccfb0" },
-      { kind: "git", status: "review", from: "8de87ca0", to: "91edcf40" },
-    ],
-    behind: [["vendor at 700ccfb"], []],
-  },
-  {
-    name: "a working clone waiting for review cannot set the reference",
-    runs: [
-      { kind: "clone", status: "unchanged", to: "8de87ca0" },
-      { kind: "clone", status: "review", from: "700ccfb0", to: "700ccfb0" },
-    ],
-    behind: [[], ["vendor at 700ccfb"]],
-  },
-];
-
-it.each(revisionCases)("compares live and cached runs: $name", async ({ runs, behind }) => {
+])("compares live and cached runs: $name", async ({ runs, behind }) => {
   const root = mkdtempSync(join(tmpdir(), "skillfleet-cache-"));
   vi.stubEnv("XDG_STATE_HOME", root);
   vi.stubEnv("SKILLFLEET_SSH", "ssh");
@@ -57,7 +35,7 @@ it.each(revisionCases)("compares live and cached runs: $name", async ({ runs, be
   vi.mocked(exec).mockImplementation(async (_command, args) => {
     const host = args.at(-2)!;
     const index = hosts.indexOf(host);
-    const { kind, status, from, to, reason } = runs[index]!;
+    const { status, to, reason } = runs[index]!;
     return {
       stderr: "",
       code: 0,
@@ -67,7 +45,7 @@ it.each(revisionCases)("compares live and cached runs: $name", async ({ runs, be
         host,
         finishedAt: new Date(now - (runs.length - index) * 60_000).toISOString(),
         ok: true,
-        sources: [{ id: "vendor", kind, status, from, to }],
+        sources: [{ id: "vendor", status, to }],
         held: reason ? [{ source: "vendor", reason, files: [] }] : [],
       }),
     };

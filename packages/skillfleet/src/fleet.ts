@@ -31,7 +31,6 @@ export interface HostResult {
     errors: string[];
     sources: Record<string, string | undefined>;
     sourceStatuses?: Record<string, string | undefined>;
-    vendoredReviews?: string[];
   };
   /** `fleet upgrade`: the version the host ran before, when known, and the one it runs now. */
   upgrade?: { from?: string; to: string };
@@ -275,17 +274,11 @@ function summarize(raw: unknown): HostResult["lastRun"] {
     : [];
   const sources = dict<string | undefined>();
   const sourceStatuses = dict<string>();
-  const vendoredReviews: string[] = [];
   if (Array.isArray(raw.sources)) {
     for (const source of raw.sources) {
       if (!isRecord(source) || typeof source.id !== "string") continue;
       sources[source.id] = typeof source.to === "string" ? source.to : undefined;
       if (typeof source.status === "string") sourceStatuses[source.id] = source.status;
-      if (
-        source.status === "review" &&
-        (source.kind === "git" || source.kind === "index" || source.kind === "npm")
-      )
-        vendoredReviews.push(source.id);
     }
   } else if (isRecord(raw.sources)) {
     for (const [id, commit] of Object.entries(raw.sources))
@@ -293,8 +286,6 @@ function summarize(raw: unknown): HostResult["lastRun"] {
     if (isRecord(raw.sourceStatuses))
       for (const [id, status] of Object.entries(raw.sourceStatuses))
         if (typeof status === "string") sourceStatuses[id] = status;
-    if (Array.isArray(raw.vendoredReviews))
-      for (const id of raw.vendoredReviews) if (typeof id === "string") vendoredReviews.push(id);
   }
   return {
     host: typeof raw.host === "string" ? raw.host : "",
@@ -306,7 +297,6 @@ function summarize(raw: unknown): HostResult["lastRun"] {
     errors,
     sources,
     ...(Object.keys(sourceStatuses).length ? { sourceStatuses } : {}),
-    ...(vendoredReviews.length ? { vendoredReviews } : {}),
   };
 }
 
@@ -686,9 +676,9 @@ function heldSource(run: NonNullable<HostResult["lastRun"]>, source: string): bo
 
 /**
  * A host is behind when its last run is over two hours old or a source sits at another commit than
- * on the freshest host that synced that source online or fetched a vendored revision for review.
- * An offline revision can be compared but cannot set the reference. A host holding a source is
- * reported as held instead. Only a host that answered can be said to have never run.
+ * on the freshest host that synced that source online. An offline revision can be compared but
+ * cannot set the reference. A host holding a source is reported as held instead. Only a host that
+ * answered can be said to have never run.
  */
 export function markBehind(results: HostResult[], now = Date.now()) {
   const runs = results
@@ -703,8 +693,7 @@ export function markBehind(results: HostResult[], now = Date.now()) {
         status === undefined ||
         status === "installed" ||
         status === "updated" ||
-        status === "unchanged" ||
-        (status === "review" && run.vendoredReviews?.includes(source))
+        status === "unchanged"
       )
         reference.set(source, commit);
     }
