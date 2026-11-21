@@ -52,6 +52,7 @@ import {
   defaultSourceId,
   editManifest,
   loadManifest,
+  manifestCheckoutRoute,
   type Manifest,
   ManifestError,
   readConfig,
@@ -974,7 +975,9 @@ async function init() {
   const pending = paths.initPending();
   const withTimer = pendingInitTimer(pending) || timerWanted();
   const withHooks = !values["no-hooks"];
-  const plan = await planInit(canonicalManifestSpec(given), { offline: values.offline, dryRun });
+  const spec = canonicalManifestSpec(given);
+  const route = manifestCheckoutRoute(spec);
+  const plan = await planInit(spec, { offline: values.offline, dryRun, checkout: route.checkout });
   if (dryRun) {
     const launcher = `would install ${tildify(launcherPath())}, the copy new shells, the hooks, the timer and \`fleet\` run (node ${stableNode()})`;
     const hooks = withHooks ? addHooks(undefined) : undefined;
@@ -1001,7 +1004,9 @@ async function init() {
     );
   mkdirSync(dirname(pending), { recursive: true });
   writeFileSync(pending, withTimer ? "timer\n" : "");
-  const applied = [...(await cloneBeforeAdopt(plan)), ...applyPlan(plan)];
+  const applied = await cloneBeforeAdopt(plan);
+  route.retain();
+  applied.push(...applyPlan(plan));
   // Naming the manifest the tailnet gave, as `fleet init --timer` does on a host, keeps following it.
   const stillFollowing =
     config?.tailscale === true && sameManifest(plan.manifestSpec, config.manifest);

@@ -156,14 +156,18 @@ describe("the manifest from the tailnet policy", () => {
       ...skills("skills/", "bundled"),
     });
     const url = "https://github.com/example/bundled.git";
-    m.git(m.root, "config", "--global", `url.${repository.served}.insteadOf`, url);
-    tailscale.policy([{ manifest: "github:example/bundled" }]);
+    const page = url.slice(0, -4);
+    m.git(m.root, "config", "--global", "--add", `url.${repository.served}.insteadOf`, page);
+    m.git(m.root, "config", "--global", "--add", `url.${repository.served}.insteadOf`, url);
+    tailscale.policy([{ manifest: page }]);
     const init = await m.runWith({ env: tailscale.env }, "init", "--no-hooks", "--copy");
     expect(init.code, init.stdout + init.stderr).toBe(0);
 
     const copy = m.at(".claude/skills/bundled/SKILL.md");
     const edited = readFileSync(copy, "utf8") + "\nMy local edit.\n";
     writeFileSync(copy, edited);
+    const cached = await m.runWith({ env: tailscale.env }, "sync", "--offline", "--manifest", url);
+    expect(cached.code, cached.stdout + cached.stderr).toBe(0);
     const alias = `${url}//.skillfleet/manifest.json`;
     tailscale.policy([{ manifest: alias }]);
     const switched = await m.runWith({ env: tailscale.env }, "sync");
@@ -289,6 +293,20 @@ describe("the manifest from the tailnet policy", () => {
     const offline = await m.runWith({ env: tailscale.env }, "sync", "--offline");
     expect(offline.code, offline.stdout + offline.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["from-tailnet"]);
+
+    const adopted = await m.runWith(
+      { env: tailscale.env },
+      "init",
+      "--offline",
+      "--force",
+      "--no-hooks",
+      override,
+    );
+    expect(adopted.code, adopted.stdout + adopted.stderr).toBe(0);
+    expect(config(m).manifest).toBe(override);
+    expect(config(m).tailscale).toBeUndefined();
+    const afterward = await m.runWith({ env: tailscale.env }, "sync", "--offline");
+    expect(afterward.code, afterward.stdout + afterward.stderr).toBe(0);
   });
 
   it("a dry-run sync names the new manifest without saving it", async () => {

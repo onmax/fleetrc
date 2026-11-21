@@ -14,7 +14,7 @@ import { distance } from "fastest-levenshtein";
 import { getSupportedAgents } from "skills";
 import { git } from "./exec.ts";
 import { isTag, tagProblem } from "./fleet.ts";
-import { fetchClone, gitUrl, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
+import { fetchClone, gitUrl, hasCachedClone, NO_GIT_REDIRECTS, splitRepoPath } from "./gitcache.ts";
 import {
   dict,
   inside,
@@ -710,10 +710,35 @@ interface LocateOptions {
   checkout?: typeof fetchClone;
 }
 
-function policyCacheRoot(spec: string, base?: string): string {
+function checkoutUrls(url: string): string[] {
+  if (!/^https:\/\/(?:github\.com|gitlab\.com)\/(?:[\w.-]+\/)+[\w.-]+$/.test(url)) return [url];
+  const page = url.replace(/\.git$/, "");
+  return [url, url === page ? `${page}.git` : page];
+}
+
+function policyCacheRoots(spec: string, base?: string): string[] {
   const remote = remoteManifest(spec, base);
-  const identity = remote ? [gitUrl(remote.repo), remote.path, remote.ref] : [spec];
-  return join(paths.cache(), "tailnet-manifests", sha256(JSON.stringify(identity)).slice(0, 32));
+  const identities = remote
+    ? checkoutUrls(gitUrl(remote.repo)).map((url) => [url, remote.path, remote.ref])
+    : [[spec]];
+  return identities.map((identity) =>
+    join(paths.cache(), "tailnet-manifests", sha256(JSON.stringify(identity)).slice(0, 32)),
+  );
+}
+
+function policyCacheRoot(spec: string, savedSpec?: string, base?: string): string {
+  const roots = policyCacheRoots(spec, base).sort();
+  const savedRoot = savedSpec && policyCacheRoots(savedSpec)[0];
+  return (
+    roots.find((root) => {
+      const marker = readJsonOrNothing(join(root, "validated.json"));
+      return isRecord(marker) && marker.preferred === true;
+    }) ??
+    roots.find((root) => root === savedRoot && existsSync(join(root, "validated.json"))) ??
+    roots.find((root) => existsSync(join(root, "validated.json"))) ??
+    roots.find((root) => existsSync(join(root, "a"))) ??
+    roots[0]!
+  );
 }
 
 type CacheSlot = "a" | "b" | "flat" | "shared";
@@ -740,49 +765,94 @@ function slotRoot(root: string, slot: CacheSlot): string {
   return slot === "flat" ? root : join(root, slot);
 }
 
+function checkoutRoute(
+  urls: string[],
+  ref: string | undefined,
+  root: string,
+  slots: Map<string, CacheSlot>,
+  fallback?: CacheSlot,
+) {
+  for (const cacheUrl of urls) {
+    const slot = slots.get(checkoutKey(cacheUrl, ref));
+    if (slot) return { slot, cacheUrl };
+  }
+  const slot = slots.get("*") ?? fallback;
+  if (!slot) return undefined;
+  return { slot, cacheUrl: cachedUrl(urls, ref, slotRoot(root, slot)) };
+}
+
+function cachedUrl(urls: string[], ref: string | undefined, root: string) {
+  return urls.find((url) => hasCachedClone(url, ref, root)) ?? urls[0]!;
+}
+
+function saveCheckoutSlots(root: string, slots: Map<string, CacheSlot>) {
+  writeJson(join(root, "validated.json"), { preferred: true, slots: Object.fromEntries(slots) });
+}
+
 /** Validate separately, but keep each working checkout whose revision has not changed. */
 export async function stagePolicyManifest(spec: string, savedSpec: string) {
-  const root = policyCacheRoot(spec);
+  const root = policyCacheRoot(spec, savedSpec);
   const active = validatedSlots(root);
   const slots = new Map(active);
-  if (root === policyCacheRoot(savedSpec) && active.size === 0) slots.set("*", "shared");
+  const saved = remoteManifest(savedSpec);
+  const savedUrl = saved && gitUrl(saved.repo);
+  if (policyCacheRoots(savedSpec).includes(root) && active.size === 0) slots.set("*", "shared");
   const loaded = await loadManifest(spec, {
     checkout: async (url, ref, _cacheRoot, options) => {
-      const key = checkoutKey(url, ref);
-      const previous = active.get(key) ?? slots.get("*");
-      const staging = previous === "a" ? "b" : "a";
-      const candidate = await fetchClone(url, ref, slotRoot(root, staging), options);
+      const urls = checkoutUrls(url);
+      const previousUrls =
+        savedUrl && urls.includes(savedUrl) && saved?.ref === ref ? checkoutUrls(savedUrl) : urls;
+      const previous = checkoutRoute(previousUrls, ref, root, active, slots.get("*"));
+      const staging = previous?.slot === "a" ? "b" : "a";
+      const cacheUrl = cachedUrl(urls, ref, slotRoot(root, staging));
+      const candidate = await fetchClone(url, ref, slotRoot(root, staging), {
+        ...options,
+        cacheUrl,
+      });
+      for (const alias of urls) slots.delete(checkoutKey(alias, ref));
       if (previous) {
-        const current = await fetchClone(url, ref, slotRoot(root, previous), {
+        const current = await fetchClone(url, ref, slotRoot(root, previous.slot), {
           offline: true,
+          cacheUrl: previous.cacheUrl,
         }).catch(() => undefined);
         if (current?.commit === candidate.commit) {
-          slots.set(key, previous);
+          slots.set(checkoutKey(previous.cacheUrl, ref), previous.slot);
           return current;
         }
       }
-      slots.set(key, staging);
+      slots.set(checkoutKey(cacheUrl, ref), staging);
       return candidate;
     },
   });
   return {
     loaded,
-    accept: () => writeJson(join(root, "validated.json"), { slots: Object.fromEntries(slots) }),
+    accept: () => saveCheckoutSlots(root, slots),
   };
 }
 
-function manifestCheckout(spec: string, base?: string): typeof fetchClone {
-  const root = policyCacheRoot(spec, base);
-  const slots = validatedSlots(root);
+export function manifestCheckoutRoute(spec: string, base?: string) {
   const config = readJsonOrNothing(paths.config());
+  const savedSpec =
+    isRecord(config) && typeof config.manifest === "string" ? config.manifest : undefined;
+  const root = policyCacheRoot(spec, savedSpec, base);
+  const slots = validatedSlots(root);
   const isolated =
+    savedSpec !== undefined &&
     isRecord(config) &&
     config.tailscale === true &&
-    typeof config.manifest === "string" &&
-    root !== policyCacheRoot(config.manifest);
+    !policyCacheRoots(savedSpec).includes(root);
   const fallback = slots.get("*") ?? (slots.size || isolated ? "a" : "shared");
-  return (url, ref, _cacheRoot, options) =>
-    fetchClone(url, ref, slotRoot(root, slots.get(checkoutKey(url, ref)) ?? fallback), options);
+  const checkout: typeof fetchClone = (url, ref, _cacheRoot, options) => {
+    const { slot, cacheUrl } = checkoutRoute(checkoutUrls(url), ref, root, slots, fallback)!;
+    return fetchClone(url, ref, slotRoot(root, slot), { ...options, cacheUrl });
+  };
+  return {
+    checkout,
+    retain: () => {
+      if (isolated && slots.size === 0 && remoteManifest(spec, base))
+        saveCheckoutSlots(root, new Map([["*", "a"]]));
+    },
+  };
 }
 
 /** Where a manifest spec lives on disk, fetching it when it is in a remote repository. */
@@ -795,7 +865,9 @@ export async function locateManifest(
       ...options,
       base,
       cacheRoot,
-      checkout: checkout ?? (cacheRoot === undefined ? manifestCheckout(spec, base) : undefined),
+      checkout:
+        checkout ??
+        (cacheRoot === undefined ? manifestCheckoutRoute(spec, base).checkout : undefined),
     })
   ).file;
 }
@@ -1120,7 +1192,8 @@ export async function loadManifest(
   const options = {
     cacheRoot,
     offline,
-    checkout: checkout ?? (cacheRoot === undefined ? manifestCheckout(spec) : undefined),
+    checkout:
+      checkout ?? (cacheRoot === undefined ? manifestCheckoutRoute(spec).checkout : undefined),
   };
   const rootFile = await locateManifest(spec, options);
   const root = readManifestFile(rootFile);

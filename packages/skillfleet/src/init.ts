@@ -14,6 +14,7 @@ import {
   loadManifest,
   type LoadedManifest,
   locateManifest,
+  manifestCheckoutRoute,
   type Manifest,
   parseManifest,
   remoteManifest,
@@ -170,12 +171,20 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
 
 export async function planInit(
   spec: string,
-  { offline = false, dryRun = false } = {},
+  {
+    offline = false,
+    dryRun = false,
+    checkout,
+  }: {
+    offline?: boolean;
+    dryRun?: boolean;
+    checkout?: ReturnType<typeof manifestCheckoutRoute>["checkout"];
+  } = {},
 ): Promise<InitPlan> {
   const scratch = mkdtempSync(join(tmpdir(), "skillfleet-init-"));
   try {
     // A dry run fetches a remote manifest into a scratch folder, so it leaves the state folder alone.
-    const cache = dryRun ? { cacheRoot: join(scratch, "manifests") } : {};
+    const cache = dryRun ? { cacheRoot: join(scratch, "manifests") } : { checkout };
     const manifestFile = await locateManifest(spec, { offline, ...cache });
     const loaded = await loadManifest(spec, { offline, ...cache });
     const imports = await collectImports(loaded);

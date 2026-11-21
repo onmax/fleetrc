@@ -113,6 +113,12 @@ export function refusals(paths: readonly string[]): Refusal[] {
   return [...found].map(([path, problem]) => ({ path, problem }));
 }
 
+const cloneKey = (url: string, ref?: string) => sha256(`${url}#${ref ?? ""}`).slice(0, 16);
+
+export function hasCachedClone(url: string, ref: string | undefined, root: string): boolean {
+  return markedCommit(join(root, `${cloneKey(url, ref)}.json`)) !== undefined;
+}
+
 /**
  * The files of `url` at `ref` (default branch when absent), kept under `root` between runs. The
  * `skills` package clones into a temporary folder on every call; this cache is what lets a timer
@@ -130,13 +136,15 @@ export async function fetchClone(
   {
     offline = false,
     check,
+    cacheUrl = url,
   }: {
     offline?: boolean;
+    cacheUrl?: string;
     /** Why `url` may not be fetched, asked in the cache's own repository right before each fetch. */
     check?: (url: string, cwd: string) => Promise<string | undefined>;
   } = {},
 ): Promise<CachedClone> {
-  const key = sha256(`${url}#${ref ?? ""}`).slice(0, 16);
+  const key = cloneKey(cacheUrl, ref);
   const cache = {
     repo: join(root, `${key}.git`),
     tree: join(root, key),
