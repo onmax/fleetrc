@@ -3,20 +3,20 @@ import { isRecord } from "./fs.ts";
 import { notInstalled, program } from "./program.ts";
 
 /** The capability a tailnet policy's `nodeAttrs` grants to hand machines the manifest's location. */
-export const TAILSCALE_CAPABILITY = "github.com/onmax/skillfleet";
+export const TAILSCALE_CAPABILITY = "github.com/onmax/fleetrc";
 
 /** `tailscale status --json` with `args`, parsed, or why Tailscale could not answer. */
 export async function tailscaleStatus(
   args: readonly string[],
   timeoutMs: number,
 ): Promise<{ status: Record<string, unknown> } | { error: string }> {
-  const { command, prefix } = program("SKILLFLEET_TAILSCALE", "tailscale");
+  const { command, prefix } = program("FLEETRC_TAILSCALE", "tailscale");
   const run = await exec(command, [...prefix, "status", "--json", ...args], {
     timeoutMs,
     maxOutput: 64 * 1024 * 1024,
   });
   if (run.spawnError === "ENOENT")
-    return { error: notInstalled(command, "tailscale", "SKILLFLEET_TAILSCALE") };
+    return { error: notInstalled(command, "tailscale", "FLEETRC_TAILSCALE") };
   if (run.timedOut)
     return { error: `\`tailscale status\` did not answer within ${timeoutMs / 1000} s` };
   if (run.code !== 0) {
@@ -39,7 +39,7 @@ export async function tailscaleStatus(
 
 /**
  * The manifest the tailnet policy names for this machine, from
- * `"nodeAttrs": [{ "target": [...], "app": { "github.com/onmax/skillfleet": [{ "manifest": "<spec>" }] } }]`,
+ * `"nodeAttrs": [{ "target": [...], "app": { "github.com/onmax/fleetrc": [{ "manifest": "<spec>" }] } }]`,
  * or why there is none.
  */
 export async function tailscaleManifest(
