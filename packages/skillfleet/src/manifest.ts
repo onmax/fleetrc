@@ -804,8 +804,10 @@ export async function stagePolicyManifest(spec: string, savedSpec: string) {
         savedUrl && urls.includes(savedUrl) && saved?.ref === ref ? checkoutUrls(savedUrl) : urls;
       const previous = checkoutRoute(previousUrls, ref, root, active, slots.get("*"));
       const staging = previous?.slot === "a" ? "b" : "a";
-      const cacheUrl = cachedUrl(urls, ref, slotRoot(root, staging));
-      const candidate = await fetchClone(url, ref, slotRoot(root, staging), {
+      const stagingRoot = slotRoot(root, staging);
+      const stagingUrls = urls.filter((alias) => active.get(checkoutKey(alias, ref)) !== staging);
+      const cacheUrl = cachedUrl(stagingUrls, ref, stagingRoot);
+      const candidate = await fetchClone(url, ref, stagingRoot, {
         ...options,
         cacheUrl,
       });

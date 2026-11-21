@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { machine, type Machine, names, remote, skills } from "./fixture.ts";
+import { machine, type Machine, names, remote, sha256, skills } from "./fixture.ts";
 
 /**
  * A fake `tailscale` for SKILLFLEET_TAILSCALE that prints `<dir>/status.json`, so a test can change
@@ -143,6 +143,73 @@ describe("the manifest from the tailnet policy", () => {
     );
     expect(override.code, override.stdout + override.stderr).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual([]);
+  });
+
+  it("preserves both active forge alias checkouts when a policy switch is rejected", async () => {
+    const m = machine();
+    const tailscale = fakeTailscale(m);
+    const vendor = remote(m, "vendor", skills("skills/", "from-team"));
+    const upstream = remote(m, "upstream", {
+      "first.json": JSON.stringify({ sources: [] }),
+      "second.json": JSON.stringify({ sources: [{ id: "vendor", git: vendor.https }] }),
+    });
+    const page = "https://github.com/example/upstream";
+    const clone = `${page}.git`;
+    const homeUrl = "https://github.com/example/home.git";
+    const home = remote(m, "home", {
+      ".skillfleet/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        extends: [`${page}//first.json`, `${clone}//second.json`],
+        sources: [],
+      }),
+    });
+    m.git(m.root, "config", "--global", `url.${upstream.served}.insteadOf`, page);
+    m.git(m.root, "config", "--global", "--add", `url.${upstream.served}.insteadOf`, clone);
+    m.git(m.root, "config", "--global", `url.${home.served}.insteadOf`, homeUrl);
+    tailscale.policy([{ manifest: "github:example/home" }]);
+    const init = await m.runWith({ env: tailscale.env }, "init", "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const before = config(m);
+
+    const hash = (value: string) => sha256(Buffer.from(value));
+    const cache = join(m.stateDir, "cache");
+    const root = join(
+      cache,
+      "tailnet-manifests",
+      hash(JSON.stringify([homeUrl, ".skillfleet/manifest.json", undefined])).slice(0, 32),
+    );
+    const pageKey = hash(`${page}#`);
+    const cloneKey = hash(`${clone}#`);
+    for (const [slot, key] of [
+      ["a", pageKey],
+      ["b", cloneKey],
+    ] as const) {
+      mkdirSync(join(root, slot), { recursive: true });
+      for (const suffix of ["", ".git", ".json"]) {
+        cpSync(
+          join(cache, "manifests", `${pageKey.slice(0, 16)}${suffix}`),
+          join(root, slot, `${key.slice(0, 16)}${suffix}`),
+          { recursive: true },
+        );
+      }
+    }
+    writeFileSync(
+      join(root, "validated.json"),
+      JSON.stringify({ slots: { "*": "shared", [pageKey]: "a", [cloneKey]: "b" } }),
+    );
+    const beforeSwitch = await m.runWith({ env: tailscale.env }, "sync", "vendor", "--offline");
+    expect(beforeSwitch.code, beforeSwitch.stdout + beforeSwitch.stderr).toBe(0);
+
+    upstream.commit({ "second.json": JSON.stringify({ sources: [] }) });
+    tailscale.policy([{ manifest: `${homeUrl}//.skillfleet/manifest.json` }]);
+    const rejected = await m.runWith({ env: tailscale.env }, "sync", "vendor");
+    expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
+    expect(rejected.stderr).toContain('no source "vendor"');
+    expect(config(m)).toEqual(before);
+
+    const offline = await m.runWith({ env: tailscale.env }, "sync", "vendor", "--offline");
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["from-team"]);
   });
 
   it("preserves managed copy edits across policy aliases at the same commit", async () => {
