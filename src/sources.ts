@@ -67,7 +67,7 @@ import { assertSegment, GIT_FOLDER, nameKey, segmentProblem } from "./names.ts";
 import { type FetchBudget, fetchNpm, guardedFetch, parseNpmSpec, withCappedFetch } from "./npm.ts";
 import { tildify } from "./paths.ts";
 import { tarFileSizes, zipEntries } from "./tar.ts";
-import type { PendingUpdate, SourceState, State } from "./state.ts";
+import type { FileItems, PendingUpdate, SourceState, State } from "./state.ts";
 
 export interface SkillEntry {
   name: string;
@@ -2487,7 +2487,7 @@ function mergeItems(out: SourceResult, sub: SourceResult, kind: FileKind, names:
 function approvedFileTargets(
   source: VendoredSource,
   kind: FileKind,
-  selected: Record<string, string[]> | undefined,
+  { selected, instructionGlobs }: FileItems,
   ctx: SourceContext,
 ): Map<string, FileTarget[]> {
   const approved = new Map<string, FileTarget[]>();
@@ -2495,11 +2495,17 @@ function approvedFileTargets(
     for (const [name, agents] of Object.entries(selected)) {
       const path = itemPath(name);
       const targets = findFileItems(source, kind, pathsLister([path]), []).get(path) ?? [];
-      const retained = targets.filter((target) => agents.includes(target.agent));
+      const retained = targets.filter(
+        ({ agent }) =>
+          agents.includes(agent) &&
+          (kind !== "instructions" ||
+            instructionGlobs?.[agent] === source.files?.instructions?.[agent]),
+      );
       if (retained.length > 0) approved.set(path, retained);
     }
     return approved;
   }
+  if (kind === "instructions") return approved;
   for (const [destination, link] of Object.entries(ctx.fileLinks ?? {})) {
     if (link.source !== source.id || link.kind !== kind) continue;
     if (!link.item.startsWith(`${kind}/`)) continue;
@@ -2548,7 +2554,7 @@ function vendoredFiles(
       findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
     const approved =
       source.update === "review"
-        ? approvedFileTargets(source, kind, records.selected, ctx)
+        ? approvedFileTargets(source, kind, records, ctx)
         : undefined;
     const found = root
       ? findFileItems(source, kind, treeLister(root), sub.warnings)
@@ -2615,6 +2621,9 @@ function vendoredFiles(
     if (root && !ctx.dryRun) {
       if (approved) records.selected = selectedAgents;
       else delete records.selected;
+      if (approved && kind === "instructions") {
+        records.instructionGlobs = source.files?.instructions ?? dict();
+      } else delete records.instructionGlobs;
     }
     mergeItems(out, sub, kind, [
       ...Object.keys(view.skills),

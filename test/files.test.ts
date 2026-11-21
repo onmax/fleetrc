@@ -270,6 +270,28 @@ describe("files across sources", () => {
     expect(read(destination)).toBe("approved\n");
   });
 
+  it("waits for online validation when a review-mode instruction glob changes", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "docs/team.md": "team\n", "docs/other.md": "other\n" });
+    const write = (glob: string) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, update: "review", instructions: glob }],
+      });
+    const destination = m.at(".claude/CLAUDE.md");
+    mkdirSync(m.at(".claude"), { recursive: true });
+    writeFileSync(destination, "foreign\n");
+    const { sync } = await m.json<{ sync: Report }>("init", write("docs/team.md"), "--no-hooks");
+    expect(sync.files.foreign).toEqual([destination]);
+    write("docs/*.md");
+    rmSync(destination);
+    await m.json<Report>("sync", "--offline");
+    expect(existsSync(destination)).toBe(false);
+    const online = await m.json<Report>("sync");
+    expect(online.warnings.join("\n")).toContain("match 2 files");
+    expect(existsSync(destination)).toBe(false);
+  });
+
   it("links a cached review-mode instruction offline when the winning source is removed", async () => {
     const m = machine();
     const first = remote(m, "first", { "AGENTS.md": "first\n" });
@@ -305,8 +327,8 @@ describe("files across sources", () => {
       ],
     });
     await m.json("init", manifest, "--no-hooks");
-    vendor.commit({ "AGENTS.md": null, "AGENTS.md/other.md": "replacement\n" });
-    vendor.commit({ "commands/a.md": null, commands: "replacement\n" });
+    vendor.commit({ "AGENTS.md": null, "AGENTS.md/other.md": "replacement\n", commands: null });
+    vendor.commit({ commands: "replacement\n" });
     const sync = await m.json<Report>("sync");
     expect(sync.errors).toEqual([]);
     expect(sync.pending.map((entry) => entry.skill).sort()).toEqual([

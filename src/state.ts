@@ -42,6 +42,8 @@ export interface FileItems {
   pending: Record<string, PendingUpdate>;
   /** Validated agents for approved review-mode items, even if no link was made. */
   selected?: Record<string, string[]>;
+  /** Instruction globs validated against the source when the selections were recorded. */
+  instructionGlobs?: Record<string, string>;
 }
 
 /** A file fleetrc linked (or copied) into an agent's folder, by the path it is at. */
@@ -190,6 +192,13 @@ function fileItems(record: unknown): FileItems | undefined {
       ? {
           selected: records(record.selected, (agents) =>
             Array.isArray(agents) ? agents.filter((agent) => typeof agent === "string") : undefined,
+          ),
+        }
+      : {}),
+    ...(isRecord(record.instructionGlobs)
+      ? {
+          instructionGlobs: records(record.instructionGlobs, (glob) =>
+            typeof glob === "string" ? glob : undefined,
           ),
         }
       : {}),
