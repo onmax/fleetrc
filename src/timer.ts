@@ -11,8 +11,8 @@ import {
 import { parseCronExpression } from "cron-schedule";
 import { exec } from "./exec.ts";
 import { isRecord, readJsonOrNothing, writeJson } from "./fs.ts";
-import { stateDir, tildify, xdgDir } from "./paths.ts";
-import { launcherPath } from "./selfinstall.ts";
+import { paths, stateDir, tildify, xdgDir } from "./paths.ts";
+import { findOnPath, launcherPath, timerEnv } from "./selfinstall.ts";
 
 export const TIMER_NAME = "fleetrc-sync";
 
@@ -38,6 +38,23 @@ export interface InstalledTimer {
 }
 
 export type TimerStatus = OsScheduleStatus;
+
+/** The timer that runs `<node> <cli> sync` on the manifest's `timer` schedule. */
+export function syncTimerSpec(
+  timer: { cron: string; timeZone?: string },
+  node: string,
+  cli: string,
+): TimerSpec {
+  return {
+    name: TIMER_NAME,
+    cron: timer.cron,
+    timeZone: timer.timeZone ?? "local",
+    command: [node, cli, "sync"],
+    // FLEETRC_TIMER puts the time of each run in the log.
+    env: { ...timerEnv(findOnPath("git"), node), FLEETRC_TIMER: "1" },
+    logDir: paths.logs(),
+  };
+}
 
 /** Why `cron` is not a five-field cron the OS timers run, or undefined when it is. */
 export function cronProblem(cron: string): string | undefined {

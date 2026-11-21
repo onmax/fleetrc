@@ -26,8 +26,20 @@ export function xdgDir(name: "XDG_CONFIG_HOME" | "XDG_STATE_HOME"): string | und
   return value && isAbsolute(value) ? value : undefined;
 }
 
+/** Folders read in place of this install's for the rest of the run; see `readPlacesFrom`. */
+let places: { state: string; config: string } | undefined;
+
+/**
+ * Reads the state and config folders of `from` for the rest of this run: a dry run of the move
+ * from the old name (migrate.ts), which writes nothing, still shows what a sync there would do.
+ */
+export function readPlacesFrom(from: { state: string; config: string }) {
+  places = from;
+}
+
 /** Where `config.json` lives: XDG config, else %APPDATA% on Windows, else ~/.config. */
 export function configDir(): string {
+  if (places) return places.config;
   const env = process.env;
   const xdg = xdgDir("XDG_CONFIG_HOME");
   if (xdg) return join(xdg, "fleetrc");
@@ -48,6 +60,7 @@ let windowsInstalledState: string | undefined;
  * platform default. The Windows installed choice stays fixed for the invocation.
  */
 export function stateDir(): string {
+  if (places) return places.state;
   const xdg = xdgDir("XDG_STATE_HOME");
   if (xdg) return join(xdg, "fleetrc");
   const installed = installedStateDir();

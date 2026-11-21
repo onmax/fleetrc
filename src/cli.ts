@@ -64,7 +64,8 @@ import {
   webPage,
 } from "./manifest.ts";
 import { findName, nameKey } from "./names.ts";
-import { paths, tildify } from "./paths.ts";
+import { migrationNeeded } from "./legacy.ts";
+import { paths, stateDir, tildify } from "./paths.ts";
 import { formatReport, type Report } from "./report.ts";
 import {
   commandOnPath,
@@ -97,7 +98,7 @@ import {
   TIMER_NAME,
   TimerError,
   timerKind,
-  type TimerSpec,
+  syncTimerSpec,
   type TimerStatus,
   timerNode,
   timerStatus,
@@ -449,15 +450,7 @@ async function installTimer(settings?: Manifest["timer"]): Promise<{
   const timer = settings ?? (await currentTimerSettings(notes));
   const installed = dryRun ? undefined : selfInstall();
   const node = installed?.node ?? stableNode();
-  const spec: TimerSpec = {
-    name: TIMER_NAME,
-    cron: timer.cron,
-    timeZone: timer.timeZone ?? "local",
-    command: [node, installed?.cli ?? installedCli(), "sync"],
-    // FLEETRC_TIMER puts the time of each run in the log.
-    env: { ...timerEnv(findOnPath("git"), node), FLEETRC_TIMER: "1" },
-    logDir: paths.logs(),
-  };
+  const spec = syncTimerSpec(timer, node, installed?.cli ?? installedCli());
   const lines = [
     ...notes,
     `timer ${TIMER_NAME}: \`${spec.command.join(" ")}\` on "${spec.cron}" (${spec.timeZone === "local" ? `the machine's time zone, now ${machineTimeZone()}` : spec.timeZone})`,
@@ -1154,7 +1147,7 @@ async function fleetCommand(action: string | undefined) {
   if (entries.length === 0) usage("the manifest has no fleet; add hosts with `fleetrc fleet add`");
   const bad = entries.filter(isTag).flatMap((entry) => tagProblem(entry) ?? []);
   if (bad.length > 0) usage(bad.join("; "));
-  if (action === "upgrade") {
+  if (action === "upgrade" && !process.env.FLEETRC_PACKAGE) {
     const reason = await unpublished(version);
     if (reason) throw new UserError(reason);
   }
@@ -1380,6 +1373,9 @@ async function merge() {
   return result.conflicts.length && !dryRun ? 1 : 0;
 }
 
+/** The commands that move the old name's install to fleetrc's names first (migrate.ts). */
+const MIGRATING = new Set(["sync", "update", "init", "self-install"]);
+
 async function main(): Promise<number> {
   if (values.version) {
     console.log(version);
@@ -1412,6 +1408,11 @@ async function main(): Promise<number> {
             ? `${command} changes nothing, so it has no --dry-run`
             : `${command} has no --dry-run`,
       );
+  // The first command of this release that changes things moves the old name's install, once.
+  if (MIGRATING.has(command) && migrationNeeded(stateDir())) {
+    const { migrate } = await import("./migrate.ts");
+    say(...(await migrate({ dryRun })).lines);
+  }
   switch (command) {
     case "sync":
       if (rest.length > 1) usage("sync takes at most one source");

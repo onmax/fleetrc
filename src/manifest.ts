@@ -32,6 +32,7 @@ import { registryUrl, urlOrigin } from "./npm.ts";
 import { expandPath, paths, tildify } from "./paths.ts";
 import { tailscaleManifest } from "./tailscale.ts";
 import { cronProblem, timeZoneProblem } from "./timer.ts";
+import { LEGACY_MANIFEST_DIR, legacyWarning } from "./legacy.ts";
 
 export type UpdateMode = "auto" | "review";
 
@@ -896,11 +897,7 @@ async function locate(
     const info = statSync(path, { throwIfNoEntry: false });
     const folder = info?.isDirectory() === true;
     const traversesParent = path.split(sep === "\\" ? /[\\/]/ : "/").includes("..");
-    const file = folder
-      ? join(path, DEFAULT_MANIFEST)
-      : info && !traversesParent
-        ? normalize(path)
-        : path;
+    const file = folder ? legacyManifest(path) : info && !traversesParent ? normalize(path) : path;
     if (folder && !existsSync(file))
       throw new ManifestError(
         `${tildify(path)} has no ${DEFAULT_MANIFEST}; name the manifest file as ${join(tildify(path), "<file>")}`,
@@ -917,13 +914,41 @@ async function locate(
     if (problem) throw new ManifestError(problem);
   }
   const clone = await checkout(url, remote.ref, cacheRoot, { offline, check });
-  const file = join(clone.dir, remote.path);
+  const file = otherDefault(clone.dir, remote.path);
   if (!existsSync(file))
     throw new ManifestError(
       `${url} has no ${remote.path}; name the manifest file as ${remote.repo}//<file>`,
     );
   if (team) within(clone.dir, file, spec);
   return { file, root: clone.dir };
+}
+
+/**
+ * A folder's manifest: `.fleetrc/manifest.json`, or for one release, with a warning, the
+ * manifest folder of fleetrc's old name (legacy.ts) when only that holds one.
+ */
+function legacyManifest(folder: string): string {
+  const file = join(folder, DEFAULT_MANIFEST);
+  const legacy = join(folder, LEGACY_MANIFEST_DIR, "manifest.json");
+  if (existsSync(file) || !existsSync(legacy)) return file;
+  legacyWarning(
+    `${tildify(legacy)} is the manifest's old place; move it to ${DEFAULT_MANIFEST} before the next release stops reading it`,
+  );
+  return legacy;
+}
+
+/**
+ * The manifest at `path` in a checkout; when `path` is the default and missing, the other of the
+ * old name's default and the new one.
+ */
+function otherDefault(dir: string, path: string): string {
+  const file = join(dir, path);
+  const legacyPath = `${LEGACY_MANIFEST_DIR}/manifest.json`;
+  if (existsSync(file)) return file;
+  if (path === DEFAULT_MANIFEST) return legacyManifest(dir);
+  if (path === legacyPath && existsSync(join(dir, DEFAULT_MANIFEST)))
+    return join(dir, DEFAULT_MANIFEST);
+  return file;
 }
 
 /** Throws unless `file`, links followed, is inside `root`. */

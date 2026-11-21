@@ -163,7 +163,7 @@ describe("mac environments", () => {
         });
         expect(run.stdout, run.stderr).toContain('"finishedAt"');
         expect(readFileSync(log, "utf8")).toBe(
-          `${join(nodeBin, "node")}\n-y fleetrc@1.2.3 self-install\n`,
+          `${join(nodeBin, "node")}\n-y --package fleetrc@1.2.3 -- fleetrc self-install\n`,
         );
 
         // The launcher's node is gone: fleet sync says so instead of "exec: not found".
