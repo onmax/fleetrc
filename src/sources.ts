@@ -39,8 +39,19 @@ import {
   SkillTooLargeError,
   writeJson,
 } from "./fs.ts";
+import {
+  dropEmptyKind,
+  type FileEntry,
+  findFileItems,
+  itemId,
+  itemName,
+  itemPath,
+  pathsLister,
+  treeLister,
+} from "./files.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
 import { globBase, globFilter } from "./glob.ts";
+import { FILE_KINDS, type FileKind } from "./kinds.ts";
 import {
   type CloneSource,
   type InPlaceSource,
@@ -94,6 +105,8 @@ export interface SourceResult {
   added: string[];
   updated: string[];
   removed: string[];
+  /** Instruction files, subagents and commands, each with the agents it goes to. */
+  files: FileEntry[];
   error?: string;
   warnings: string[];
 }
@@ -123,6 +136,7 @@ const result = (source: Source, status: SourceStatus): SourceResult => ({
   added: [],
   updated: [],
   removed: [],
+  files: [],
   warnings: [],
 });
 
@@ -493,7 +507,8 @@ async function discoverInPlace(
     ) {
       // Links that lead out were all there was: name them and the rule, not just "no skills".
       if (why.length > 0) warnings.push(...why);
-      else
+      // A source of files alone has no skills to find.
+      else if (!(source.files && isDiagnostic(error, "SKILLS_NO_VALID_SKILLS")))
         warnings.push(
           `${source.id}: ${message(error)}${source.kind === "clone" && /leaves the source|links out of the source/.test(message(error)) ? `; add "followLinks": true to this source to use it` : ""}`,
         );
@@ -1067,6 +1082,13 @@ function windowsNames(source: Source, refused: readonly Refusal[], warnings: str
       );
 }
 
+/** A source with no skills to discover, for one that gives only files. */
+const noSkills = (dir: string): SkillSource => ({
+  source: { input: dir, type: "local", url: dir },
+  skills: [],
+  dispose: async () => {},
+});
+
 /** Fetches a vendored source and returns the skills `skills` would install from it. */
 async function openVendored(
   source: VendoredSource,
@@ -1089,18 +1111,15 @@ async function openVendored(
       windowsNames(source, clone.refused, warnings);
       return {
         handle: await discover(clone.dir, source.skills).catch((error: unknown): SkillSource => {
-          // Only the linked-folder pass can rescue this specific empty discovery result.
+          // Only the linked-folder pass, or the files of a source of files, can rescue this
+          // specific empty discovery result.
           if (
-            !source.skills ||
             !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
-            linkedFolders(source, clone.dir, [], []).length === 0
+            (!source.files &&
+              (!source.skills || linkedFolders(source, clone.dir, [], []).length === 0))
           )
             throw error;
-          return {
-            source: { input: clone.dir, type: "local", url: clone.dir },
-            skills: [],
-            dispose: async () => {},
-          };
+          return noSkills(clone.dir);
         }),
         version: clone.commit,
         glob: source.skills,
@@ -1128,7 +1147,10 @@ async function openVendored(
           : {}),
       });
       return {
-        handle: await discover(pkg.dir, source.skills),
+        handle: await discover(pkg.dir, source.skills).catch((error: unknown): SkillSource => {
+          if (!source.files || !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS")) throw error;
+          return noSkills(pkg.dir);
+        }),
         version: pkg.version,
         glob: source.skills,
         root: pkg.dir,
@@ -1604,6 +1626,61 @@ function* archiveFiles(
 }
 
 /**
+ * Looks for local edits of the copies in a store, and what each waiting update changes. A copy
+ * published by a sync killed before it saved state.json is an update, not an edit.
+ */
+function lookForEdits(
+  source: VendoredSource,
+  state: SourceState,
+  ctx: SourceContext,
+  out: SourceResult,
+) {
+  for (const [name, copy] of Object.entries(state.skills)) {
+    const { live, base } = storePaths(ctx.storeDir, name);
+    const publishing = join(ctx.storeDir, "publishing", name);
+    if (!existsSync(live)) continue;
+    const now = hashDir(live);
+    const files = changedFiles(copy.hashes, now);
+    const published = existsSync(publishing) && sameTree(hashDir(publishing), now);
+    if (existsSync(publishing) && !ctx.dryRun) {
+      if (published) replaceDir(publishing, base);
+      rmSync(publishing, { recursive: true, force: true });
+    }
+    const receipts = publicationPaths(ctx.storeDir, name);
+    if (files.length === 0) {
+      if (!ctx.dryRun) rmSync(receipts, { recursive: true, force: true });
+      continue;
+    }
+    // If the witness was already retired, the matching base still proves publication until the
+    // source checkpoint saves the new hashes together with its change notifications.
+    if (published || (existsSync(base) && sameTree(hashDir(base), now))) {
+      const pathsByTree = readJsonOrNothing(join(receipts, "paths.json"));
+      const receipt = isRecord(pathsByTree) ? pathsByTree[treeKey(now)] : undefined;
+      const path = isRecord(receipt) ? receipt.path : receipt;
+      copy.path = typeof path === "string" ? path : path === null ? undefined : copy.path;
+      if (source.kind === "git")
+        copy.commit =
+          typeof path === "string" && isRecord(receipt) && typeof receipt.commit === "string"
+            ? receipt.commit
+            : null;
+      reportVendoredUpdate(source, out, { name, path: copy.path }, files);
+      copy.hashes = now;
+      continue;
+    }
+    out.edited.push({ skill: name, files });
+  }
+  for (const [skill, pending] of Object.entries(state.pending)) {
+    const upstream = storePaths(ctx.storeDir, skill).upstream;
+    const base = state.skills[skill]?.hashes ?? {};
+    out.pending.push({
+      skill,
+      reason: pending.reason,
+      files: existsSync(upstream) ? changedFiles(base, hashDir(upstream)) : [],
+    });
+  }
+}
+
+/**
  * Runs `work` with every archive an index lists checked against the digest the index gives,
  * before `skills` sees it. `skills` gives up on the whole index at the first mismatch; here a
  * mismatched archive reads as a failed download instead, which drops only its skill, and its name
@@ -1712,53 +1789,13 @@ async function fetchVendored(
     );
   const firstRun = Object.keys(state.skills).length === 0;
   // Local edits are checked on every run, online or not.
-  for (const [name, copy] of Object.entries(state.skills)) {
-    const { live, base } = storePaths(ctx.storeDir, name);
-    const publishing = join(ctx.storeDir, "publishing", name);
-    if (!existsSync(live)) continue;
-    const now = hashDir(live);
-    const files = changedFiles(copy.hashes, now);
-    const published = existsSync(publishing) && sameTree(hashDir(publishing), now);
-    if (existsSync(publishing) && !ctx.dryRun) {
-      if (published) replaceDir(publishing, base);
-      rmSync(publishing, { recursive: true, force: true });
-    }
-    const receipts = publicationPaths(ctx.storeDir, name);
-    if (files.length === 0) {
-      if (!ctx.dryRun) rmSync(receipts, { recursive: true, force: true });
-      continue;
-    }
-    // If the witness was already retired, the matching base still proves publication until the
-    // source checkpoint saves the new hashes together with its change notifications.
-    if (published || (existsSync(base) && sameTree(hashDir(base), now))) {
-      const pathsByTree = readJsonOrNothing(join(receipts, "paths.json"));
-      const receipt = isRecord(pathsByTree) ? pathsByTree[treeKey(now)] : undefined;
-      const path = isRecord(receipt) ? receipt.path : receipt;
-      copy.path = typeof path === "string" ? path : path === null ? undefined : copy.path;
-      if (source.kind === "git")
-        copy.commit =
-          typeof path === "string" && isRecord(receipt) && typeof receipt.commit === "string"
-            ? receipt.commit
-            : null;
-      reportVendoredUpdate(source, out, { name, path: copy.path }, files);
-      copy.hashes = now;
-      continue;
-    }
-    out.edited.push({ skill: name, files });
-  }
-  for (const [skill, pending] of Object.entries(state.pending)) {
-    const upstream = storePaths(ctx.storeDir, skill).upstream;
-    const base = state.skills[skill]?.hashes ?? {};
-    out.pending.push({
-      skill,
-      reason: pending.reason,
-      files: existsSync(upstream) ? changedFiles(base, hashDir(upstream)) : [],
-    });
-  }
+  lookForEdits(source, state, ctx, out);
   if (ctx.offline) {
     out.status = "offline";
     out.skills = keptSkills(state, ctx.storeDir);
-    if (!state.fetchedAt && out.skills.length === 0) neverFetched(out, ctx, "nothing is cached");
+    vendoredFiles(source, state, ctx, out);
+    if (!state.fetchedAt && out.skills.length === 0 && out.files.length === 0)
+      neverFetched(out, ctx, "nothing is cached");
     return out;
   }
   let opened: Awaited<ReturnType<typeof openVendored>>;
@@ -1774,7 +1811,8 @@ async function fetchVendored(
     ];
     out.error = refusals.length > 0 ? refusals.join("; ") : message(error);
     out.skills = keptSkills(state, ctx.storeDir);
-    if (out.skills.length > 0)
+    vendoredFiles(source, state, ctx, out);
+    if (out.skills.length > 0 || out.files.length > 0)
       out.warnings.push(
         `${source.id}: kept the last good copy (${state.fetchedAt ?? "unknown date"})`,
       );
@@ -1821,6 +1859,7 @@ async function fetchVendored(
         dir: storePaths(ctx.storeDir, skill.name).live,
         path: skill.path,
       }));
+      if (opened.root) vendoredFiles(source, state, ctx, out, opened.root, opened.version);
       state.fetchedAt = ctx.now;
       out.to = opened.version;
       return out;
@@ -1949,6 +1988,7 @@ async function fetchVendored(
       heldBack,
       commit: source.kind === "git" ? opened.version : undefined,
     });
+    if (opened.root) vendoredFiles(source, state, ctx, out, opened.root, opened.version);
     state.fetchedAt = ctx.now;
     if (source.kind === "npm") state.version = opened.version;
     else state.commit = opened.version;
@@ -1957,6 +1997,8 @@ async function fetchVendored(
     out.status = "error";
     out.error = message(error);
     out.skills = keptSkills(state, ctx.storeDir);
+    out.files = [];
+    vendoredFiles(source, state, ctx, out);
   } finally {
     await opened.handle.dispose();
     if (staging) rmSync(staging, { recursive: true, force: true });
@@ -2345,9 +2387,12 @@ export async function sourceFiles(source: Source, result: SourceResult): Promise
     const listed = await git(["ls-files", "-z"], { cwd: source.path, allowFail: true });
     return listed.code === 0 ? listed.stdout.split("\0").filter(Boolean) : [];
   }
-  return result.skills.flatMap((skill) =>
-    listFiles(skill.dir).map((file) => `${filesAt(source, skill)}${file}`),
-  );
+  return [
+    ...result.skills.flatMap((skill) =>
+      listFiles(skill.dir).map((file) => `${filesAt(source, skill)}${file}`),
+    ),
+    ...result.files.map((entry) => entry.path),
+  ];
 }
 
 export async function syncSource(
@@ -2357,10 +2402,16 @@ export async function syncSource(
 ): Promise<SourceResult> {
   if (!ctx.dryRun) mkdirSync(ctx.storeDir, { recursive: true });
   switch (source.kind) {
-    case "clone":
-      return syncClone(source, state, ctx);
-    case "local":
-      return syncLocal(source, state, ctx);
+    case "clone": {
+      const out = await syncClone(source, state, ctx);
+      if (existsSync(source.path)) inPlaceFiles(source, state, out, source.path);
+      return out;
+    }
+    case "local": {
+      const out = await syncLocal(source, state, ctx);
+      if (!out.error) inPlaceFiles(source, state, out, source.local);
+      return out;
+    }
     case "git":
     case "index":
     case "npm":
@@ -2370,4 +2421,187 @@ export async function syncSource(
       return exhaustive;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Files besides skills: instruction files, subagents and commands (see files.ts).
+
+/** The kinds of files a source gives now or gave before, whose items sync looks at. */
+const fileKindsOf = (source: Source, state: SourceState): FileKind[] =>
+  FILE_KINDS.filter((kind) => source.files?.[kind] !== undefined || state.files?.[kind]);
+
+/**
+ * A kind's records shaped as a source's, so the store code for skills keeps its items: an item is
+ * a folder of one file, named by `itemName`. The view shares its records with `state`.
+ */
+function itemsView(state: SourceState, kind: FileKind): SourceState {
+  const files = (state.files ??= {});
+  const items = (files[kind] ??= { items: dict(), pending: dict() });
+  return { ...state, skills: items.items, pending: items.pending };
+}
+
+/** Forgets a kind with nothing recorded, and its store folder. */
+function dropKindIfEmpty(state: SourceState, kind: FileKind, dir: string, write: boolean) {
+  const items = state.files?.[kind];
+  if (items && (Object.keys(items.items).length > 0 || Object.keys(items.pending).length > 0))
+    return;
+  if (state.files) delete state.files[kind];
+  if (state.files && Object.keys(state.files).length === 0) delete state.files;
+  if (write && existsSync(dir)) dropEmptyKind(dir);
+}
+
+/**
+ * Takes what the store code reported for a kind's items into the source's result, named by item
+ * id (`<kind>/<path>`), as `diff`, `merge` and the report name them.
+ */
+function mergeItems(out: SourceResult, sub: SourceResult, kind: FileKind, names: string[]) {
+  const id = (name: string) => itemId(kind, itemPath(name));
+  const known = [...new Set(names)].sort((a, b) => b.length - a.length);
+  const escaped = known.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const pattern = known.length > 0 ? new RegExp(escaped.join("|"), "g") : undefined;
+  out.added.push(...sub.added.map(id));
+  out.updated.push(...sub.updated.map(id));
+  out.removed.push(...sub.removed.map(id));
+  out.changed.push(...sub.changed);
+  out.edited.push(...sub.edited.map((entry) => ({ ...entry, skill: id(entry.skill) })));
+  out.pending.push(...sub.pending.map((entry) => ({ ...entry, skill: id(entry.skill) })));
+  out.warnings.push(
+    ...sub.warnings.map((warning) =>
+      pattern ? warning.replace(pattern, (name) => id(name)) : warning,
+    ),
+  );
+  if (sub.added.length + sub.updated.length + sub.removed.length > 0) {
+    if (out.status === "unchanged" || out.status === "review") out.status = "updated";
+  } else if (sub.pending.some((entry) => entry.reason === "review") && out.status === "unchanged")
+    out.status = "review";
+}
+
+/**
+ * Keeps a vendored source's files in its store, each kind in `<store>/<kind>`, as its skills are
+ * kept: an edited copy holds the update, review mode waits for `fleetrc update`, and an item the
+ * manifest no longer names goes unless it has edits. Without `root` (offline, or the fetch failed)
+ * the store keeps what it has.
+ */
+function vendoredFiles(
+  source: VendoredSource,
+  state: SourceState,
+  ctx: SourceContext,
+  out: SourceResult,
+  root?: string,
+  version?: string,
+) {
+  if (source.kind === "index") return;
+  for (const kind of fileKindsOf(source, state)) {
+    const view = itemsView(state, kind);
+    const kindCtx = { ...ctx, storeDir: join(ctx.storeDir, kind) };
+    const sub = result(source, "unchanged");
+    for (const name of new Set([...Object.keys(view.skills), ...Object.keys(view.pending)]))
+      if (segmentProblem(name)) {
+        delete view.skills[name];
+        delete view.pending[name];
+      }
+    if (!ctx.dryRun) recoverStore(kindCtx.storeDir);
+    const rebuilt = rebuildRecords(view, kindCtx.storeDir);
+    const firstRun = Object.keys(view.skills).length === 0;
+    lookForEdits(source, view, kindCtx, sub);
+    const found = root
+      ? findFileItems(source, kind, treeLister(root), sub.warnings)
+      : findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
+    if (!root) sub.skills = keptSkills(view, kindCtx.storeDir);
+    else {
+      const staging = ctx.dryRun
+        ? mkdtempSync(join(tmpdir(), "fleetrc-stage-"))
+        : join(kindCtx.storeDir, `.stage-${process.pid}`);
+      try {
+        if (!ctx.dryRun) {
+          rmSync(staging, { recursive: true, force: true });
+          mkdirSync(staging, { recursive: true });
+        }
+        const chosen: Found[] = [];
+        const staged = new Map<string, string>();
+        const heldBack = new Set<string>();
+        for (const path of found.keys()) {
+          const name = itemName(path);
+          const from = join(root, ...path.split("/"));
+          if (statSync(from).size > SKILL_LIMITS.bytes) {
+            sub.warnings.push(
+              `${source.id}: skipped ${itemId(kind, path)}: it is larger than ${SKILL_LIMITS.bytes / 1024 / 1024} MB`,
+            );
+            if (view.skills[name]) heldBack.add(name);
+            continue;
+          }
+          mkdirSync(join(staging, name), { recursive: true });
+          copyFileSync(from, join(staging, name, posix.basename(path)));
+          staged.set(name, join(staging, name));
+          chosen.push({ name, path: posix.dirname(path) });
+        }
+        applyVendored(source, view, kindCtx, sub, chosen, staged, {
+          rebuilt,
+          firstRun,
+          earlier: new Map(),
+          heldBack,
+          commit: source.kind === "git" ? version : undefined,
+        });
+      } finally {
+        rmSync(staging, { recursive: true, force: true });
+      }
+    }
+    const fresh = new Set([...sub.added, ...sub.updated]);
+    for (const item of sub.skills) {
+      const path = itemPath(item.name);
+      out.files.push({
+        kind,
+        path,
+        file: join(item.dir, posix.basename(path)),
+        agents: found.get(path) ?? [],
+        ...(fresh.has(item.name) ? { updated: true } : {}),
+      });
+    }
+    mergeItems(out, sub, kind, [
+      ...Object.keys(view.skills),
+      ...sub.removed,
+      ...sub.skills.map((item) => item.name),
+    ]);
+    dropKindIfEmpty(state, kind, kindCtx.storeDir, !ctx.dryRun);
+  }
+}
+
+/**
+ * The files of a working clone or local folder, linked where they are. A local folder's are
+ * hashed, as its skills are, so hooks hear which changed.
+ */
+function inPlaceFiles(source: InPlaceSource, state: SourceState, out: SourceResult, root: string) {
+  const follow = source.kind === "local" || source.followLinks;
+  for (const kind of fileKindsOf(source, state)) {
+    const found = findFileItems(
+      source,
+      kind,
+      treeLister(root, { inPlace: true, followLinks: follow }),
+      out.warnings,
+    );
+    const before = state.files?.[kind]?.items ?? {};
+    const now = dict<{ hashes: Hashes; path: string }>();
+    for (const [path, agents] of found) {
+      const file = join(root, ...path.split("/"));
+      let changed = false;
+      if (source.kind === "local") {
+        const name = itemName(path);
+        const hashes = dict([[posix.basename(path), sha256(readFileSync(file))]]);
+        now[name] = { hashes, path: posix.dirname(path) };
+        changed = changedFiles(before[name]?.hashes ?? {}, hashes).length > 0;
+        if (changed) out.changed.push(path);
+      }
+      out.files.push({ kind, path, file, agents, ...(changed ? { updated: true } : {}) });
+    }
+    if (source.kind !== "local") continue;
+    for (const name of Object.keys(before)) if (!now[name]) out.changed.push(itemPath(name));
+    if (Object.keys(now).length > 0)
+      (state.files ??= {})[kind] = { items: now, pending: state.files?.[kind]?.pending ?? dict() };
+    else if (state.files) {
+      delete state.files[kind];
+      if (Object.keys(state.files).length === 0) delete state.files;
+    }
+  }
+  if (source.kind === "local" && out.status === "unchanged" && out.changed.length > 0)
+    out.status = "updated";
 }

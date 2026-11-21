@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, posix, relative, sep } from "node:path";
 import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
 import {
@@ -23,6 +23,7 @@ import {
   moveDir,
   sha256,
 } from "./fs.ts";
+import { itemName, itemPath, parseItemId } from "./files.ts";
 import { fetchClone, gitUrl, repoKey } from "./gitcache.ts";
 import { globBase } from "./glob.ts";
 import {
@@ -40,7 +41,14 @@ import {
 import { findName } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import { pendingGitBase, storePaths } from "./sources.ts";
-import { loadState, saveState, type State } from "./state.ts";
+import type { FileKind } from "./kinds.ts";
+import {
+  loadState,
+  saveState,
+  type InstalledCopy,
+  type PendingUpdate,
+  type State,
+} from "./state.ts";
 
 /** The file a command changes: the root manifest, or a working clone of the repository it is in. */
 export interface ManifestTarget {
@@ -81,11 +89,55 @@ interface Located {
   source: Source;
   /** The skill's entry under "forks", by the key the manifest gives it. */
   fork?: { key: string; fork: Fork };
+  /** For a file (`<kind>/<path>`): its kind, and its folder's name in the store. */
+  item?: { kind: FileKind; key: string };
+}
+
+/**
+ * An instruction file, subagent or command by its id, `<kind>/<path>`: from the first source in
+ * the manifest that keeps it, as that is the one sync links.
+ */
+function locateItem(loaded: LoadedManifest, state: State, typed: string): Located | undefined {
+  const parsed = parseItemId(typed);
+  if (!parsed) return undefined;
+  const key = itemName(parsed.path);
+  for (const source of loaded.sources) {
+    const files = state.sources[source.id]?.files?.[parsed.kind];
+    if (files && (Object.hasOwn(files.items, key) || Object.hasOwn(files.pending, key)))
+      return { loaded, state, name: typed, source, item: { kind: parsed.kind, key } };
+  }
+  // A folder linked in place keeps no records, only the link.
+  const link = Object.values(state.links ?? {}).find((record) => record.item === typed);
+  const source = loaded.sources.find((candidate) => candidate.id === link?.source);
+  return source
+    ? { loaded, state, name: typed, source, item: { kind: parsed.kind, key } }
+    : undefined;
+}
+
+/** Where a vendored skill or file is kept: its folders in the store and its records. */
+function kept(state: State, source: Source, located: Pick<Located, "name" | "item">) {
+  const sourceState = state.sources[source.id];
+  const files = located.item ? sourceState?.files?.[located.item.kind] : undefined;
+  const records: { skills: Record<string, InstalledCopy>; pending: Record<string, PendingUpdate> } =
+    located.item
+      ? { skills: files?.items ?? {}, pending: files?.pending ?? {} }
+      : { skills: sourceState?.skills ?? {}, pending: sourceState?.pending ?? {} };
+  const key = located.item?.key ?? located.name;
+  const storeDir = located.item
+    ? join(paths.store(source.id), located.item.kind)
+    : paths.store(source.id);
+  // A file's patch names it `<kind>/<path>`, its folder in the store holding only the file.
+  const label = located.item
+    ? posix.join(located.item.kind, posix.dirname(itemPath(located.item.key)))
+    : located.name;
+  return { records, key, store: storePaths(storeDir, key), label };
 }
 
 async function locate(spec: string, typed: string): Promise<Located> {
   const loaded = await loadManifest(spec, { offline: true });
   const state = loadState();
+  const item = locateItem(loaded, state, typed);
+  if (item) return item;
   // A linked skill, or one a review-mode source is holding back.
   const name =
     findName(
@@ -321,17 +373,21 @@ export function conflictLines(state: State): string[] {
   });
 }
 
-/** A vendored skill's pending update against the copy in use, or else its local edits. */
-function diffVendored(state: State, source: Source, name: string): Promise<string> {
-  const store = storePaths(paths.store(source.id), name);
-  if (state.sources[source.id]?.pending[name])
+/** A vendored skill's or file's pending update against the copy in use, or else its local edits. */
+function diffVendored(
+  state: State,
+  source: Source,
+  located: Pick<Located, "name" | "item">,
+): Promise<string> {
+  const { records, key, store, label } = kept(state, source, located);
+  if (Object.hasOwn(records.pending, key))
     return diffDirs(
-      name,
+      label,
       { dir: store.live, label: "local" },
       { dir: store.upstream, label: "upstream" },
     );
   return diffDirs(
-    name,
+    label,
     { dir: store.base, label: "upstream" },
     { dir: store.live, label: "local" },
   );
@@ -339,7 +395,7 @@ function diffVendored(state: State, source: Source, name: string): Promise<strin
 
 /** `fleetrc diff <skill>`: local edits against upstream, or a pending update against what is installed. */
 export async function diffSkill(spec: string, typed: string): Promise<string> {
-  const { loaded, state, source, name, fork } = await locate(spec, typed);
+  const { loaded, state, source, name, fork, item } = await locate(spec, typed);
   if (fork) {
     gitFork(loaded, name, fork.fork);
     const upstream = await forkUpstream(fork.fork);
@@ -350,7 +406,7 @@ export async function diffSkill(spec: string, typed: string): Promise<string> {
     throw new UserError(
       `${name} comes from ${source.id}, a folder you edit in place; use git there`,
     );
-  return diffVendored(state, source, name);
+  return diffVendored(state, source, { name, item });
 }
 
 /**
@@ -363,10 +419,18 @@ export async function diffPending(spec: string): Promise<string> {
   const state = loadState();
   const parts: string[] = [];
   for (const source of loaded.sources) {
-    if (isVendored(source))
+    if (isVendored(source)) {
       for (const name of Object.keys(state.sources[source.id]?.pending ?? {}).sort())
-        parts.push(await diffVendored(state, source, name));
-    else if (source.kind === "clone" && source.update === "review" && existsSync(source.path)) {
+        parts.push(await diffVendored(state, source, { name }));
+      for (const [kind, files] of Object.entries(state.sources[source.id]?.files ?? {}))
+        for (const key of Object.keys(files.pending).sort())
+          parts.push(
+            await diffVendored(state, source, {
+              name: `${kind}/${itemPath(key)}`,
+              item: { kind: kind as FileKind, key },
+            }),
+          );
+    } else if (source.kind === "clone" && source.update === "review" && existsSync(source.path)) {
       const run = await git(["-c", "core.quotepath=off", "diff", "--no-color", "HEAD", "@{u}"], {
         cwd: source.path,
         allowFail: true,
@@ -568,7 +632,7 @@ export async function mergeSkill(
   typed: string,
   { dryRun = false } = {},
 ): Promise<MergeResult & { into: string; manifest?: ManifestTarget }> {
-  const { loaded, state, source, name, fork } = await locate(spec, typed);
+  const { loaded, state, source, name, fork, item } = await locate(spec, typed);
   // An earlier merge's conflicts: resolved by hand now, or still in the way.
   const earlier = state.conflicts?.[name];
   let resolved = false;
@@ -623,24 +687,23 @@ export async function mergeSkill(
     throw new UserError(
       `${name} comes from ${source.id}, a folder you edit in place; use git there`,
     );
-  const store = storePaths(paths.store(source.id), name);
-  const sourceState = state.sources[source.id]!;
+  const { records, key, store } = kept(state, source, { name, item });
   if (!existsSync(store.upstream)) {
     if (resolved) return { merged: [], conflicts: [], resolved, into: store.live };
     throw new UserError(`${name} has no upstream change to merge; \`fleetrc sync\` fetches one`);
   }
   const hashes = hashDir(store.upstream);
-  const pending = pendingGitBase(sourceState.pending[name], hashes);
+  const pending = pendingGitBase(records.pending[key], hashes);
   const result = await mergeTrees(store.live, store.base, store.upstream, dryRun);
   if (dryRun) return { ...result, ...(resolved ? { resolved } : {}), into: store.live };
   copyDir(store.upstream, store.base);
-  sourceState.skills[name] = {
-    ...sourceState.skills[name],
+  records.skills[key] = {
+    ...records.skills[key],
     hashes,
     ...(source.kind === "git" ? { path: pending?.path, commit: pending?.commit ?? null } : {}),
   };
   rmSync(store.upstream, { recursive: true, force: true });
-  delete sourceState.pending[name];
+  delete records.pending[key];
   saveState(state);
   return record(result, store.live);
 }
