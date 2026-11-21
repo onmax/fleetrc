@@ -12,19 +12,75 @@ The same agent skills in Claude Code, Codex, Gemini CLI, OpenCode, Cursor and Co
 
 [![Download the 90-second explainer (MP4)](https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/explainer-poster.png)](https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/explainer.mp4)
 
-You list where your skills come from in one manifest in git: your own repo, your team's, GitHub upstreams, skill indexes like Drop's, and npm. Each machine pulls them when a Claude Code or Codex session starts, links every skill into every agent's folder, and reports what changed. A skill you edited on that machine is never overwritten.
-
-[Usage](#usage) · [Manifest](#manifest) · [Agents and systems](#agents-and-systems) · [Build on skillfleet](#build-on-skillfleet) · [Status](#status) · [GitHub](https://github.com/onmax/skillfleet)
-
 ```sh
 npx skillfleet init my-team/agents
 ```
 
-- **One manifest.** It lives in git next to your skills, so every machine and every teammate reads the same list.
-- **Every agent.** The agent folders come from the [`skills`](https://github.com/vercel-labs/skills) package's agent list, so an agent it adds works here too.
-- **Your edits stay.** If a sync would change a file you edited, skillfleet keeps your copy, holds upstream's update to that skill, and says so in `status`.
-- **On session start.** A Claude Code or Codex hook starts a sync in the background when the last one is more than 15 minutes old, so nothing runs while you aren't using an agent. On a machine where no agent runs, such as a VPS, the timer does it instead: systemd, launchd or Task Scheduler runs the sync on a schedule.
-- **The whole fleet.** `skillfleet fleet sync` runs it over SSH on every machine you list. Tailscale names work.
+[What it fixes](#what-it-fixes) · [Usage](#usage) · [Manifest](#manifest) · [Agents and systems](#agents-and-systems) · [Build on skillfleet](#build-on-skillfleet) · [Status](#status) · [GitHub](https://github.com/onmax/skillfleet)
+
+## What it fixes
+
+### Every agent reads its own skills folder
+
+Claude Code reads `~/.claude/skills`. Codex reads `~/.agents/skills`, and so do Gemini CLI, OpenCode, Cursor and Copilot. Other agents each have a folder of their own. A skill you install for one agent is missing in the next, and if you copy it into each folder, the copies drift apart the first time you edit one.
+
+skillfleet keeps one copy of each skill and links it into the folder of every agent installed on the machine. An edit made from any agent changes that one copy, so every agent sees it. Agents that share `~/.agents/skills` get each skill once there, so Gemini CLI doesn't list it twice. The agents and their folders come from Vercel's [`skills`](https://github.com/vercel-labs/skills) package, so an agent added there works here too.
+
+### Your skills come from five places, and nothing records which
+
+Some skills are yours and some are your team's. Others come from a GitHub repository, an npm package or a skills index like Drop's. Install them one `npx skills add` at a time and the next machine needs the same commands, which nobody wrote down.
+
+skillfleet reads that list from one manifest in git, next to your skills:
+
+```json
+{
+  "sources": [
+    { "id": "mine", "git": "me/skills", "skills": "skills/*" },
+    { "id": "nuxt", "git": "onmax/nuxt-skills", "include": ["nuxt", "nuxt-ui"] },
+    { "id": "drop", "index": "https://drop.vitehub.dev" }
+  ]
+}
+```
+
+Every machine and every teammate reads the same file. `skillfleet add <source>` and `skillfleet remove <source|skill>` edit it for you. [Write your manifest](#write-your-manifest) covers the rest.
+
+### Your machines drift apart
+
+The laptop gets the new skill. The desktop and the VPS keep last month's until you remember them.
+
+Each machine syncs itself. When a Claude Code or Codex session starts and the last sync is more than 15 minutes old, a hook starts one in the background. The agent doesn't wait for it, and nothing runs while you aren't using an agent. A server where no agent runs gets a timer instead.
+
+From a machine that's set up, `skillfleet fleet init vps2` sets up another one over SSH, and `skillfleet fleet sync` syncs them all. `skillfleet fleet status` says which machine is behind, which never ran, and which is holding an update. On Tailscale, a `tag:servers` entry covers every machine with that tag, and your tailnet policy can name the manifest for all of them. See [Add a machine](#add-a-machine).
+
+### An update wipes the fix you made
+
+You fix a line in someone else's skill, and the next update overwrites it.
+
+When a sync would change a file you edited, skillfleet keeps your copy, holds upstream's update to that one skill, and says so in `skillfleet status`. `skillfleet diff <skill>` shows the update and `skillfleet merge <skill>` merges it into your copy. To own a skill for good, `skillfleet fork <skill>` moves it into your repository and records where it came from, so `merge` still brings in upstream's changes.
+
+### A skill you didn't write runs with your permissions
+
+Your agent follows a skill with your shell, your files and your credentials. Anyone who can push to the skill's repository changes what your agents do on the next sync.
+
+Mark a source you don't own `"update": "review"`. skillfleet holds its changes until you read them with `skillfleet diff` and take them with `skillfleet update <source>`. The first fetch links straight away, so read a source before you add it. A team manifest you extend can add sources but can't run anything on your machines. Hooks, reports, fleet hosts and folders on your machine come only from your own manifest.
+
+### Your team shares skills, and you keep your own
+
+The team wants one list that everyone gets. You want your own skills on top, and maybe not every team skill.
+
+The team keeps a manifest with the shared sources, and yours `extends` it. Your sources come first, so your skill wins over a team skill with the same name. `exclude` leaves out a team skill or source you don't want.
+
+### You edit skills in the repository they live in
+
+When an agent improves a skill, you want the change in your checkout, ready to commit, not in a copy inside a hidden folder.
+
+A source with `"path"` is a clone you work in. skillfleet fast-forwards it with git and links the skills from there, so an agent that edits a skill edits your clone. While the clone has changes you haven't committed, skillfleet leaves it where it is and `status` says so. `"adopt": true` makes it the repository that skills you made by hand move into.
+
+### Your agent folders already hold skills
+
+Some you wrote by hand, some came from `npx skills add`, some from an old install script.
+
+`skillfleet init` goes through each agent folder first. A skill that a source also provides moves to a backup folder, and the source's copy takes its place. One that no source provides moves into your adopt repository, ready to commit, or stays where it is if you have none. If a skill name would disappear, `init` stops and names it, and `--force` goes ahead anyway. `--dry-run` prints the plan and changes nothing.
 
 ## Usage
 
@@ -163,6 +219,7 @@ Then `npx skillfleet init me/skills` on each machine. Your sources come first, s
 - `$schema` points editors at the schema, for completion and checks.
 - Relative paths (`path`, `local`, `extends`) resolve against the manifest's own folder, `.skillfleet/`. To use the repository itself as a local source, add `{ "id": "mine", "local": ".." }` to `sources`.
 - A source is one of `git`, `index` (a site serving `/.well-known/agent-skills/index.json`), `npm` (with an optional `registry`) or `local` (a folder on this machine). `skills` is a glob of skill folders inside it, and `ref` pins a git branch, tag or commit, written in full or as its first 7 or more characters. A `"path"` clone pinned to a commit stays on it, since there is nothing to fast-forward, until the manifest names another commit.
+- Source and hook globs are limited to 8,192 UTF-16 code units. If matching a glob against many paths exceeds its work limit, skillfleet reports an error instead of skipping the remaining matches. Narrow the glob, for example by adding a fixed folder prefix.
 - An `index` site may serve the older v0.1 index at `/.well-known/skills/index.json` instead; skillfleet reads both.
 - `agents` is `"all"` (the default) or a list of agent ids. `"all"` means every agent installed on the machine: one whose folder is in your home, such as `~/.claude` for Claude Code or `~/.codex` for Codex. `skillfleet agents` lists the ids and which agents it found. A sync that links into no folder says so.
 - When two sources have a skill with the same name, the first one wins, and `status` prints one line about it. Names that differ only in case or Unicode form (`Foo` and `foo`, or `café` typed as one character and as `e` plus an accent) are one name, since macOS and Windows keep them in one folder: a source renaming `alpha` to `Alpha` renames the skill, and `include`, `exclude`, `forks` and the skill named in `diff`, `merge`, `fork` and `remove` find it in any of them. `include` and `exclude` pick skills from a source.
