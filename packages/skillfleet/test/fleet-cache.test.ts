@@ -8,7 +8,11 @@ import { fleet, notInFleet, resolveFleet, type FleetAction } from "../src/fleet.
 
 vi.mock("../src/exec.ts", () => ({ exec: vi.fn() }));
 
-it.each([
+const revisionCases: {
+  name: string;
+  runs: { kind?: string; status: string; from?: string; to: string; reason?: string }[];
+  behind: string[][];
+}[] = [
   {
     name: "offline observations do not set the reference",
     runs: [
@@ -26,7 +30,25 @@ it.each([
     ],
     behind: [["vendor at 700ccfb"], ["held: vendor"]],
   },
-])("compares live and cached runs: $name", async ({ runs, behind }) => {
+  {
+    name: "a vendored revision fetched for review sets the reference",
+    runs: [
+      { kind: "git", status: "unchanged", to: "700ccfb0" },
+      { kind: "git", status: "review", from: "8de87ca0", to: "91edcf40" },
+    ],
+    behind: [["vendor at 700ccfb"], []],
+  },
+  {
+    name: "a working clone waiting for review cannot set the reference",
+    runs: [
+      { kind: "clone", status: "unchanged", to: "8de87ca0" },
+      { kind: "clone", status: "review", from: "700ccfb0", to: "700ccfb0" },
+    ],
+    behind: [[], ["vendor at 700ccfb"]],
+  },
+];
+
+it.each(revisionCases)("compares live and cached runs: $name", async ({ runs, behind }) => {
   const root = mkdtempSync(join(tmpdir(), "skillfleet-cache-"));
   vi.stubEnv("XDG_STATE_HOME", root);
   vi.stubEnv("SKILLFLEET_SSH", "ssh");
@@ -35,7 +57,7 @@ it.each([
   vi.mocked(exec).mockImplementation(async (_command, args) => {
     const host = args.at(-2)!;
     const index = hosts.indexOf(host);
-    const { status, to, reason } = runs[index]!;
+    const { kind, status, from, to, reason } = runs[index]!;
     return {
       stderr: "",
       code: 0,
@@ -45,7 +67,7 @@ it.each([
         host,
         finishedAt: new Date(now - (runs.length - index) * 60_000).toISOString(),
         ok: true,
-        sources: [{ id: "vendor", status, to }],
+        sources: [{ id: "vendor", kind, status, from, to }],
         held: reason ? [{ source: "vendor", reason, files: [] }] : [],
       }),
     };
@@ -53,7 +75,11 @@ it.each([
   try {
     const live = await fleet(hosts, "status", "0.0.0");
     expect(live.map((result) => result.behind)).toEqual(behind);
-    const cached = await fleet(hosts.map((host) => ({ host, offline: true })), "status", "0.0.0");
+    const cached = await fleet(
+      hosts.map((host) => ({ host, offline: true })),
+      "status",
+      "0.0.0",
+    );
     expect(cached.map((result) => result.behind)).toEqual(behind);
   } finally {
     vi.unstubAllEnvs();
