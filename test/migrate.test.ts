@@ -15,7 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { remoteScript } from "../src/fleet.ts";
 import {
@@ -45,7 +45,7 @@ const RECORD_DIRS = [".agents/skills", ".claude/skills", ".codex/skills"];
  * launcher, the agents' link records and their links, the session hooks and the timer under the
  * old name, every path in them pointing at the old folders.
  */
-function toLegacy(m: Machine) {
+function toLegacy(m: Machine, { records = RECORD_DIRS, hooks = HOOK_FILES } = {}) {
   const text = (s: string) =>
     s
       .replaceAll("/state/fleetrc/bin/fleetrc", "/state/skillfleet/bin/skillfleet")
@@ -65,7 +65,7 @@ function toLegacy(m: Machine) {
   const bin = join(oldState(m), "bin");
   rewrite(join(bin, "fleetrc"), join(bin, "skillfleet"));
   chmodSync(join(bin, "skillfleet"), 0o755);
-  for (const dir of RECORD_DIRS) {
+  for (const dir of records) {
     const record = m.at(dir, ".fleetrc-manifest.json");
     if (!existsSync(record)) continue;
     rewrite(record, m.at(dir, ".skillfleet-manifest.json"));
@@ -78,7 +78,7 @@ function toLegacy(m: Machine) {
       symlinkSync(text(target), path);
     }
   }
-  for (const file of HOOK_FILES) if (existsSync(m.at(file))) rewrite(m.at(file));
+  for (const file of hooks) if (existsSync(m.at(file))) rewrite(m.at(file));
   if (existsSync(units(m)))
     for (const name of readdirSync(units(m)))
       if (name.startsWith("fleetrc-sync"))
@@ -353,5 +353,77 @@ writeFileSync(${JSON.stringify(out)}, [process.env.FLEETRC_HOOK, process.env.SKI
     expect(existsSync(oldState(m))).toBe(false);
     expect(existsSync(join(m.stateDir, "bin", "fleetrc"))).toBe(true);
     expect(read(m.at(".claude/settings.json"))).not.toContain("skillfleet");
+  });
+
+  it("keeps an edited legacy file that differs from the one the new folder already holds, and says where", async () => {
+    const { m } = await legacyMachine();
+    toLegacy(m);
+    const link = readlinkSync(m.at(".claude/skills/tool"));
+    const skill = join(relative(oldState(m), link), "SKILL.md");
+    // The user's edit, made through the agent's folder, in the old store.
+    writeFileSync(join(oldState(m), skill), skillMd("tool", "my edit"));
+    // A fleetrc run that stopped partway left its own copy, and no state.json.
+    writeFiles(m.stateDir, { [skill]: skillMd("tool", "another copy") });
+
+    const run = await m.run("self-install");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(read(join(oldState(m), skill))).toContain("my edit");
+    expect(read(join(m.stateDir, skill))).toContain("another copy");
+    expect(run.stdout).toContain("kept ~/.local/state/skillfleet");
+    expect(run.stdout).toContain(skill);
+    // What moved is gone from the old folder; the next run moves nothing.
+    expect(existsSync(join(oldState(m), "state.json"))).toBe(false);
+    const again = await m.run("self-install");
+    expect(again.stdout + again.stderr).not.toContain("skillfleet");
+  });
+
+  it.skipIf(process.getuid?.() === 0)(
+    "a move that fails partway is finished by the next run",
+    async () => {
+      const { m } = await legacyMachine();
+      toLegacy(m);
+      // Relinking fails: the agent's folder can't be written.
+      chmodSync(m.at(".claude/skills"), 0o555);
+      let first;
+      try {
+        first = await m.run("self-install");
+      } finally {
+        chmodSync(m.at(".claude/skills"), 0o755);
+      }
+      expect(first.code, first.stdout + first.stderr).not.toBe(0);
+      expect(existsSync(oldState(m))).toBe(false);
+
+      const second = await m.run("self-install");
+      expect(second.code, second.stdout + second.stderr).toBe(0);
+      expect(second.stdout).toContain("skillfleet is now fleetrc");
+      expect(readlinkSync(m.at(".claude/skills/tool")).startsWith(m.stateDir + "/")).toBe(true);
+      expect(read(m.at(".claude/skills/tool/SKILL.md"))).toContain("tool body");
+      expect(existsSync(m.at(".claude/skills/.skillfleet-manifest.json"))).toBe(false);
+      expect(existsSync(join(m.stateDir, "bin", "fleetrc"))).toBe(true);
+      const third = await m.run("self-install");
+      expect(third.stdout + third.stderr).not.toContain("skillfleet");
+    },
+  );
+
+  it("finds the agents' folders the install saved, from a shell that doesn't name them", async () => {
+    const m = machine();
+    const alt = m.at("alt-claude");
+    mkdirSync(alt);
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    const init = await m.runWith({ env: { CLAUDE_CONFIG_DIR: alt } }, "init", manifest);
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    toLegacy(m, { records: ["alt-claude/skills"], hooks: ["alt-claude/settings.json"] });
+    expect(read(join(alt, "settings.json"))).toContain("skillfleet/bin/skillfleet");
+
+    // A bare ssh shell, as `fleet upgrade` runs self-install in.
+    const run = await m.runWith({ env: { CLAUDE_CONFIG_DIR: undefined } }, "self-install");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(read(join(alt, "settings.json"))).not.toContain("skillfleet");
+    expect(readlinkSync(join(alt, "skills", "tool")).startsWith(m.stateDir + "/")).toBe(true);
+    expect(existsSync(join(alt, "skills", ".skillfleet-manifest.json"))).toBe(false);
   });
 });
