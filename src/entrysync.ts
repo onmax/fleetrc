@@ -15,7 +15,7 @@
 // run writes nothing, not even a lock folder.
 import { mkdtempSync, realpathSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
+import { dirname, join, posix } from "node:path";
 import {
   editConfigFile,
   type KeyEdit,
@@ -25,7 +25,13 @@ import {
   replaceIfUnchanged,
   valueAt,
 } from "./configfile.ts";
-import { decideEntry, type EntryDecision, type EntryRecord, sameValue } from "./entries.ts";
+import {
+  decideEntry,
+  type EntryDecision,
+  type EntryRecord,
+  hashValue,
+  sameValue,
+} from "./entries.ts";
 import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
 import { type FileEntry, findFileItems, itemName, itemPath, treeLister } from "./files.ts";
@@ -89,8 +95,6 @@ export interface EntrySource {
 
 export interface EntrySyncOptions {
   dryRun?: boolean;
-  /** Sources whose entries stay as last synced, such as ones an unreadable manifest declares. */
-  keep?: ReadonlySet<string>;
 }
 
 /** What the manifest's sources define, first source first. */
@@ -111,8 +115,7 @@ interface Definitions {
 
 function collect(
   sources: readonly EntrySource[],
-  keep: ReadonlySet<string>,
-  records: Readonly<Record<string, OwnedEntry>>,
+  records: readonly [string, OwnedEntry][],
 ): Definitions {
   const defs: Definitions = {
     servers: dict(),
@@ -121,9 +124,9 @@ function collect(
     hooks: Object.fromEntries(
       HOOK_DEF_AGENTS.map((agent) => [agent, dict()]),
     ) as Definitions["hooks"],
-    frozenMcp: new Set(keep),
+    frozenMcp: new Set(),
     frozenHooks: Object.fromEntries(
-      HOOK_DEF_AGENTS.map((agent) => [agent, new Set(keep)]),
+      HOOK_DEF_AGENTS.map((agent) => [agent, new Set<string>()]),
     ) as Definitions["frozenHooks"],
     shadowed: [],
     warnings: [],
@@ -143,16 +146,13 @@ function collect(
   const freezeMcp = (source: string) => {
     defs.frozenMcp.add(source);
     const names = new Set<string>();
-    for (const [id, record] of Object.entries(records))
+    for (const [id, record] of records)
       if (id.startsWith("mcp/") && record.source === source)
         names.add(id.slice(id.indexOf("/", "mcp/".length) + 1));
     for (const name of [...names].sort()) claim(name, source);
   };
-  // A source that only an unreadable manifest declares is not among `sources`.
-  const present = new Set(sources.map((source) => source.id));
-  for (const source of [...keep].sort()) if (!present.has(source)) freezeMcp(source);
   for (const source of sources) {
-    if (source.error || keep.has(source.id)) {
+    if (source.error) {
       freezeMcp(source.id);
       for (const agent of HOOK_DEF_AGENTS) defs.frozenHooks[agent].add(source.id);
       continue;
@@ -209,6 +209,7 @@ class Ledger {
   readonly records: Readonly<Record<string, OwnedEntry>>;
   readonly report: EntriesReport;
   readonly next: Record<string, OwnedEntry>;
+  readonly confirmed = new Set<string>();
 
   constructor(records: Readonly<Record<string, OwnedEntry>>, report: EntriesReport) {
     this.records = records;
@@ -238,11 +239,13 @@ class Ledger {
       case "write":
       case "re-add":
       case "update":
+        this.confirmed.add(id);
         this.next[id] = { ...decision.record, ...owner };
         (decision.action === "update" ? report.updated : report.added).push(id);
         return;
       case "keep":
       case "adopt":
+        this.confirmed.add(id);
         this.next[id] = { ...decision.record, ...owner };
         if (decision.action === "adopt") report.adopted.push(id);
         return;
@@ -279,18 +282,8 @@ function realFile(file: string): { target: string } | { error: string } {
   }
 }
 
-/**
- * Merges each agent's MCP servers and hooks into its config, for the manifest's `agents`. Entries
- * an agent no longer gets (dropped from the manifest, or the agent no longer chosen) are pruned
- * unless edited. Records go to `state.entries`, except in a dry run.
- */
-export function syncEntries(
-  sources: readonly EntrySource[],
-  agents: readonly string[],
-  state: State,
-  { dryRun = false, keep = new Set() }: EntrySyncOptions = {},
-): EntriesReport {
-  const report: EntriesReport = {
+function emptyReport(): EntriesReport {
+  return {
     total: 0,
     added: [],
     updated: [],
@@ -304,20 +297,41 @@ export function syncEntries(
     warnings: [],
     errors: [],
   };
+}
+
+/**
+ * Merges each agent's MCP servers and hooks into its config, for the manifest's `agents`. Entries
+ * an agent no longer gets (dropped from the manifest, or the agent no longer chosen) are pruned
+ * unless edited. Records go to `state.entries`, except in a dry run.
+ */
+export function syncEntries(
+  sources: readonly EntrySource[],
+  agents: readonly string[],
+  state: State,
+  { dryRun = false }: EntrySyncOptions = {},
+): EntriesReport {
+  const report = emptyReport();
   const ledger = new Ledger(state.entries ?? dict(), report);
-  const defs = collect(sources, keep, ledger.records);
+  const otherMcpEntries = dict(Object.entries(state.otherMcpEntries ?? {}));
+  const ownership = [
+    ...Object.entries(ledger.records),
+    ...Object.values(otherMcpEntries).flatMap((records) => Object.entries(records)),
+  ];
+  const defs = collect(sources, ownership);
   report.shadowed.push(...defs.shadowed);
   report.warnings.push(...defs.warnings);
   const chosen = new Set(agents);
 
   const mcpAgents = new Set<McpAgent>(
-    MCP_AGENTS.filter((agent) => chosen.has(agent) || ledger.ids(`mcp/${agent}/`).length > 0),
+    MCP_AGENTS.filter(
+      (agent) => chosen.has(agent) || ownership.some(([id]) => id.startsWith(`mcp/${agent}/`)),
+    ),
   );
   for (const agent of mcpAgents) {
     const cell = AGENT_KINDS[agent]?.mcp;
     if (!cell) continue;
     try {
-      syncMcp(agent, cell, chosen.has(agent), defs, ledger, dryRun);
+      syncMcp(agent, cell, chosen.has(agent), defs, ledger, otherMcpEntries, dryRun);
     } catch (error) {
       report.errors.push(`${tildify(cell.file())}: ${message(error)}`);
     }
@@ -340,6 +354,8 @@ export function syncEntries(
     list.sort();
   report.total = Object.keys(ledger.next).length;
   if (!dryRun) {
+    if (Object.keys(otherMcpEntries).length > 0) state.otherMcpEntries = otherMcpEntries;
+    else delete state.otherMcpEntries;
     if (report.total > 0) state.entries = ledger.next;
     else delete state.entries;
   }
@@ -362,37 +378,71 @@ function syncMcp(
   chosen: boolean,
   defs: Definitions,
   ledger: Ledger,
+  otherMcpEntries: NonNullable<State["otherMcpEntries"]>,
   dryRun: boolean,
 ) {
   const file = cell.file();
   const prefix = `mcp/${agent}/`;
   const desired = desiredServers(agent, chosen, defs, ledger.report.warnings);
+  const byFile = new Map<string, Record<string, OwnedEntry>>();
+  const remember = (id: string, record: OwnedEntry) => {
+    let records = byFile.get(record.file);
+    if (!records) byFile.set(record.file, (records = dict()));
+    records[id] = record;
+  };
+  for (const records of Object.values(otherMcpEntries))
+    for (const [id, record] of Object.entries(records))
+      if (id.startsWith(prefix)) remember(id, record);
+  for (const id of ledger.ids(prefix)) remember(id, ledger.records[id]!);
+
+  const here = new Ledger(byFile.get(file) ?? dict(), ledger.report);
+  const sibling = agent === "opencode" ? openCodeSibling(file) : undefined;
+  const old = new Ledger(sibling ? (byFile.get(sibling) ?? dict()) : dict(), ledger.report);
   // A server whose definition has a mistake, or whose source did not sync, stays as it is.
-  const settled = (name: string) => {
+  const settled = (name: string, at: Ledger) => {
     if (defs.broken.has(name)) return false;
-    const source = ledger.records[prefix + name]?.source;
+    const source = at.records[prefix + name]?.source;
     return !(source !== undefined && defs.frozenMcp.has(source) && !defs.owner.has(name));
   };
-  // A server recorded in another file, since the agent's file moved (OpenCode's opencode.json
-  // gave way to opencode.jsonc, or CLAUDE_CONFIG_DIR changed), is pruned there unless edited.
-  const elsewhere = new Map<string, string[]>();
-  const here: string[] = [];
-  for (const id of ledger.ids(prefix)) {
-    const name = id.slice(prefix.length);
-    const recorded = ledger.records[id]!.file;
-    if (recorded === file) here.push(name);
-    else if (settled(name)) elsewhere.set(recorded, [...(elsewhere.get(recorded) ?? []), name]);
+  const namesIn = (at: Ledger) => at.ids(prefix).map((id) => id.slice(prefix.length));
+  const oldNames = namesIn(old).filter((name) => settled(name, old));
+  const moving = oldNames.filter((name) => Object.hasOwn(desired, name));
+  const preview = new Ledger(old.records, emptyReport());
+  if (sibling && moving.length > 0) {
+    mergeMcp(sibling, cell, prefix, moving, dict(), defs, preview, true, false);
+    ledger.report.held.push(...preview.report.held);
+    ledger.report.errors.push(...preview.report.errors);
   }
-  for (const [old, list] of elsewhere)
-    mergeMcp(old, cell, prefix, list, dict(), defs, ledger, dryRun, false);
-  // One still recorded in the old file (held there, edited) moves once it goes from there.
-  const names = [...new Set([...Object.keys(desired), ...here])].filter(
-    (name) =>
-      (Object.hasOwn(desired, name) || settled(name)) &&
-      (ledger.next[prefix + name]?.file ?? file) === file,
+
+  const names = [...new Set([...Object.keys(desired), ...namesIn(here)])].filter(
+    (name) => (Object.hasOwn(desired, name) || settled(name, here)) && !preview.next[prefix + name],
   );
-  mergeMcp(file, cell, prefix, names, desired, defs, ledger, dryRun, true);
+  mergeMcp(file, cell, prefix, names, desired, defs, here, dryRun, true);
+  if (sibling) {
+    const removable = oldNames.filter(
+      (name) => !Object.hasOwn(desired, name) || here.confirmed.has(prefix + name),
+    );
+    mergeMcp(sibling, cell, prefix, removable, dict(), defs, old, dryRun, false);
+    byFile.set(sibling, old.next);
+  }
+  byFile.set(file, here.next);
+
+  for (const id of ledger.ids(prefix)) delete ledger.next[id];
+  for (const [path, entries] of byFile) {
+    const rest = dict(
+      Object.entries(otherMcpEntries[path] ?? {}).filter(([id]) => !id.startsWith(prefix)),
+    );
+    for (const [id, record] of Object.entries(entries)) {
+      if (path === file || (path === sibling && !here.next[id])) ledger.next[id] = record;
+      else rest[id] = record;
+    }
+    if (Object.keys(rest).length > 0) otherMcpEntries[path] = rest;
+    else delete otherMcpEntries[path];
+  }
 }
+
+const openCodeSibling = (file: string) =>
+  join(dirname(file), file.endsWith(".jsonc") ? "opencode.json" : "opencode.jsonc");
 
 /** Merges `desired` into `file`, for `names`: the servers wanted there and the ones recorded. */
 function mergeMcp(
@@ -559,7 +609,10 @@ function claudePlugin(chosen: boolean, defs: Definitions, ledger: Ledger, dryRun
   // A folder of that name holding a file fleetrc never wrote, such as a skill's SKILL.md, is
   // someone else's.
   const strangers = stat ? listFiles(dir).filter((rel) => !rels.includes(rel)) : [];
-  if (strangers.length > 0) {
+  const managed = recorded.some((id) =>
+    ledger.record(id, join(dir, ...id.slice(prefix.length).split("/"))),
+  );
+  if (strangers.length > 0 && !managed) {
     ledger.report.warnings.push(
       `${tildify(dir)} holds ${strangers.join(", ")}, which fleetrc did not write, so Claude Code's hooks were not synced; move it away`,
     );
@@ -567,14 +620,15 @@ function claudePlugin(chosen: boolean, defs: Definitions, ledger: Ledger, dryRun
   }
   const planned = rels.map((rel) => {
     const path = join(dir, ...rel.split("/"));
+    const snapshot = readText(path);
     const decision = decideEntry({
       file: path,
       key: rel,
-      current: readText(path),
+      current: snapshot,
       record: ledger.record(prefix + rel, path),
       desired: Object.hasOwn(files, rel) ? files[rel] : undefined,
     });
-    return { rel, path, decision };
+    return { rel, path, snapshot, decision };
   });
   // While a hooks file edited by hand stays, so does the manifest that makes Claude Code load it.
   if (planned.some(({ decision }) => decision.action === "hold"))
@@ -590,23 +644,32 @@ function claudePlugin(chosen: boolean, defs: Definitions, ledger: Ledger, dryRun
     );
     return;
   }
-  for (const { rel, path, decision } of planned) {
+  if (Object.keys(files).length === 0) planned.reverse();
+  let cleanupBlocked = false;
+  for (const { rel, path, snapshot, decision } of planned) {
+    if (cleanupBlocked && rel === PLUGIN_MANIFEST && decision.action === "prune") continue;
     const owners =
       decision.action === "keep" && !Object.hasOwn(files, rel)
         ? ledger.records[prefix + rel]!.sources
         : sources;
     if (!dryRun)
       try {
-        if (writes(decision)) {
-          if (!replaceIfUnchanged(path, readText(path), decision.value as string, 0o644)) {
+        if (writes(decision) || decision.action === "prune") {
+          const saved = writes(decision)
+            ? replaceIfUnchanged(path, snapshot, decision.value as string, 0o644)
+            : readText(path) === snapshot;
+          if (!saved) {
+            cleanupBlocked = true;
             ledger.skip(
               path,
               `${tildify(path)} changed while fleetrc was writing it; fleetrc will try again on the next sync`,
             );
             continue;
           }
-        } else if (decision.action === "prune") rmSync(path, { force: true });
+          if (decision.action === "prune") rmSync(path, { force: true });
+        }
       } catch (error) {
+        cleanupBlocked = true;
         ledger.report.errors.push(`${tildify(path)}: ${message(error)}`);
         continue;
       }
@@ -755,7 +818,42 @@ function codexHooks(chosen: boolean, defs: Definitions, ledger: Ledger, dryRun: 
 interface ListPlan {
   replace: Map<number, unknown>;
   remove: number[];
-  add: unknown[];
+  add: { before: number; value: unknown }[];
+}
+
+const HOOK_SLOT = "fleetrcSlot";
+
+function hookSlots(
+  list: readonly unknown[],
+  indices: readonly number[],
+  records: readonly (OwnedEntry | undefined)[],
+) {
+  const slots = new Map<number, number>();
+  const legacy: number[] = [];
+  for (const index of indices) {
+    const item = list[index];
+    const slot = isRecord(item) ? item[HOOK_SLOT] : undefined;
+    if (typeof slot === "number" && Number.isSafeInteger(slot) && slot >= 0) {
+      if (slots.has(slot)) return undefined;
+      slots.set(slot, index);
+    } else legacy.push(index);
+  }
+  const unmatched = legacy.filter((index) => {
+    const hash = hashValue(list[index]);
+    const slot = records.findIndex((record, slot) => record?.hash === hash && !slots.has(slot));
+    if (slot < 0) return true;
+    slots.set(slot, index);
+    return false;
+  });
+  const remaining = records.flatMap((record, slot) => (record && !slots.has(slot) ? [slot] : []));
+  if (unmatched.length > 0 && remaining.length > 0 && remaining.length !== unmatched.length)
+    return undefined;
+  let free = 0;
+  unmatched.forEach((index, ordinal) => {
+    while (slots.has(free)) free++;
+    slots.set(remaining[ordinal] ?? free, index);
+  });
+  return slots;
 }
 
 /**
@@ -830,23 +928,49 @@ function markedHooks(
           [HOOK_MARK]: name,
           ...item,
         }));
+        const entryId = (slot: number) => `${prefix}${key}/${slot}`;
+        const records = Array.from({ length: recorded.get(key) ?? 0 }, (_, slot) =>
+          ledger.record(entryId(slot), file),
+        );
+        const slots = hookSlots(list, have, records);
+        if (!slots) {
+          for (const [slot, record] of records.entries())
+            if (record) ledger.report.held.push({ id: entryId(slot), file });
+          ledger.report.warnings.push(
+            `${tildify(file)}: could not identify ${name}'s ${event} hook slots; left them unchanged`,
+          );
+          continue;
+        }
         const plan: ListPlan = plans.get(event) ?? { replace: new Map(), remove: [], add: [] };
         plans.set(event, plan);
-        const count = Math.max(want.length, have.length, recorded.get(key) ?? 0);
-        for (let nth = 0; nth < count; nth++) {
-          const id = `${prefix}${name}/${event}/${nth}`;
-          const index = have[nth];
+        const order = [
+          ...new Set([...Array(Math.max(want.length, records.length)).keys(), ...slots.keys()]),
+        ].sort((left, right) => left - right);
+        for (const nth of order) {
+          const id = entryId(nth);
+          const index = slots.get(nth);
+          const current = index === undefined ? undefined : list[index];
+          const desired = want[nth];
           const decision = decideEntry({
             file,
             key: `hooks.${event}`,
-            current: index === undefined ? undefined : list[index],
-            record: ledger.record(id, file),
-            desired: want[nth],
+            current,
+            record: records[nth],
+            desired:
+              desired &&
+              (!records[nth] && sameValue(current, desired)
+                ? desired
+                : { ...desired, [HOOK_SLOT]: nth }),
           });
           done.push({ id, decision, source: name });
           if (writes(decision))
-            if (index === undefined) plan.add.push(decision.value);
-            else plan.replace.set(index, decision.value);
+            if (index === undefined) {
+              const nextSlot = order.find((slot) => slot > nth && slots.has(slot));
+              plan.add.push({
+                before: nextSlot === undefined ? list.length : slots.get(nextSlot)!,
+                value: decision.value,
+              });
+            } else plan.replace.set(index, decision.value);
           else if (decision.action === "prune" && index !== undefined) plan.remove.push(index);
         }
       }
@@ -863,7 +987,12 @@ function markedHooks(
         }
         for (const [item, value] of replace) edits.push({ path, item, value });
         for (const item of remove.sort((a, b) => b - a)) edits.push({ path, item });
-        add.forEach((value, i) => edits.push({ path, item: length - remove.length + i, value }));
+        add
+          .sort((left, right) => left.before - right.before)
+          .forEach(({ before, value }, index) => {
+            const item = before - remove.filter((removed) => removed < before).length + index;
+            edits.push({ path, item, value, insert: true });
+          });
       }
       if (root === undefined && edits.length > 0)
         for (const [key, value] of Object.entries(cell.seed ?? {}))
@@ -991,10 +1120,20 @@ export async function diffEntry(spec: string, id: string): Promise<string> {
   if (!cell) throw new UserError(`fleetrc writes no MCP servers for ${agent}`);
   const loaded = await loadManifest(spec, { offline: true });
   const state = loadState();
-  const defs = collect(offlineSources(loaded.sources, state), new Set(), state.entries ?? {});
+  const defs = collect(
+    offlineSources(loaded.root.sources, state),
+    Object.entries(state.entries ?? {}),
+  );
   const desired = mcpEntries(agent, defs.servers).entries[name];
   // The file the entry was written to, which stays its file until a sync moves it.
-  const file = state.entries?.[id]?.file ?? cell.file();
+  const currentFile = cell.file();
+  const sibling = agent === "opencode" ? openCodeSibling(currentFile) : undefined;
+  const recorded = state.entries?.[id]?.file;
+  const file = state.otherMcpEntries?.[currentFile]?.[id]
+    ? currentFile
+    : recorded && (recorded === currentFile || recorded === sibling)
+      ? recorded
+      : currentFile;
   let current: unknown;
   if (cell.format === "toml") {
     const text = readText(file);

@@ -680,11 +680,12 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       { copy: options.copy, dryRun, keep: keepFiles },
     );
     doing = "merging MCP servers and hooks into agent configs";
+    const rootSources = new Set(loaded.root.sources.map((source) => source.id));
     const entries = syncEntries(
-      results,
+      results.filter((source) => rootSources.has(source.id)),
       targets.flatMap((target) => target.agents),
       state,
-      { dryRun, keep: keepFiles },
+      { dryRun },
     );
     const linkedItem = (source: string, item: string) =>
       fileLinks.links.some((link) => link.source === source && link.item === item);

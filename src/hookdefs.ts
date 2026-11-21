@@ -174,12 +174,18 @@ const FORMATS: Record<HookDefAgent, Format> = {
         throw new Error(`${at} has "timeout" ${JSON.stringify(timeout)}; give whole seconds`);
       if (background !== undefined && typeof background !== "boolean")
         throw new Error(`${at} has "async" that isn't true or false`);
-      for (const field of ["commandWindows", "command_windows", "statusMessage"])
-        if (handler[field] !== undefined && typeof handler[field] !== "string")
+      for (const field of ["commandWindows", "command_windows", "statusMessage"]) {
+        const value = handler[field];
+        if (value !== undefined && value !== null && typeof value !== "string")
           throw new Error(`${at} has "${field}" that isn't a string`);
+      }
       if (handler.commandWindows !== undefined && handler.command_windows !== undefined)
         throw new Error(`${at} has both "commandWindows" and "command_windows"; keep one`);
-      if (limit !== undefined && !(Number.isSafeInteger(limit) && (limit as number) >= 0))
+      if (
+        limit !== undefined &&
+        limit !== null &&
+        !(Number.isSafeInteger(limit) && (limit as number) >= 0)
+      )
         throw new Error(`${at} has "additionalContextLimit" that isn't a whole number from 0`);
       if (input !== undefined && !(isRecord(input) && tomlValue(input)))
         throw new Error(`${at} has "input" that isn't an object TOML can hold`);

@@ -100,6 +100,8 @@ export interface State {
    * `mcp/codex/github`; see entrysync.ts.
    */
   entries?: Record<string, OwnedEntry>;
+  /** MCP records outside the current config file, grouped by file and then entry id. */
+  otherMcpEntries?: Record<string, Record<string, OwnedEntry>>;
 }
 
 /** An entry fleetrc wrote, and the source it came from. */
@@ -176,6 +178,13 @@ export function loadState(warnings?: string[]): State {
       : {}),
     ...(isRecord(raw.links) ? { links: records(raw.links, fileLink) } : {}),
     ...(isRecord(raw.entries) ? { entries: records(raw.entries, ownedEntry) } : {}),
+    ...(isRecord(raw.otherMcpEntries)
+      ? {
+          otherMcpEntries: records(raw.otherMcpEntries, (value) =>
+            isRecord(value) ? records(value, ownedEntry) : undefined,
+          ),
+        }
+      : {}),
   };
 }
 

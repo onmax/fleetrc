@@ -340,7 +340,7 @@ describe("MCP servers", () => {
     );
   });
 
-  it("a source kept while an extended manifest does not load keeps its servers' names", async () => {
+  it("does not retain a removed root source's server when an extension fails", async () => {
     const m = machine();
     const sources = ["first", "second"].map((id, index) => {
       const local = join(m.root, id);
@@ -360,8 +360,29 @@ describe("MCP servers", () => {
     });
     const report = await m.json<Report>("sync");
     expect(report.warnings.join("\n")).toContain("kept first as last synced");
-    expect(report.entries.updated).toEqual([]);
-    expect(read(m.at(".claude", ".claude.json"))).toContain("docs-mcp@1");
+    expect(report.entries.updated).toEqual(["mcp/claude-code/docs"]);
+    expect(read(m.at(".claude", ".claude.json"))).toContain("docs-mcp@2");
+  });
+
+  it("reconciles the selected Codex home without changing or losing ownership in another", async () => {
+    const { m, write, define } = await setup(["codex"], { docs: docs() });
+    const first = m.at(".codex", "config.toml");
+    const secondHome = m.at(".codex-other");
+    const second = join(secondHome, "config.toml");
+    const run = async () => {
+      const report = await m.runWith({ env: { CODEX_HOME: secondHome } }, "sync", "--json");
+      expect(report.code, report.stderr || report.stdout).toBe(0);
+    };
+    define({ docs: docs("2") });
+    await run();
+    expect(read(first)).toContain("docs-mcp@1");
+    expect(read(second)).toContain("docs-mcp@2");
+    write({});
+    expect((await sync(m)).entries.removed).toEqual(["mcp/codex/docs"]);
+    expect(read(first)).not.toContain("docs-mcp");
+    expect(read(second)).toContain("docs-mcp@2");
+    await run();
+    expect(read(second)).not.toContain("docs-mcp");
   });
 
   it("names the source of a server an agent can't take", async () => {
@@ -482,6 +503,23 @@ describe("MCP servers", () => {
     expect((await sync(m)).entries.removed).toEqual(["mcp/opencode/docs"]);
     expect(jsonc(read(file)).mcp).toEqual({ servers: {} });
     expect(read(file)).toContain("// mine");
+  });
+
+  it("keeps the old OpenCode server until the replacement can be written", async () => {
+    const { m } = await setup(["opencode"], { docs: docs() });
+    const old = m.at(".config", "opencode", "opencode.json");
+    const next = m.at(".config", "opencode", "opencode.jsonc");
+    writeFileSync(next, "{}\n");
+    mkdirSync(`${next}.lock`);
+    const busy = await sync(m);
+    expect(busy.entries.skipped).toContain(next);
+    expect(busy.entries.removed).toEqual([]);
+    expect(read(old)).toContain("docs-mcp@1");
+    expect(read(next)).not.toContain("docs-mcp");
+    rmSync(`${next}.lock`, { recursive: true });
+    await sync(m);
+    expect(read(next)).toContain("docs-mcp@1");
+    expect(read(old)).not.toContain("docs-mcp");
   });
 
   it("keeps a server edited in the old opencode.json there, and moves it once it is put back", async () => {

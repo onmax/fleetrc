@@ -5,6 +5,7 @@
 // by hand, left alone when foreign, and never written in a dry run.
 import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parse as parseJsonc } from "jsonc-parser";
 import { describe, expect, it } from "vite-plus/test";
 import {
   type EntriesReport as Report,
@@ -266,6 +267,70 @@ describe("hooks", () => {
     expect(read(m.at(".claude", "skills", "fleetrc", "SKILL.md"))).toBe(skill);
   });
 
+  it("Claude Code: prunes its plugin files without removing unrelated files", async () => {
+    const { m, write } = await setup(named("claude-code"));
+    const plugin = m.at(".claude", "skills", "fleetrc");
+    writeFileSync(join(plugin, "notes.txt"), "my notes\n");
+    write({});
+    expect((await sync(m)).entries.removed).toEqual(named("claude-code").ids);
+    expect(readdirSync(plugin)).toEqual(["notes.txt"]);
+    expect(read(join(plugin, "notes.txt"))).toBe("my notes\n");
+  });
+
+  it("Claude Code: skips a write when a user edits the hook after the planning read", async () => {
+    const agent = named("claude-code");
+    const { m, define } = await setup(agent);
+    const file = m.at(agent.file);
+    const edit = read(file).replace("echo one", "echo mine");
+    const preload = join(m.root, "edit-on-read.cjs");
+    writeFileSync(
+      preload,
+      `
+      const fs = require('node:fs');
+      const read = fs.readFileSync;
+      let edited = false;
+      fs.readFileSync = (file, ...args) => {
+        const snapshot = read(file, ...args);
+        if (file === ${JSON.stringify(file)} && !edited) {
+          edited = true;
+          fs.writeFileSync(file, ${JSON.stringify(edit)});
+        }
+        return snapshot;
+      };
+      require('node:module').syncBuiltinESMExports();
+    `,
+    );
+    define("echo two");
+    const run = await m.runWith(
+      { env: { NODE_OPTIONS: `--require "${preload}"` } },
+      "sync",
+      "--json",
+    );
+    expect(run.code, run.stderr || run.stdout).toBe(0);
+    const report = JSON.parse(run.stdout) as Report;
+    expect(report.entries.skipped).toContain(file);
+    expect(report.entries.updated).toEqual([]);
+    expect(read(file)).toBe(edit);
+  });
+
+  it("Codex: accepts null optional fields in a native hook definition", async () => {
+    const agent = named("codex");
+    const { m, defs } = await setup(agent);
+    const handler = {
+      type: "command",
+      command: "echo two",
+      commandWindows: null,
+      statusMessage: null,
+      additionalContextLimit: null,
+    };
+    writeFileSync(
+      join(defs, "hooks.json"),
+      JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [handler] }] } }),
+    );
+    expect((await sync(m)).entries.updated).toEqual(agent.changes);
+    expect(read(m.at(agent.file))).toContain("echo two");
+  });
+
   it("Codex: slots never move, and each change asks for approval in /hooks", async () => {
     const mine = { matcher: "Read", hooks: [{ type: "command", command: "echo mine" }] };
     const later = { matcher: "Edit", hooks: [{ type: "command", command: "echo later" }] };
@@ -366,12 +431,66 @@ describe("hooks", () => {
     expect(read(file)).toBe(settings);
   });
 
+  it("Gemini CLI: preserves the leading comment of a neighboring user hook", async () => {
+    const agent = named("gemini-cli");
+    const { m, write } = await setup(agent);
+    const file = m.at(agent.file);
+    const { hooks } = JSON.parse(read(file)) as { hooks: { BeforeTool: unknown[] } };
+    const user = { hooks: [{ type: "command", command: "echo mine" }] };
+    writeFileSync(
+      file,
+      `{"hooks":{"BeforeTool":[${JSON.stringify(hooks.BeforeTool[0])}, /* why this hook exists */ ${JSON.stringify(user)}]}}`,
+    );
+    write({});
+    expect((await sync(m)).entries.removed).toEqual(agent.ids);
+    expect(read(file)).toContain("/* why this hook exists */");
+    expect(parseJsonc(read(file)).hooks.BeforeTool).toEqual([user]);
+  });
+
+  it.each(["cursor", "gemini-cli"] as const)(
+    "%s keeps later hook identity after an earlier hook is deleted",
+    async (name) => {
+      const agent = named(name);
+      const { m, defs, write } = await setup(agent);
+      const event = name === "cursor" ? "preToolUse" : "BeforeTool";
+      const item = (command: string) =>
+        name === "cursor"
+          ? { command, matcher: "Shell" }
+          : { matcher: "Bash", hooks: [{ type: "command", command }] };
+      writeFileSync(
+        join(defs, "hooks.json"),
+        JSON.stringify({ hooks: { [event]: [item("echo one"), item("echo later")] } }),
+      );
+      const file = m.at(agent.file);
+      const readHooks = () => JSON.parse(read(file)) as { hooks: Record<string, unknown[]> };
+      await sync(m);
+      const root = readHooks();
+      const [first, later] = root.hooks[event]!;
+      expect(later).toMatchObject({ fleetrcSlot: 1 });
+      root.hooks[event] = [later];
+      writeFileSync(file, JSON.stringify(root));
+      const restored = await sync(m);
+      expect(restored.entries.added).toEqual(agent.ids);
+      expect(restored.entries.held).toEqual([]);
+      expect(readHooks().hooks[event]).toEqual([first, later]);
+      root.hooks[event] = [{ ...item("echo mine"), fleetrc: "defs", fleetrcSlot: 1 }];
+      writeFileSync(file, JSON.stringify(root));
+      write({});
+      expect((await sync(m)).entries.held).toEqual([
+        { id: agent.ids[0]!.replace(/0$/, "1"), file },
+      ]);
+      expect(readHooks().hooks[event]).toEqual(root.hooks[event]);
+    },
+  );
+
   it("Cursor: a new hooks.json gets version 1, and the user's scripts stay where they are", async () => {
     const cursor = named("cursor");
     const fresh = await setup(cursor);
     expect(JSON.parse(read(fresh.m.at(cursor.file)))).toEqual({
       version: 1,
-      hooks: { preToolUse: [{ fleetrc: "defs", command: "echo one", matcher: "Shell" }] },
+      hooks: {
+        preToolUse: [{ fleetrc: "defs", fleetrcSlot: 0, command: "echo one", matcher: "Shell" }],
+      },
     });
     const mine = `{
   "version": 1,
@@ -388,7 +507,7 @@ describe("hooks", () => {
     expect(hooks()).toEqual({
       preToolUse: [
         { command: "./mine.sh" },
-        { fleetrc: "defs", command: "echo one", matcher: "Shell" },
+        { fleetrc: "defs", fleetrcSlot: 0, command: "echo one", matcher: "Shell" },
       ],
       stop: [{ command: "./done.sh" }],
     });

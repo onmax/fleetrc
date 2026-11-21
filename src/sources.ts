@@ -2572,19 +2572,18 @@ function vendoredFiles(
     const selected = () =>
       findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
     const approved =
-      source.update === "review"
-        ? (approvedTargets(source, kind, records, ctx) ?? selected())
-        : undefined;
+      source.update === "review" ? approvedTargets(source, kind, records, ctx) : undefined;
+    const retained = source.update === "review" && !approved ? selected() : approved;
     const found = root
       ? findFileItems(source, kind, treeLister(root), sub.warnings)
-      : (approved ?? selected());
+      : (retained ?? selected());
     const removals = new Map<string, FileTarget[]>();
     /** Definition texts a dry run takes from the staged copy, which it never moves to the store. */
     const stagedTexts = new Map<string, string | undefined>();
     if (!root) sub.skills = keptSkills(view, kindCtx.storeDir);
     else {
-      if (reviewing && approved)
-        for (const [path, targets] of approved)
+      if (reviewing && retained)
+        for (const [path, targets] of retained)
           if (!sourcePathStat(join(root, ...path.split("/")))?.isFile())
             removals.set(path, targets);
       const staging = ctx.dryRun
@@ -2654,7 +2653,7 @@ function vendoredFiles(
       });
     }
     if (root && !ctx.dryRun) {
-      if (approved) records.selected = selectedAgents;
+      if (retained) records.selected = selectedAgents;
       else delete records.selected;
       if (approved && kind === "instructions") {
         records.instructionGlobs = source.files?.instructions ?? dict();

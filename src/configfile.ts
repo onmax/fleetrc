@@ -41,12 +41,14 @@ export type KeyPath = readonly string[];
 /**
  * Sets the value at `path`, creating missing objects on the way; an undefined value removes it.
  * With `item`, `path` names a list and the edit is to its item at that index: replaced, removed, or
- * added when the index is the list's length (a missing list is created with it).
+ * added when the index is the list's length (a missing list is created with it). With `insert`,
+ * the value goes before the item at that index instead of replacing it.
  */
 export interface KeyEdit {
   path: KeyPath;
   value?: unknown;
   item?: number;
+  insert?: boolean;
 }
 
 /** A file that does not parse, or an edit that can't be placed in its text. */
@@ -124,10 +126,17 @@ function withValue(root: Record<string, unknown>, path: KeyPath, value: unknown)
 }
 
 /** `root` with the list at `path` edited at `index`, as `KeyEdit.item` describes. */
-function withItem(root: Record<string, unknown>, path: KeyPath, index: number, value: unknown) {
+function withItem(
+  root: Record<string, unknown>,
+  path: KeyPath,
+  index: number,
+  value: unknown,
+  insert?: boolean,
+) {
   const list = valueAt(root, path);
   const items = Array.isArray(list) ? [...list] : [];
   if (value === undefined) items.splice(index, 1);
+  else if (insert) items.splice(index, 0, value);
   else items[index] = value;
   return withValue(root, path, items);
 }
@@ -139,7 +148,7 @@ const nest = (path: KeyPath, value: unknown): unknown =>
 /** Applies one edit to `text` (no byte order mark), placed as the text around it is laid out. */
 function editOnce(
   text: string,
-  { path, value, item: index }: KeyEdit,
+  { path, value, item: index, insert: insertItem }: KeyEdit,
   format: ConfigFormat,
 ): string {
   if (path.length === 0) throw new ConfigEditError("an edit needs a key");
@@ -257,11 +266,19 @@ function editOnce(
       }
     }
     const next = members[index + 1];
-    if (next) return [{ offset: start, length: next.offset - start, content: "" }];
-    if (comma !== undefined) return [{ offset: start, length: comma + 1 - start, content: "" }];
-    if (previousComma !== undefined)
+    if (next && comma === end && /^\s*$/.test(text.slice(comma + 1, next.offset)))
+      return [{ offset: start, length: next.offset - start, content: "" }];
+    const delimiter = comma ?? previousComma;
+    if (comma === end) return [{ offset: start, length: end + 1 - start, content: "" }];
+    if (
+      comma === undefined &&
+      previousComma !== undefined &&
+      /^\s*$/.test(text.slice(previousComma + 1, start))
+    )
       return [{ offset: previousComma, length: end - previousComma, content: "" }];
-    return [{ offset: start, length: end - start, content: "" }];
+    const edits = [{ offset: start, length: end - start, content: "" }];
+    if (delimiter !== undefined) edits.push({ offset: delimiter, length: 1, content: "" });
+    return edits;
   };
 
   let object = treeOf(text, format);
@@ -284,6 +301,13 @@ function editOnce(
       const items = node.children ?? [];
       const at = items[index];
       if (value === undefined) return at ? applyEdits(text, remove(node, at)) : text;
+      if (at && insertItem) {
+        const indent = indentAt(at.offset);
+        const content = startsLine(at.offset)
+          ? `${block(value, indent)},${eol}${indent}`
+          : `${inline(value)}, `;
+        return applyEdits(text, [{ offset: at.offset, length: 0, content }]);
+      }
       if (at)
         return applyEdits(text, [
           { offset: at.offset, length: at.length, content: block(value, indentAt(at.offset)) },
@@ -323,7 +347,7 @@ export function editConfigText(
     expected =
       edit.item === undefined
         ? withValue(expected, edit.path, edit.value)
-        : withItem(expected, edit.path, edit.item, edit.value);
+        : withItem(expected, edit.path, edit.item, edit.value, edit.insert);
   }
   if (!sameValue(parseConfigText(out, format), expected))
     throw new ConfigEditError("the edit could not be placed in its text");
