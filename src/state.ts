@@ -106,6 +106,8 @@ export interface State {
 
 /** An entry fleetrc wrote, and the source it came from. */
 export interface OwnedEntry extends EntryRecord {
+  /** Resolved OpenCode config path, used to recover ownership through a surviving alias. */
+  configTarget?: string;
   /** The source that defined it; undefined for a file built from several (Claude's hook plugin). */
   source?: string;
   /** For a file built from several definitions: the sources whose definitions it holds. */
@@ -196,7 +198,13 @@ function ownedEntry(record: unknown): OwnedEntry | undefined {
   const sources = Array.isArray(record.sources)
     ? record.sources.filter((source): source is string => typeof source === "string")
     : undefined;
-  return { file, key, hash, ...strings(record, "source"), ...(sources ? { sources } : {}) };
+  return {
+    file,
+    key,
+    hash,
+    ...strings(record, "source", "configTarget"),
+    ...(sources ? { sources } : {}),
+  };
 }
 
 function fileLink(record: unknown): FileLink | undefined {

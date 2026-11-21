@@ -152,9 +152,15 @@ function editOnce(
   format: ConfigFormat,
 ): string {
   if (path.length === 0) throw new ConfigEditError("an edit needs a key");
-  const eol = text.includes("\r\n") ? "\r\n" : "\n";
-  const unit = text.match(/\n([ \t]+)\S/)?.[1] ?? "  ";
-  const lineStart = (at: number) => text.lastIndexOf("\n", at - 1) + 1;
+  const eol = text.match(/\r\n?|\n/)?.[0] ?? "\n";
+  const unit = text.match(/[\r\n]([ \t]+)\S/)?.[1] ?? "  ";
+  const lineStart = (at: number) =>
+    Math.max(text.lastIndexOf("\n", at - 1), text.lastIndexOf("\r", at - 1)) + 1;
+  const lineBreak = /\r\n?|\n/g;
+  const nextLineBreak = (from: number) => {
+    lineBreak.lastIndex = from;
+    return lineBreak.exec(text);
+  };
   const indentAt = (at: number) => text.slice(lineStart(at)).match(/^[ \t]*/)![0];
   const startsLine = (at: number) => /^[ \t]*$/.test(text.slice(lineStart(at), at));
   /** `value` laid out on lines, continuing at `indent`. */
@@ -176,11 +182,10 @@ function editOnce(
       const c = text[at];
       if (c === " " || c === "\t" || (lines && (c === "\n" || c === "\r"))) at++;
       else if (c === "/" && text[at + 1] === "/") {
-        const end = text.indexOf("\n", at);
-        at = end === -1 ? text.length : text[end - 1] === "\r" ? end - 1 : end;
+        at = nextLineBreak(at)?.index ?? text.length;
       } else if (c === "/" && text[at + 1] === "*") {
         const end = text.indexOf("*/", at + 2) + 2;
-        if (!lines && text.slice(at, end).includes("\n")) return at;
+        if (!lines && /[\r\n]/.test(text.slice(at, end))) return at;
         at = end;
       } else return at;
     }
@@ -312,8 +317,10 @@ function editOnce(
           boundary + text.slice(boundary, at.offset).match(/^\s*/)![0].length;
         if (previous) {
           const trivia = firstNonSpace();
-          if (text.startsWith("//", trivia) && lineStart(trivia) === lineStart(endOf(previous)))
-            boundary = text.indexOf("\n", trivia) + 1;
+          if (text.startsWith("//", trivia) && lineStart(trivia) === lineStart(endOf(previous))) {
+            const end = nextLineBreak(trivia);
+            if (end) boundary = end.index + end[0].length;
+          }
         }
         const offset = firstNonSpace();
         const indent = indentAt(offset);

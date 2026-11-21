@@ -383,7 +383,9 @@ function syncMcp(
 ) {
   const preferred = cell.file();
   const alternate = agent === "opencode" ? openCodeSibling(preferred) : undefined;
-  const aliased = alternate !== undefined && sameRealFile(preferred, alternate);
+  const target = alternate === undefined ? undefined : resolvedConfigPath(preferred);
+  const aliased =
+    alternate !== undefined && target !== undefined && target === resolvedConfigPath(alternate);
   const file =
     aliased && lstat(preferred)?.isSymbolicLink() && !lstat(alternate)?.isSymbolicLink()
       ? alternate
@@ -402,13 +404,20 @@ function syncMcp(
       if (id.startsWith(prefix)) remember(id, record);
   for (const id of ledger.ids(prefix)) remember(id, ledger.records[id]!);
 
-  if (aliased && sibling) {
-    const records = dict<OwnedEntry>();
-    for (const path of [sibling, file])
-      for (const [id, record] of Object.entries(byFile.get(path) ?? {}))
-        records[id] = { ...record, file };
+  if (sibling && target !== undefined) {
+    const records = byFile.get(file) ?? dict<OwnedEntry>();
+    const siblingRecords = byFile.get(sibling) ?? dict<OwnedEntry>();
+    for (const [id, record] of Object.entries(siblingRecords)) {
+      if (aliased || isMissingAlias(record, target)) {
+        if (!Object.hasOwn(records, id)) records[id] = { ...record, file, configTarget: target };
+        delete siblingRecords[id];
+      }
+    }
+    if (aliased)
+      for (const [id, record] of Object.entries(records))
+        records[id] = { ...record, configTarget: target };
     byFile.set(file, records);
-    byFile.set(sibling, dict());
+    byFile.set(sibling, siblingRecords);
   }
   const here = new Ledger(byFile.get(file) ?? dict(), ledger.report);
   const old = new Ledger(sibling ? (byFile.get(sibling) ?? dict()) : dict(), ledger.report);
@@ -431,7 +440,7 @@ function syncMcp(
   const names = [...new Set([...Object.keys(desired), ...namesIn(here)])].filter(
     (name) => (Object.hasOwn(desired, name) || settled(name, here)) && !preview.next[prefix + name],
   );
-  mergeMcp(file, cell, prefix, names, desired, defs, here, dryRun, true);
+  mergeMcp(file, cell, prefix, names, desired, defs, here, dryRun, true, target);
   if (sibling) {
     const removable = oldNames.filter(
       (name) => !Object.hasOwn(desired, name) || here.confirmed.has(prefix + name),
@@ -458,12 +467,16 @@ function syncMcp(
 const openCodeSibling = (file: string) =>
   join(dirname(file), file.endsWith(".jsonc") ? "opencode.json" : "opencode.jsonc");
 
-function sameRealFile(left: string, right: string): boolean {
+function resolvedConfigPath(file: string): string | undefined {
   try {
-    return realpathSync.native(left) === realpathSync.native(right);
+    return realpathSync.native(file);
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+function isMissingAlias(record: OwnedEntry, target: string): boolean {
+  return record.configTarget === target && !lstat(record.file);
 }
 
 /** Merges `desired` into `file`, for `names`: the servers wanted there and the ones recorded. */
@@ -477,6 +490,7 @@ function mergeMcp(
   ledger: Ledger,
   dryRun: boolean,
   create: boolean,
+  configTarget?: string,
 ) {
   if (names.length === 0) return;
   const decide = (name: string, current: unknown) =>
@@ -489,7 +503,10 @@ function mergeMcp(
     });
   const settle = (done: { name: string; decision: EntryDecision }[]) => {
     for (const { name, decision } of done)
-      ledger.settle(prefix + name, file, decision, { source: defs.owner.get(name) });
+      ledger.settle(prefix + name, file, decision, {
+        source: defs.owner.get(name),
+        ...(configTarget === undefined ? {} : { configTarget }),
+      });
   };
   if (!create && !lstat(file)) {
     settle(names.map((name) => ({ name, decision: decide(name, undefined) })));
@@ -1150,11 +1167,14 @@ export async function diffEntry(spec: string, id: string): Promise<string> {
   // The file the entry was written to, which stays its file until a sync moves it.
   const currentFile = cell.file();
   const sibling = agent === "opencode" ? openCodeSibling(currentFile) : undefined;
-  const recorded = state.entries?.[id]?.file;
-  const file = state.otherMcpEntries?.[currentFile]?.[id]
-    ? currentFile
-    : recorded && (recorded === currentFile || recorded === sibling)
-      ? recorded
+  const record = state.entries?.[id];
+  const target = sibling === undefined ? undefined : resolvedConfigPath(currentFile);
+  const file =
+    record &&
+    record.file === sibling &&
+    !state.otherMcpEntries?.[currentFile]?.[id] &&
+    (target === undefined || !isMissingAlias(record, target))
+      ? record.file
       : currentFile;
   let current: unknown;
   if (cell.format === "toml") {

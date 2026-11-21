@@ -550,6 +550,37 @@ describe("MCP servers", () => {
     expect(jsonc(read(preferred)).mcp).toEqual({ servers: {} });
   });
 
+  it.skipIf(isWindows).each(["opencode.jsonc", "opencode.json"])(
+    "still prunes the shared OpenCode server after unlinking %s",
+    async (removed) => {
+      const m = machine();
+      const config = m.at(".config", "opencode");
+      const fallback = join(config, "opencode.json");
+      const preferred = join(config, "opencode.jsonc");
+      const target = join(config, "shared.json");
+      const defs = join(m.root, "defs");
+      writeFiles(defs, { ...skills("skills/", "tool"), "mcp.json": mcpFile({ docs: docs() }) });
+      writeFiles(config, { "shared.json": AGENTS.find(({ agent }) => agent === "opencode")!.own });
+      symlinkSync("shared.json", fallback);
+      const write = (spec: object) =>
+        m.manifest({ agents: ["opencode"], sources: [{ id: "defs", local: defs, ...spec }] });
+      await m.json("init", write({ mcp: "mcp.json" }), "--no-hooks");
+      symlinkSync("shared.json", preferred);
+      const unchanged = await sync(m);
+      expect(unchanged.entries.adopted).toEqual([]);
+      expect(unchanged.entries.removed).toEqual([]);
+      expect(unchanged.entries.total).toBe(1);
+
+      rmSync(join(config, removed));
+      write({});
+      expect((await sync(m)).entries.removed).toEqual(["mcp/opencode/docs"]);
+      expect(jsonc(read(target)).mcp).toEqual({
+        servers: { mine: { type: "local", command: ["mine"] } },
+      });
+      expect(existsSync(join(config, removed))).toBe(false);
+    },
+  );
+
   it("keeps a server edited in the old opencode.json there, and moves it once it is put back", async () => {
     const { m } = await setup(["opencode"], { docs: docs() });
     const old = m.at(".config", "opencode", "opencode.json");
