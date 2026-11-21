@@ -2173,6 +2173,7 @@ function applyVendored(
     earlier,
     commit,
     heldBack = new Set(),
+    reviewRemovals,
   }: {
     /** Skills whose install record was rebuilt from the store this run. */
     rebuilt: readonly string[];
@@ -2185,6 +2186,7 @@ function applyVendored(
     commit?: string;
     /** Skills upstream still has but whose download was refused: their copy stays as it is. */
     heldBack?: ReadonlySet<string>;
+    reviewRemovals?: ReadonlySet<string>;
   },
 ) {
   const write = !ctx.dryRun;
@@ -2205,8 +2207,10 @@ function applyVendored(
   ) => {
     const paths = storePaths(ctx.storeDir, name);
     const incoming = from ? hashDir(from) : {};
-    const upstreamChanged =
-      !existsSync(paths.upstream) || !sameTree(hashDir(paths.upstream), incoming);
+    const hasUpstream = existsSync(paths.upstream);
+    const upstreamChanged = from
+      ? !hasUpstream || !sameTree(hashDir(paths.upstream), incoming)
+      : hasUpstream;
     if (write && upstreamChanged) {
       if (from) replaceDir(from, paths.upstream);
       else rmSync(paths.upstream, { recursive: true, force: true });
@@ -2333,13 +2337,6 @@ function applyVendored(
   // A skill held back keeps the update it was already waiting on.
   for (const entry of out.pending)
     if (heldBack.has(entry.skill) && !pending.has(entry.skill)) pending.set(entry.skill, entry);
-  out.pending = [...pending.values()].sort((a, b) => (a.skill < b.skill ? -1 : 1));
-  if (write)
-    for (const name of Object.keys(state.pending))
-      if (!pending.has(name)) {
-        delete state.pending[name];
-        rmSync(storePaths(ctx.storeDir, name).upstream, { recursive: true, force: true });
-      }
   const kept = new Set(chosen.filter((skill) => staged.has(skill.name)).map((skill) => skill.name));
   for (const name of Object.keys(state.skills)) {
     if (kept.has(name)) continue;
@@ -2348,7 +2345,7 @@ function applyVendored(
       out.skills.push({ name, dir: paths.live, path: state.skills[name]?.path });
       continue;
     }
-    if (edited.has(name) || review) {
+    if (edited.has(name) || (review && (reviewRemovals?.has(name) ?? true))) {
       if (edited.has(name))
         out.warnings.push(
           `${source.id}: ${name} is gone upstream but has local edits, so it stays`,
@@ -2375,6 +2372,13 @@ function applyVendored(
     }
     out.removed.push(name);
   }
+  out.pending = [...pending.values()].sort((a, b) => (a.skill < b.skill ? -1 : 1));
+  if (write)
+    for (const name of Object.keys(state.pending))
+      if (!pending.has(name)) {
+        delete state.pending[name];
+        rmSync(storePaths(ctx.storeDir, name).upstream, { recursive: true, force: true });
+      }
   if (firstRun && out.added.length > 0) out.status = "installed";
   else if (out.updated.length > 0 || out.added.length > 0 || out.removed.length > 0)
     out.status = "updated";
@@ -2491,6 +2495,8 @@ function vendoredFiles(
   version?: string,
 ) {
   if (source.kind === "index") return;
+  const firstRun = !state.fetchedAt;
+  const reviewing = source.update === "review" && !ctx.apply;
   for (const kind of fileKindsOf(source, state)) {
     const view = itemsView(state, kind);
     const kindCtx = { ...ctx, storeDir: join(ctx.storeDir, kind) };
@@ -2502,11 +2508,11 @@ function vendoredFiles(
       }
     if (!ctx.dryRun) recoverStore(kindCtx.storeDir);
     const rebuilt = rebuildRecords(view, kindCtx.storeDir);
-    const firstRun = Object.keys(view.skills).length === 0;
     lookForEdits(source, view, kindCtx, sub);
-    const found = root
-      ? findFileItems(source, kind, treeLister(root), sub.warnings)
-      : findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
+    const selected = () =>
+      findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
+    const found = root ? findFileItems(source, kind, treeLister(root), sub.warnings) : selected();
+    let targets = found;
     if (!root) sub.skills = keptSkills(view, kindCtx.storeDir);
     else {
       const staging = ctx.dryRun
@@ -2540,8 +2546,16 @@ function vendoredFiles(
           firstRun,
           earlier: new Map(),
           heldBack,
+          reviewRemovals: reviewing ? new Set([...selected().keys()].map(itemName)) : undefined,
           commit: source.kind === "git" ? version : undefined,
         });
+        if (reviewing)
+          targets = findFileItems(
+            source,
+            kind,
+            pathsLister(sub.skills.map((item) => itemPath(item.name))),
+            [],
+          );
       } finally {
         rmSync(staging, { recursive: true, force: true });
       }
@@ -2553,7 +2567,7 @@ function vendoredFiles(
         kind,
         path,
         file: join(item.dir, posix.basename(path)),
-        agents: found.get(path) ?? [],
+        agents: targets.get(path) ?? [],
         ...(fresh.has(item.name) ? { updated: true } : {}),
       });
     }

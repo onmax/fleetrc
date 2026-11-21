@@ -576,7 +576,20 @@ async function timer(action: string | undefined) {
 
 function lastRun(): Report | undefined {
   const raw = readJsonOrNothing(paths.lastRun());
-  return isRecord(raw) && raw.version === 1 ? (raw as unknown as Report) : undefined;
+  if (!isRecord(raw) || raw.version !== 1) return undefined;
+  const report = raw as unknown as Report;
+  return {
+    ...report,
+    files: report.files ?? {
+      total: 0,
+      links: [],
+      added: [],
+      updated: [],
+      removed: [],
+      adopted: [],
+      foreign: [],
+    },
+  };
 }
 
 /** The installed timer's schedule, when the manifest now names another; see `scheduleDrift`. */

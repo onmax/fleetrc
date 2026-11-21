@@ -101,17 +101,25 @@ function locateItem(loaded: LoadedManifest, state: State, typed: string): Locate
   const parsed = parseItemId(typed);
   if (!parsed) return undefined;
   const key = itemName(parsed.path);
-  for (const source of loaded.sources) {
-    const files = state.sources[source.id]?.files?.[parsed.kind];
-    if (files && (Object.hasOwn(files.items, key) || Object.hasOwn(files.pending, key)))
-      return { loaded, state, name: typed, source, item: { kind: parsed.kind, key } };
-  }
-  // A folder linked in place keeps no records, only the link.
-  const link = Object.values(state.links ?? {}).find((record) => record.item === typed);
-  const source = loaded.sources.find((candidate) => candidate.id === link?.source);
-  return source
-    ? { loaded, state, name: typed, source, item: { kind: parsed.kind, key } }
-    : undefined;
+  const linked = new Set(
+    Object.values(state.links ?? {})
+      .filter((record) => record.item === typed)
+      .map((record) => record.source),
+  );
+  const active = loaded.sources.filter((source) => linked.has(source.id));
+  const candidates =
+    active.length > 0
+      ? active
+      : loaded.sources.filter((source) =>
+          Object.hasOwn(state.sources[source.id]?.files?.[parsed.kind]?.pending ?? {}, key),
+        );
+  if (candidates.length > 1)
+    throw new UserError(
+      `${typed} is ambiguous: it comes from ${candidates.map((source) => source.id).join(", ")}`,
+    );
+  const [source] = candidates;
+  if (!source) throw new UserError(`no file "${typed}" is linked or pending; run \`fleetrc list\``);
+  return { loaded, state, name: typed, source, item: { kind: parsed.kind, key } };
 }
 
 /** Where a vendored skill or file is kept: its folders in the store and its records. */
