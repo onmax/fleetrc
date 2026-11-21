@@ -285,6 +285,42 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
     expect(warnings[0]).toContain('rename that capability to "github.com/onmax/fleetrc"');
   });
 
+  it("keeps the manifest at its old place when the tailnet policy names only its repository", async () => {
+    const m = machine();
+    const vendor = remote(m, "home-skills", skills("skills/", "from-tailnet"));
+    const team = remote(m, "home", {
+      ".skillfleet/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "home", git: vendor.https }],
+      }),
+    });
+    const saved = `${team.https}//.skillfleet/manifest.json`;
+    const first = await m.run("init", saved, "--no-hooks");
+    expect(first.code, first.stdout + first.stderr).toBe(0);
+    const config = m.at(".config/fleetrc/config.json");
+    writeFileSync(config, JSON.stringify({ manifest: saved, tailscale: true }));
+    const dir = join(m.root, "tailscale");
+    mkdirSync(dir);
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({
+        BackendState: "Running",
+        Self: { CapMap: { "github.com/onmax/fleetrc": [{ manifest: team.https }] } },
+      }),
+    );
+    writeFileSync(
+      join(dir, "tailscale.mjs"),
+      `process.stdout.write((await import("node:fs")).readFileSync(${JSON.stringify(join(dir, "status.json"))}, "utf8"));`,
+    );
+    const run = await m.runWith({ env: { FLEETRC_TAILSCALE: join(dir, "tailscale.mjs") } }, "sync");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(run.stdout + run.stderr).not.toContain("the tailnet policy now names");
+    expect(JSON.parse(read(config))).toMatchObject({ manifest: saved });
+    expect(readdirSync(m.at(".claude/skills")).filter((name) => !name.startsWith("."))).toEqual([
+      "from-tailnet",
+    ]);
+  });
+
   it("reads a folder's old .skillfleet/manifest.json, and gives manifest hooks the old variables too, each with a warning", async () => {
     const m = machine();
     const folder = join(m.root, "dotfiles");
