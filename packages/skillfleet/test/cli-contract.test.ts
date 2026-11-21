@@ -1,6 +1,7 @@
 // What the CLI promises in its help and the README: errors as one line, --dry-run that writes
 // nothing, --json that prints one document, --copy that sticks, and the commands and messages the
 // docs name (D1, D3, D4, D5, D7, D11, D12, MAC10).
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -17,6 +18,7 @@ import { dirname, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import { listedPath } from "../src/linker.ts";
+import type { SkillList } from "../src/list.ts";
 import {
   clone,
   isLink,
@@ -282,6 +284,45 @@ describe("--json prints one JSON document", () => {
 });
 
 describe("list --json, the API programs built on skillfleet read", () => {
+  it.skipIf(isWindows)("lists the state a custom installed launcher just synced", async () => {
+    const m = machine({ agents: false });
+    const mine = join(m.root, "mine");
+    const add = (name: string) => {
+      mkdirSync(join(mine, "skills", name), { recursive: true });
+      writeFileSync(join(mine, "skills", name, "SKILL.md"), skillMd(name));
+    };
+    add("alpha");
+    const manifest = m.manifest({ sources: [{ id: "mine", local: mine, skills: "skills/*" }] });
+    const custom = join(m.root, "custom-state");
+    const init = await m.runWith(
+      { env: { XDG_STATE_HOME: custom } },
+      "init",
+      manifest,
+      "--no-hooks",
+    );
+    expect(init.code, init.stderr).toBe(0);
+    const launcher = join(custom, "skillfleet", "bin", "skillfleet");
+    const run = <T>(override: string | undefined, ...args: string[]): T => {
+      const result = spawnSync(launcher, args, {
+        cwd: m.home,
+        env: { ...m.env, XDG_STATE_HOME: override },
+        encoding: "utf8",
+      });
+      expect(result.status, result.stderr).toBe(0);
+      return JSON.parse(result.stdout) as T;
+    };
+
+    add("zeta");
+    expect(run(undefined, "sync", "--json")).toMatchObject({ skills: { total: 2 } });
+    const list = (override?: string) => run<SkillList>(override, "list", "--json").skills;
+    expect(list().map(({ name }) => name)).toEqual(["alpha", "zeta"]);
+    expect(existsSync(join(m.stateDir, "state.json"))).toBe(false);
+    expect(list(m.env.XDG_STATE_HOME)).toEqual([]);
+    expect(run(m.env.XDG_STATE_HOME, "sync", "--json")).toMatchObject({ skills: { total: 2 } });
+    expect(list(m.env.XDG_STATE_HOME)).toHaveLength(2);
+    expect(existsSync(join(m.stateDir, "state.json"))).toBe(true);
+  });
+
   it("prints version 1, lastChange and the skills sorted by name, each with its real folder", async () => {
     const fresh = machine({ agents: false });
     const empty = await fresh.run("list", "--json");

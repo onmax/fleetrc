@@ -996,7 +996,7 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(existsSync(m.at(".local", "state", "skillfleet"))).toBe(false);
   });
 
-  it("lists installed state without an override and syncs and lists under an explicit override", async () => {
+  it("syncs and lists installed state while honoring explicit and existing Windows state", async () => {
     const m = machine();
     const mine = join(m.root, "mine");
     writeFiles(mine, { "skills/first/SKILL.md": skillMd("first") });
@@ -1027,24 +1027,55 @@ describe("the hooks on shared and upgraded machines", () => {
     expect(names(run("--json", "list"))).toEqual(["first"]);
     expect(run("list")).toContain("first");
 
+    const local = join(caller.LOCALAPPDATA, "skillfleet");
+    if (isWindows) {
+      const install = await m.runWith(
+        { env: { ...caller, XDG_STATE_HOME: undefined } },
+        "self-install",
+      );
+      expect(install.code, install.stderr).toBe(0);
+      expect(existsSync(join(local, "bin", "skillfleet.cmd"))).toBe(true);
+      expect(existsSync(join(local, "state.json"))).toBe(false);
+      expect(names(run("list", "--json"))).toEqual(["first"]);
+    }
+
     writeFiles(mine, { "skills/second/SKILL.md": skillMd("second") });
-    caller.XDG_STATE_HOME = join(m.root, "alternate");
     run("sync");
     expect(names(run("list", "--json"))).toEqual(["first", "second"]);
-    expect(names(run("--json", "list"))).toEqual(["first", "second"]);
-    expect(run("list")).toContain("second");
+    expect(existsSync(join(local, "state.json"))).toBe(false);
+
+    writeFiles(mine, { "skills/third/SKILL.md": skillMd("third") });
+    caller.XDG_STATE_HOME = caller.LOCALAPPDATA;
+    expect(names(run("list", "--json"))).toEqual([]);
+    run("sync");
+    expect(names(run("list", "--json"))).toEqual(["first", "second", "third"]);
+    expect(names(run("--json", "list"))).toEqual(["first", "second", "third"]);
+    expect(run("list")).toContain("third");
     delete caller.XDG_STATE_HOME;
     if (isWindows) {
-      run("sync");
-      expect(names(run("list", "--json"))).toEqual(["first", "second"]);
-      expect(names(run("--json", "list"))).toEqual(["first", "second"]);
-      expect(run("list")).toContain("second");
+      expect(names(run("list", "--json"))).toEqual(["first", "second", "third"]);
       caller.XDG_STATE_HOME = join(m.root, "uninitialized");
       expect(names(run("list", "--json"))).toEqual([]);
       delete caller.XDG_STATE_HOME;
+
+      const customState = read(join(state, "state.json"));
+      const customReport = read(join(state, "last-run.json"));
+      const localState = join(local, "state.json");
+      writeFileSync(localState, "not JSON");
+      chmodSync(localState, 0o444);
+      const recovered = run("sync", "--json");
+      expect(recovered).toContain("was corrupt");
+      expect(names(run("list", "--json"))).toEqual(["first", "second", "third"]);
+      expect(read(join(local, "last-run.json"))).toContain("was corrupt");
+      const backups = readdirSync(join(local, "backup"))
+        .filter((name) => name.startsWith("state-"))
+        .map((name) => read(join(local, "backup", name)));
+      expect(backups).toEqual(["not JSON"]);
+      expect(read(join(state, "state.json"))).toBe(customState);
+      expect(read(join(state, "last-run.json"))).toBe(customReport);
     }
     delete caller.LOCALAPPDATA;
-    expect(names(run("list", "--json"))).toEqual(["first"]);
+    expect(names(run("list", "--json"))).toEqual(["first", "second"]);
     // The installed copy keeps node's compile cache beside itself, and nowhere else.
     expect(existsSync(join(state, "app", "compile"))).toBe(true);
     expect(existsSync(m.at(".cache"))).toBe(false);

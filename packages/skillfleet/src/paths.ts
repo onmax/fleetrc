@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { isRecord, readJsonOrNothing } from "./fs.ts";
@@ -34,15 +35,29 @@ export function configDir(): string {
   return join(homedir(), ".config", "skillfleet");
 }
 
-function stateOverride(): string | undefined {
-  const xdg = xdgDir("XDG_STATE_HOME");
-  if (xdg) return xdg;
-  return (process.platform === "win32" && process.env.LOCALAPPDATA) || undefined;
+function installedStateDir(): string | undefined {
+  const script = process.argv[1];
+  if (script && basename(script) === "cli.mjs" && basename(dirname(script)) === "app")
+    return dirname(dirname(script));
 }
 
-/** Per-machine state: XDG state, else %LOCALAPPDATA% on Windows, else ~/.local/state. */
+let windowsInstalledState: string | undefined;
+
+/**
+ * Per-machine state: explicit XDG state, existing Windows state or the installed copy, then the
+ * platform default. The Windows installed choice stays fixed for the invocation.
+ */
 export function stateDir(): string {
-  return join(stateOverride() ?? join(homedir(), ".local", "state"), "skillfleet");
+  const xdg = xdgDir("XDG_STATE_HOME");
+  if (xdg) return join(xdg, "skillfleet");
+  const installed = installedStateDir();
+  const appData = process.platform === "win32" && process.env.LOCALAPPDATA;
+  if (appData) {
+    const local = join(appData, "skillfleet");
+    if (!installed || installed === local) return local;
+    return (windowsInstalledState ??= existsSync(join(local, "state.json")) ? local : installed);
+  }
+  return installed ?? join(homedir(), ".local", "state", "skillfleet");
 }
 
 export const paths = {
@@ -79,9 +94,9 @@ const PLACES = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"] 
  * Run from anywhere else (npx, a checkout), it keeps its own environment.
  */
 export function adoptInstalledPlaces() {
-  const script = process.argv[1];
-  if (!script || basename(script) !== "cli.mjs" || basename(dirname(script)) !== "app") return;
-  const saved = readJsonOrNothing(join(dirname(dirname(script)), "hook-env.json"));
+  const installed = installedStateDir();
+  if (!installed) return;
+  const saved = readJsonOrNothing(join(installed, "hook-env.json"));
   if (!isRecord(saved)) return;
   for (const key of PLACES)
     if (typeof saved[key] === "string") process.env[key] = saved[key];

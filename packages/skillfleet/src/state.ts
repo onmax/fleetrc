@@ -1,4 +1,4 @@
-import { mkdirSync, renameSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { dict, type Hashes, isRecord, JsonFileError, readJson, writeJson } from "./fs.ts";
 import { isVendoredKind, type Source } from "./manifest.ts";
@@ -88,7 +88,9 @@ export const emptyState = (): State => ({ version: 1, sources: dict(), skills: d
  * Reads state.json. A file that does not parse, or has a shape this version does not know (another
  * version wrote it), reads as empty: the sync rebuilds what it can from the store, and vendored
  * copies it cannot vouch for count as edited, so nothing local is overwritten. With `warnings` (a
- * sync that will write a new state), the old file is first moved to the backup folder.
+ * sync that will write a new state), the old file is copied to the backup folder and stays in
+ * place until the atomic save, so other invocations still see the same state directory.
+ * On Windows, a read-only original is made writable so the atomic save can replace it.
  */
 export function loadState(warnings?: string[]): State {
   let raw: unknown;
@@ -223,11 +225,16 @@ function conflictRecord(record: unknown): MergeConflict | undefined {
 }
 
 function backUp(problem: string, warnings: string[]) {
+  const from = paths.state();
   const to = join(paths.backup(), `state-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
   mkdirSync(dirname(to), { recursive: true });
-  renameSync(paths.state(), to);
+  copyFileSync(from, to);
+  if (process.platform === "win32") {
+    const { mode } = statSync(from);
+    if (!(mode & 0o200)) chmodSync(from, mode | 0o200);
+  }
   warnings.push(
-    `${tildify(paths.state())} ${problem} so skillfleet started a new one and kept the old one at ${tildify(to)}`,
+    `${tildify(from)} ${problem} so skillfleet started a new one and kept the old one at ${tildify(to)}`,
   );
 }
 

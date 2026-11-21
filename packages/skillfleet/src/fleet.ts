@@ -344,6 +344,7 @@ async function runOnHost(
   action: FleetAction,
   remoteCommand: string,
   timeoutMs: number,
+  requireTimer = false,
 ) {
   const problem = hostProblem(host);
   if (problem) return { error: problem, reached: false, checked: false };
@@ -399,7 +400,7 @@ async function runOnHost(
   // sync --json prints the report last, and exits 1 when a source failed; status prints the file.
   // init --json prints its sync's report under "sync", or {"ok": false, "error"} when it stopped.
   const setUp = action === "init" && !already;
-  const report = parseReport(run.stdout, setUp);
+  const report = parseReport(run.stdout, setUp, requireTimer);
   if (report !== undefined && "error" in report) return { error: report.error, reached: true };
   // init exits nonzero when its sync, the hooks or the timer failed: the host is not set up.
   if (report !== undefined && setUp && run.code !== 0)
@@ -408,6 +409,8 @@ async function runOnHost(
       error: initFailure(report.report, run.code, stderr),
       reached: true,
     };
+  if (report !== undefined && report.timerError !== undefined)
+    return { report: report.report, error: report.timerError, reached: true };
   if (report !== undefined) return { report: report.report, was, now, already };
   if (run.code !== 0)
     return {
@@ -439,7 +442,8 @@ function initFailure(report: unknown, code: number | null, stderr: string): stri
 function parseReport(
   stdout: string,
   init = false,
-): { report: unknown } | { error: string } | undefined {
+  requireTimer = false,
+): { report: unknown; timerError?: string } | { error: string } | undefined {
   const text = stdout.trim();
   const start = text.indexOf("{");
   if (start < 0) return undefined;
@@ -451,7 +455,15 @@ function parseReport(
   }
   if (init && isRecord(raw)) {
     if (raw.ok === false && typeof raw.error === "string") return { error: raw.error };
-    raw = raw.sync;
+    if (!summarize(raw.sync)) return undefined;
+    const timer = isRecord(raw.timer) ? raw.timer : undefined;
+    const timerError =
+      typeof timer?.error === "string"
+        ? `skillfleet init did not install the timer: ${timer.error}`
+        : requireTimer && !timer
+          ? "skillfleet init did not report installing the requested timer"
+          : undefined;
+    return { report: raw.sync, timerError };
   }
   return summarize(raw) ? { report: raw } : undefined;
 }
@@ -469,6 +481,7 @@ export async function fleet(
 ): Promise<HostResult[]> {
   const cache = readCache();
   const remoteCommand = sshRemoteCommand(action, version, dryRun, setup);
+  const requireTimer = setup?.flags.includes("--timer");
   const results = await Promise.all(
     hosts.map(async (target): Promise<HostResult> => {
       const {
@@ -497,7 +510,7 @@ export async function fleet(
           behind: [],
         };
       let verifiedRefresh = refreshPeer;
-      let answer = await runOnHost(host, action, remoteCommand, timeoutMs);
+      let answer = await runOnHost(host, action, remoteCommand, timeoutMs, requireTimer);
       if (
         "note" in answer &&
         answer.note === "other-manifest" &&
@@ -530,7 +543,7 @@ export async function fleet(
             };
           if (retryEndpoint !== refreshPeer?.endpoint) verifiedRefresh = undefined;
         }
-        answer = await runOnHost(host, "init", retryCommand, timeoutMs);
+        answer = await runOnHost(host, "init", retryCommand, timeoutMs, requireTimer);
       }
       const already = "already" in answer && answer.already === true;
       if ("note" in answer && answer.note === "other-manifest" && setup && answer.has) {
@@ -978,7 +991,11 @@ export async function resolveFleet(
     version: "0.0.0",
   },
   coveredByTags?: Set<string>,
-): Promise<{ targets: FleetTarget[]; warnings: string[]; enrollment: Map<string, string[]> }> {
+): Promise<{
+  targets: FleetTarget[];
+  warnings: string[];
+  enrollment: Map<string, FleetTarget[] | null>;
+}> {
   const warnings: string[] = [];
   const tagNames = new Set(entries.filter(isTag).map((entry) => entry.toLowerCase()));
   const explicit = [...new Set(entries.filter((entry) => !isTag(entry)))];
@@ -1129,56 +1146,58 @@ export async function resolveFleet(
   for (const [entry, { peer }] of peerOf) {
     if (!explicitPeers.has(peer)) explicitPeers.set(peer, entry);
   }
-  const seen = new Map<string, string>();
-  const enrollment = new Map<string, string[]>();
-  const enroll = (host: string, entry: string) => {
-    const known = enrollment.get(host);
-    if (known) known.push(entry);
-    else enrollment.set(host, [entry]);
-  };
-  const targets: FleetTarget[] = [];
+  const seen = new Map<string, FleetTarget>();
+  const namedTargets = new Map<string, FleetTarget>();
+  for (const entry of explicit) {
+    const target = sshTarget(entry);
+    const peer = peerOf.get(entry);
+    const endpoint = aliases.get(entry);
+    const machine = peer
+      ? `peer:${peer.index}`
+      : endpoint
+        ? `endpoint:${endpoint}`
+        : `host:${sshHostKey(target.machine)}`;
+    const key = [machine, target.user, target.port, peer?.target.user, peer?.target.port].join(
+      "\0",
+    );
+    let dispatch = seen.get(key);
+    if (!dispatch) {
+      const refreshPeer = refresh.get(entry);
+      const initRetryRoute =
+        action === "init" &&
+        peer &&
+        explicitPeers.get(peer.peer) === entry &&
+        destination.has(peer.peer)
+          ? { key: retryRouteKey(peer.target) }
+          : undefined;
+      dispatch = {
+        host: entry,
+        ...(refreshPeer && { refreshPeer }),
+        ...(initRetryRoute && { initRetryRoute }),
+      };
+      seen.set(key, dispatch);
+    }
+    namedTargets.set(entry, dispatch);
+  }
+  const taggedTargets = new Map<TailscalePeer, FleetTarget>();
+  const enrollment = new Map<string, FleetTarget[] | null>();
+  const targets = new Set<FleetTarget>();
   for (const entry of entries) {
-    if (!isTag(entry)) {
-      const target = sshTarget(entry);
-      const peer = peerOf.get(entry);
-      const endpoint = aliases.get(entry);
-      const machine = peer
-        ? `peer:${peer.index}`
-        : endpoint
-          ? `endpoint:${endpoint}`
-          : `host:${sshHostKey(target.machine)}`;
-      const key = [machine, target.user, target.port, peer?.target.user, peer?.target.port].join(
-        "\0",
-      );
-      const existing = seen.get(key);
-      if (!existing) {
-        const refreshPeer = refresh.get(entry);
-        const effectiveTarget = peer?.target;
-        const initRetryRoute =
-          action === "init" &&
-          peer &&
-          explicitPeers.get(peer.peer) === entry &&
-          destination.has(peer.peer)
-            ? { key: effectiveTarget && retryRouteKey(effectiveTarget) }
-            : undefined;
-        targets.push({
-          host: entry,
-          ...(refreshPeer && { refreshPeer }),
-          ...(initRetryRoute && { initRetryRoute }),
-        });
-        seen.set(key, entry);
-      }
-      enroll(existing ?? entry, entry);
+    const named = namedTargets.get(entry);
+    if (named) {
+      targets.add(named);
+      enrollment.set(entry, [named]);
       continue;
     }
     if ("error" in answer) {
-      targets.push({ host: entry, via: entry, error: answer.error });
+      targets.add({ host: entry, via: entry, error: answer.error });
       continue;
     }
     const tag = entry.toLowerCase();
     const matches = answer.peers.filter((peer) => peer.tags.some((t) => t.toLowerCase() === tag));
     if (matches.length === 0)
       warnings.push(`${entry} matches no machine on your tailnet besides this one`);
+    const requiredTargets: FleetTarget[] = [];
     for (const peer of matches) {
       const selected = destination.get(peer);
       if (!selected) {
@@ -1187,15 +1206,19 @@ export async function resolveFleet(
         );
         continue;
       }
-      const id = `tag:${selected.cacheKey}`;
-      const existing = explicitPeers.get(peer) ?? seen.get(id);
-      enroll(existing ?? selected.host, entry);
-      if (existing) continue;
-      seen.set(id, selected.host);
-      targets.push({ ...selected, via: entry });
+      const explicitPeer = explicitPeers.get(peer);
+      let dispatch = explicitPeer ? namedTargets.get(explicitPeer) : taggedTargets.get(peer);
+      if (!dispatch) {
+        dispatch = { ...selected, via: entry };
+        taggedTargets.set(peer, dispatch);
+        targets.add(dispatch);
+      }
+      requiredTargets.push(dispatch);
     }
+    if (matches.length > 0)
+      enrollment.set(entry, requiredTargets.length === matches.length ? requiredTargets : null);
   }
-  return { targets, warnings, enrollment };
+  return { targets: [...targets], warnings, enrollment };
 }
 
 /**

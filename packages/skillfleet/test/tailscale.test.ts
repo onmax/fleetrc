@@ -176,6 +176,74 @@ describe("the manifest from the tailnet policy", () => {
     expect(readFileSync(copy, "utf8")).toBe(edited);
   });
 
+  it("keeps root copy edits when a policy alias refreshes a remote team manifest", async () => {
+    const m = machine();
+    const tailscale = fakeTailscale(m);
+    const upstream = remote(m, "upstream", { "team.json": JSON.stringify({ sources: [] }) });
+    const vendor = remote(m, "vendor", skills("skills/", "from-team"));
+    const repository = remote(m, "bundled", {
+      ".skillfleet/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        extends: [`${upstream.https}//team.json`],
+        sources: [{ id: "bundled", local: "../skills" }],
+      }),
+      ...skills("skills/", "bundled"),
+    });
+    const url = "https://github.com/example/bundled.git";
+    m.git(m.root, "config", "--global", `url.${repository.served}.insteadOf`, url);
+    tailscale.policy([{ manifest: "github:example/bundled" }]);
+    const init = await m.runWith({ env: tailscale.env }, "init", "--no-hooks", "--copy");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const copy = m.at(".claude/skills/bundled/SKILL.md");
+    const edited = readFileSync(copy, "utf8") + "\nMy local edit.\n";
+    writeFileSync(copy, edited);
+
+    upstream.commit({
+      "team.json": JSON.stringify({ sources: [{ id: "vendor", git: vendor.https }] }),
+    });
+    const alias = `${url}//.skillfleet/manifest.json`;
+    tailscale.policy([{ manifest: alias }]);
+    const switched = await m.runWith({ env: tailscale.env }, "sync");
+    expect(switched.code, switched.stdout + switched.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["bundled", "from-team"]);
+    expect(readFileSync(copy, "utf8")).toBe(edited);
+
+    const offline = await m.runWith({ env: tailscale.env }, "sync", "--offline");
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["bundled", "from-team"]);
+    expect(readFileSync(copy, "utf8")).toBe(edited);
+  });
+
+  it("keeps the saved policy alias usable offline after a same-repo override", async () => {
+    const m = machine();
+    const tailscale = fakeTailscale(m);
+    const repository = remote(m, "saved", {
+      ".skillfleet/manifest.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
+    });
+    const url = "https://github.com/example/saved.git";
+    m.git(m.root, "config", "--global", `url.${repository.served}.insteadOf`, url);
+    tailscale.policy([{ manifest: "github:example/saved" }]);
+    const init = await m.runWith({ env: tailscale.env }, "init", "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const alias = `${url}//.skillfleet/manifest.json`;
+    tailscale.policy([{ manifest: alias }]);
+    const switched = await m.runWith({ env: tailscale.env }, "sync");
+    expect(switched.code, switched.stdout + switched.stderr).toBe(0);
+
+    repository.commit({
+      ".skillfleet/manifest.json": null,
+      "alternate.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
+    });
+    const override = `${url}//alternate.json`;
+    const online = await m.runWith({ env: tailscale.env }, "sync", "--manifest", override);
+    expect(online.code, online.stdout + online.stderr).toBe(0);
+    expect(config(m).manifest).toBe(alias);
+    for (const manifest of [[], ["--manifest", url], ["--manifest", override]]) {
+      const offline = await m.runWith({ env: tailscale.env }, "sync", "--offline", ...manifest);
+      expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    }
+  });
+
   it("a dry-run sync names the new manifest without saving it", async () => {
     const m = machine();
     const tailscale = fakeTailscale(m);

@@ -85,7 +85,7 @@ it.each([false, true])("only refreshes on the same retry route (%s)", async (cha
     const invocation = { action, version: "0.0.0", setup: action === "init" ? setup : undefined };
     const { targets, enrollment } = await resolveFleet(entries, undefined, 30_000, invocation);
     const results = await fleet(targets, action, invocation.version, 30_000, invocation);
-    return { results, enrollment };
+    return { results, enrollment, targets };
   };
   try {
     expect((await run("status", tag)).results).toMatchObject([{ lastRun: { finishedAt: first } }]);
@@ -97,7 +97,12 @@ it.each([false, true])("only refreshes on the same retry route (%s)", async (cha
     };
     if (changed) expect((await run("init", tag)).results).toMatchObject([rejected]);
     const named = await run("init", "alias", tag);
-    expect(named.enrollment.get("alias")).toEqual(["alias", tag]);
+    expect(named.targets).toMatchObject([{ host: "alias" }]);
+    for (const selector of ["alias", tag]) {
+      const enrolled = named.enrollment.get(selector);
+      expect(enrolled).toHaveLength(1);
+      expect(enrolled?.[0]).toBe(named.targets[0]);
+    }
     expect(named.results).toMatchObject([
       changed ? rejected : { host: "alias", setup: "set up", lastRun: { finishedAt: second } },
     ]);
