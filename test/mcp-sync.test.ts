@@ -1,7 +1,15 @@
 // MCP servers from a source's `mcp` file, merged into each agent's own config over fixture homes:
 // added, updated, removed when dropped, held when edited by hand, left alone when foreign, and
 // never written in a dry run. Every byte that is not fleetrc's entry stays as it was.
-import { chmodSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { parse as parseJsonc } from "jsonc-parser";
 import { parse as parseToml } from "smol-toml";
@@ -520,6 +528,26 @@ describe("MCP servers", () => {
     await sync(m);
     expect(read(next)).toContain("docs-mcp@1");
     expect(read(old)).not.toContain("docs-mcp");
+  });
+
+  it.skipIf(isWindows)("reconciles aliased OpenCode configs only once", async () => {
+    const { m, define, write } = await setup(["opencode"], { docs: docs() });
+    const original = m.at(".config", "opencode", "opencode.json");
+    const preferred = m.at(".config", "opencode", "opencode.jsonc");
+    const before = read(original);
+    symlinkSync("opencode.json", preferred);
+
+    const unchanged = await sync(m);
+    expect(unchanged.entries.removed).toEqual([]);
+    expect(unchanged.entries.adopted).toEqual([]);
+    expect(read(preferred)).toBe(before);
+    define({ docs: docs("changed") });
+    expect((await sync(m)).entries.updated).toEqual(["mcp/opencode/docs"]);
+    expect(read(original)).not.toBe(before);
+
+    write({});
+    expect((await sync(m)).entries.removed).toEqual(["mcp/opencode/docs"]);
+    expect(jsonc(read(preferred)).mcp).toEqual({ servers: {} });
   });
 
   it("keeps a server edited in the old opencode.json there, and moves it once it is put back", async () => {

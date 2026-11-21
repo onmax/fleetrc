@@ -302,7 +302,7 @@ describe("hooks", () => {
     );
     define("echo two");
     const run = await m.runWith(
-      { env: { NODE_OPTIONS: `--require "${preload}"` } },
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --require ${JSON.stringify(preload)}` } },
       "sync",
       "--json",
     );
@@ -459,20 +459,30 @@ describe("hooks", () => {
           : { matcher: "Bash", hooks: [{ type: "command", command }] };
       writeFileSync(
         join(defs, "hooks.json"),
-        JSON.stringify({ hooks: { [event]: [item("echo one"), item("echo later")] } }),
+        JSON.stringify({ hooks: { [event]: [item("echo [ one ]"), item("echo later")] } }),
       );
       const file = m.at(agent.file);
-      const readHooks = () => JSON.parse(read(file)) as { hooks: Record<string, unknown[]> };
+      const readHooks = () => parseJsonc(read(file)) as { hooks: Record<string, unknown[]> };
       await sync(m);
       const root = readHooks();
       const [first, later] = root.hooks[event]!;
       expect(later).toMatchObject({ fleetrcSlot: 1 });
       root.hooks[event] = [later];
-      writeFileSync(file, JSON.stringify(root));
+      const comment = "// describes the later hook";
+      writeFileSync(
+        file,
+        name === "gemini-cli"
+          ? `{"hooks":{"${event}":[\n  ${comment}\n  ${JSON.stringify(later)}\n]}}`
+          : JSON.stringify(root),
+      );
       const restored = await sync(m);
       expect(restored.entries.added).toEqual(agent.ids);
       expect(restored.entries.held).toEqual([]);
       expect(readHooks().hooks[event]).toEqual([first, later]);
+      if (name === "gemini-cli") {
+        expect(read(file)).toContain(`${comment}\n  ${JSON.stringify(later)}`);
+        expect(read(file).indexOf("echo [ one ]")).toBeLessThan(read(file).indexOf(comment));
+      }
       root.hooks[event] = [{ ...item("echo mine"), fleetrc: "defs", fleetrcSlot: 1 }];
       writeFileSync(file, JSON.stringify(root));
       write({});

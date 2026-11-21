@@ -381,7 +381,14 @@ function syncMcp(
   otherMcpEntries: NonNullable<State["otherMcpEntries"]>,
   dryRun: boolean,
 ) {
-  const file = cell.file();
+  const preferred = cell.file();
+  const alternate = agent === "opencode" ? openCodeSibling(preferred) : undefined;
+  const aliased = alternate !== undefined && sameRealFile(preferred, alternate);
+  const file =
+    aliased && lstat(preferred)?.isSymbolicLink() && !lstat(alternate)?.isSymbolicLink()
+      ? alternate
+      : preferred;
+  const sibling = alternate === undefined ? undefined : openCodeSibling(file);
   const prefix = `mcp/${agent}/`;
   const desired = desiredServers(agent, chosen, defs, ledger.report.warnings);
   const byFile = new Map<string, Record<string, OwnedEntry>>();
@@ -395,8 +402,15 @@ function syncMcp(
       if (id.startsWith(prefix)) remember(id, record);
   for (const id of ledger.ids(prefix)) remember(id, ledger.records[id]!);
 
+  if (aliased && sibling) {
+    const records = dict<OwnedEntry>();
+    for (const path of [sibling, file])
+      for (const [id, record] of Object.entries(byFile.get(path) ?? {}))
+        records[id] = { ...record, file };
+    byFile.set(file, records);
+    byFile.set(sibling, dict());
+  }
   const here = new Ledger(byFile.get(file) ?? dict(), ledger.report);
-  const sibling = agent === "opencode" ? openCodeSibling(file) : undefined;
   const old = new Ledger(sibling ? (byFile.get(sibling) ?? dict()) : dict(), ledger.report);
   // A server whose definition has a mistake, or whose source did not sync, stays as it is.
   const settled = (name: string, at: Ledger) => {
@@ -443,6 +457,14 @@ function syncMcp(
 
 const openCodeSibling = (file: string) =>
   join(dirname(file), file.endsWith(".jsonc") ? "opencode.json" : "opencode.jsonc");
+
+function sameRealFile(left: string, right: string): boolean {
+  try {
+    return realpathSync.native(left) === realpathSync.native(right);
+  } catch {
+    return false;
+  }
+}
 
 /** Merges `desired` into `file`, for `names`: the servers wanted there and the ones recorded. */
 function mergeMcp(

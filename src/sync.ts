@@ -44,15 +44,16 @@ import {
   type TargetReport,
 } from "./linker.ts";
 import {
+  checkedOutPath,
+  DEFAULT_MANIFEST,
   isVendoredKind,
   type LoadedManifest,
   loadManifest,
   ManifestError,
   readConfig,
   remoteManifest,
-  stagePolicyManifest,
-  DEFAULT_MANIFEST,
   sameManifest,
+  stagePolicyManifest,
   tailnetManifestSpec,
   writeConfig,
 } from "./manifest.ts";
@@ -429,20 +430,22 @@ async function postToHub(hub: string, report: Report): Promise<string | undefine
  * `spec`, or on a machine that took its manifest from the tailnet, the one the tailnet policy names
  * now. When Tailscale can't say, use the saved spec.
  */
-async function followTailnet(spec: string, warnings: string[]): Promise<string> {
-  if (readConfig()?.tailscale !== true) return spec;
+async function followTailnet(
+  spec: string,
+  warnings: string[],
+): Promise<{ spec: string; legacyPath?: string }> {
+  if (readConfig()?.tailscale !== true) return { spec };
   const found = await tailnetManifestSpec();
   if ("error" in found) {
     warnings.push(`kept the manifest ${spec}: ${found.error}`);
-    return spec;
+    return { spec };
   }
-  // The policy names a repository alone, and this machine reads its manifest from the old name's
-  // default place: that is the same manifest, not a new one, until the repository moves it.
   if (found.defaultPath) {
-    const legacy = `${found.spec.slice(0, -DEFAULT_MANIFEST.length)}${LEGACY_MANIFEST_DIR}/manifest.json`;
-    if (sameManifest(legacy, spec)) return spec;
+    const legacyPath = `${LEGACY_MANIFEST_DIR}/manifest.json`;
+    const legacy = `${found.spec.slice(0, -DEFAULT_MANIFEST.length)}${legacyPath}`;
+    if (sameManifest(legacy, spec)) return { spec: found.spec, legacyPath };
   }
-  return found.spec;
+  return { spec: found.spec };
 }
 
 export async function sync(options: SyncOptions = {}): Promise<Report> {
@@ -469,26 +472,30 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   try {
     // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
     const savedSpec = options.loaded?.root.file ?? manifestSpec(options.manifest);
-    const spec =
+    const policy =
       options.loaded || options.manifest || offline
-        ? savedSpec
+        ? { spec: savedSpec }
         : await followTailnet(savedSpec, warnings);
     const candidate =
-      spec !== savedSpec && !dryRun ? await stagePolicyManifest(spec, savedSpec) : undefined;
+      policy.spec !== savedSpec && !dryRun
+        ? await stagePolicyManifest(policy.spec, savedSpec)
+        : undefined;
     const loaded =
       options.loaded ??
       candidate?.loaded ??
-      (await loadManifest(spec, {
+      (await loadManifest(policy.spec, {
         offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
       }));
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
+    const spec =
+      policy.legacyPath && checkedOutPath(DEFAULT_MANIFEST, loaded.root.file) === policy.legacyPath
+        ? savedSpec
+        : policy.spec;
+    candidate?.accept();
     if (spec !== savedSpec) {
-      if (candidate) {
-        candidate.accept();
-        writeConfig({ manifest: spec });
-      }
+      if (candidate) writeConfig({ manifest: spec });
       warnings.push(`the tailnet policy now names the manifest ${spec}, not ${savedSpec}`);
     }
     const stateFile = new StateFile(loadState(dryRun ? undefined : warnings));

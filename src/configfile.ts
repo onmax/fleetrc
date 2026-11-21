@@ -164,7 +164,11 @@ function editOnce(
       .join(eol + indent);
   /** `value` on one line, spaced as people write it: `{ "a": 1 }`, `["x"]`. */
   const inline = (item: unknown) =>
-    JSON.stringify(item, null, 1).replace(/\n\s*/g, " ").replace(/\[ /g, "[").replace(/ \]/g, "]");
+    JSON.stringify(item, null, 1).replace(/"(?:\\.|[^"\\])*"|[^"]+/g, (part) =>
+      part.startsWith('"')
+        ? part
+        : part.replace(/\n\s*/g, " ").replace(/\[ /g, "[").replace(/ \]/g, "]"),
+    );
   /** Past spaces and comments from `from`, and past line breaks too when `lines`. */
   const skip = (from: number, lines: boolean) => {
     let at = from;
@@ -302,11 +306,21 @@ function editOnce(
       const at = items[index];
       if (value === undefined) return at ? applyEdits(text, remove(node, at)) : text;
       if (at && insertItem) {
-        const indent = indentAt(at.offset);
-        const content = startsLine(at.offset)
+        const previous = items[index - 1];
+        let boundary = previous ? commaAfter(previous)! + 1 : node.offset + 1;
+        const firstNonSpace = () =>
+          boundary + text.slice(boundary, at.offset).match(/^\s*/)![0].length;
+        if (previous) {
+          const trivia = firstNonSpace();
+          if (text.startsWith("//", trivia) && lineStart(trivia) === lineStart(endOf(previous)))
+            boundary = text.indexOf("\n", trivia) + 1;
+        }
+        const offset = firstNonSpace();
+        const indent = indentAt(offset);
+        const content = startsLine(offset)
           ? `${block(value, indent)},${eol}${indent}`
           : `${inline(value)}, `;
-        return applyEdits(text, [{ offset: at.offset, length: 0, content }]);
+        return applyEdits(text, [{ offset, length: 0, content }]);
       }
       if (at)
         return applyEdits(text, [

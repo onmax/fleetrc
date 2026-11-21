@@ -322,6 +322,29 @@ describe("files across sources", () => {
     expect(existsSync(destination)).toBe(false);
   });
 
+  it("keeps a pending instruction deletion when the changed glob still selects it", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "docs/team.md": "approved\n" });
+    const write = (instructions: string) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, update: "review", instructions }],
+      });
+    const destination = m.at(".claude/CLAUDE.md");
+    await m.json("init", write("docs/*.md"), "--no-hooks");
+    vendor.commit({ "docs/team.md": null });
+    const pending = ["instructions/docs/team.md"];
+    expect((await m.json<Report>("sync")).pending.map((entry) => entry.skill)).toEqual(pending);
+    write("docs/team.md");
+    for (const args of [[], ["--offline"]]) {
+      const sync = await m.json<Report>("sync", ...args);
+      expect(sync.pending.map((entry) => entry.skill)).toEqual(pending);
+      expect(read(destination)).toBe("approved\n");
+    }
+    expect((await m.run("update", "vendor")).code).toBe(0);
+    expect(existsSync(destination)).toBe(false);
+  });
+
   it("links a cached review-mode instruction offline when the winning source is removed", async () => {
     const m = machine();
     const first = remote(m, "first", { "AGENTS.md": "first\n" });

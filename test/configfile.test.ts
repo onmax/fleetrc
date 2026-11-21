@@ -210,6 +210,17 @@ describe("editConfigText", () => {
     );
     expect(() => editConfigText(`[]`, [set("a", 1)], "json")).toThrow(/not hold a JSON object/);
   });
+
+  it("inserts after the previous item's trailing comment and before the next item's leading comment", () => {
+    const text = '{"hooks":[\r\n  1, // first\r\n  // last\r\n  3\r\n]}';
+    const edit = { path: ["hooks"], item: 1, insert: true, value: 2 };
+    expect(editConfigText(text, [edit], "jsonc")).toBe(
+      '{"hooks":[\r\n  1, // first\r\n  2,\r\n  // last\r\n  3\r\n]}',
+    );
+    expect(editConfigText('{"hooks":[1, /* last */ 3]}', [edit], "jsonc")).toBe(
+      '{"hooks":[1, 2, /* last */ 3]}',
+    );
+  });
 });
 
 describe("editConfigFile", () => {
