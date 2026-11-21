@@ -1154,8 +1154,10 @@ describe.skipIf(isWindows)("fleet init", () => {
     writeFileSync(join(home, alias), "{}");
     const launcher = join(bin, "fleetrc");
     writeFileSync(launcher, `#!/bin/sh\ntouch "${m.root}/synced"\n`, { mode: 0o755 });
-    const savedPath = process.env.PATH;
+    const saved = { PATH: process.env.PATH, XDG_STATE_HOME: process.env.XDG_STATE_HOME };
     process.env.PATH = env.PATH;
+    // fleet() saves fleet.json in the state folder: the test's, never this machine's.
+    process.env.XDG_STATE_HOME = join(m.root, "state");
     try {
       const [result] = await fleet(["box"], "init", "1.2.3", 30_000, {
         setup: { spec, flags: [], force: false, same: (value) => sameManifest(value, spec) },
@@ -1166,8 +1168,9 @@ describe.skipIf(isWindows)("fleet init", () => {
       expect(readFileSync(join(config, "config.json"), "utf8")).toBe(contents);
       expect(npxCalls(m)).toEqual([]);
     } finally {
-      if (savedPath === undefined) delete process.env.PATH;
-      else process.env.PATH = savedPath;
+      for (const [key, value] of Object.entries(saved))
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
     }
   });
 
