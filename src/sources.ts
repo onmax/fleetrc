@@ -55,7 +55,7 @@ import {
 } from "./files.ts";
 import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
 import { globBase, globFilter } from "./glob.ts";
-import { FILE_KINDS, type FileKind } from "./kinds.ts";
+import { isFileKind, ITEM_KINDS, type ItemKind } from "./kinds.ts";
 import {
   type CloneSource,
   type InPlaceSource,
@@ -109,7 +109,10 @@ export interface SourceResult {
   added: string[];
   updated: string[];
   removed: string[];
-  /** Instruction files, subagents and commands, each with the agents it goes to. */
+  /**
+   * Instruction files, subagents and commands, each with the agents it goes to, and the `mcp` and
+   * `agentHooks` definition files.
+   */
   files: FileEntry[];
   error?: string;
   warnings: string[];
@@ -2433,24 +2436,34 @@ export async function syncSource(
 }
 
 // ---------------------------------------------------------------------------
-// Files besides skills: instruction files, subagents and commands (see files.ts).
+// Files besides skills: instruction files, subagents and commands, and the MCP and hook
+// definition files (see files.ts).
 
 /** The kinds of files a source gives now or gave before, whose items sync looks at. */
-const fileKindsOf = (source: Source, state: SourceState): FileKind[] =>
-  FILE_KINDS.filter((kind) => source.files?.[kind] !== undefined || state.files?.[kind]);
+const fileKindsOf = (source: Source, state: SourceState): ItemKind[] =>
+  ITEM_KINDS.filter((kind) => source.files?.[kind] !== undefined || state.files?.[kind]);
+
+/** A definition file's text, or undefined when it can't be read. */
+function definitionText(file: string): string | undefined {
+  try {
+    return readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * A kind's records shaped as a source's, so the store code for skills keeps its items: an item is
  * a folder of one file, named by `itemName`. The view shares its records with `state`.
  */
-function itemsView(state: SourceState, kind: FileKind): SourceState {
+function itemsView(state: SourceState, kind: ItemKind): SourceState {
   const files = (state.files ??= {});
   const items = (files[kind] ??= { items: dict(), pending: dict() });
   return { ...state, skills: items.items, pending: items.pending };
 }
 
 /** Forgets a kind with nothing recorded, and its store folder. */
-function dropKindIfEmpty(state: SourceState, kind: FileKind, dir: string, write: boolean) {
+function dropKindIfEmpty(state: SourceState, kind: ItemKind, dir: string, write: boolean) {
   const items = state.files?.[kind];
   if (items && (Object.keys(items.items).length > 0 || Object.keys(items.pending).length > 0))
     return;
@@ -2463,7 +2476,7 @@ function dropKindIfEmpty(state: SourceState, kind: FileKind, dir: string, write:
  * Takes what the store code reported for a kind's items into the source's result, named by item
  * id (`<kind>/<path>`), as `diff`, `merge` and the report name them.
  */
-function mergeItems(out: SourceResult, sub: SourceResult, kind: FileKind, names: string[]) {
+function mergeItems(out: SourceResult, sub: SourceResult, kind: ItemKind, names: string[]) {
   const id = (name: string) => itemId(kind, itemPath(name));
   const known = [...new Set(names)].sort((a, b) => b.length - a.length);
   const escaped = known.map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
@@ -2485,12 +2498,17 @@ function mergeItems(out: SourceResult, sub: SourceResult, kind: FileKind, names:
     out.status = "review";
 }
 
-function approvedFileTargets(
+/**
+ * Where a review-mode source's items were approved to go: the agents recorded at the last sync
+ * that fetched it, or before one recorded them, a file's links. A definition is never linked, so
+ * without a record this is undefined and the store's copies count as approved.
+ */
+function approvedTargets(
   source: VendoredSource,
-  kind: FileKind,
+  kind: ItemKind,
   { selected, instructionGlobs }: FileItems,
   ctx: SourceContext,
-): Map<string, FileTarget[]> {
+): Map<string, FileTarget[]> | undefined {
   const approved = new Map<string, FileTarget[]>();
   if (selected) {
     for (const [name, agents] of Object.entries(selected)) {
@@ -2506,6 +2524,7 @@ function approvedFileTargets(
     }
     return approved;
   }
+  if (!isFileKind(kind)) return undefined;
   if (kind === "instructions") return approved;
   for (const [destination, link] of Object.entries(ctx.fileLinks ?? {})) {
     if (link.source !== source.id || link.kind !== kind) continue;
@@ -2523,7 +2542,7 @@ function approvedFileTargets(
 
 function reviewFileRemovals(
   source: VendoredSource,
-  kind: FileKind,
+  kind: ItemKind,
   ctx: SourceContext,
   approved: ReadonlyMap<string, FileTarget[]>,
   root: string,
@@ -2589,13 +2608,16 @@ function vendoredFiles(
     const selected = () =>
       findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
     const approved =
-      source.update === "review" ? approvedFileTargets(source, kind, records, ctx) : undefined;
+      source.update === "review" ? approvedTargets(source, kind, records, ctx) : undefined;
+    const retained = source.update === "review" && !approved ? selected() : approved;
     const list = root ? treeLister(root) : undefined;
-    const found = list ? findFileItems(source, kind, list, sub.warnings) : (approved ?? selected());
+    const found = list ? findFileItems(source, kind, list, sub.warnings) : (retained ?? selected());
     const removals =
-      root && list && reviewing && approved
-        ? reviewFileRemovals(source, kind, ctx, approved, root, list)
+      root && list && reviewing && retained
+        ? reviewFileRemovals(source, kind, ctx, retained, root, list)
         : new Map<string, FileTarget[]>();
+    /** Definition texts a dry run takes from the staged copy, which it never moves to the store. */
+    const stagedTexts = new Map<string, string | undefined>();
     if (!root) sub.skills = keptSkills(view, kindCtx.storeDir);
     else {
       const staging = ctx.dryRun
@@ -2632,6 +2654,13 @@ function vendoredFiles(
           reviewRemovals: new Set([...removals.keys()].map(itemName)),
           commit: source.kind === "git" ? version : undefined,
         });
+        if (ctx.dryRun && !isFileKind(kind))
+          for (const name of [...sub.added, ...sub.updated])
+            if (staged.has(name))
+              stagedTexts.set(
+                name,
+                definitionText(join(staged.get(name)!, posix.basename(itemPath(name)))),
+              );
       } finally {
         rmSync(staging, { recursive: true, force: true });
       }
@@ -2640,18 +2669,25 @@ function vendoredFiles(
     const selectedAgents = dict<string[]>();
     for (const item of sub.skills) {
       const path = itemPath(item.name);
+      const file = join(item.dir, posix.basename(path));
+      const text = isFileKind(kind)
+        ? undefined
+        : stagedTexts.has(item.name)
+          ? stagedTexts.get(item.name)
+          : definitionText(file);
       const agents = found.get(path) ?? removals.get(path) ?? [];
       if (agents.length > 0) selectedAgents[item.name] = agents.map((target) => target.agent);
       out.files.push({
         kind,
         path,
-        file: join(item.dir, posix.basename(path)),
+        file,
         agents,
         ...(fresh.has(item.name) ? { updated: true } : {}),
+        ...(text === undefined ? {} : { text }),
       });
     }
     if (root && !ctx.dryRun) {
-      if (approved) records.selected = selectedAgents;
+      if (retained) records.selected = selectedAgents;
       else delete records.selected;
       if (approved && kind === "instructions") {
         records.instructionGlobs = source.files?.instructions ?? dict();
@@ -2691,7 +2727,15 @@ function inPlaceFiles(source: InPlaceSource, state: SourceState, out: SourceResu
         changed = changedFiles(before[name]?.hashes ?? {}, hashes).length > 0;
         if (changed) out.changed.push(path);
       }
-      out.files.push({ kind, path, file, agents, ...(changed ? { updated: true } : {}) });
+      const text = isFileKind(kind) ? undefined : definitionText(file);
+      out.files.push({
+        kind,
+        path,
+        file,
+        agents,
+        ...(changed ? { updated: true } : {}),
+        ...(text === undefined ? {} : { text }),
+      });
     }
     if (source.kind !== "local") continue;
     for (const name of Object.keys(before)) if (!now[name]) out.changed.push(itemPath(name));
