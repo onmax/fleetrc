@@ -42,6 +42,7 @@ import {
 import {
   dropEmptyKind,
   type FileEntry,
+  type FileLister,
   type FileTarget,
   findFileItems,
   itemId,
@@ -2520,6 +2521,41 @@ function approvedFileTargets(
   return approved;
 }
 
+function reviewFileRemovals(
+  source: VendoredSource,
+  kind: FileKind,
+  ctx: SourceContext,
+  approved: ReadonlyMap<string, FileTarget[]>,
+  root: string,
+  list: FileLister,
+): Map<string, FileTarget[]> {
+  const prior = new Map(approved);
+  if (kind === "instructions") {
+    for (const [destination, link] of Object.entries(ctx.fileLinks ?? {})) {
+      if (link.source !== source.id || link.kind !== kind) continue;
+      if (!link.item.startsWith(`${kind}/`)) continue;
+      const target = { agent: link.agent };
+      if (targetPath(kind, target) !== destination) continue;
+      const path = link.item.slice(kind.length + 1);
+      prior.set(path, [...(prior.get(path) ?? []), target]);
+    }
+  }
+  const removals = new Map<string, FileTarget[]>();
+  for (const [path, targets] of prior) {
+    if (sourcePathStat(join(root, ...path.split("/")))?.isFile()) continue;
+    if (kind !== "instructions") {
+      removals.set(path, targets);
+      continue;
+    }
+    const missing = pathsLister([path]);
+    const retained = findFileItems(source, kind, (base) => [...list(base), ...missing(base)], [])
+      .get(path)
+      ?.filter(({ agent }) => targets.some((target) => target.agent === agent));
+    if (retained?.length) removals.set(path, retained);
+  }
+  return removals;
+}
+
 /**
  * Keeps a vendored source's files in its store, each kind in `<store>/<kind>`, as its skills are
  * kept: an edited copy holds the update, review mode waits for `fleetrc update`, and an item the
@@ -2554,16 +2590,14 @@ function vendoredFiles(
       findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
     const approved =
       source.update === "review" ? approvedFileTargets(source, kind, records, ctx) : undefined;
-    const found = root
-      ? findFileItems(source, kind, treeLister(root), sub.warnings)
-      : (approved ?? selected());
-    const removals = new Map<string, FileTarget[]>();
+    const list = root ? treeLister(root) : undefined;
+    const found = list ? findFileItems(source, kind, list, sub.warnings) : (approved ?? selected());
+    const removals =
+      root && list && reviewing && approved
+        ? reviewFileRemovals(source, kind, ctx, approved, root, list)
+        : new Map<string, FileTarget[]>();
     if (!root) sub.skills = keptSkills(view, kindCtx.storeDir);
     else {
-      if (reviewing && approved)
-        for (const [path, targets] of approved)
-          if (!sourcePathStat(join(root, ...path.split("/")))?.isFile())
-            removals.set(path, targets);
       const staging = ctx.dryRun
         ? mkdtempSync(join(tmpdir(), "fleetrc-stage-"))
         : join(kindCtx.storeDir, `.stage-${process.pid}`);

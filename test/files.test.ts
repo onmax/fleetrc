@@ -270,6 +270,51 @@ describe("files across sources", () => {
     expect(read(destination)).toBe("approved\n");
   });
 
+  it("waits for online validation when a review-mode instruction glob changes", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "docs/team.md": "team\n", "docs/other.md": "other\n" });
+    const write = (glob: string) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, update: "review", instructions: glob }],
+      });
+    const destination = m.at(".claude/CLAUDE.md");
+    mkdirSync(m.at(".claude"), { recursive: true });
+    writeFileSync(destination, "foreign\n");
+    const { sync } = await m.json<{ sync: Report }>("init", write("docs/team.md"), "--no-hooks");
+    expect(sync.files.foreign).toEqual([destination]);
+    write("docs/*.md");
+    rmSync(destination);
+    await m.json<Report>("sync", "--offline");
+    expect(existsSync(destination)).toBe(false);
+    const online = await m.json<Report>("sync");
+    expect(online.warnings.join("\n")).toContain("match 2 files");
+    expect(existsSync(destination)).toBe(false);
+  });
+
+  it("keeps a pending instruction deletion when the changed glob still selects it", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "docs/team.md": "approved\n" });
+    const write = (instructions: string) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, update: "review", instructions }],
+      });
+    const destination = m.at(".claude/CLAUDE.md");
+    await m.json("init", write("docs/*.md"), "--no-hooks");
+    vendor.commit({ "docs/team.md": null });
+    const pending = ["instructions/docs/team.md"];
+    expect((await m.json<Report>("sync")).pending.map((entry) => entry.skill)).toEqual(pending);
+    write("docs/team.md");
+    for (const args of [[], ["--offline"]]) {
+      const sync = await m.json<Report>("sync", ...args);
+      expect(sync.pending.map((entry) => entry.skill)).toEqual(pending);
+      expect(read(destination)).toBe("approved\n");
+    }
+    expect((await m.run("update", "vendor")).code).toBe(0);
+    expect(existsSync(destination)).toBe(false);
+  });
+
   it("links a cached review-mode instruction offline when the winning source is removed", async () => {
     const m = machine();
     const first = remote(m, "first", { "AGENTS.md": "first\n" });
