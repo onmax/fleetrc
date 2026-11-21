@@ -662,12 +662,19 @@ export async function fleet(
 
 /**
  * A host is behind when its last run is over two hours old or a source sits at another commit than
- * on the freshest host. Only a host that answered can be said to have never run.
+ * on the freshest host that took that source's updates. A host holding a source stays on its commit
+ * on purpose, so it sets no reference for the others and is reported as held instead. Only a host
+ * that answered can be said to have never run.
  */
 export function markBehind(results: HostResult[], now = Date.now()) {
-  const freshest = results
-    .filter((result) => result.lastRun)
-    .sort((a, b) => (a.lastRun!.finishedAt < b.lastRun!.finishedAt ? 1 : -1))[0]?.lastRun;
+  const runs = results
+    .flatMap((result) => (result.lastRun ? [result.lastRun] : []))
+    .sort((a, b) => (a.finishedAt < b.finishedAt ? 1 : -1));
+  const reference = new Map<string, string>();
+  for (const run of runs)
+    for (const [source, commit] of Object.entries(run.sources))
+      if (commit && !run.held.includes(source) && !reference.has(source))
+        reference.set(source, commit);
   for (const result of results) {
     const run = result.lastRun;
     if (!run) {
@@ -676,10 +683,11 @@ export function markBehind(results: HostResult[], now = Date.now()) {
     }
     if (now - new Date(run.finishedAt).getTime() > 2 * 60 * 60 * 1000)
       result.behind.push(`last run ${age(run.finishedAt, now)} ago`);
-    if (freshest && run !== freshest)
-      for (const [source, commit] of Object.entries(freshest.sources))
-        if (commit && run.sources[source] && run.sources[source] !== commit)
-          result.behind.push(`${source} at ${run.sources[source]!.slice(0, 7)}`);
+    for (const [source, commit] of reference) {
+      const here = run.sources[source];
+      if (here && here !== commit && !run.held.includes(source))
+        result.behind.push(`${source} at ${here.slice(0, 7)}`);
+    }
     if (run.held.length) result.behind.push(`held: ${run.held.join(", ")}`);
   }
 }

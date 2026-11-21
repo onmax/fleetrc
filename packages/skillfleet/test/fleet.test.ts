@@ -12,7 +12,15 @@ import {
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vite-plus/test";
 import * as execution from "../src/exec.ts";
-import { fleet, formatFleet, type InitSetup, remoteScript, resolveFleet } from "../src/fleet.ts";
+import {
+  fleet,
+  formatFleet,
+  type HostResult,
+  type InitSetup,
+  markBehind,
+  remoteScript,
+  resolveFleet,
+} from "../src/fleet.ts";
 import { hostManifestSpec, loadManifest, sameManifest } from "../src/manifest.ts";
 import { launchers } from "../src/selfinstall.ts";
 import { cli, isWindows, machine, type Machine, pathWith, remote, skills } from "./fixture.ts";
@@ -1846,5 +1854,40 @@ if (process.env.FAKE_ANSWER === "mismatch") {
     expect(run(bin)).toBe("skillfleet-fleet: init-no-node");
     symlinkSync(process.execPath, join(bin, "node"));
     expect(run(bin)).toBe("skillfleet-fleet: no-npx");
+  });
+});
+
+describe("markBehind", () => {
+  const now = Date.parse("2026-11-21T14:00:00Z");
+  const host = (
+    name: string,
+    finishedAt: string,
+    mine: string,
+    held: string[] = [],
+  ): HostResult => ({
+    host: name,
+    reachable: true,
+    checked: true,
+    behind: [],
+    lastRun: {
+      finishedAt,
+      ok: true,
+      skillfleet: "0.0.1",
+      host: name,
+      skills: 1,
+      held,
+      errors: [],
+      sources: { mine },
+    },
+  });
+
+  it("measures hosts against the newest host that took the source, not one holding it", () => {
+    const current = host("air", "2026-11-21T13:58:00Z", "8de87ca0");
+    const holding = host("mbp", "2026-11-21T13:59:00Z", "700ccfb0", ["mine"]);
+    const old = host("vps", "2026-11-21T13:50:00Z", "69147e30");
+    markBehind([current, holding, old], now);
+    expect(current.behind).toEqual([]);
+    expect(holding.behind).toEqual(["held: mine"]);
+    expect(old.behind).toEqual(["mine at 69147e3"]);
   });
 });
