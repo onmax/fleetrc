@@ -26,6 +26,7 @@ import { dirname, join } from "node:path";
 import { isErrno, isRecord, JsonFileError, lstat, readJson } from "./fs.ts";
 import { HOOK_AGENTS, type HookAgent } from "./hook.ts";
 import { editJsonText } from "./jsonedit.ts";
+import { eitherName, LEGACY_DISABLED } from "./legacy.ts";
 import { claudeHome, tildify } from "./paths.ts";
 import { installedCli, launcherPath, linkedNode, stableNode } from "./selfinstall.ts";
 
@@ -137,8 +138,14 @@ export function hookHandler(
   };
 }
 
+/**
+ * fleetrc's name in the commands it wrote, or the name it had before (legacy.ts), so the move from
+ * that name replaces its entries where they stand.
+ */
+const NAME = eitherName("fleetrc");
+
 /** A launcher path as fleetrc writes it: double-quoted (escapes allowed) or bare, ending in fleetrc. */
-const LAUNCHER = String.raw`(?:"(?:[^"\\]|\\.)*[\\/]fleetrc(?:\.cmd)?"|[^\s"'\`;&|<>()$]*[\\/]fleetrc(?:\.cmd)?)`;
+const LAUNCHER = String.raw`(?:"(?:[^"\\]|\\.)*[\\/]${NAME}(?:\.cmd)?"|[^\s"'\`;&|<>()$]*[\\/]${NAME}(?:\.cmd)?)`;
 
 /**
  * The commands fleetrc writes, by this install or another one: `test -x <launcher> &&
@@ -150,13 +157,15 @@ const LAUNCHER = String.raw`(?:"(?:[^"\\]|\\.)*[\\/]fleetrc(?:\.cmd)?"|[^\s"'\`;
  * command that only mentions them is not fleetrc's.
  */
 const OWN_COMMAND = new RegExp(
-  String.raw`^(?:test -x (${LAUNCHER}) && \1 hook run (?:claude-code|codex) 2>/dev/null; true|${LAUNCHER} hook run (?:claude-code|codex)(?: 2>/dev/null \|\| true)?|(?:npx (?:-y )?)?fleetrc hook prompt|${LAUNCHER} hook prompt)$`,
+  String.raw`^(?:test -x (${LAUNCHER}) && \1 hook run (?:claude-code|codex) 2>/dev/null; true|${LAUNCHER} hook run (?:claude-code|codex)(?: 2>/dev/null \|\| true)?|(?:npx (?:-y )?)?${NAME} hook prompt|${LAUNCHER} hook prompt)$`,
 );
 
 const DISABLED_POSIX = "exit 0 # fleetrc: disabled legacy hook";
 const DISABLED_WINDOWS = "exit /b 0 & rem fleetrc: disabled legacy hook";
 const isDisabledCommand = (command: unknown) =>
-  command === DISABLED_POSIX || command === DISABLED_WINDOWS;
+  command === DISABLED_POSIX ||
+  command === DISABLED_WINDOWS ||
+  (typeof command === "string" && LEGACY_DISABLED.includes(command));
 
 /**
  * A matcher group that runs on every event of its kind in `agent`: no matcher, or one that matches
@@ -193,12 +202,14 @@ export function isOwnHandler(hook: unknown): boolean {
     typeof hook.command === "string" &&
     // node: any program in fleetrc's bin/node-dir (it keeps node's own name, which may be
     // renamed, such as node-v24.exe), or any node by name.
-    (/[\\/]fleetrc[\\/]bin[\\/]node-dir[\\/][^\\/]+$/i.test(hook.command) ||
+    (new RegExp(String.raw`[\\/]${NAME}[\\/]bin[\\/]node-dir[\\/][^\\/]+$`, "i").test(
+      hook.command,
+    ) ||
       /^node(?:\.exe)?$/i.test(hook.command.split(/[\\/]/).at(-1)!)) &&
     Array.isArray(args) &&
     args.length === 4 &&
     typeof args[0] === "string" &&
-    /[\\/]fleetrc[\\/]app[\\/]cli\.mjs$/i.test(args[0]) &&
+    new RegExp(String.raw`[\\/]${NAME}[\\/]app[\\/]cli\.mjs$`, "i").test(args[0]) &&
     args[1] === "hook" &&
     args[2] === "run" &&
     (args[3] === "claude-code" || args[3] === "codex")
@@ -241,7 +252,8 @@ function withoutOwn(
     const hooks = group.hooks.flatMap((hook: unknown, position: number) => {
       if (!isRecord(hook) || !isOwn(hook)) return [hook];
       if (keepGroup || position < lastOther) {
-        if (hook.type === disabled.type && sameHandler(hook, disabled)) return [hook];
+        // A placeholder stays as it is, the old name's too: Codex trusts it by its hash.
+        if (isDisabled(hook)) return [hook];
         changedGroup = true;
         return [disabled];
       }
@@ -428,9 +440,10 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
       catchAll(holder, agent)
     )
       continue;
-    if (agent === "codex" && Array.isArray(hooks[event])) {
+    if (Array.isArray(hooks[event])) {
       // Codex keys a hook's approval to its place, so an older entry of fleetrc's is replaced
-      // where it stands, and any others become no-ops where a hook after them would move.
+      // where it stands, and any others become no-ops where a hook after them would move. Claude
+      // Code's is replaced where it stands too, and its others removed.
       let placed = undefined as HookHandler | undefined;
       const groups = (hooks[event] as unknown[]).map((group: unknown) =>
         isRecord(group) && Array.isArray(group.hooks)
@@ -447,7 +460,7 @@ export function withHook(raw: Json, handler: HookHandler, agent: HookAgent) {
           : group,
       );
       if (placed) {
-        hooks[event] = withoutOwn(groups, true, placed).groups;
+        hooks[event] = withoutOwn(groups, agent === "codex", placed).groups;
         continue;
       }
     }

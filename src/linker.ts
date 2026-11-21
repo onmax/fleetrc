@@ -34,6 +34,12 @@ import { tildify } from "./paths.ts";
 
 export const MANIFEST_FILE = ".fleetrc-manifest.json";
 
+/** A record read where `MANIFEST_FILE` is missing: the old name's, in a dry run of the move (migrate.ts). */
+let fallbackRecord: string | undefined;
+export const readRecordsFrom = (name: string) => {
+  fallbackRecord = name;
+};
+
 export type LinkKind = "symlink" | "junction" | "copy";
 
 export interface LinkRecord {
@@ -81,8 +87,14 @@ export interface TargetReport {
  */
 export function readTargetManifest(dir: string, warnings: string[] = []): TargetManifest {
   let raw: unknown;
+  const file =
+    fallbackRecord !== undefined &&
+    !existsSync(join(dir, MANIFEST_FILE)) &&
+    existsSync(join(dir, fallbackRecord))
+      ? join(dir, fallbackRecord)
+      : join(dir, MANIFEST_FILE);
   try {
-    raw = readJson(join(dir, MANIFEST_FILE));
+    raw = readJson(file);
   } catch (error) {
     if (!(error instanceof JsonFileError)) throw error;
     warnings.push(

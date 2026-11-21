@@ -59,6 +59,7 @@ import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sour
 import { loadState, sourceState, type State, StateFile } from "./state.ts";
 import { scheduleDrift } from "./timer.ts";
 import { version } from "./version.ts";
+import { legacyHookEnv, legacyHookNote, legacyWarning } from "./legacy.ts";
 
 export interface SyncOptions {
   /** Fetch only this source; the others are linked from what is already on disk. */
@@ -312,10 +313,18 @@ async function runHooks(
       continue;
     }
     if (matched.length === 0) continue;
+    const note = legacyHookNote(hook.name, hook.run);
+    if (note) legacyWarning(note);
     const run = await exec(hook.run, [], {
       shell: true,
       input: JSON.stringify(report),
-      env: { ...process.env, FLEETRC_HOOK: hook.name, FLEETRC_CHANGED: matched.join("\n") },
+      env: {
+        ...process.env,
+        FLEETRC_HOOK: hook.name,
+        FLEETRC_CHANGED: matched.join("\n"),
+        // The old name's, for one release.
+        ...legacyHookEnv(hook.name, matched.join("\n")),
+      },
       timeoutMs: HOOK_TIMEOUT_MS,
       maxOutput: 8000,
     });

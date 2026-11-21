@@ -6,6 +6,7 @@ import { paths } from "./paths.ts";
 import { notInstalled, program } from "./program.ts";
 import { tailscaleStatus } from "./tailscale.ts";
 import type { Report } from "./report.ts";
+import { LEGACY_FLEET, reportVersion } from "./legacy.ts";
 
 export type FleetAction = "status" | "sync" | "upgrade" | "init";
 
@@ -41,6 +42,8 @@ export interface HostResult {
 }
 
 const STATE = '"${XDG_STATE_HOME:-$HOME/.local/state}/fleetrc"';
+/** The state folder of fleetrc's old name, on a host not yet moved (migrate.ts). */
+const OLD_STATE = LEGACY_FLEET.state;
 
 /** What a host prints, instead of a report, when it cannot give one. */
 const NOTE = "fleetrc-fleet:";
@@ -83,7 +86,7 @@ const watched = (command: string) =>
   `{ exec 3<&0; ${command} </dev/null 3<&- & p=$!; { read -r _ && { while read -r _; do :; done; kill $p; }; } <&3 >/dev/null 2>&1 & w=$!; exec 3<&-; wait $p; s=$?; kill $w 2>/dev/null; exit $s; }`;
 
 /** Finds fleetrc on the host: the installed launcher, else a `fleetrc` on PATH. */
-const FIND = `f=${STATE}/bin/fleetrc; [ -x "$f" ] || f=$(command -v fleetrc) || f=`;
+const FIND = `f=${STATE}/bin/fleetrc; [ -x "$f" ] || f=${OLD_STATE}/${LEGACY_FLEET.launcher}; [ -x "$f" ] || f=$(command -v fleetrc) || f=`;
 /**
  * The node the installed launcher runs, in `n` when it is still there. ssh runs commands in a
  * non-interactive shell, without what ~/.zprofile or ~/.bashrc add to PATH (on macOS PATH is
@@ -91,7 +94,7 @@ const FIND = `f=${STATE}/bin/fleetrc; [ -x "$f" ] || f=$(command -v fleetrc) || 
  * `exec "<node>" "<cli>" "$@"`, with `\`, `"`, `$` and a backtick escaped by a backslash. A node
  * the launcher names that is gone, as after a Node.js upgrade, is in `g`.
  */
-const LAUNCHER_NODE = `l=${STATE}/bin/fleetrc; n=; g=; if [ -f "$l" ]; then n=$(sed -n 's/^exec "\\([^"]*\\)" .*/\\1/p' "$l" | sed 's/\\\\\\(.\\)/\\1/g'); if [ -n "$n" ] && [ ! -x "$n" ]; then g=$n; n=; fi; fi`;
+const LAUNCHER_NODE = `l=${STATE}/bin/fleetrc; [ -f "$l" ] || [ ! -f ${OLD_STATE}/${LEGACY_FLEET.launcher} ] || l=${OLD_STATE}/${LEGACY_FLEET.launcher}; n=; g=; if [ -f "$l" ]; then n=$(sed -n 's/^exec "\\([^"]*\\)" .*/\\1/p' "$l" | sed 's/\\\\\\(.\\)/\\1/g'); if [ -n "$n" ] && [ ! -x "$n" ]; then g=$n; n=; fi; fi`;
 /**
  * npx in `x`: the one next to the launcher's node, with that node first on PATH for npx's own
  * `#!/usr/bin/env node`, else the one on PATH.
@@ -101,7 +104,7 @@ const NPX = `x=; if [ -n "$n" ] && [ -x "\${n%/*}/npx" ]; then x="\${n%/*}/npx";
  * Read the host's config into `m` with the launcher's Node or the one on PATH. Only a missing
  * config or one without a manifest is treated as unconfigured.
  */
-const CONFIGURED = `case "\${XDG_CONFIG_HOME:-}" in /*) c="$XDG_CONFIG_HOME";; *) c="$HOME/.config";; esac; k=\${n:-node}; m=$("$k" -e '
+const CONFIGURED = `case "\${XDG_CONFIG_HOME:-}" in /*) c="$XDG_CONFIG_HOME";; *) c="$HOME/.config";; esac; cf="$c/fleetrc/config.json"; [ -f "$cf" ] || [ ! -f "$c/${LEGACY_FLEET.config}" ] || cf="$c/${LEGACY_FLEET.config}"; k=\${n:-node}; m=$("$k" -e '
   let text;
   try { text = require("node:fs").readFileSync(process.argv[1], "utf8"); }
   catch (error) { if (error.code === "ENOENT") process.exit(0); throw error; }
@@ -112,7 +115,7 @@ const CONFIGURED = `case "\${XDG_CONFIG_HOME:-}" in /*) c="$XDG_CONFIG_HOME";; *
     if (typeof spec !== "string" || !spec || /[\\r\\n\\0]/.test(spec)) process.exit(1);
     process.stdout.write(spec);
   }
-' "$c/fleetrc/config.json" </dev/null 2>/dev/null)`;
+' "$cf" </dev/null 2>/dev/null)`;
 
 const NOT_SHADOWED = `const {statSync}=require("node:fs");
 const {join,resolve}=require("node:path");
@@ -150,6 +153,12 @@ export function initArgs(version: string, { spec, flags }: InitSetup): string[] 
   return ["-y", "--package", pkg, "--", "fleetrc", "init", spec, ...flags];
 }
 
+/** The npx arguments that run `fleetrc self-install` on a host, from the package `initArgs` names. */
+export function upgradeArgs(version: string): string[] {
+  const pkg = process.env.FLEETRC_PACKAGE || `fleetrc@${version}`;
+  return ["-y", "--package", pkg, "--", "fleetrc", "self-install"];
+}
+
 /** `npx <args>` as a person would type it, quoting only the words a shell would split. */
 export const commandLine = (args: readonly string[]) =>
   ["npx", ...args.map((arg) => (/^[\w@%+=:,./-]+$/.test(arg) ? arg : quote(arg)))].join(" ");
@@ -165,11 +174,12 @@ export function remoteScript(
 ): string {
   switch (action) {
     case "status":
-      return `${ANSWERED}; r=${STATE}/last-run.json; if [ -f "$r" ]; then cat "$r"; else ${FIND}; if [ -n "$f" ]; then echo "${NOTE} never-synced"; else ${MISSING}; fi; fi`;
+      return `${ANSWERED}; r=${STATE}/last-run.json; [ -f "$r" ] || [ ! -f ${OLD_STATE}/last-run.json ] || r=${OLD_STATE}/last-run.json; if [ -f "$r" ]; then cat "$r"; else ${FIND}; if [ -n "$f" ]; then echo "${NOTE} never-synced"; else ${MISSING}; fi; fi`;
     case "sync":
       return `${ANSWERED}; ${LAUNCHER_NODE}; ${FIND}; if [ -n "$g" ] && [ "$f" = "$l" ]; then echo "${NOTE} node-gone"; elif [ -n "$f" ]; then ${watched(`"$f" sync --json${dryRun ? " --dry-run" : ""}`)}; else ${MISSING}; fi`;
     case "upgrade":
-      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; ${NPX}; if [ -n "$x" ]; then "$x" -y fleetrc@${version} self-install </dev/null && ${NOW} && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
+      // self-install moves a host with the old name's install first, launcher included.
+      return `${ANSWERED}; ${LAUNCHER_NODE}; ${WAS}; ${NPX}; if [ -n "$x" ]; then "$x" ${upgradeArgs(version).map(quote).join(" ")} </dev/null && l=${STATE}/bin/fleetrc && ${NOW} && ${watched('"$l" sync --json')}; elif [ -n "$g" ]; then echo "${NOTE} node-gone"; else echo "${NOTE} no-node"; fi`;
     case "init": {
       if (!setup) throw new Error("remoteScript: init needs a setup");
       // A relative FLEETRC_PACKAGE is a path from the login folder, which `cd /` leaves.
@@ -291,7 +301,7 @@ function summarize(raw: unknown): HostResult["lastRun"] {
     host: typeof raw.host === "string" ? raw.host : "",
     finishedAt: raw.finishedAt,
     ok: raw.ok === true,
-    fleetrc: typeof raw.fleetrc === "string" ? raw.fleetrc : "",
+    fleetrc: reportVersion(raw, "fleetrc"),
     skills,
     held,
     errors,

@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { isRecord, lstat, readJsonOrNothing } from "./fs.ts";
+import { migrationNeeded } from "./legacy.ts";
 import { adoptInstalledPlaces, claudeHome, paths, stateDir } from "./paths.ts";
 
 export const HOOK_AGENTS = ["claude-code", "codex"] as const;
@@ -166,6 +167,14 @@ function configured(): boolean {
 export async function runHook(agent: HookAgent, promptOnly = false) {
   try {
     adoptInstalledPlaces();
+    if (migrationNeeded(stateDir())) {
+      // The old name's install, moved once and quietly; the sync after it starts now.
+      try {
+        const { migrate } = await import("./migrate.ts");
+        await migrate();
+        rmSync(paths.hookAttempt(), { force: true });
+      } catch {}
+    }
     if (!configured()) return;
     let input = "";
     try {
