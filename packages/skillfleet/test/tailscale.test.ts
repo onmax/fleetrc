@@ -238,10 +238,57 @@ describe("the manifest from the tailnet policy", () => {
     const online = await m.runWith({ env: tailscale.env }, "sync", "--manifest", override);
     expect(online.code, online.stdout + online.stderr).toBe(0);
     expect(config(m).manifest).toBe(alias);
-    for (const manifest of [[], ["--manifest", url], ["--manifest", override]]) {
+    for (const manifest of [
+      [],
+      ["--manifest", url],
+      ["--manifest", alias],
+      ["--manifest", override],
+    ]) {
       const offline = await m.runWith({ env: tailscale.env }, "sync", "--offline", ...manifest);
       expect(offline.code, offline.stdout + offline.stderr).toBe(0);
     }
+  });
+
+  it("shares the isolated override checkout with read-only commands", async () => {
+    const m = machine();
+    const tailscale = fakeTailscale(m);
+    const repository = team(m, "saved", "from-tailnet");
+    tailscale.policy([{ manifest: repository.https }]);
+    expect((await m.runWith({ env: tailscale.env }, "init", "--no-hooks")).code).toBe(0);
+    repository.commit({
+      ".skillfleet/manifest.json": null,
+      "alternate.json": JSON.stringify({ agents: ["codex"], sources: [] }),
+    });
+    const override = `${repository.https}//alternate.json`;
+    const synced = await m.runWith({ env: tailscale.env }, "sync", "--manifest", override);
+    expect(synced.code, synced.stdout + synced.stderr).toBe(0);
+    const listed = await m.runWith({ env: tailscale.env }, "agents", "--manifest", override);
+    expect(listed.code, listed.stdout + listed.stderr).toBe(0);
+  });
+
+  it("keeps the saved manifest offline after timer install fetches an override", async () => {
+    const m = machine({ scheduler: "refuse" });
+    const tailscale = fakeTailscale(m);
+    const repository = team(m, "saved", "from-tailnet");
+    tailscale.policy([{ manifest: repository.https }]);
+    expect((await m.runWith({ env: tailscale.env }, "init", "--no-hooks")).code).toBe(0);
+    repository.commit({
+      ".skillfleet/manifest.json": null,
+      "alternate.json": JSON.stringify({ agents: ["codex"], sources: [] }),
+    });
+    const override = `${repository.https}//alternate.json`;
+    const timer = await m.runWith(
+      { env: tailscale.env },
+      "timer",
+      "install",
+      "--manifest",
+      override,
+    );
+    expect(timer.code, timer.stdout + timer.stderr).toBe(1);
+    expect(m.schedulerCalls().length).toBeGreaterThan(0);
+    const offline = await m.runWith({ env: tailscale.env }, "sync", "--offline");
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["from-tailnet"]);
   });
 
   it("a dry-run sync names the new manifest without saving it", async () => {

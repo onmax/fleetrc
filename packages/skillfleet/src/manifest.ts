@@ -582,7 +582,8 @@ function webManifest(spec: string): RemoteManifest | undefined {
   const { repo, kind, ref, path } = page;
   const file =
     kind === "blob" && path ? path : path ? `${path}/${DEFAULT_MANIFEST}` : DEFAULT_MANIFEST;
-  return { repo, path: file, ref };
+  const cloneUrl = !kind && /^[^?#]+\.git\/?(?:[?#]|$)/.test(spec) ? `${repo}.git` : repo;
+  return { repo: cloneUrl, path: file, ref };
 }
 
 export interface RemoteManifest {
@@ -770,10 +771,10 @@ export async function stagePolicyManifest(spec: string, savedSpec: string) {
   };
 }
 
-function manifestCheckout(spec: string, base?: string, override = false): typeof fetchClone {
+function manifestCheckout(spec: string, base?: string): typeof fetchClone {
   const root = policyCacheRoot(spec, base);
   const slots = validatedSlots(root);
-  const config = override ? readJsonOrNothing(paths.config()) : undefined;
+  const config = readJsonOrNothing(paths.config());
   const isolated =
     isRecord(config) &&
     config.tailscale === true &&
@@ -1114,14 +1115,12 @@ const ROOT_ONLY_SOURCE_KEYS = ["followLinks"] as const;
  */
 export async function loadManifest(
   spec: string,
-  { cacheRoot, offline = false, checkout, override }: LocateOptions & { override?: boolean } = {},
+  { cacheRoot, offline = false, checkout }: LocateOptions = {},
 ): Promise<LoadedManifest> {
   const options = {
     cacheRoot,
     offline,
-    checkout:
-      checkout ??
-      (cacheRoot === undefined ? manifestCheckout(spec, undefined, override) : undefined),
+    checkout: checkout ?? (cacheRoot === undefined ? manifestCheckout(spec) : undefined),
   };
   const rootFile = await locateManifest(spec, options);
   const root = readManifestFile(rootFile);

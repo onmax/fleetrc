@@ -459,7 +459,6 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       candidate?.loaded ??
       (await loadManifest(spec, {
         offline,
-        override: options.manifest !== undefined,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
       }));
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
