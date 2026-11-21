@@ -1,8 +1,8 @@
 <h1>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./.github/assets/banner-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./.github/assets/banner-light.svg">
-    <img src="./.github/assets/banner-light.svg" alt="skillfleet: the same skills on every agent and every machine, synced when an agent session starts" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/banner-light.svg">
+    <img src="https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/banner-light.png" alt="skillfleet: the same skills on every agent and every machine, synced when an agent session starts" width="100%">
   </picture>
 </h1>
 
@@ -10,11 +10,11 @@
 [![npm downloads](https://comark-ui.onmax.me/badge.svg?source=npm-downloads&package=skillfleet&period=month&icon=npm)](https://www.npmjs.com/package/skillfleet)
 [![Release status](https://comark-ui.onmax.me/badge.svg?source=github-actions&repository=onmax%2Fskillfleet&workflow=release.yaml&icon=github)](https://github.com/onmax/skillfleet/actions/workflows/release.yaml)
 [![status: early](https://comark-ui.onmax.me/badge.svg?label=status&value=early)](#status)
-[![license: MIT](https://comark-ui.onmax.me/badge.svg?label=license&value=MIT)](./LICENSE)
+[![license: MIT](https://comark-ui.onmax.me/badge.svg?label=license&value=MIT)](https://github.com/onmax/skillfleet/blob/main/LICENSE)
 
 One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode, Cursor and Copilot, synced on every machine when an agent session starts.
 
-[![Download the 90-second explainer (MP4)](./.github/assets/explainer-poster.png)](./.github/assets/explainer.mp4?raw=true)
+[![Download the 90-second explainer (MP4)](https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/explainer-poster.png)](https://raw.githubusercontent.com/onmax/skillfleet/main/.github/assets/explainer.mp4)
 
 ```sh
 npx skillfleet init my-team/agents
@@ -249,4 +249,4 @@ pnpm ready   # format, build, check and test
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](https://github.com/onmax/skillfleet/blob/main/LICENSE)

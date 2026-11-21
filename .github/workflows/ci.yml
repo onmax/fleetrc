@@ -12,8 +12,7 @@ permissions:
   contents: read
 
 env:
-  # CI makes no commits. Without the hook dispatcher, the packages' `vp config`
-  # prepare scripts don't race each other for .git/config during install.
+  # CI makes no commits, so the `vp config` prepare script skips the git hooks.
   VP_GIT_HOOKS: "0"
 
 jobs:
@@ -36,8 +35,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dist
-          # Keeps each package's folder: the artifact holds skillfleet/dist, ...
-          path: packages/*/dist
+          path: dist
           if-no-files-found: error
           retention-days: 7
 
@@ -113,7 +111,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - name: Pack
-        run: pnpm --filter skillfleet pack --out "$RUNNER_TEMP/skillfleet.tgz"
+        run: pnpm pack --out "$RUNNER_TEMP/skillfleet.tgz"
       # The runner user has no login session, so it has no systemd user manager. Linger starts one,
       # as on a server.
       - name: Start the systemd user manager
@@ -164,12 +162,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - name: Pack
-        run: pnpm --filter skillfleet pack --out "$RUNNER_TEMP/skillfleet.tgz"
+        run: pnpm pack --out "$RUNNER_TEMP/skillfleet.tgz"
       - name: Run the session hooks as Claude Code and Codex do, and wait for their syncs
         run: node .github/scripts/hook-e2e.mjs "$RUNNER_TEMP/skillfleet.tgz"
 
   # Windows breaks that change the machine or need the real Task Scheduler: a subst drive for HOME
-  # (packages/skillfleet/test/windows.test.ts, W-SUBST), and the timer e2e under a USERPROFILE with
+  # (test/windows.test.ts, W-SUBST), and the timer e2e under a USERPROFILE with
   # cmd and PowerShell metacharacters, with and without a %VAR% in it.
   windows-break:
     name: windows-break (node ${{ matrix.node }})
@@ -195,13 +193,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - name: Windows break tests, with subst
-        working-directory: packages/skillfleet
         env:
           SKILLFLEET_BREAK_SUBST: "1"
         run: pnpm exec vp test run test/windows.test.ts
       - name: Pack
         if: ${{ !cancelled() }}
-        run: pnpm --filter skillfleet pack --out "$RUNNER_TEMP/skillfleet.tgz"
+        run: pnpm pack --out "$RUNNER_TEMP/skillfleet.tgz"
       - name: Task Scheduler e2e under a USERPROFILE with metacharacters
         if: ${{ !cancelled() }}
         run: node .github/scripts/timer-e2e.mjs "$RUNNER_TEMP/skillfleet.tgz" --home-name "O'Brien & Zoë ^ ! (x) \$(whoami) 😀"

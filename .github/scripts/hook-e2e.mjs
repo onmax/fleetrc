@@ -6,7 +6,7 @@
 // second sync, init wrote no prompt hook, and `hook remove` takes skillfleet's entries out.
 //
 //   pnpm --filter skillfleet build
-//   (cd packages/skillfleet && pnpm pack --out ../../skillfleet.tgz)
+//   pnpm pack --out skillfleet.tgz
 //   node .github/scripts/hook-e2e.mjs skillfleet.tgz
 //
 // Everything lives under a throwaway HOME, and nothing touches the OS scheduler, so it runs
@@ -143,7 +143,8 @@ try {
   cli = join(prefix, "node_modules", "skillfleet", "dist", "cli.mjs");
 
   step("a throwaway HOME with Claude Code and Codex, a local git source and a manifest");
-  for (const dir of [".claude", ".codex", ".agents"]) mkdirSync(join(home, dir), { recursive: true });
+  for (const dir of [".claude", ".codex", ".agents"])
+    mkdirSync(join(home, dir), { recursive: true });
   writeFileSync(
     join(home, ".gitconfig"),
     "[user]\n\tname = e2e\n\temail = e2e@example.com\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n[core]\n\tautocrlf = false\n",
@@ -181,7 +182,12 @@ try {
     if (agent === "Claude Code" && process.platform === "win32") {
       const entry = hookEntry(file, "SessionStart");
       assert.equal(entry.command, join(stateDir, "bin", "node-dir", "node.exe"));
-      assert.deepEqual(entry.args, [join(stateDir, "app", "cli.mjs"), "hook", "run", "claude-code"]);
+      assert.deepEqual(entry.args, [
+        join(stateDir, "app", "cli.mjs"),
+        "hook",
+        "run",
+        "claude-code",
+      ]);
     }
     step(`${agent}: commit ${name} upstream, then start a session`);
     mkdirSync(join(work, "skills", name), { recursive: true });

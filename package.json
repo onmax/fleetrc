@@ -1,12 +1,69 @@
 {
-  "name": "skillfleet-workspace",
-  "private": true,
+  "name": "skillfleet",
+  "version": "0.0.0",
+  "description": "The same skills on every agent and every machine, synced when an agent session starts.",
+  "keywords": [
+    "agent-skills",
+    "ai-agents",
+    "claude-code",
+    "cli",
+    "codex",
+    "copilot",
+    "cursor",
+    "gemini-cli",
+    "opencode",
+    "skill-md",
+    "skills",
+    "ssh",
+    "sync",
+    "tailscale"
+  ],
+  "homepage": "https://github.com/onmax/skillfleet#readme",
+  "bugs": "https://github.com/onmax/skillfleet/issues",
+  "license": "MIT",
+  "author": "onmax",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/onmax/skillfleet.git"
+  },
+  "bin": {
+    "skillfleet": "./dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "schema.json"
+  ],
   "type": "module",
+  "exports": {
+    "./schema.json": "./schema.json",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
-    "build": "pnpm -r build",
-    "check": "pnpm -r check",
-    "test": "pnpm -r test",
-    "ready": "pnpm -r ready"
+    "build": "vp pack",
+    "lint": "vp lint",
+    "fmt": "vp fmt",
+    "typecheck": "tsrs --noEmit",
+    "test": "vp test",
+    "check": "vp check && pnpm typecheck",
+    "ready": "vp fmt && pnpm build && pnpm check && pnpm test",
+    "prepare": "vp config"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@vite-hub/schedule": "https://pkg.pr.new/vite-hub/vitehub/@vite-hub/schedule@6b1390a",
+    "cron-schedule": "^6.0.0",
+    "fastest-levenshtein": "1.0.16",
+    "jsonc-parser": "3.3.1",
+    "publint": "^0.3.25",
+    "skills": "^1.9.0",
+    "tar": "^7.5.22",
+    "tsrs": "0.20.1-ts7.1.0-beta",
+    "typescript": "^7.0.2",
+    "vite-plus": "^1.4.0"
   },
   "engines": {
     "node": ">=22.12.0"

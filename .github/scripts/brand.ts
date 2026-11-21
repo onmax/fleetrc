@@ -60,7 +60,8 @@ const machines = [
   ["desktop", "Windows"],
   ["homelab", "Linux"],
 ];
-const cellSail = (x: number, y: number) => `M${x} ${y + 11} V${y - 13} Q${x + 17} ${y} ${x + 18} ${y + 11} Z`;
+const cellSail = (x: number, y: number) =>
+  `M${x} ${y + 11} V${y - 13} Q${x + 17} ${y} ${x + 18} ${y + 11} Z`;
 const fleet = (t: Theme) => {
   const cx = (i: number) => 902 + i * 60;
   const cy = (r: number) => 160 + r * 72;
@@ -95,7 +96,9 @@ const fleet = (t: Theme) => {
 };
 
 // The mark and name on the left, a line and the two commands under them; the fleet on the right.
-const banner = (t: Theme) => `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-labelledby="t">
+const banner = (
+  t: Theme,
+) => `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-labelledby="t">
 <title id="t">skillfleet: the same skills on every agent and every machine, synced when an agent session starts</title>
 <style>${style(t)}</style>
 <clipPath id="frame"><rect width="1280" height="400" rx="24"/></clipPath>

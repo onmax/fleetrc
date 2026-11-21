@@ -4,7 +4,7 @@
 // to prove that changes nothing, removes the timer, and checks the OS has nothing left.
 //
 //   pnpm --filter skillfleet build
-//   (cd packages/skillfleet && pnpm pack --out ../../skillfleet.tgz)
+//   pnpm pack --out skillfleet.tgz
 //   node .github/scripts/timer-e2e.mjs skillfleet.tgz
 //   node .github/scripts/timer-e2e.mjs skillfleet.tgz --home-name "O'Brien & Zoë"
 //
@@ -145,7 +145,10 @@ function osKnows() {
 function leftoversInRealHome() {
   const candidates =
     platform === "linux"
-      ? [".config/systemd/user/skillfleet-sync.service", ".config/systemd/user/skillfleet-sync.timer"]
+      ? [
+          ".config/systemd/user/skillfleet-sync.service",
+          ".config/systemd/user/skillfleet-sync.timer",
+        ]
       : platform === "darwin"
         ? ["Library/LaunchAgents/skillfleet-sync.plist"]
         : ["AppData/Local/ViteHub/schedules/skillfleet-sync.ps1"];
@@ -183,7 +186,9 @@ function diagnose() {
       run("systemctl", ["--user", "status", "--no-pager", `${NAME}.timer`, `${NAME}.service`])
         .stdout,
     );
-    console.log(run("journalctl", ["--user", "-u", `${NAME}.service`, "--no-pager", "-n", "50"]).stdout);
+    console.log(
+      run("journalctl", ["--user", "-u", `${NAME}.service`, "--no-pager", "-n", "50"]).stdout,
+    );
   }
   const log = join(stateDir, "logs", `${NAME}.log`);
   console.log(`[timer-e2e] ${log}:\n${existsSync(log) ? readFileSync(log, "utf8") : "(missing)"}`);
@@ -254,7 +259,10 @@ try {
   console.log(init.stdout, init.stderr);
   assert.equal(init.code, 0, "init failed");
   assert.match(init.stdout, /^installed a /m, "init did not install the timer");
-  assert.ok(existsSync(join(claudeSkills, "first", "SKILL.md")), "init did not link the first skill");
+  assert.ok(
+    existsSync(join(claudeSkills, "first", "SKILL.md")),
+    "init did not link the first skill",
+  );
   const initRun = lastRun();
   assert.ok(initRun, "init wrote no last-run.json");
 
@@ -289,7 +297,11 @@ try {
     return report && report.finishedAt > initRun.finishedAt;
   });
   const firstScheduled = lastRun();
-  assert.equal(firstScheduled.ok, true, `the scheduled sync failed: ${JSON.stringify(firstScheduled)}`);
+  assert.equal(
+    firstScheduled.ok,
+    true,
+    `the scheduled sync failed: ${JSON.stringify(firstScheduled)}`,
+  );
 
   step("commit a second skill upstream");
   mkdirSync(join(work, "skills", "second"), { recursive: true });
@@ -308,7 +320,10 @@ try {
   assert.equal(status.json.timer.installed, true, "status says the timer is not installed");
   assert.equal(status.json.timer.platform, platform);
   assert.ok(status.json.lastRun, "status has no last run");
-  assert.ok(status.json.lastRun.skills.names.includes("second"), "the last run did not link second");
+  assert.ok(
+    status.json.lastRun.skills.names.includes("second"),
+    "the last run did not link second",
+  );
   // launchd does not expose the start of the last run; systemd and Task Scheduler do.
   if (platform !== "darwin") assert.ok(status.json.timer.lastRunAt, "status has no lastRunAt");
   if (status.json.timer.lastExitCode !== undefined)
@@ -324,8 +339,7 @@ try {
   assert.equal(removal.code, 0, removal.stderr);
   assert.equal(removal.json.existed, true);
   installed = false;
-  for (const file of again.json.files)
-    assert.ok(!existsSync(file), `timer remove left ${file}`);
+  for (const file of again.json.files) assert.ok(!existsSync(file), `timer remove left ${file}`);
   const gone = osKnows();
   assert.ok(!gone.known, `the OS still lists ${NAME} after timer remove:\n${gone.output}`);
   assert.deepEqual(leftoversInRealHome(), [], "timer files are left in the real home");

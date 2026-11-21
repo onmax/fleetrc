@@ -16,8 +16,7 @@ permissions:
   contents: read
 
 env:
-  # CI makes no commits. Without the hook dispatcher, the packages' `vp config`
-  # prepare scripts don't race each other for .git/config during install.
+  # CI makes no commits, so the `vp config` prepare script skips the git hooks.
   VP_GIT_HOOKS: "0"
 
 jobs:
@@ -45,7 +44,7 @@ jobs:
       # preview does not wait for the tests. A broken build still publishes nothing.
       - run: pnpm build
       - run: pnpm check
-      - run: pnpm dlx pkg-pr-new publish './packages/*' --pnpm --packageManager=pnpm
+      - run: pnpm dlx pkg-pr-new publish --pnpm --packageManager=pnpm
         env:
           # The steps above already built and checked the package.
           pnpm_config_ignore_scripts: "true"

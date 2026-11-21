@@ -11,8 +11,8 @@ if ! user=$(npm whoami 2>/dev/null); then
   exit 1
 fi
 
-name=$(node -p 'require("./packages/skillfleet/package.json").name')
-version=$(node -p 'require("./packages/skillfleet/package.json").version')
+name=$(node -p 'require("./package.json").name')
+version=$(node -p 'require("./package.json").version')
 
 if npm view "$name" name >/dev/null 2>&1; then
   echo "$name is already on npm, so there is nothing to claim. Skip to the trusted publisher below." >&2
@@ -24,9 +24,8 @@ pnpm install --frozen-lockfile
 pnpm build
 pnpm test
 
-# ./ so npm reads a folder, not the GitHub repo packages/skillfleet. publishConfig
-# asks for provenance, which only CI can sign.
-npm publish ./packages/skillfleet --access public --provenance=false
+# publishConfig asks for provenance, which only CI can sign.
+npm publish --access public --provenance=false
 
 echo
 echo "$name@$version is on npm: https://www.npmjs.com/package/$name"
