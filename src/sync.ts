@@ -440,6 +440,8 @@ async function followTailnet(
     warnings.push(`kept the manifest ${spec}: ${found.error}`);
     return { spec };
   }
+  // The policy names a repository alone, and this machine reads its manifest from the old name's
+  // default place: that is the same manifest, not a new one, until the repository moves it.
   if (found.defaultPath) {
     const legacyPath = `${LEGACY_MANIFEST_DIR}/manifest.json`;
     const legacy = `${found.spec.slice(0, -DEFAULT_MANIFEST.length)}${legacyPath}`;
@@ -493,7 +495,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       policy.legacyPath && checkedOutPath(DEFAULT_MANIFEST, loaded.root.file) === policy.legacyPath
         ? savedSpec
         : policy.spec;
-    candidate?.accept();
+    candidate?.accept(spec);
     if (spec !== savedSpec) {
       if (candidate) writeConfig({ manifest: spec });
       warnings.push(`the tailnet policy now names the manifest ${spec}, not ${savedSpec}`);

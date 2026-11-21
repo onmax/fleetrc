@@ -2567,10 +2567,15 @@ function reviewFileRemovals(
       continue;
     }
     const missing = pathsLister([path]);
-    const retained = findFileItems(source, kind, (base) => [...list(base), ...missing(base)], [])
-      .get(path)
-      ?.filter(({ agent }) => targets.some((target) => target.agent === agent));
-    if (retained?.length) removals.set(path, retained);
+    const matching = findFileItems(source, kind, missing, []).get(path) ?? [];
+    const unique = findFileItems(source, kind, (base) => [...list(base), ...missing(base)], []);
+    const retained = matching.filter(
+      ({ agent }) =>
+        approved.get(path)?.some((target) => target.agent === agent) ||
+        (targets.some((target) => target.agent === agent) &&
+          unique.get(path)?.some((target) => target.agent === agent)),
+    );
+    if (retained.length) removals.set(path, retained);
   }
   return removals;
 }

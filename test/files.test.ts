@@ -345,6 +345,29 @@ describe("files across sources", () => {
     expect(existsSync(destination)).toBe(false);
   });
 
+  it("keeps the approved instruction through a pending upstream rename", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "docs/team.md": "approved\n" });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url, update: "review", instructions: "docs/*.md" }],
+    });
+    const destination = m.at(".claude/CLAUDE.md");
+    await m.json("init", manifest, "--no-hooks");
+    vendor.commit({ "docs/team.md": null, "docs/new.md": "replacement\n" });
+    for (const args of [[], ["--offline"], []]) {
+      const sync = await m.json<Report>("sync", ...args);
+      expect(sync.pending.map((entry) => entry.skill).sort()).toEqual([
+        "instructions/docs/new.md",
+        "instructions/docs/team.md",
+      ]);
+      expect(read(destination)).toBe("approved\n");
+    }
+    const update = await m.run("update", "vendor");
+    expect(update.code, update.stdout + update.stderr).toBe(0);
+    expect(read(destination)).toBe("replacement\n");
+  });
+
   it("links a cached review-mode instruction offline when the winning source is removed", async () => {
     const m = machine();
     const first = remote(m, "first", { "AGENTS.md": "first\n" });

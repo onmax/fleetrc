@@ -285,7 +285,7 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
     expect(warnings[0]).toContain('rename that capability to "github.com/onmax/fleetrc"');
   });
 
-  it("validates a repository-only tailnet manifest before moving to its new default path", async () => {
+  it("keeps the manifest at its old place when the tailnet policy names only its repository", async () => {
     const m = machine();
     const vendor = remote(m, "home-skills", skills("skills/", "from-tailnet"));
     const team = remote(m, "home", {
@@ -312,9 +312,7 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
       join(dir, "tailscale.mjs"),
       `process.stdout.write((await import("node:fs")).readFileSync(${JSON.stringify(join(dir, "status.json"))}, "utf8"));`,
     );
-    const sync = () =>
-      m.runWith({ env: { FLEETRC_TAILSCALE: join(dir, "tailscale.mjs") } }, "sync");
-    const run = await sync();
+    const run = await m.runWith({ env: { FLEETRC_TAILSCALE: join(dir, "tailscale.mjs") } }, "sync");
     expect(run.code, run.stdout + run.stderr).toBe(0);
     expect(run.stdout + run.stderr).not.toContain("the tailnet policy now names");
     expect(JSON.parse(read(config))).toMatchObject({ manifest: saved });
@@ -322,15 +320,32 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
       "from-tailnet",
     ]);
 
+    const sync = () =>
+      m.runWith({ env: { FLEETRC_TAILSCALE: join(dir, "tailscale.mjs") } }, "sync");
     const legacyPath = ".skillfleet/manifest.json";
     const newPath = ".fleetrc/manifest.json";
+    const updated = remote(m, "updated-skills", skills("skills/", "updated-tailnet"));
+    team.commit({
+      [legacyPath]: JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "updated", git: updated.https }],
+      }),
+    });
+    const updatedRun = await sync();
+    expect(updatedRun.code, updatedRun.stdout + updatedRun.stderr).toBe(0);
+    expect(JSON.parse(read(config))).toMatchObject({ manifest: saved });
+    const updatedOffline = await m.run("sync", "--offline");
+    expect(updatedOffline.code, updatedOffline.stdout + updatedOffline.stderr).toBe(0);
+    expect(existsSync(m.at(".claude/skills/updated-tailnet"))).toBe(true);
+    expect(existsSync(m.at(".claude/skills/from-tailnet"))).toBe(false);
+
     team.commit({ [legacyPath]: null, [newPath]: "{" });
     const rejected = await sync();
     expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
     expect(JSON.parse(read(config))).toMatchObject({ manifest: saved });
     const offline = await m.run("sync", "--offline");
     expect(offline.code, offline.stdout + offline.stderr).toBe(0);
-    expect(existsSync(m.at(".claude/skills/from-tailnet"))).toBe(true);
+    expect(existsSync(m.at(".claude/skills/updated-tailnet"))).toBe(true);
 
     team.commit({
       [legacyPath]: JSON.stringify({
@@ -342,6 +357,7 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
     const migrated = await sync();
     expect(migrated.code, migrated.stdout + migrated.stderr).toBe(0);
     expect(JSON.parse(read(config))).toMatchObject({ manifest: `${team.https}//${newPath}` });
+    expect(existsSync(m.at(".claude/skills/updated-tailnet"))).toBe(false);
     expect(existsSync(m.at(".claude/skills/from-tailnet"))).toBe(false);
     const migratedOffline = await m.run("sync", "--offline");
     expect(migratedOffline.code, migratedOffline.stdout + migratedOffline.stderr).toBe(0);
