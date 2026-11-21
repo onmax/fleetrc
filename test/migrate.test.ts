@@ -426,4 +426,77 @@ writeFileSync(${JSON.stringify(out)}, [process.env.FLEETRC_HOOK, process.env.SKI
     expect(readlinkSync(join(alt, "skills", "tool")).startsWith(m.stateDir + "/")).toBe(true);
     expect(existsSync(join(alt, "skills", ".skillfleet-manifest.json"))).toBe(false);
   });
+
+  it("fleet upgrade from a controller with the old install moves it, then the host", async () => {
+    // The host: its own HOME, reached through a fake ssh that runs the command in its environment.
+    const host = machine();
+    const nodeDir = join(host.root, "node", "bin");
+    mkdirSync(nodeDir, { recursive: true });
+    symlinkSync(realpathSync(process.execPath), join(nodeDir, "node"));
+    writeFileSync(
+      join(nodeDir, "npx"),
+      `#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift 2\nexec "${join(nodeDir, "node")}" "${cli}" "$@"\n`,
+    );
+    chmodSync(join(nodeDir, "npx"), 0o755);
+    const hostEnv = {
+      ...host.env,
+      PATH: [nodeDir, host.env.PATH].join(":"),
+      FLEETRC_PACKAGE: "fleetrc@preview",
+    };
+    const hostInit = await host.runWith(
+      { env: hostEnv },
+      "init",
+      host.manifest({ agents: ["claude-code"], sources: [] }),
+    );
+    expect(hostInit.code, hostInit.stdout + hostInit.stderr).toBe(0);
+    toLegacy(host);
+
+    const m = machine();
+    const init = await m.run(
+      "init",
+      m.manifest({ agents: ["claude-code"], sources: [], fleet: ["localhost"] }),
+      "--no-hooks",
+    );
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    toLegacy(m);
+    const bin = join(m.root, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "host-env.json"), JSON.stringify(hostEnv));
+    writeFileSync(
+      join(bin, "ssh.mjs"),
+      `import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const probe = args[0] === "-G" && args.shift();
+while (args[0] === "-o") args.splice(0, 2);
+if (args[0] === "--") args.shift();
+const [host, command] = args;
+if (probe) {
+  console.log("hostname " + host + "\\nuser alice\\nport 22");
+  process.exit(0);
+}
+const env = JSON.parse(readFileSync(${JSON.stringify(join(bin, "host-env.json"))}, "utf8"));
+process.exit(spawnSync("sh", ["-c", command], { stdio: "inherit", env }).status ?? 1);`,
+    );
+    writeFileSync(
+      join(bin, "ssh"),
+      `#!/bin/sh\nexec "${process.execPath}" "${join(bin, "ssh.mjs")}" "$@"\n`,
+    );
+    chmodSync(join(bin, "ssh"), 0o755);
+
+    const run = await m.runWith(
+      { env: { PATH: [bin, m.env.PATH].join(":"), FLEETRC_PACKAGE: "fleetrc@preview" } },
+      "fleet",
+      "upgrade",
+      "--json",
+    );
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(run.stderr).toContain("skillfleet is now fleetrc");
+    expect(JSON.parse(run.stdout)).toMatchObject([{ host: "localhost", reachable: true }]);
+    for (const machine of [m, host]) {
+      expect(existsSync(oldState(machine))).toBe(false);
+      expect(existsSync(join(machine.stateDir, "bin", "fleetrc"))).toBe(true);
+    }
+    expect(read(host.at(".claude/settings.json"))).not.toContain("skillfleet");
+  });
 });
