@@ -166,10 +166,21 @@ const FORMATS: Record<HookDefAgent, Format> = {
     matcherList: false,
     zeroTimeout: false,
     // hook_config.rs reads `timeout` as a u64, `async` as a bool, the Windows command (under one
-    // of its two names) as a string, `additionalContextLimit` as a usize and `input` as an object
-    // that TOML can hold; one field of the wrong type makes Codex drop the whole file.
+    // of its two names) as a string, `additionalContextLimit` as a usize, `onFailure` as
+    // "continue" or "block", and `input` as an object that TOML can hold; one field of the wrong
+    // type makes Codex drop the whole file.
     check: (handler, at) => {
       const { timeout, async: background, additionalContextLimit: limit, input } = handler;
+      const { onFailure } = handler;
+      if (
+        onFailure !== undefined &&
+        onFailure !== null &&
+        onFailure !== "continue" &&
+        onFailure !== "block"
+      )
+        throw new Error(
+          `${at} has "onFailure" ${JSON.stringify(onFailure)}; give "continue" or "block"`,
+        );
       if (timeout !== undefined && !Number.isSafeInteger(timeout))
         throw new Error(`${at} has "timeout" ${JSON.stringify(timeout)}; give whole seconds`);
       if (background !== undefined && typeof background !== "boolean")

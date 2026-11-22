@@ -163,6 +163,11 @@ describe("parseHookFile", () => {
       ],
       [
         "codex",
+        hooksFile({ Stop: [{ hooks: [{ ...command("x"), onFailure: "fail" }] }] }),
+        `hooks.Stop[0].hooks[0] has "onFailure" "fail"; give "continue" or "block"`,
+      ],
+      [
+        "codex",
         hooksFile({ Stop: [{ hooks: [{ ...command("x"), async: "yes" }] }] }),
         `hooks.Stop[0].hooks[0] has "async" that isn't true or false`,
       ],
