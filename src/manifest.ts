@@ -943,7 +943,13 @@ export function manifestCheckoutRoute(spec: string, base?: string) {
     !policyCacheRoots(savedSpec).includes(root);
   const fallback = slots.get("*") ?? (slots.size || isolated ? "a" : "shared");
   const checkout: typeof fetchClone = (url, ref, _cacheRoot, options) => {
-    const { slot, cacheUrl } = checkoutRoute(checkoutUrls(url), ref, checkoutRoot, slots, fallback)!;
+    const { slot, cacheUrl } = checkoutRoute(
+      checkoutUrls(url),
+      ref,
+      checkoutRoot,
+      slots,
+      fallback,
+    )!;
     return fetchClone(url, ref, slotRoot(checkoutRoot, slot), { ...options, cacheUrl });
   };
   return {

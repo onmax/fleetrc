@@ -229,6 +229,53 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
     expect(existsSync(m.stateDir)).toBe(false);
   });
 
+  it("init's dry run reads the old record of links, so it removes none of them", async () => {
+    const { m, manifest } = await legacyMachine();
+    toLegacy(m);
+    const run = await m.run("init", manifest, "--no-hooks", "--dry-run");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(run.stdout).not.toContain("remove the link");
+  });
+
+  it("moves the install before a command that syncs, such as add, writes a new one beside it", async () => {
+    const { m } = await legacyMachine();
+    toLegacy(m);
+    const extra = remote(m, "extra", skills("skills/", "other"));
+    const added = await m.run("add", extra.url, "--id", "extra");
+    expect(added.code, added.stdout + added.stderr).toBe(0);
+    expect(added.stdout).toContain("skillfleet is now fleetrc");
+    expect(existsSync(oldState(m))).toBe(false);
+    expect(existsSync(oldConfig(m))).toBe(false);
+  });
+
+  it.skipIf(process.platform !== "linux")(
+    "leaves the install where it is for a command that only reads, such as timer status",
+    async () => {
+      const { m } = await legacyMachine();
+      toLegacy(m);
+      const run = await m.runWith({ env: { PATH: systemdShim(m) } }, "timer", "status");
+      expect(run.stdout + run.stderr).not.toContain("skillfleet is now fleetrc");
+      expect(existsSync(oldState(m))).toBe(true);
+    },
+  );
+
+  it.each([
+    ["fleet", "typo"],
+    ["fleet", "status", "--dry-run"],
+    ["fleet", "sync", "--force"],
+  ])(
+    "a fleet command it can't run, such as %s %s, leaves the old install where it is",
+    async (...args) => {
+      const { m } = await legacyMachine();
+      toLegacy(m);
+      const run = await m.run(...args);
+      expect(run.code).toBe(2);
+      expect(run.stdout).not.toContain("skillfleet is now fleetrc");
+      expect(existsSync(oldState(m))).toBe(true);
+      expect(existsSync(m.stateDir)).toBe(false);
+    },
+  );
+
   it("a second run moves nothing", async () => {
     const { m } = await legacyMachine({ hooks: true });
     toLegacy(m);
@@ -484,27 +531,38 @@ writeFileSync(${JSON.stringify(out)}, [process.env.FLEETRC_HOOK, process.env.SKI
     },
   );
 
-  it("finds the agents' folders the install saved, from a shell that doesn't name them", async () => {
-    const m = machine();
-    const alt = m.at("alt-claude");
-    mkdirSync(alt);
-    const vendor = remote(m, "vendor", skills("skills/", "tool"));
-    const manifest = m.manifest({
-      agents: ["claude-code"],
-      sources: [{ id: "vendor", git: vendor.url }],
-    });
-    const init = await m.runWith({ env: { CLAUDE_CONFIG_DIR: alt } }, "init", manifest);
-    expect(init.code, init.stdout + init.stderr).toBe(0);
-    toLegacy(m, { records: ["alt-claude/skills"], hooks: ["alt-claude/settings.json"] });
-    expect(read(join(alt, "settings.json"))).toContain("skillfleet/bin/skillfleet");
+  it.each([
+    ["", false],
+    [", after a move that stopped once it had moved them", true],
+  ])(
+    "finds the agents' folders the install saved, from a shell that doesn't name them%s",
+    async (_, stopped) => {
+      const m = machine();
+      const alt = m.at("alt-claude");
+      mkdirSync(alt);
+      const vendor = remote(m, "vendor", skills("skills/", "tool"));
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      });
+      const init = await m.runWith({ env: { CLAUDE_CONFIG_DIR: alt } }, "init", manifest);
+      expect(init.code, init.stdout + init.stderr).toBe(0);
+      toLegacy(m, { records: ["alt-claude/skills"], hooks: ["alt-claude/settings.json"] });
+      expect(read(join(alt, "settings.json"))).toContain("skillfleet/bin/skillfleet");
+      if (stopped) {
+        mkdirSync(m.stateDir);
+        writeFileSync(join(m.stateDir, "migrating"), "{}");
+        renameSync(join(oldState(m), "hook-env.json"), join(m.stateDir, "hook-env.json"));
+      }
 
-    // A bare ssh shell, as `fleet upgrade` runs self-install in.
-    const run = await m.runWith({ env: { CLAUDE_CONFIG_DIR: undefined } }, "self-install");
-    expect(run.code, run.stdout + run.stderr).toBe(0);
-    expect(read(join(alt, "settings.json"))).not.toContain("skillfleet");
-    expect(readlinkSync(join(alt, "skills", "tool")).startsWith(m.stateDir + "/")).toBe(true);
-    expect(existsSync(join(alt, "skills", ".skillfleet-manifest.json"))).toBe(false);
-  });
+      // A bare ssh shell, as `fleet upgrade` runs self-install in.
+      const run = await m.runWith({ env: { CLAUDE_CONFIG_DIR: undefined } }, "self-install");
+      expect(run.code, run.stdout + run.stderr).toBe(0);
+      expect(read(join(alt, "settings.json"))).not.toContain("skillfleet");
+      expect(readlinkSync(join(alt, "skills", "tool")).startsWith(m.stateDir + "/")).toBe(true);
+      expect(existsSync(join(alt, "skills", ".skillfleet-manifest.json"))).toBe(false);
+    },
+  );
 
   it("fleet upgrade from a controller with the old install moves it, then the host", async () => {
     // The host: its own HOME, reached through a fake ssh that runs the command in its environment.

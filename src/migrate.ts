@@ -1,5 +1,5 @@
 // The move from fleetrc's old name (legacy.ts), done once per machine by the first command of the
-// new release that changes things (`init`, `sync`, `update`, `self-install`, a session hook). It
+// new release that changes things, or its first session hook (cli.ts `migrating`). It
 // keeps everything a sync relies on: state.json and the store (the merge bases of vendored skills),
 // the links in agents' folders and their records, the session hooks in their slots, and the timer.
 import {
@@ -233,7 +233,9 @@ export async function migrate(options: { dryRun?: boolean } = {}): Promise<Migra
     (isRecord(oldConfigRaw) && oldConfigRaw.timer === true);
   const lines = [`${LEGACY_NAME} is now fleetrc; moving this machine's install:`];
   const say = (line: string) => lines.push(`  ${line}`);
-  const agentEnv = adoptAgentEnv(join(hadState ? oldState : newState, "hook-env.json"));
+  // A move that stopped partway may have taken it to the new folder already.
+  const envFile = join(oldState, "hook-env.json");
+  const agentEnv = adoptAgentEnv(existsSync(envFile) ? envFile : join(newState, "hook-env.json"));
 
   if (options.dryRun) {
     try {

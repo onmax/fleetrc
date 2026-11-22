@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
@@ -6,7 +6,7 @@ import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { confine, personalSkillsDir, personalSource } from "./edits.ts";
 import { UserError } from "./errors.ts";
 import { dict, isRecord, lstat, moveDir, readJsonFile } from "./fs.ts";
-import { linkTarget, MANIFEST_FILE, removeLink } from "./linker.ts";
+import { linkTarget, readTargetManifest, removeLink } from "./linker.ts";
 import {
   defaultSourceId,
   editManifest,
@@ -270,7 +270,7 @@ export async function planInit(
         for (const name of entries(dir)) if (!provided.has(name)) kept.delete(name);
         continue;
       }
-      const ours = new Set(Object.keys(readOwnLinks(dir)));
+      const ours = new Set(Object.keys(readTargetManifest(dir).links));
       for (const name of entries(dir)) {
         const path = join(dir, name);
         const entry = lstat(path);
@@ -327,15 +327,6 @@ export async function planInit(
     };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
-  }
-}
-
-function readOwnLinks(dir: string): Record<string, unknown> {
-  try {
-    const raw: unknown = JSON.parse(readFileSync(join(dir, MANIFEST_FILE), "utf8"));
-    return isRecord(raw) && isRecord(raw.links) ? raw.links : {};
-  } catch {
-    return {};
   }
 }
 

@@ -1096,11 +1096,23 @@ async function hookCommand(action: string | undefined) {
   return changes.some((change) => change.error) ? 1 : 0;
 }
 
-async function fleetCommand(action: string | undefined) {
+/** Rejects a fleet action or flag that can't run, before main moves the old install for it. */
+function checkFleetArgs(action: string | undefined) {
   const initOnly = (["copy", "no-copy", "timer", "no-hooks", "force"] as const).filter(
     (name) => values[name],
   );
   if (action !== "init" && initOnly.length > 0) usage(`only fleet init takes --${initOnly[0]}`);
+  if (!["sync", "status", "upgrade", "init", "add"].includes(action ?? ""))
+    usage("fleet takes sync, status, upgrade, init or add");
+  if (dryRun && (action === "status" || action === "upgrade"))
+    usageError(
+      action === "status"
+        ? "fleet status changes nothing, so it has no --dry-run"
+        : "fleet upgrade has no --dry-run; `fleetrc fleet status` shows each host's version",
+    );
+}
+
+async function fleetCommand(action: "sync" | "status" | "upgrade" | "init" | "add") {
   if (action === "init") copyMode();
   const loaded = await loadManifest(manifestSpec(values.manifest), { offline: true });
   if (action === "add") {
@@ -1161,14 +1173,6 @@ async function fleetCommand(action: string | undefined) {
     return 0;
   }
   if (action === "init") return fleetInit(loaded);
-  if (action !== "sync" && action !== "status" && action !== "upgrade")
-    return usage("fleet takes sync, status, upgrade, init or add");
-  if (dryRun && action !== "sync")
-    usageError(
-      action === "status"
-        ? "fleet status changes nothing, so it has no --dry-run"
-        : "fleet upgrade has no --dry-run; `fleetrc fleet status` shows each host's version",
-    );
   const entries = rest.length > 1 ? rest.slice(1) : loaded.root.fleet;
   if (entries.length === 0) usage("the manifest has no fleet; add hosts with `fleetrc fleet add`");
   const bad = entries.filter(isTag).flatMap((entry) => tagProblem(entry) ?? []);
@@ -1400,11 +1404,15 @@ async function merge() {
 }
 
 /**
- * The commands that move the old name's install to fleetrc's names first (migrate.ts): those that
- * change things, and every fleet action but status, so `fleet upgrade` can start the rollout from a
- * machine that has only the old install.
+ * Whether `command` moves the old name's install to fleetrc's names first (migrate.ts): every one
+ * that changes things, so none writes a new install beside the old one, and every fleet action but
+ * status, so `fleet upgrade` can start the rollout from a machine that has only the old install.
+ * `timer status` only reads, and a session hook moves it itself (hook.ts).
  */
-const MIGRATING = new Set(["sync", "update", "init", "self-install", "fleet"]);
+const migrating = (command: string, action: string | undefined) =>
+  !READ_ONLY.has(command) &&
+  !(command === "hook" && action !== "install" && action !== "remove") &&
+  !((command === "fleet" || command === "timer") && action === "status");
 
 async function main(): Promise<number> {
   if (values.version) {
@@ -1438,12 +1446,9 @@ async function main(): Promise<number> {
             ? `${command} changes nothing, so it has no --dry-run`
             : `${command} has no --dry-run`,
       );
+  if (command === "fleet") checkFleetArgs(rest[0]);
   // The first command of this release that changes things moves the old name's install, once.
-  if (
-    MIGRATING.has(command) &&
-    !(command === "fleet" && rest[0] === "status") &&
-    migrationNeeded(stateDir())
-  ) {
+  if (migrating(command, rest[0]) && migrationNeeded(stateDir())) {
     const { migrate } = await import("./migrate.ts");
     say(...(await migrate({ dryRun })).lines);
   }
@@ -1495,7 +1500,7 @@ async function main(): Promise<number> {
     case "timer":
       return timer(rest[0]);
     case "fleet":
-      return fleetCommand(rest[0]);
+      return fleetCommand(rest[0] as Parameters<typeof fleetCommand>[0]);
     case "hook":
       return hookCommand(rest[0]);
     case "self-install": {
