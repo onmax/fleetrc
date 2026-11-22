@@ -1089,6 +1089,15 @@ function windowsNames(source: Source, refused: readonly Refusal[], warnings: str
       );
 }
 
+/**
+ * Whether a source with no skills to discover still has files to reconcile: it gives files, or it
+ * gave only files before and the manifest has just dropped them, which unlinks them.
+ */
+const filesOnly = (source: VendoredSource, state: SourceState) =>
+  !!source.files ||
+  (Object.keys(state.skills).length === 0 &&
+    Object.values(state.files ?? {}).some((kind) => Object.keys(kind?.items ?? {}).length > 0));
+
 /** A source with no skills to discover, for one that gives only files. */
 const noSkills = (dir: string): SkillSource => ({
   source: { input: dir, type: "local", url: dir },
@@ -1122,7 +1131,7 @@ async function openVendored(
           // specific empty discovery result.
           if (
             !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
-            (!source.files &&
+            (!filesOnly(source, state) &&
               (!source.skills || linkedFolders(source, clone.dir, [], []).length === 0))
           )
             throw error;
@@ -1155,7 +1164,8 @@ async function openVendored(
       });
       return {
         handle: await discover(pkg.dir, source.skills).catch((error: unknown): SkillSource => {
-          if (!source.files || !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS")) throw error;
+          if (!filesOnly(source, state) || !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS"))
+            throw error;
           return noSkills(pkg.dir);
         }),
         version: pkg.version,

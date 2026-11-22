@@ -184,6 +184,24 @@ describe.each(KINDS)("$key for $agent", (kind) => {
     expect(report.files.total).toBe(0);
   });
 
+  it("is removed when the manifest drops the only thing a source without skills gave", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { [kind.file]: lines("one", "two", "three") });
+    const write = (fields: object) =>
+      m.manifest({
+        agents: [kind.agent],
+        sources: [{ id: "vendor", git: vendor.url, ...fields }],
+      });
+    const init = await m.json<{ sync: Report }>("init", write(spec(kind)), "--no-hooks");
+    expect(init.sync.ok, JSON.stringify(init.sync.errors)).toBe(true);
+    expect(existsSync(m.at(kind.at))).toBe(true);
+    write({});
+    const report = await m.json<Report>("sync");
+    expect(report.ok, JSON.stringify(report.errors)).toBe(true);
+    expect(report.files.removed).toEqual([m.at(kind.at)]);
+    expect(existsSync(m.at(kind.at))).toBe(false);
+  });
+
   it("keeps a local edit and holds the upstream change", async () => {
     const { m, vendor } = await vendored(kind);
     const local = lines("one", "TWO (mine)", "three");
