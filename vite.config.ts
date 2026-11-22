@@ -82,7 +82,7 @@ export default defineConfig({
     testTimeout: 120_000,
     hookTimeout: 120_000,
     // On shared CI runners a test that races a detached sync, a timeout or a filesystem watcher
-    // can lose to a slow disk now and then. Each test sets up its own machine, so a retry is clean.
+    // can lose to a slow disk now and then. A retry sets up a new machine in a fresh temp folder.
     retry: process.env.CI ? 2 : 0,
   },
   staged: {
