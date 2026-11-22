@@ -34,7 +34,14 @@ import {
 } from "./entries.ts";
 import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
-import { type FileEntry, findFileItems, itemName, itemPath, treeLister } from "./files.ts";
+import {
+  type FileEntry,
+  findFileItems,
+  itemName,
+  itemPath,
+  pathsLister,
+  treeLister,
+} from "./files.ts";
 import { dict, isRecord, listFiles, lstat } from "./fs.ts";
 import {
   CLAUDE_PLUGIN_NAME,
@@ -160,6 +167,7 @@ function collect(
     for (const entry of source.files) {
       const at = `${source.id}: ${entry.path}`;
       if (entry.kind === "mcp") {
+        if (!entry.agents.some(({ agent }) => agent === "*")) continue;
         if (entry.text === undefined) {
           defs.warnings.push(`${at} could not be read, so its MCP servers stay as last synced`);
           freezeMcp(source.id);
@@ -336,16 +344,20 @@ export function syncEntries(
       report.errors.push(`${tildify(cell.file())}: ${message(error)}`);
     }
   }
-  const steps: [HookDefAgent, () => void][] = [
-    ["claude-code", () => claudePlugin(chosen.has("claude-code"), defs, ledger, dryRun)],
-    ["codex", () => codexHooks(chosen.has("codex"), defs, ledger, dryRun)],
-    ["grok", () => grokHooks(chosen.has("grok"), defs, ledger, dryRun)],
-    ["gemini-cli", () => markedHooks("gemini-cli", chosen.has("gemini-cli"), defs, ledger, dryRun)],
-    ["cursor", () => markedHooks("cursor", chosen.has("cursor"), defs, ledger, dryRun)],
+  const otherHooks = dict(Object.entries(state.otherHookEntries ?? {}));
+  const steps: [HookDefAgent, (active: Ledger) => void][] = [
+    ["claude-code", (active) => claudePlugin(chosen.has("claude-code"), defs, active, dryRun)],
+    ["codex", (active) => codexHooks(chosen.has("codex"), defs, active, dryRun)],
+    ["grok", (active) => grokHooks(chosen.has("grok"), defs, active, dryRun)],
+    [
+      "gemini-cli",
+      (active) => markedHooks("gemini-cli", chosen.has("gemini-cli"), defs, active, dryRun),
+    ],
+    ["cursor", (active) => markedHooks("cursor", chosen.has("cursor"), defs, active, dryRun)],
   ];
   for (const [agent, step] of steps)
     try {
-      step();
+      syncHookProfile(agent, ledger, otherHooks, step);
     } catch (error) {
       report.errors.push(`${agent} hooks: ${message(error)}`);
     }
@@ -356,10 +368,54 @@ export function syncEntries(
   if (!dryRun) {
     if (Object.keys(otherMcpEntries).length > 0) state.otherMcpEntries = otherMcpEntries;
     else delete state.otherMcpEntries;
+    if (Object.keys(otherHooks).length > 0) state.otherHookEntries = otherHooks;
+    else delete state.otherHookEntries;
     if (report.total > 0) state.entries = ledger.next;
     else delete state.entries;
   }
   return report;
+}
+
+function syncHookProfile(
+  agent: HookDefAgent,
+  ledger: Ledger,
+  inactive: NonNullable<State["otherHookEntries"]>,
+  sync: (active: Ledger) => void,
+) {
+  const cell = AGENT_KINDS[agent]?.agentHooks;
+  const prefix = `agentHooks/${agent}/`;
+  const dir =
+    agent === "claude-code"
+      ? join(claudeHome(), "skills", CLAUDE_PLUGIN_NAME)
+      : cell?.style === "files"
+        ? cell.dir()
+        : undefined;
+  const file = cell?.style === "file" || cell?.style === "entries" ? cell.file() : undefined;
+  const active = dict<OwnedEntry>();
+  const matches = (id: string, record: OwnedEntry) =>
+    record.file === (dir ? join(dir, ...id.slice(prefix.length).split("/")) : file);
+  for (const [path, records] of Object.entries(inactive)) {
+    const rest = dict(Object.entries(records));
+    for (const [id, record] of Object.entries(records)) {
+      if (!id.startsWith(prefix) || !matches(id, record)) continue;
+      active[id] = record;
+      delete rest[id];
+    }
+    if (Object.keys(rest).length > 0) inactive[path] = rest;
+    else delete inactive[path];
+  }
+  for (const id of ledger.ids(prefix)) {
+    const record = ledger.records[id]!;
+    if (matches(id, record)) active[id] = record;
+    else (inactive[record.file] ??= dict())[id] = record;
+    delete ledger.next[id];
+  }
+  const profile = new Ledger(active, ledger.report);
+  try {
+    sync(profile);
+  } finally {
+    Object.assign(ledger.next, profile.next);
+  }
 }
 
 /** The servers `agent` gets, in its own shape. */
@@ -720,19 +776,49 @@ function claudePlugin(chosen: boolean, defs: Definitions, ledger: Ledger, dryRun
 
 /** The groups each owner has under each event, in file order. */
 function ownedGroups(root: Record<string, unknown> | undefined) {
-  const owned = new Map<string, unknown[]>();
+  const owned = new Map<string, { index: number; group: unknown }[]>();
   const hooks = root?.hooks;
   if (!isRecord(hooks)) return owned;
   for (const [event, groups] of Object.entries(hooks)) {
     if (!Array.isArray(groups)) continue;
-    for (const group of groups) {
+    for (const [index, group] of groups.entries()) {
       const owner = isRecord(group) ? group[HOOK_MARK] : undefined;
       if (typeof owner !== "string" || owner === "") continue;
       const key = `${owner}/${event}`;
-      owned.set(key, [...(owned.get(key) ?? []), group]);
+      if (!owned.has(key)) owned.set(key, []);
+      owned.get(key)!.push({ index, group });
     }
   }
   return owned;
+}
+
+function matchCodexGroups(
+  existing: { index: number; group: unknown }[],
+  records: (OwnedEntry | undefined)[],
+) {
+  const byHash = new Map<string, number[]>();
+  for (const [ordinal, record] of records.entries()) {
+    if (!record) continue;
+    if (!byHash.has(record.hash)) byHash.set(record.hash, []);
+    byHash.get(record.hash)!.push(ordinal);
+  }
+  const matches = new Map<number, number>();
+  const used = new Set<number>();
+  const assign = (index: number, ordinal: number) => {
+    matches.set(index, ordinal);
+    used.add(ordinal);
+  };
+  for (const { index, group } of existing) {
+    const ordinal = byHash.get(hashValue(group))?.shift();
+    if (ordinal !== undefined) assign(index, ordinal);
+  }
+  let vacant = 0;
+  for (const [ordinal, { index }] of existing.entries()) {
+    if (matches.has(index)) continue;
+    while (used.has(vacant)) vacant++;
+    assign(index, used.has(ordinal) ? vacant : ordinal);
+  }
+  return matches;
 }
 
 /**
@@ -765,9 +851,23 @@ function codexHooks(chosen: boolean, defs: Definitions, ledger: Ledger, dryRun: 
       for (const [name, events] of Object.entries(definitions))
         for (const event of Object.keys(events)) keys.add(`${name}/${event}`);
       const desired = dict<HookEvents>();
+      const ordinals = new Map<string, Map<number, number>>();
       for (const key of [...keys].sort()) {
         const [name, event] = key.split("/") as [string, string];
-        const have = owned.get(key) ?? [];
+        const existing = owned.get(key) ?? [];
+        const count = recorded.get(key) ?? 0;
+        const records = Array.from({ length: count }, (_, ordinal) =>
+          ledger.record(`${prefix}${key}/${ordinal}`, file),
+        );
+        const matches = matchCodexGroups(existing, records);
+        if (!ordinals.has(event)) ordinals.set(event, new Map());
+        const slots = ordinals.get(event)!;
+        const have: unknown[] = [];
+        for (const { index, group } of existing) {
+          const ordinal = matches.get(index)!;
+          slots.set(index, ordinal);
+          have[ordinal] = group;
+        }
         // A definition whose source did not sync keeps its groups as they are.
         if (frozen.has(name) && !Object.hasOwn(definitions, name)) {
           if (have.length > 0) (desired[name] ??= dict())[event] = have as never;
@@ -777,51 +877,28 @@ function codexHooks(chosen: boolean, defs: Definitions, ledger: Ledger, dryRun: 
           [HOOK_MARK]: name,
           ...group,
         }));
-        const count = Math.max(want.length, have.length, recorded.get(key) ?? 0);
         const list: unknown[] = [];
-        const decisions: EntryDecision[] = [];
-        for (let nth = 0; nth < count; nth++) {
+        for (let nth = 0; nth < Math.max(want.length, have.length, count); nth++) {
           const id = `${prefix}${name}/${event}/${nth}`;
           const decision = decideEntry({
             file,
             key: `hooks.${event}`,
             current: have[nth],
-            record: ledger.record(id, file),
+            record: records[nth],
             desired: want[nth],
           });
-          decisions.push(decision);
+          done.push({ id, decision, source: name });
           if (writes(decision)) list[nth] = decision.value;
           else if (decision.action === "keep" || decision.action === "adopt") list[nth] = want[nth];
           // Edited, or marked as this definition's without a record: it stays as it is.
           else if (decision.action === "hold" || decision.action === "foreign")
             list[nth] = have[nth];
         }
-        // A group dropped before one that stays keeps its place, and its record.
-        const last = list.findLastIndex((group) => group !== undefined);
-        for (let nth = 0; nth <= last; nth++) {
-          const id = `${prefix}${name}/${event}/${nth}`;
-          if (list[nth] === undefined && have[nth] !== undefined) {
-            list[nth] = have[nth];
-            const record = ledger.record(id, file);
-            decisions[nth] = record
-              ? {
-                  action: "hold",
-                  record,
-                  current: have[nth],
-                  currentHash: record.hash,
-                  desired: undefined,
-                }
-              : { action: "foreign", record: undefined };
-          }
-        }
-        decisions.forEach((decision, nth) =>
-          done.push({ id: `${prefix}${name}/${event}/${nth}`, decision, source: name }),
-        );
-        if (last >= 0) (desired[name] ??= dict())[event] = list.slice(0, last + 1) as never;
+        if (list.length > 0) (desired[name] ??= dict())[event] = list as never;
       }
       let next;
       try {
-        next = codexHooksWith(root, desired);
+        next = codexHooksWith(root, desired, ordinals);
       } catch (error) {
         if (!(error instanceof HookFileError)) throw error;
         refused = `${tildify(file)}: ${error.message}`;
@@ -1115,16 +1192,14 @@ function offlineSources(sources: readonly Source[], state: State): EntrySource[]
     const add = (path: string, file: string) =>
       files.push({ kind: "mcp", path, file, agents: [{ agent: "*" }], text: readText(file) });
     if (isVendored(source)) {
-      for (const name of Object.keys(state.sources[source.id]?.files?.mcp?.items ?? {}))
+      const records = state.sources[source.id]?.files?.mcp;
+      const selected = Object.keys(records?.items ?? {})
+        .filter((name) => !records?.selected || records.selected[name]?.includes("*"))
+        .map(itemPath);
+      for (const path of findFileItems(source, "mcp", pathsLister(selected), []).keys())
         add(
-          itemPath(name),
-          join(
-            paths.store(source.id),
-            "mcp",
-            "live",
-            itemName(itemPath(name)),
-            posix.basename(itemPath(name)),
-          ),
+          path,
+          join(paths.store(source.id), "mcp", "live", itemName(path), posix.basename(path)),
         );
     } else {
       const root = source.kind === "clone" ? source.path : source.local;

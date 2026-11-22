@@ -390,6 +390,8 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
     const rejected = await sync();
     expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
     expect(JSON.parse(read(config))).toMatchObject({ manifest: saved });
+    const override = await m.run("sync", "--manifest", `${team.https}//${newPath}`);
+    expect(override.code, override.stdout + override.stderr).toBe(1);
     const offline = await m.run("sync", "--offline");
     expect(offline.code, offline.stdout + offline.stderr).toBe(0);
     expect(existsSync(m.at(".claude/skills/updated-tailnet"))).toBe(true);
@@ -408,6 +410,54 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
     expect(existsSync(m.at(".claude/skills/from-tailnet"))).toBe(false);
     const migratedOffline = await m.run("sync", "--offline");
     expect(migratedOffline.code, migratedOffline.stdout + migratedOffline.stderr).toBe(0);
+  });
+
+  it("keeps an old-place manifest saved over SSH readable offline when the tailnet policy names its repository over HTTPS", async () => {
+    const m = machine();
+    const vendor = remote(m, "home-skills", skills("skills/", "from-tailnet"));
+    const team = remote(m, "home", {
+      ".skillfleet/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "home", git: vendor.https }],
+      }),
+    });
+    const ssh = "git@github.com:example/home.git";
+    const https = "https://github.com/example/home";
+    m.git(m.root, "config", "--global", `url.${team.served}.insteadOf`, ssh);
+    m.git(m.root, "config", "--global", "--add", `url.${team.served}.insteadOf`, https);
+    const saved = `${ssh}//.skillfleet/manifest.json`;
+    const first = await m.run("init", saved, "--no-hooks");
+    expect(first.code, first.stdout + first.stderr).toBe(0);
+    const config = m.at(".config/fleetrc/config.json");
+    writeFileSync(config, JSON.stringify({ manifest: saved, tailscale: true }));
+    const dir = join(m.root, "tailscale");
+    mkdirSync(dir);
+    writeFileSync(
+      join(dir, "status.json"),
+      JSON.stringify({
+        BackendState: "Running",
+        Self: { CapMap: { "github.com/onmax/fleetrc": [{ manifest: https }] } },
+      }),
+    );
+    writeFileSync(
+      join(dir, "tailscale.mjs"),
+      `process.stdout.write((await import("node:fs")).readFileSync(${JSON.stringify(join(dir, "status.json"))}, "utf8"));`,
+    );
+
+    const updated = remote(m, "updated-skills", skills("skills/", "updated-tailnet"));
+    team.commit({
+      ".skillfleet/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "updated", git: updated.https }],
+      }),
+    });
+    const run = await m.runWith({ env: { FLEETRC_TAILSCALE: join(dir, "tailscale.mjs") } }, "sync");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(JSON.parse(read(config))).toMatchObject({ manifest: saved });
+    const offline = await m.run("sync", "--offline");
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    expect(existsSync(m.at(".claude/skills/updated-tailnet"))).toBe(true);
+    expect(existsSync(m.at(".claude/skills/from-tailnet"))).toBe(false);
   });
 
   it("reads a folder's old .skillfleet/manifest.json, and gives manifest hooks the old variables too, each with a warning", async () => {

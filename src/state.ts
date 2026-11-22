@@ -102,6 +102,7 @@ export interface State {
   entries?: Record<string, OwnedEntry>;
   /** MCP records outside the current config file, grouped by file and then entry id. */
   otherMcpEntries?: Record<string, Record<string, OwnedEntry>>;
+  otherHookEntries?: Record<string, Record<string, OwnedEntry>>;
 }
 
 /** An entry fleetrc wrote, and the source it came from. */
@@ -183,6 +184,13 @@ export function loadState(warnings?: string[]): State {
     ...(isRecord(raw.otherMcpEntries)
       ? {
           otherMcpEntries: records(raw.otherMcpEntries, (value) =>
+            isRecord(value) ? records(value, ownedEntry) : undefined,
+          ),
+        }
+      : {}),
+    ...(isRecord(raw.otherHookEntries)
+      ? {
+          otherHookEntries: records(raw.otherHookEntries, (value) =>
             isRecord(value) ? records(value, ownedEntry) : undefined,
           ),
         }

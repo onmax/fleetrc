@@ -367,6 +367,47 @@ describe("hooks", () => {
     expect((await m.run("status")).stdout).toContain("approve in /hooks");
   });
 
+  it("Codex: restores a deleted first group without moving the survivors", async () => {
+    const { m, defs } = await setup(named("codex"));
+    const first = { hooks: [{ type: "command", command: "echo first" }] };
+    const second = { matcher: "Edit", hooks: [{ type: "command", command: "echo second" }] };
+    const mine = { matcher: "Bash", hooks: [{ type: "command", command: "echo mine" }] };
+    writeFileSync(
+      join(defs, "hooks.json"),
+      JSON.stringify({ hooks: { PreToolUse: [first, second] } }),
+    );
+    await sync(m);
+    const markedFirst = { fleetrc: "defs", ...first };
+    const markedSecond = { fleetrc: "defs", ...second };
+    const file = m.at(".codex", "hooks.json");
+    writeFileSync(file, JSON.stringify({ hooks: { PreToolUse: [markedSecond, mine] } }));
+    const restored = await sync(m);
+    expect(restored.entries.added).toEqual(["agentHooks/codex/defs/PreToolUse/0"]);
+    expect(restored.entries.held).toEqual([]);
+    expect(JSON.parse(read(file)).hooks.PreToolUse).toEqual([markedSecond, mine, markedFirst]);
+    expect((await sync(m)).entries.added).toEqual([]);
+    expect(JSON.parse(read(file)).hooks.PreToolUse).toEqual([markedSecond, mine, markedFirst]);
+  });
+
+  it("Codex: reconciles hook ownership independently in each home", async () => {
+    const { m, write } = await setup(named("codex"));
+    const first = m.at(".codex", "hooks.json");
+    const secondHome = m.at(".codex-other");
+    const second = join(secondHome, "hooks.json");
+    const otherSync = async () => {
+      const run = await m.runWith({ env: { CODEX_HOME: secondHome } }, "sync");
+      expect(run.code, run.stdout + run.stderr).toBe(0);
+    };
+    await otherSync();
+    const other = read(second);
+    write({});
+    expect((await sync(m)).entries.removed).toEqual(["agentHooks/codex/defs/PreToolUse/0"]);
+    expect(JSON.parse(read(first))).toEqual({ hooks: {} });
+    expect(read(second)).toBe(other);
+    await otherSync();
+    expect(JSON.parse(read(second))).toEqual({ hooks: {} });
+  });
+
   it("Codex: a definition losing a group leaves no gap before the user's", async () => {
     const m = machine();
     const defs = join(m.root, "defs");

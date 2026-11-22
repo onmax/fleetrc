@@ -482,21 +482,25 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       policy.spec !== savedSpec && !dryRun
         ? await stagePolicyManifest(policy.spec, savedSpec)
         : undefined;
-    const loaded =
+    let loaded =
       options.loaded ??
       candidate?.loaded ??
       (await loadManifest(policy.spec, {
         offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
       }));
+    // The repository has no manifest at the new default place yet, so the policy's spec loaded the
+    // one this machine already reads. Keep the saved spec, and read it through its own checkout,
+    // which is the one later offline syncs and one-off `--manifest` reads use.
+    const unmoved =
+      policy.legacyPath !== undefined &&
+      checkedOutPath(DEFAULT_MANIFEST, loaded.root.file) === policy.legacyPath;
+    if (unmoved && candidate) loaded = await loadManifest(savedSpec);
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
-    const spec =
-      policy.legacyPath && checkedOutPath(DEFAULT_MANIFEST, loaded.root.file) === policy.legacyPath
-        ? savedSpec
-        : policy.spec;
-    candidate?.accept(spec);
+    const spec = unmoved ? savedSpec : policy.spec;
     if (spec !== savedSpec) {
+      candidate?.accept();
       if (candidate) writeConfig({ manifest: spec });
       warnings.push(`the tailnet policy now names the manifest ${spec}, not ${savedSpec}`);
     }

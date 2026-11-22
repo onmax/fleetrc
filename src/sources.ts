@@ -2613,7 +2613,9 @@ function vendoredFiles(
     const selected = () =>
       findFileItems(source, kind, pathsLister(Object.keys(view.skills).map(itemPath)), []);
     const approved =
-      source.update === "review" ? approvedTargets(source, kind, records, ctx) : undefined;
+      source.update === "review" || kind === "mcp"
+        ? approvedTargets(source, kind, records, ctx)
+        : undefined;
     const retained = source.update === "review" && !approved ? selected() : approved;
     const list = root ? treeLister(root) : undefined;
     const found = list ? findFileItems(source, kind, list, sub.warnings) : (retained ?? selected());
@@ -2692,7 +2694,7 @@ function vendoredFiles(
       });
     }
     if (root && !ctx.dryRun) {
-      if (retained) records.selected = selectedAgents;
+      if (retained || kind === "mcp") records.selected = selectedAgents;
       else delete records.selected;
       if (approved && kind === "instructions") {
         records.instructionGlobs = source.files?.instructions ?? dict();

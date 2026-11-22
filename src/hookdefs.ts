@@ -589,7 +589,11 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
  * `current` is the parsed file, or undefined when there is none. Throws `HookFileError` when it
  * isn't a hooks file.
  */
-export function codexHooksWith(current: unknown, desired: Record<string, HookEvents>): CodexHooks {
+export function codexHooksWith(
+  current: unknown,
+  desired: Record<string, HookEvents>,
+  ordinals?: ReadonlyMap<string, ReadonlyMap<number, number>>,
+): CodexHooks {
   if (
     current !== undefined &&
     (!isRecord(current) || (current.hooks !== undefined && !isRecord(current.hooks)))
@@ -614,12 +618,14 @@ export function codexHooksWith(current: unknown, desired: Record<string, HookEve
         (desired[name]![event] ?? []).map((group) => ({ [HOOK_MARK]: name, ...group })),
       ]),
     );
-    const seen = new Map<string, number>();
+    const seen = new Map<string, Set<number>>();
     groups.forEach((group, index) => {
       const owner = ownerOf(group);
       if (owner === undefined) return;
-      const nth = seen.get(owner) ?? 0;
-      seen.set(owner, nth + 1);
+      if (!seen.has(owner)) seen.set(owner, new Set());
+      const used = seen.get(owner)!;
+      const nth = ordinals?.get(event)?.get(index) ?? used.size;
+      used.add(nth);
       const next = wanted.get(owner)?.[nth];
       if (next === undefined) groups[index] = placeholder();
       else if (!same(group, next)) {
@@ -630,7 +636,8 @@ export function codexHooksWith(current: unknown, desired: Record<string, HookEve
     for (const [name, list] of wanted) {
       // A new group goes after the definition's last one, so its groups keep their order.
       let after = groups.findLastIndex((group) => ownerOf(group) === name);
-      for (const group of list.slice(seen.get(name) ?? 0)) {
+      for (const [nth, group] of list.entries()) {
+        if (!group || seen.get(name)?.has(nth)) continue;
         let index = groups.findIndex((slot, i) => i > after && isPlaceholder(slot));
         if (index === -1) index = groups.push(group) - 1;
         else groups[index] = group;

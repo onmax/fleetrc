@@ -623,6 +623,30 @@ describe("MCP servers", () => {
     expect(existsSync(m.at(".claude", ".claude.json"))).toBe(false);
   });
 
+  it("prunes a dropped MCP definition without using its retained local edits", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", {
+      ...skills("skills/", "tool"),
+      "mcp.json": mcpFile({ docs: docs() }),
+    });
+    const source = { id: "vendor", git: vendor.url };
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ ...source, mcp: "mcp.json" }],
+    });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const live = join(m.stateDir, "store", "vendor", "mcp", "live", "mcp.json", "mcp.json");
+    const edited = mcpFile({ docs: docs("2") });
+    writeFileSync(live, edited);
+    m.manifest({ agents: ["claude-code"], sources: [source] });
+    const report = await sync(m);
+    expect(report.entries.removed).toEqual(["mcp/claude-code/docs"]);
+    expect(read(live)).toBe(edited);
+    const diff = await m.run("diff", "mcp/claude-code/docs");
+    expect(diff.code).toBe(1);
+    expect(diff.stderr).toContain("nor the manifest has it");
+  });
+
   it("a review-mode source holds a changed mcp file until `update`", async () => {
     const m = machine();
     const vendor = remote(m, "vendor", {
