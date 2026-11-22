@@ -1091,12 +1091,15 @@ function windowsNames(source: Source, refused: readonly Refusal[], warnings: str
 
 /**
  * Whether a source with no skills to discover still has files to reconcile: it gives files, or it
- * gave only files before and the manifest has just dropped them, which unlinks them.
+ * gave only files before (linked or pending review) and the manifest has just dropped them, which
+ * unlinks them or drops the pending change.
  */
 const filesOnly = (source: VendoredSource, state: SourceState) =>
   !!source.files ||
   (Object.keys(state.skills).length === 0 &&
-    Object.values(state.files ?? {}).some((kind) => Object.keys(kind?.items ?? {}).length > 0));
+    Object.values(state.files ?? {}).some(
+      (kind) => !!kind && Object.keys(kind.items).length + Object.keys(kind.pending).length > 0,
+    ));
 
 /** A source with no skills to discover, for one that gives only files. */
 const noSkills = (dir: string): SkillSource => ({

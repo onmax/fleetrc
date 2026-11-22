@@ -363,6 +363,25 @@ describe("files across sources", () => {
     expect(existsSync(destination)).toBe(false);
   });
 
+  it("drops a pending instruction when the manifest drops the only thing its source gave", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "A.md": "a\n", "B.md": "b\n" });
+    const write = (fields: object) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, update: "review", ...fields }],
+      });
+    await m.json("init", write({ instructions: "A.md" }), "--no-hooks");
+    write({ instructions: "B.md" });
+    const pending = await m.json<Report>("sync");
+    expect(pending.pending.map((entry) => entry.skill)).toEqual(["instructions/B.md"]);
+    write({});
+    const report = await m.json<Report>("sync");
+    expect(report.ok, JSON.stringify(report.errors)).toBe(true);
+    expect(report.pending).toEqual([]);
+    expect(existsSync(m.at(".claude/CLAUDE.md"))).toBe(false);
+  });
+
   it("keeps the approved instruction through a pending upstream rename", async () => {
     const m = machine();
     const vendor = remote(m, "vendor", { "docs/team.md": "approved\n" });
