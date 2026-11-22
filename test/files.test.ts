@@ -720,6 +720,17 @@ describe("files across sources", () => {
     expect((await m.run("diff", "subagents/.claude/agents/reviewer.md")).code).toBe(0);
   });
 
+  it("does not take files from git's own folder", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "README.md": "vendor\n" });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", local: vendor.work, subagents: ".git/info/*" }],
+    });
+    await m.run("init", manifest, "--no-hooks");
+    expect(existsSync(m.at(".claude/agents/exclude"))).toBe(false);
+  });
+
   it.skipIf(isWindows).each(["clone", "git"])(
     "does not follow a linked folder above a glob's base in a %s source",
     async (kind) => {
@@ -745,6 +756,29 @@ describe("files across sources", () => {
       });
       await m.run("init", manifest, "--no-hooks");
       expect(existsSync(m.at(".claude/agents/reviewer.md"))).toBe(false);
+    },
+  );
+
+  it.skipIf(isWindows)(
+    "holds a review-mode removal when an approved file's folder becomes a link out of the source",
+    async () => {
+      const m = machine();
+      const vendor = remote(m, "vendor", { "agents/reviewer.md": "approved\n" });
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, update: "review", subagents: "agents/*.md" }],
+      });
+      await m.run("init", manifest, "--no-hooks");
+      const outside = join(m.root, "outside");
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(join(outside, "reviewer.md"), "outside\n");
+      rmSync(join(vendor.work, "agents"), { recursive: true });
+      symlinkSync(outside, join(vendor.work, "agents"));
+      m.git(vendor.work, "add", "-A");
+      m.git(vendor.work, "commit", "--quiet", "-m", "linked folder");
+      m.git(vendor.work, "push", "--quiet", "origin", "main");
+      await m.run("sync");
+      expect(read(m.at(".claude/agents/reviewer.md"))).toBe("approved\n");
     },
   );
 

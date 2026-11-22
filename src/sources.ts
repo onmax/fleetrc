@@ -49,7 +49,6 @@ import {
   itemName,
   itemPath,
   pathsLister,
-  sourcePathStat,
   targetPath,
   treeLister,
 } from "./files.ts";
@@ -2561,7 +2560,7 @@ function reviewFileRemovals(
   }
   const removals = new Map<string, FileTarget[]>();
   for (const [path, targets] of prior) {
-    if (sourcePathStat(join(root, ...path.split("/")))?.isFile()) continue;
+    if (list(path).includes(path)) continue;
     if (kind !== "instructions") {
       removals.set(path, targets);
       continue;

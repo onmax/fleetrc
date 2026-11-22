@@ -22,7 +22,7 @@ import { globBase, globFilter, GlobWorkLimitError } from "./glob.ts";
 import { type FileKind, isFileKind, ITEM_KINDS, type ItemKind, kindPath } from "./kinds.ts";
 import { errorText, linkTarget, samePath } from "./linker.ts";
 import type { Source } from "./manifest.ts";
-import { segmentProblem } from "./names.ts";
+import { nameKey, segmentProblem } from "./names.ts";
 import { tildify } from "./paths.ts";
 import type { FileLink, State } from "./state.ts";
 
@@ -167,14 +167,14 @@ export function findFileItems(
       warnings.push(error.message);
       continue;
     }
-    // A folder in the glob's base, such as `.claude`, may start with a dot.
+    // A folder in the glob's base, such as `.claude`, may start with a dot, but not be git's own.
     const fixed = base === "" ? 0 : base.split("/").length;
     found = found.filter((path) => {
       const problem =
         path
           .split("/")
           .map((segment, i) =>
-            i < fixed && segment.startsWith(".")
+            i < fixed && segment.startsWith(".") && nameKey(segment) !== ".git"
               ? segmentProblem(segment.slice(1))
               : segmentProblem(segment),
           )
