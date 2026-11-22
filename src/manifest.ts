@@ -747,13 +747,6 @@ function policyCacheRoot(spec: string, savedSpec?: string, base?: string): strin
   );
 }
 
-function policyCheckoutRoot(root: string): string {
-  const marker = readJsonOrNothing(join(root, "validated.json"));
-  const alias = isRecord(marker) ? marker.checkoutRoot : undefined;
-  if (typeof alias !== "string" || !/^[a-f0-9]{32}$/.test(alias)) return root;
-  return join(dirname(root), alias);
-}
-
 type CacheSlot = "a" | "b" | "flat" | "shared";
 
 function validatedSlots(root: string): Map<string, CacheSlot> {
@@ -804,7 +797,7 @@ function saveCheckoutSlots(root: string, slots: Map<string, CacheSlot>) {
 
 /** Validate separately, but keep each working checkout whose revision has not changed. */
 export async function stagePolicyManifest(spec: string, savedSpec: string) {
-  const root = policyCheckoutRoot(policyCacheRoot(spec, savedSpec));
+  const root = policyCacheRoot(spec, savedSpec);
   const active = validatedSlots(root);
   const slots = new Map(active);
   const saved = remoteManifest(savedSpec);
@@ -841,16 +834,7 @@ export async function stagePolicyManifest(spec: string, savedSpec: string) {
   });
   return {
     loaded,
-    accept: (acceptedSpec = spec) => {
-      saveCheckoutSlots(root, slots);
-      if (acceptedSpec === spec) return;
-      const acceptedRoot = policyCacheRoot(acceptedSpec, acceptedSpec);
-      if (policyCheckoutRoot(acceptedRoot) === root) return;
-      writeJson(join(acceptedRoot, "validated.json"), {
-        preferred: true,
-        checkoutRoot: basename(root),
-      });
-    },
+    accept: () => saveCheckoutSlots(root, slots),
   };
 }
 
@@ -859,8 +843,7 @@ export function manifestCheckoutRoute(spec: string, base?: string) {
   const savedSpec =
     isRecord(config) && typeof config.manifest === "string" ? config.manifest : undefined;
   const root = policyCacheRoot(spec, savedSpec, base);
-  const checkoutRoot = policyCheckoutRoot(root);
-  const slots = validatedSlots(checkoutRoot);
+  const slots = validatedSlots(root);
   const isolated =
     savedSpec !== undefined &&
     isRecord(config) &&
@@ -868,20 +851,14 @@ export function manifestCheckoutRoute(spec: string, base?: string) {
     !policyCacheRoots(savedSpec).includes(root);
   const fallback = slots.get("*") ?? (slots.size || isolated ? "a" : "shared");
   const checkout: typeof fetchClone = (url, ref, _cacheRoot, options) => {
-    const { slot, cacheUrl } = checkoutRoute(
-      checkoutUrls(url),
-      ref,
-      checkoutRoot,
-      slots,
-      fallback,
-    )!;
-    return fetchClone(url, ref, slotRoot(checkoutRoot, slot), { ...options, cacheUrl });
+    const { slot, cacheUrl } = checkoutRoute(checkoutUrls(url), ref, root, slots, fallback)!;
+    return fetchClone(url, ref, slotRoot(root, slot), { ...options, cacheUrl });
   };
   return {
     checkout,
     retain: () => {
       if (isolated && slots.size === 0 && remoteManifest(spec, base))
-        saveCheckoutSlots(checkoutRoot, new Map([["*", "a"]]));
+        saveCheckoutSlots(root, new Map([["*", "a"]]));
     },
   };
 }
