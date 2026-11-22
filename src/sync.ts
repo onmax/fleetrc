@@ -424,22 +424,26 @@ async function postToHub(hub: string, report: Report): Promise<string | undefine
 
 /**
  * `spec`, or on a machine that took its manifest from the tailnet, the one the tailnet policy names
- * now. When Tailscale can't say, use the saved spec. `legacyDefault` says the policy names a
- * repository alone while this machine reads that repository's manifest at the old name's default
- * place: the same manifest, unless the repository now has one at the new default place too.
+ * now. When Tailscale can't say, use the saved spec.
  */
 async function followTailnet(
   spec: string,
   warnings: string[],
-): Promise<{ spec: string; legacyDefault: boolean }> {
-  if (readConfig()?.tailscale !== true) return { spec, legacyDefault: false };
+): Promise<{ spec: string; legacyPath?: string }> {
+  if (readConfig()?.tailscale !== true) return { spec };
   const found = await tailnetManifestSpec();
   if ("error" in found) {
     warnings.push(`kept the manifest ${spec}: ${found.error}`);
-    return { spec, legacyDefault: false };
+    return { spec };
   }
-  const legacy = `${found.spec.slice(0, -DEFAULT_MANIFEST.length)}${LEGACY_MANIFEST_DIR}/manifest.json`;
-  return { spec: found.spec, legacyDefault: found.defaultPath && sameManifest(legacy, spec) };
+  // The policy names a repository alone, and this machine reads its manifest from the old name's
+  // default place: that is the same manifest, not a new one, until the repository moves it.
+  if (found.defaultPath) {
+    const legacyPath = `${LEGACY_MANIFEST_DIR}/manifest.json`;
+    const legacy = `${found.spec.slice(0, -DEFAULT_MANIFEST.length)}${legacyPath}`;
+    if (sameManifest(legacy, spec)) return { spec: found.spec, legacyPath };
+  }
+  return { spec: found.spec };
 }
 
 export async function sync(options: SyncOptions = {}): Promise<Report> {
@@ -466,34 +470,31 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   try {
     // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
     const savedSpec = options.loaded?.root.file ?? manifestSpec(options.manifest);
-    const followed =
+    const policy =
       options.loaded || options.manifest || offline
-        ? { spec: savedSpec, legacyDefault: false }
+        ? { spec: savedSpec }
         : await followTailnet(savedSpec, warnings);
-    let spec = followed.spec;
     const candidate =
-      spec !== savedSpec && !dryRun ? await stagePolicyManifest(spec, savedSpec) : undefined;
+      policy.spec !== savedSpec && !dryRun
+        ? await stagePolicyManifest(policy.spec, savedSpec)
+        : undefined;
     const loaded =
       options.loaded ??
       candidate?.loaded ??
-      (await loadManifest(spec, {
+      (await loadManifest(policy.spec, {
         offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
       }));
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
-    // The repository has no manifest at the new default place yet, so the policy's spec loaded the
-    // one this machine already reads: keep its saved spec until the repository moves it.
-    const unmoved =
-      followed.legacyDefault &&
-      checkedOutPath(DEFAULT_MANIFEST, loaded.root.file) !== DEFAULT_MANIFEST;
+    const spec =
+      policy.legacyPath && checkedOutPath(DEFAULT_MANIFEST, loaded.root.file) === policy.legacyPath
+        ? savedSpec
+        : policy.spec;
+    candidate?.accept(spec);
     if (spec !== savedSpec) {
-      candidate?.accept();
-      if (unmoved) spec = savedSpec;
-      else {
-        if (candidate) writeConfig({ manifest: spec });
-        warnings.push(`the tailnet policy now names the manifest ${spec}, not ${savedSpec}`);
-      }
+      if (candidate) writeConfig({ manifest: spec });
+      warnings.push(`the tailnet policy now names the manifest ${spec}, not ${savedSpec}`);
     }
     const stateFile = new StateFile(loadState(dryRun ? undefined : warnings));
     const state = stateFile.state;

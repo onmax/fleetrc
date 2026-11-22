@@ -367,24 +367,47 @@ describe.skipIf(isWindows)("the move from skillfleet", () => {
       "from-tailnet",
     ]);
 
-    // The repository adds the manifest at the new place and keeps the old one for older machines.
-    const moved = remote(m, "moved-skills", skills("skills/", "from-new-place"));
+    const sync = () =>
+      m.runWith({ env: { FLEETRC_TAILSCALE: join(dir, "tailscale.mjs") } }, "sync");
+    const legacyPath = ".skillfleet/manifest.json";
+    const newPath = ".fleetrc/manifest.json";
+    const updated = remote(m, "updated-skills", skills("skills/", "updated-tailnet"));
     team.commit({
-      ".fleetrc/manifest.json": JSON.stringify({
+      [legacyPath]: JSON.stringify({
         agents: ["claude-code"],
-        sources: [{ id: "moved", git: moved.https }],
+        sources: [{ id: "updated", git: updated.https }],
       }),
     });
-    const next = await m.runWith(
-      { env: { FLEETRC_TAILSCALE: join(dir, "tailscale.mjs") } },
-      "sync",
-    );
-    expect(next.code, next.stdout + next.stderr).toBe(0);
-    expect(next.stdout + next.stderr).toContain("the tailnet policy now names");
-    expect(JSON.parse(read(config)).manifest).toContain(".fleetrc/manifest.json");
-    expect(readdirSync(m.at(".claude/skills")).filter((name) => !name.startsWith("."))).toEqual([
-      "from-new-place",
-    ]);
+    const updatedRun = await sync();
+    expect(updatedRun.code, updatedRun.stdout + updatedRun.stderr).toBe(0);
+    expect(JSON.parse(read(config))).toMatchObject({ manifest: saved });
+    const updatedOffline = await m.run("sync", "--offline");
+    expect(updatedOffline.code, updatedOffline.stdout + updatedOffline.stderr).toBe(0);
+    expect(existsSync(m.at(".claude/skills/updated-tailnet"))).toBe(true);
+    expect(existsSync(m.at(".claude/skills/from-tailnet"))).toBe(false);
+
+    team.commit({ [legacyPath]: null, [newPath]: "{" });
+    const rejected = await sync();
+    expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
+    expect(JSON.parse(read(config))).toMatchObject({ manifest: saved });
+    const offline = await m.run("sync", "--offline");
+    expect(offline.code, offline.stdout + offline.stderr).toBe(0);
+    expect(existsSync(m.at(".claude/skills/updated-tailnet"))).toBe(true);
+
+    team.commit({
+      [legacyPath]: JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "home", git: vendor.https }],
+      }),
+      [newPath]: JSON.stringify({ agents: ["claude-code"], sources: [] }),
+    });
+    const migrated = await sync();
+    expect(migrated.code, migrated.stdout + migrated.stderr).toBe(0);
+    expect(JSON.parse(read(config))).toMatchObject({ manifest: `${team.https}//${newPath}` });
+    expect(existsSync(m.at(".claude/skills/updated-tailnet"))).toBe(false);
+    expect(existsSync(m.at(".claude/skills/from-tailnet"))).toBe(false);
+    const migratedOffline = await m.run("sync", "--offline");
+    expect(migratedOffline.code, migratedOffline.stdout + migratedOffline.stderr).toBe(0);
   });
 
   it("reads a folder's old .skillfleet/manifest.json, and gives manifest hooks the old variables too, each with a warning", async () => {
