@@ -48,6 +48,7 @@ import {
   readConfig,
   remoteManifest,
   stagePolicyManifest,
+  checkedOutPath,
   DEFAULT_MANIFEST,
   sameManifest,
   tailnetManifestSpec,
@@ -423,22 +424,22 @@ async function postToHub(hub: string, report: Report): Promise<string | undefine
 
 /**
  * `spec`, or on a machine that took its manifest from the tailnet, the one the tailnet policy names
- * now. When Tailscale can't say, use the saved spec.
+ * now. When Tailscale can't say, use the saved spec. `legacyDefault` says the policy names a
+ * repository alone while this machine reads that repository's manifest at the old name's default
+ * place: the same manifest, unless the repository now has one at the new default place too.
  */
-async function followTailnet(spec: string, warnings: string[]): Promise<string> {
-  if (readConfig()?.tailscale !== true) return spec;
+async function followTailnet(
+  spec: string,
+  warnings: string[],
+): Promise<{ spec: string; legacyDefault: boolean }> {
+  if (readConfig()?.tailscale !== true) return { spec, legacyDefault: false };
   const found = await tailnetManifestSpec();
   if ("error" in found) {
     warnings.push(`kept the manifest ${spec}: ${found.error}`);
-    return spec;
+    return { spec, legacyDefault: false };
   }
-  // The policy names a repository alone, and this machine reads its manifest from the old name's
-  // default place: that is the same manifest, not a new one, until the repository moves it.
-  if (found.defaultPath) {
-    const legacy = `${found.spec.slice(0, -DEFAULT_MANIFEST.length)}${LEGACY_MANIFEST_DIR}/manifest.json`;
-    if (sameManifest(legacy, spec)) return spec;
-  }
-  return found.spec;
+  const legacy = `${found.spec.slice(0, -DEFAULT_MANIFEST.length)}${LEGACY_MANIFEST_DIR}/manifest.json`;
+  return { spec: found.spec, legacyDefault: found.defaultPath && sameManifest(legacy, spec) };
 }
 
 export async function sync(options: SyncOptions = {}): Promise<Report> {
@@ -465,10 +466,11 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   try {
     // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
     const savedSpec = options.loaded?.root.file ?? manifestSpec(options.manifest);
-    const spec =
+    const followed =
       options.loaded || options.manifest || offline
-        ? savedSpec
+        ? { spec: savedSpec, legacyDefault: false }
         : await followTailnet(savedSpec, warnings);
+    let spec = followed.spec;
     const candidate =
       spec !== savedSpec && !dryRun ? await stagePolicyManifest(spec, savedSpec) : undefined;
     const loaded =
@@ -480,12 +482,18 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       }));
     if (options.only && !loaded.sources.some((source) => source.id === options.only))
       throw new ManifestError(`no source "${options.only}" in the manifest`);
+    // The repository has no manifest at the new default place yet, so the policy's spec loaded the
+    // one this machine already reads: keep its saved spec until the repository moves it.
+    const unmoved =
+      followed.legacyDefault &&
+      checkedOutPath(DEFAULT_MANIFEST, loaded.root.file) !== DEFAULT_MANIFEST;
     if (spec !== savedSpec) {
-      if (candidate) {
-        candidate.accept();
-        writeConfig({ manifest: spec });
+      candidate?.accept();
+      if (unmoved) spec = savedSpec;
+      else {
+        if (candidate) writeConfig({ manifest: spec });
+        warnings.push(`the tailnet policy now names the manifest ${spec}, not ${savedSpec}`);
       }
-      warnings.push(`the tailnet policy now names the manifest ${spec}, not ${savedSpec}`);
     }
     const stateFile = new StateFile(loadState(dryRun ? undefined : warnings));
     const state = stateFile.state;
