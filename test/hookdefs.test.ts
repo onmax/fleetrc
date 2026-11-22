@@ -86,12 +86,12 @@ describe("parseHookFile", () => {
       [
         "gemini-cli",
         hooksFile({ BeforeTool: [{ hooks: [{ command: "x" }] }] }),
-        `hooks.BeforeTool[0].hooks[0] has type undefined; use "command"`,
+        `hooks.BeforeTool[0].hooks[0] has a type that isn't one of "command"`,
       ],
       [
         "gemini-cli",
         hooksFile({ BeforeTool: [{ hooks: [{ ...command("x"), timeout: 0 }] }] }),
-        `give a number of milliseconds`,
+        `that isn't a number of milliseconds`,
       ],
       [
         "gemini-cli",
@@ -114,15 +114,15 @@ describe("parseHookFile", () => {
         `hooks.stop[0] has "hooks", which a "command" hook doesn't take here`,
       ],
       ["cursor", hooksFile({ stop: [{ matcher: "(" }] }), `needs "command", a non-empty string`],
-      ["cursor", hooksFile({ stop: [{ command: "x", matcher: "(" }] }), `which isn't a regex`],
+      ["cursor", hooksFile({ stop: [{ command: "x", matcher: "(" }] }), `that isn't a regex`],
       ["cursor", hooksFile({ stop: [{ type: "prompt", prompt: "p", model: "" }] }), `"model"`],
       [
         "cursor",
         hooksFile({ stop: [{ command: "x", loop_limit: 0 }] }),
-        `"loop_limit" 0; give a positive integer or null`,
+        `"loop_limit" that isn't a positive integer or null`,
       ],
       ["cursor", hooksFile({ stop: [{ command: "x", failClosed: 1 }] }), `"failClosed"`],
-      ["cursor", hooksFile({}, { version: "1" }), `has "version" "1"; give a positive integer`],
+      ["cursor", hooksFile({}, { version: "1" }), `has "version" that isn't a positive integer`],
       ["cursor", hooksFile({}, { description: "x" }), `cursor takes "hooks", "version"`],
     ];
     for (const [agent, text, message] of cases) {
@@ -159,12 +159,12 @@ describe("parseHookFile", () => {
       [
         "codex",
         hooksFile({ Stop: [{ hooks: [{ ...command("x"), timeout: 1.5 }] }] }),
-        `hooks.Stop[0].hooks[0] has "timeout" 1.5; give whole seconds`,
+        `hooks.Stop[0].hooks[0] has "timeout" that isn't whole seconds`,
       ],
       [
         "codex",
         hooksFile({ Stop: [{ hooks: [{ ...command("x"), onFailure: "fail" }] }] }),
-        `hooks.Stop[0].hooks[0] has "onFailure" "fail"; give "continue" or "block"`,
+        `hooks.Stop[0].hooks[0] has "onFailure" that isn't "continue" or "block"`,
       ],
       [
         "codex",
@@ -226,12 +226,12 @@ describe("parseHookFile", () => {
       [
         "claude-code",
         hooksFile({ Stop: [{ hooks: [{ type: "shell", command: "x" }] }] }),
-        `hooks.Stop[0].hooks[0] has type "shell"; use "command", "http", "mcp_tool", "prompt", "agent"`,
+        `hooks.Stop[0].hooks[0] has a type that isn't one of "command", "http", "mcp_tool", "prompt", "agent"`,
       ],
       [
         "codex",
         hooksFile({ Stop: [{ hooks: [{ type: "prompt", prompt: "x" }] }] }),
-        `has type "prompt"; use "command", "mcp_tool"`,
+        `has a type that isn't one of "command", "mcp_tool"`,
       ],
       [
         "codex",
@@ -246,12 +246,12 @@ describe("parseHookFile", () => {
       [
         "claude-code",
         hooksFile({ Stop: [{ hooks: [{ ...command("x"), timeout: "10" }] }] }),
-        `has "timeout" "10"; give a number of seconds`,
+        `has "timeout" that isn't a number of seconds`,
       ],
       [
         "claude-code",
         hooksFile({ Stop: [{ hooks: [{ ...command("x"), timeout: 0 }] }] }),
-        `has "timeout" 0`,
+        `has "timeout" that isn't a number of seconds`,
       ],
       [
         "claude-code",

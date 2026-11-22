@@ -178,11 +178,9 @@ const FORMATS: Record<HookDefAgent, Format> = {
         onFailure !== "continue" &&
         onFailure !== "block"
       )
-        throw new Error(
-          `${at} has "onFailure" ${JSON.stringify(onFailure)}; give "continue" or "block"`,
-        );
+        throw new Error(`${at} has "onFailure" that isn't "continue" or "block"`);
       if (timeout !== undefined && !Number.isSafeInteger(timeout))
-        throw new Error(`${at} has "timeout" ${JSON.stringify(timeout)}; give whole seconds`);
+        throw new Error(`${at} has "timeout" that isn't whole seconds`);
       if (background !== undefined && typeof background !== "boolean")
         throw new Error(`${at} has "async" that isn't true or false`);
       for (const field of ["commandWindows", "command_windows", "statusMessage"]) {
@@ -310,7 +308,7 @@ const FORMATS: Record<HookDefAgent, Format> = {
           try {
             new RegExp(matcher);
           } catch {
-            throw new Error(`${at} has "matcher" ${JSON.stringify(matcher)}, which isn't a regex`);
+            throw new Error(`${at} has "matcher" that isn't a regex`);
           }
       }
       if (model !== undefined && (typeof model !== "string" || model.trim() === ""))
@@ -322,9 +320,7 @@ const FORMATS: Record<HookDefAgent, Format> = {
         limit !== null &&
         !(Number.isInteger(limit) && (limit as number) > 0)
       )
-        throw new Error(
-          `${at} has "loop_limit" ${JSON.stringify(limit)}; give a positive integer or null`,
-        );
+        throw new Error(`${at} has "loop_limit" that isn't a positive integer or null`);
     },
   },
 };
@@ -358,9 +354,7 @@ function checkHandler(format: Format, handler: unknown, at: string): HookHandler
         : "";
   const fields = format.handlers[type];
   if (!fields)
-    throw new Error(
-      `${at} has type ${JSON.stringify(handler.type)}; use ${quoted(Object.keys(format.handlers))}`,
-    );
+    throw new Error(`${at} has a type that isn't one of ${quoted(Object.keys(format.handlers))}`);
   const unknown = Object.keys(handler).filter((key) => !fields.includes(key));
   if (unknown.length > 0)
     throw new Error(`${at} has ${quoted(unknown)}, which a "${type}" hook doesn't take here`);
@@ -376,7 +370,7 @@ function checkHandler(format: Format, handler: unknown, at: string): HookHandler
       (timeout === 0 && !format.zeroTimeout))
   )
     throw new Error(
-      `${at} has "timeout" ${JSON.stringify(timeout)}; give a number of ${format.timeoutUnit ?? "seconds"}`,
+      `${at} has "timeout" that isn't a number of ${format.timeoutUnit ?? "seconds"}`,
     );
   if (
     handler.args !== undefined &&
@@ -453,7 +447,7 @@ export function parseHookFile(
       json.version !== undefined &&
       !(Number.isInteger(json.version) && (json.version as number) >= 1)
     )
-      throw new Error(`has "version" ${JSON.stringify(json.version)}; give a positive integer`);
+      throw new Error(`has "version" that isn't a positive integer`);
     const events = dict<HookItem[]>();
     for (const [event, groups] of Object.entries(json.hooks)) {
       if (!format.events.includes(event))
