@@ -389,6 +389,37 @@ describe("hooks", () => {
     expect(JSON.parse(read(file)).hooks.PreToolUse).toEqual([markedSecond, mine, markedFirst]);
   });
 
+  it("Codex: keeps identical survivors in order after restoring a deleted predecessor", async () => {
+    const { m, defs } = await setup(named("codex"));
+    const group = (command: string) => ({ hooks: [{ type: "command", command }] });
+    const first = group("echo one");
+    const repeated = group("echo two");
+    const updated = group("echo three");
+    const write = (groups: ReturnType<typeof group>[]) =>
+      writeFileSync(join(defs, "hooks.json"), JSON.stringify({ hooks: { PreToolUse: groups } }));
+    const markedFirst = { fleetrc: "defs", ...first };
+    const markedRepeated = { fleetrc: "defs", ...repeated };
+    const file = m.at(".codex", "hooks.json");
+    write([first, repeated, repeated]);
+    await sync(m);
+    writeFileSync(
+      file,
+      JSON.stringify({ hooks: { PreToolUse: [markedRepeated, markedRepeated] } }),
+    );
+
+    const prefix = "agentHooks/codex/defs/PreToolUse";
+    expect((await sync(m)).entries.added).toEqual([`${prefix}/0`]);
+    expect(JSON.parse(read(file)).hooks.PreToolUse).toEqual([
+      markedRepeated,
+      markedRepeated,
+      markedFirst,
+    ]);
+    write([first, updated, repeated]);
+    expect((await sync(m)).entries.updated).toEqual([`${prefix}/1`]);
+    const expected = [{ fleetrc: "defs", ...updated }, markedRepeated, markedFirst];
+    expect(JSON.parse(read(file)).hooks.PreToolUse).toEqual(expected);
+  });
+
   it("Codex: keeps a local edit that matches an unchanged sibling", async () => {
     const { m, defs } = await setup(named("codex"));
     const group = (command: string) => ({ hooks: [{ type: "command", command }] });

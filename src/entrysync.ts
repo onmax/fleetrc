@@ -817,6 +817,20 @@ function matchCodexGroups(
     const ordinal = byHash.get(hashes[position]!)?.shift();
     if (ordinal !== undefined) assign(index, ordinal);
   }
+  const indicesByHash = new Map<string, number[]>();
+  for (const [position, { index }] of existing.entries()) {
+    if (!matches.has(index)) continue;
+    const hash = hashes[position]!;
+    if (!indicesByHash.has(hash)) indicesByHash.set(hash, []);
+    indicesByHash.get(hash)!.push(index);
+  }
+  for (const indices of indicesByHash.values()) {
+    if (indices.length < 2) continue;
+    const ordinals = indices
+      .map((index) => matches.get(index)!)
+      .sort((left, right) => left - right);
+    for (const [position, index] of indices.entries()) matches.set(index, ordinals[position]!);
+  }
   let vacant = 0;
   for (const [ordinal, { index }] of existing.entries()) {
     if (matches.has(index)) continue;
