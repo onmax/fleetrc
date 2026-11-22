@@ -389,6 +389,31 @@ describe("hooks", () => {
     expect(JSON.parse(read(file)).hooks.PreToolUse).toEqual([markedSecond, mine, markedFirst]);
   });
 
+  it("Codex: keeps a local edit that matches an unchanged sibling", async () => {
+    const { m, defs } = await setup(named("codex"));
+    const group = (command: string) => ({ hooks: [{ type: "command", command }] });
+    const first = group("echo one");
+    const second = group("echo two");
+    const updated = group("echo three");
+    const write = (groups: ReturnType<typeof group>[]) =>
+      writeFileSync(join(defs, "hooks.json"), JSON.stringify({ hooks: { PreToolUse: groups } }));
+    const markedSecond = { fleetrc: "defs", ...second };
+    const file = m.at(".codex", "hooks.json");
+    write([first, second]);
+    await sync(m);
+    writeFileSync(file, JSON.stringify({ hooks: { PreToolUse: [markedSecond, markedSecond] } }));
+    write([first, updated]);
+
+    const report = await sync(m);
+    const prefix = "agentHooks/codex/defs/PreToolUse";
+    expect(report.entries.held.map((entry) => entry.id)).toEqual([`${prefix}/0`]);
+    expect(report.entries.updated).toEqual([`${prefix}/1`]);
+    expect(JSON.parse(read(file)).hooks.PreToolUse).toEqual([
+      markedSecond,
+      { fleetrc: "defs", ...updated },
+    ]);
+  });
+
   it("Codex: reconciles hook ownership independently in each home", async () => {
     const { m, write } = await setup(named("codex"));
     const first = m.at(".codex", "hooks.json");

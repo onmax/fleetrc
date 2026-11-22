@@ -333,8 +333,7 @@ export function editHooksFile(
     const out =
       (snapshot === undefined ? undefined : editJsonText(snapshot, before, after)) ??
       `${JSON.stringify(after, null, 2)}\n`;
-    // The temp file gets the target's mode, so a 0600 settings.json is never readable by others.
-    const mode = snapshot === undefined ? 0o600 : statSync(target).mode & 0o7777;
+    const mode = snapshot === undefined ? undefined : statSync(target).mode & 0o7777;
     // Claude Code writes settings.json too, without a lock, so a write of its between this read
     // and the rename is lost: a narrow window this check can't close.
     if (!replaceIfUnchanged(target, snapshot, out, mode, options.step)) continue;

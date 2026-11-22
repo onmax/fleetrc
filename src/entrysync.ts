@@ -796,20 +796,25 @@ function matchCodexGroups(
   existing: { index: number; group: unknown }[],
   records: (OwnedEntry | undefined)[],
 ) {
-  const byHash = new Map<string, number[]>();
-  for (const [ordinal, record] of records.entries()) {
-    if (!record) continue;
-    if (!byHash.has(record.hash)) byHash.set(record.hash, []);
-    byHash.get(record.hash)!.push(ordinal);
-  }
   const matches = new Map<number, number>();
   const used = new Set<number>();
   const assign = (index: number, ordinal: number) => {
     matches.set(index, ordinal);
     used.add(ordinal);
   };
-  for (const { index, group } of existing) {
-    const ordinal = byHash.get(hashValue(group))?.shift();
+  const hashes = existing.map(({ group }) => hashValue(group));
+  for (const [ordinal, { index }] of existing.entries()) {
+    if (records[ordinal]?.hash === hashes[ordinal]) assign(index, ordinal);
+  }
+  const byHash = new Map<string, number[]>();
+  for (const [ordinal, record] of records.entries()) {
+    if (!record || used.has(ordinal)) continue;
+    if (!byHash.has(record.hash)) byHash.set(record.hash, []);
+    byHash.get(record.hash)!.push(ordinal);
+  }
+  for (const [position, { index }] of existing.entries()) {
+    if (matches.has(index)) continue;
+    const ordinal = byHash.get(hashes[position]!)?.shift();
     if (ordinal !== undefined) assign(index, ordinal);
   }
   let vacant = 0;

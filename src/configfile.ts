@@ -394,16 +394,16 @@ export function replaceIfUnchanged(
   target: string,
   snapshot: string | undefined,
   text: string,
-  mode: number,
+  mode: number | undefined,
   step?: () => void,
 ): boolean {
   mkdirSync(dirname(target), { recursive: true });
   // Created with the target's mode, so a 0600 file is never readable by others, not even in its
   // copy; the umask can only narrow the mode, which fchmod restores.
   const temp = `${target}.fleetrc-${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
-  const fd = openSync(temp, "wx", mode);
+  const fd = openSync(temp, "wx", mode ?? 0o600);
   try {
-    fchmodSync(fd, mode);
+    if (mode !== undefined) fchmodSync(fd, mode);
     writeFileSync(fd, text);
   } finally {
     closeSync(fd);
