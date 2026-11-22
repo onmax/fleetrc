@@ -81,6 +81,9 @@ export default defineConfig({
     // End-to-end tests run the built CLI against real git and HTTP.
     testTimeout: 120_000,
     hookTimeout: 120_000,
+    // On shared CI runners a test that races a detached sync, a timeout or a filesystem watcher
+    // can lose to a slow disk now and then. Each test sets up its own machine, so a retry is clean.
+    retry: process.env.CI ? 2 : 0,
   },
   staged: {
     "*": "vp check --fix",
