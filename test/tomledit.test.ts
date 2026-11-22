@@ -161,6 +161,15 @@ describe("setTomlTable", () => {
     });
   });
 
+  it("says where a document fails to parse without quoting its lines", () => {
+    const broken = `api_key = "sk-secret"\nb = = 1\n`;
+    expect(() => readTomlTable(broken, "mcp_servers", "x")).toThrow(/at line 2, column \d+$/);
+    expect(() => readTomlTable(broken, "mcp_servers", "x")).not.toThrow(/sk-secret/);
+    expect(setTomlTable(broken, "mcp_servers", "x", github)).toEqual({
+      refused: expect.not.stringMatching(/sk-secret/),
+    });
+  });
+
   it("replaces an entry whose subtable comes before it, removing the subtable", () => {
     // A subtable defined before its parent is valid TOML; replacing both leaves the result as asked.
     const text = `[mcp_servers.a.env]\nA = "1"\n\n[other]\nx = 1\n\n[mcp_servers.a]\ncommand = "a"\n`;

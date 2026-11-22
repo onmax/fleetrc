@@ -707,6 +707,65 @@ describe("files across sources", () => {
     expect(read(m.at(".config/opencode/agents/reviewer.md"))).toBe("opencode\n");
   });
 
+  it("links files from a folder whose name starts with a dot", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { ".claude/agents/reviewer.md": "review\n" });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url, subagents: ".claude/agents/*.md" }],
+    });
+    const init = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
+    expect(init.sync.warnings).toEqual([]);
+    expect(read(m.at(".claude/agents/reviewer.md"))).toBe("review\n");
+    expect((await m.run("diff", "subagents/.claude/agents/reviewer.md")).code).toBe(0);
+  });
+
+  it.skipIf(isWindows).each(["clone", "git"])(
+    "does not follow a linked folder above a glob's base in a %s source",
+    async (kind) => {
+      const m = machine();
+      const outside = join(m.root, "outside");
+      mkdirSync(join(outside, "team"), { recursive: true });
+      writeFileSync(join(outside, "team", "reviewer.md"), "outside\n");
+      const vendor = remote(m, "vendor", { "README.md": "vendor\n" });
+      symlinkSync(outside, join(vendor.work, "agents"));
+      m.git(vendor.work, "add", "-A");
+      m.git(vendor.work, "commit", "--quiet", "-m", "linked folder");
+      m.git(vendor.work, "push", "--quiet", "origin", "main");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          {
+            id: "vendor",
+            git: vendor.url,
+            ...(kind === "clone" ? { path: "~/code/vendor" } : {}),
+            subagents: "agents/team/*.md",
+          },
+        ],
+      });
+      await m.run("init", manifest, "--no-hooks");
+      expect(existsSync(m.at(".claude/agents/reviewer.md"))).toBe(false);
+    },
+  );
+
+  it.skipIf(isWindows)(
+    "reads a glob whose base is a link to nothing as matching no file",
+    async () => {
+      const m = machine();
+      const vendor = remote(m, "vendor", { "README.md": "vendor\n" });
+      symlinkSync(join(m.root, "nowhere"), join(vendor.work, "agents"));
+      m.git(vendor.work, "add", "-A");
+      m.git(vendor.work, "commit", "--quiet", "-m", "dangling link");
+      m.git(vendor.work, "push", "--quiet", "origin", "main");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, subagents: "agents/*.md" }],
+      });
+      const init = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
+      expect(init.sync.errors).toEqual([]);
+    },
+  );
+
   it("vendored edit held; diff and merge work", async () => {
     const m = machine();
     const vendor = remote(m, "vendor", {

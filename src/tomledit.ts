@@ -6,7 +6,7 @@
 //
 // A table written inline (`mcp_servers = { x = { … } }`, `mcp_servers.x = { … }`) or with dotted
 // keys (`mcp_servers.x.command = "…"`) has no block of its own to replace, so it is refused.
-import { parse, stringify } from "smol-toml";
+import { parse, stringify, TomlError } from "smol-toml";
 import { sameValue } from "./entries.ts";
 import { dict, isRecord } from "./fs.ts";
 
@@ -129,15 +129,27 @@ const startsWith = (key: readonly string[], prefix: readonly string[]) =>
 /** A table key as TOML writes it: bare where it can be, else a basic string. */
 const tomlKey = (part: string) => (/^[A-Za-z0-9_-]+$/.test(part) ? part : JSON.stringify(part));
 
-/** The document as smol-toml reads it, every table a `dict`. */
+/**
+ * The document as smol-toml reads it, every table a `dict`. A parse error says only where: its
+ * excerpt of the file can hold a secret, and sync's report can go to a hub.
+ */
 function read(text: string): Record<string, unknown> {
+  let doc;
+  try {
+    doc = parse(text, { integersAsBigInt: "asNeeded" });
+  } catch (error) {
+    if (!(error instanceof TomlError)) throw error;
+    throw new Error(
+      `${error.message.split("\n")[0]} at line ${error.line}, column ${error.column}`,
+    );
+  }
   const copy = (item: unknown): unknown =>
     Array.isArray(item)
       ? item.map(copy)
       : isRecord(item) && !(item instanceof Date)
         ? dict(Object.entries(item).map(([k, v]) => [k, copy(v)]))
         : item;
-  return copy(parse(text, { integersAsBigInt: "asNeeded" })) as Record<string, unknown>;
+  return copy(doc) as Record<string, unknown>;
 }
 
 /** `doc` without `table.name`, and without `table` once that leaves it empty. */

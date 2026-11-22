@@ -52,10 +52,12 @@ export interface FileEntry {
 export const itemId = (kind: ItemKind, path: string) => `${kind}/${path}`;
 
 /** The item's folder name in the store: its path as one segment. */
-export const itemName = (path: string) => path.replaceAll("%", "%25").replaceAll("/", "%2F");
+export const itemName = (path: string) =>
+  path.replaceAll("%", "%25").replaceAll("/", "%2F").replace(/^\./, "%2E");
 
 /** The path in the source an item's store folder name stands for. */
-export const itemPath = (name: string) => name.replaceAll("%2F", "/").replaceAll("%25", "%");
+export const itemPath = (name: string) =>
+  name.replace(/^%2E/, ".").replaceAll("%2F", "/").replaceAll("%25", "%");
 
 /** The kind and path of an item id, or undefined for a skill name. */
 export function parseItemId(id: string): { kind: ItemKind; path: string } | undefined {
@@ -123,7 +125,10 @@ export function treeLister(
       }
     };
     const start = base ? join(root, base) : root;
-    const stat = sourcePathStat(start);
+    let stat = sourcePathStat(start);
+    // A linked folder above the base would lead the walk out of the source.
+    if (base && (stat?.isDirectory() || stat?.isFile()) && !followLinks)
+      if (!inside(realRoot, realpathSync(start))) stat = undefined;
     if (stat?.isDirectory()) walk(start, base);
     else if (base && stat?.isFile()) files.push(base);
     listed.set(base, files);
@@ -162,11 +167,17 @@ export function findFileItems(
       warnings.push(error.message);
       continue;
     }
+    // A folder in the glob's base, such as `.claude`, may start with a dot.
+    const fixed = base === "" ? 0 : base.split("/").length;
     found = found.filter((path) => {
       const problem =
         path
           .split("/")
-          .map(segmentProblem)
+          .map((segment, i) =>
+            i < fixed && segment.startsWith(".")
+              ? segmentProblem(segment.slice(1))
+              : segmentProblem(segment),
+          )
           .find((why) => why !== undefined) ?? segmentProblem(itemName(path));
       if (problem)
         warnings.push(`${source.id}: left out the ${kind} file ${path}: its name ${problem}`);
