@@ -424,6 +424,28 @@ describe("npm and local sources", () => {
     expect(read(m.at(".claude/skills/npm-skill/SKILL.md"))).toBe(skillMd("npm-skill", "v1.1"));
   });
 
+  it("7a2. asks the registry nothing for a pinned version it already downloaded", async () => {
+    const m = machine();
+    const registry = await http();
+    publishNpm(
+      registry,
+      "@acme/skills",
+      { "1.0.0": { "skills/npm-skill/SKILL.md": skillMd("npm-skill") } },
+      "1.0.0",
+    );
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "acme", npm: "@acme/skills@1.0.0", registry: registry.url }],
+    });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const asked: string[] = [];
+    registry.before = (path) => void asked.push(path);
+    const report = await m.json("sync");
+    expect(report.ok).toBe(true);
+    expect(report.sources[0]).toMatchObject({ status: "unchanged", to: "1.0.0" });
+    expect(asked).toEqual([]);
+  });
+
   it("7b. rejects an npm tarball whose integrity does not match", async () => {
     const m = machine();
     const registry = await http();

@@ -38,6 +38,7 @@ const PACKAGE_NAME = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/i
 
 /** One path segment that looks like a version: semver and the looser versions old registries hold. */
 const VERSION = /^[0-9A-Za-z](?:[0-9A-Za-z.+_-]{0,126}[0-9A-Za-z])?$/;
+const EXACT_VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]*)?$/;
 
 /** Largest tarball fleetrc downloads, and the most it unpacks to. */
 const TARBALL_LIMIT = 100 * 1024 * 1024;
@@ -265,8 +266,23 @@ export async function fetchNpm(
   const { name, want } = parseNpmSpec(spec);
   if (!PACKAGE_NAME.test(name)) throw new Error(`npm "${name}" is not a package name`);
   const base = registryUrl(registry);
+  const folder = (version: string) => {
+    const dir = join(cacheRoot, `${name.replace("/", "+")}@${version}`);
+    const inside = relative(cacheRoot, dir);
+    if (!inside || inside.startsWith("..") || /[/\\]/.test(inside))
+      throw new Error(`npm ${name}@${version}: the cache folder would be outside the cache`);
+    return dir;
+  };
+  // A published version never changes, so one already downloaded needs no registry. A tag can't
+  // look like a version, so `want` is one.
+  if (EXACT_VERSION.test(want) && existsSync(folder(want)))
+    return { dir: folder(want), version: want };
   const response = await fetch(`${base}/${name.replace("/", "%2f")}`, {
-    headers: { accept: "application/json", ...headers(sendToken) },
+    // The abbreviated packument npm installs from: about half the size, with the same dist fields.
+    headers: {
+      accept: "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8",
+      ...headers(sendToken),
+    },
     signal: AbortSignal.timeout(30_000),
   });
   if (!response.ok) throw new Error(`npm ${name}: registry answered ${response.status}`);
@@ -280,10 +296,7 @@ export async function fetchNpm(
   if (!isRecord(manifest) || !isRecord(manifest.dist) || typeof manifest.dist.tarball !== "string")
     throw new Error(`npm ${name}: no version or tag "${want}"`);
   if (!VERSION.test(version)) throw new Error(`npm ${name}: the registry gave an invalid version`);
-  const dir = join(cacheRoot, `${name.replace("/", "+")}@${version}`);
-  const inside = relative(cacheRoot, dir);
-  if (!inside || inside.startsWith("..") || /[/\\]/.test(inside))
-    throw new Error(`npm ${name}@${version}: the cache folder would be outside the cache`);
+  const dir = folder(version);
   if (existsSync(dir)) return { dir, version };
   const url = manifest.dist.tarball;
   // The token is for the registry; a packument can point the tarball at any host.
