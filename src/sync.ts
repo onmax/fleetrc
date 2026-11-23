@@ -527,6 +527,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const adoptedFileEdits = adoptFileCopyEdits(state, dryRun);
     warnings.push(...adoptedSkillEdits, ...adoptedFileEdits);
     if (dryRun) previewLimitations.push(...adoptedFileEdits);
+    const pendingCopyEdits = previewLimitations.length > 0;
     // Skills linked last time, by source: what a source that fails, or can't be read, keeps.
     const lastLinked = (id: string) =>
       Object.entries(state.skills)
@@ -651,7 +652,9 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           : "none of the manifest's agents has a global skills folder, so no skills were linked",
       );
     const desired = [...winners.values()];
-    if (preview?.inspectConfirmed) {
+    if (preview?.inspectConfirmed && pendingCopyEdits) {
+      preview.inspectConfirmed([]);
+    } else if (preview?.inspectConfirmed) {
       const confirmed = new Set(
         results
           .filter(

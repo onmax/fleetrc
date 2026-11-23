@@ -801,6 +801,58 @@ describe("init", () => {
     expect(existsSync(join(work, "skills/tool"))).toBe(true);
   });
 
+  it("keeps a matching personal copy when an agent edit renames the replacement", async () => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const base = upstream.head();
+    const replacementPath = clone(m, upstream, "code/upstream");
+    const replacement = {
+      id: "upstream",
+      git: upstream.url,
+      path: replacementPath,
+      include: ["tool"],
+    };
+    const agents = ["claude-code", "codex"];
+    const initial = m.manifest({ agents, sources: [replacement] });
+    await m.json("init", initial, "--copy", "--no-hooks");
+    const renamed = skillMd("renamed");
+    writeFileSync(m.at(".claude/skills/tool/SKILL.md"), renamed);
+
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: {
+          tool: { source: upstream.url, skillPath: "skills/tool/SKILL.md", commit: base },
+        },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents,
+      sources: [
+        { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+        replacement,
+      ],
+    });
+    const plan = await m.json<LockImportPlan & { sync: Report }>("init", manifest, "--dry-run");
+    expect(plan.sync.previewLimitations).toContainEqual(
+      expect.stringContaining("would move the edits"),
+    );
+    expect(plan.lost).toEqual([]);
+    expect(plan.imports.forks).toEqual({ tool: { from: upstream.url, path: "skills/tool", base } });
+    expect(plan.migrations).not.toContainEqual(
+      expect.objectContaining({ path: join(work, "skills/tool") }),
+    );
+
+    const init = await m.run("init", manifest, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(read(join(replacementPath, "skills/tool/SKILL.md"))).toBe(renamed);
+    expect(read(join(work, "skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    expect(read(m.at(".agents/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
+
   it("plans one backup for duplicate lock entries and preserves copies with conflicting entries", async () => {
     const m = machine({ scheduler: "empty" });
     const upstream = remote(m, "upstream", skills("skills/", "tool", "conflict"));
