@@ -270,6 +270,41 @@ describe("init", () => {
     expect(preview).toMatchObject({ ok: true, previewLimitations: [] });
   });
 
+  it("previews an unchanged working clone with fetch-all and only its tracked remote", async () => {
+    const setup = machine();
+    const repo = remote(setup, "mine", { "instructions.md": "original\n" });
+    const working = clone(setup, repo, "mine");
+    const manifest = setup.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "mine", git: repo.url, path: working, instructions: "instructions.md" }],
+    });
+    const args = ["init", manifest, "--no-hooks", "--copy"];
+    await setup.json(...args);
+    setup.git(working, "config", "fetch.all", "true");
+    const before = repo.head();
+    const copy = setup.at(".claude/CLAUDE.md");
+    const expectUnchanged = () => {
+      expect(setup.git(working, "rev-parse", "HEAD")).toBe(before);
+      expect(setup.git(working, "rev-parse", "@{u}")).toBe(before);
+      expect(read(copy)).toBe("original\n");
+    };
+
+    const { sync: preview } = await setup.json<{ sync: Report }>(...args, "--dry-run");
+    expectUnchanged();
+    const { sync: applied } = await setup.json<{ sync: Report }>(...args);
+    expectUnchanged();
+    expect(applied).toMatchObject({ ok: true, files: { replaced: [] } });
+    expect(preview).toMatchObject({ ok: true, previewLimitations: [], files: { replaced: [] } });
+
+    setup.git(working, "remote", "add", "other", repo.url);
+    const { sync: multipleRemotes } = await setup.json<{ sync: Report }>(...args, "--dry-run");
+    expect(multipleRemotes).toMatchObject({
+      ok: true,
+      previewLimitations: [expect.stringContaining("working clone")],
+    });
+    expectUnchanged();
+  });
+
   it("flags a newer cached upstream that fetch can skip even when the advertised tip matches HEAD", async () => {
     const setup = machine();
     const repo = remote(setup, "mine", { "instructions.md": "original\n" });
@@ -300,10 +335,12 @@ describe("init", () => {
     };
 
     setup.git(working, "config", "fetch.all", "true");
-    setup.git(working, "config", "remote.origin.skipFetchAll", "true");
-    await expectIncompletePreview();
+    for (const key of ["remote.origin.skipFetchAll", "remote.origin.skipDefaultUpdate"]) {
+      setup.git(working, "config", key, "true");
+      await expectIncompletePreview();
+      setup.git(working, "config", "--unset", key);
+    }
     setup.git(working, "config", "--unset", "fetch.all");
-    setup.git(working, "config", "--unset", "remote.origin.skipFetchAll");
 
     setup.git(working, "config", "--add", "remote.origin.fetch", "^refs/heads/main");
     await expectIncompletePreview();

@@ -779,6 +779,25 @@ async function updatePinned(
   out.changed = [...new Set([...out.changed, ...incoming])];
 }
 
+async function fetchAllUsesOnlyUpstream(dir: string, remote: string): Promise<boolean> {
+  const remotes = await git(["remote"], { cwd: dir, allowFail: true });
+  if (remotes.code !== 0 || remotes.stdout.trim() !== remote) return false;
+  const skip = await git(
+    ["config", "--type=bool", "--get-regexp", "^remote\\..*\\.(skipdefaultupdate|skipfetchall)$"],
+    { cwd: dir, allowFail: true },
+  );
+  if (skip.code !== 0) return skip.code === 1 && !skip.stderr.trim();
+  const effective = skip.stdout
+    .trim()
+    .split(/\r?\n/)
+    .findLast(
+      (line) =>
+        line.startsWith(`remote.${remote}.skipdefaultupdate `) ||
+        line.startsWith(`remote.${remote}.skipfetchall `),
+    );
+  return effective === undefined || effective.endsWith(" false");
+}
+
 async function updateClone(
   source: CloneSource,
   dir: string,
@@ -827,7 +846,7 @@ async function updateClone(
             .map((line) => line.split("\t"))
             .find(([, ref]) => ref === remoteRef)?.[0]
         : undefined;
-    if (advertised === before && remoteRef?.startsWith("refs/heads/")) {
+    if (advertised === before && remote && remoteRef?.startsWith("refs/heads/")) {
       const prefix = `refs/remotes/${remote}/`;
       const branch = remoteRef.slice("refs/heads/".length);
       const fetch = await git(["config", "--get-all", `remote.${remote}.fetch`], {
@@ -844,7 +863,8 @@ async function updateClone(
           );
           if (
             fetchAll.code === 0 &&
-            fetchAll.stdout.trim() === "false" &&
+            (fetchAll.stdout.trim() === "false" ||
+              (fetchAll.stdout.trim() === "true" && (await fetchAllUsesOnlyUpstream(dir, remote)))) &&
             (refspec.startsWith("+") || (await gitOut(["rev-parse", "@{u}"], dir)) === before)
           )
             return;
