@@ -864,7 +864,8 @@ async function updateClone(
           if (
             fetchAll.code === 0 &&
             (fetchAll.stdout.trim() === "false" ||
-              (fetchAll.stdout.trim() === "true" && (await fetchAllUsesOnlyUpstream(dir, remote)))) &&
+              (fetchAll.stdout.trim() === "true" &&
+                (await fetchAllUsesOnlyUpstream(dir, remote)))) &&
             (refspec.startsWith("+") || (await gitOut(["rev-parse", "@{u}"], dir)) === before)
           )
             return;
