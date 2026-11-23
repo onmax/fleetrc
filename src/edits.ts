@@ -514,7 +514,9 @@ function writeSidecar(target: string, content: Buffer, suffix = ".upstream"): st
 }
 
 /**
- * Three-way merge of one folder: `base` to `upstream` changes applied onto `live`, file by file.
+ * Three-way merge of one folder: `base` to `upstream` changes applied onto `live`, file by file,
+ * except that a path that is a file on one side and a folder on another merges as one unit with
+ * what is under it.
  * Links are compared by their targets and never followed, read through or written: a file that is
  * a link, or sits in a linked folder, on any side, and changed upstream, is a conflict. A dry run
  * works out the same result and writes nothing.
@@ -525,11 +527,15 @@ async function mergeTrees(
   upstream: string,
   dryRun: boolean,
 ): Promise<MergeResult> {
-  const files = new Set([
-    ...Object.keys(hashDir(live)),
-    ...Object.keys(hashDir(base)),
-    ...Object.keys(hashDir(upstream)),
-  ]);
+  const [hl, hb, hu] = [hashDir(live), hashDir(base), hashDir(upstream)];
+  const files = new Set([...Object.keys(hl), ...Object.keys(hb), ...Object.keys(hu)]);
+  const within = (root: string) => (file: string) => file === root || file.startsWith(`${root}/`);
+  const folded = [...files].filter((file) =>
+    [...files].some((other) => other.startsWith(`${file}/`)),
+  );
+  const roots = folded.filter((root) => !folded.some((other) => root.startsWith(`${other}/`)));
+  const subtree = (hashes: Record<string, string>, root: string) =>
+    JSON.stringify(Object.entries(hashes).filter(([file]) => within(root)(file)));
   const result: MergeResult = { merged: [], conflicts: [] };
   const markers: Record<string, string> = {};
   /**
@@ -537,7 +543,7 @@ async function mergeTrees(
    * `<file>.upstream` (a link's as a note of its target), or a note that upstream deleted it. A file
    * in a linked folder gets its note beside that folder, since merge never writes through a link.
    */
-  const conflict = (file: string, upstream: Content | undefined) => {
+  const conflict = (file: string, upstream: Content | "folder" | undefined) => {
     result.conflicts.push(file);
     if (dryRun) return;
     const folder = linkedFolder(live, file);
@@ -560,15 +566,57 @@ async function mergeTrees(
               ),
               ".upstream-deleted",
             )
-          : writeSidecar(
-              at,
-              Buffer.isBuffer(upstream)
-                ? upstream
-                : Buffer.from(`upstream has a link here, to ${upstream.link}\n`),
-            );
+          : upstream === "folder"
+            ? writeSidecar(
+                at,
+                Buffer.from(
+                  `upstream turned ${file} into a folder, and you changed it. Bring in upstream's ${file}/ by hand, then delete this file and run \`fleetrc merge\` again.\n`,
+                ),
+                ".upstream-conflict",
+              )
+            : writeSidecar(
+                at,
+                Buffer.isBuffer(upstream)
+                  ? upstream
+                  : Buffer.from(`upstream has a link here, to ${upstream.link}\n`),
+              );
     markers[file] = relative(live, written).split(sep).join("/");
   };
+  /**
+   * Replaces the unit at `root` with upstream's when the local copy has no edits in it and upstream's
+   * holds only plain files, and is a conflict on `root` otherwise.
+   */
+  const mergeUnit = (root: string) => {
+    if (subtree(hu, root) === subtree(hb, root) || subtree(hl, root) === subtree(hu, root)) return;
+    const incoming = Object.keys(hu).filter(within(root));
+    const contents = incoming.map((file) => readContent(upstream, file));
+    if (
+      subtree(hl, root) !== subtree(hb, root) ||
+      linkedFolder(live, root) !== undefined ||
+      !contents.every((content) => Buffer.isBuffer(content))
+    ) {
+      conflict(
+        root,
+        hu[root] === undefined && incoming.length > 0 ? "folder" : readContent(upstream, root),
+      );
+      return;
+    }
+    if (!dryRun) {
+      rmSync(join(live, root), { recursive: true, force: true });
+      incoming.forEach((file, i) => {
+        mkdirSync(dirname(join(live, file)), { recursive: true });
+        writeFileSync(join(live, file), contents[i] as Buffer);
+      });
+    }
+    const changed = [...files].filter((file) => within(root)(file) && hb[file] !== hu[file]);
+    result.merged.push(...changed.sort());
+  };
   for (const file of [...files].sort()) {
+    const root = roots.find((candidate) => within(candidate)(file));
+    if (root !== undefined) {
+      if (file === root) mergeUnit(root);
+      continue;
+    }
     const b = readContent(base, file);
     const l = readContent(live, file);
     const u = readContent(upstream, file);

@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import {
@@ -169,6 +169,41 @@ describe("edited vendored skills", () => {
     );
     expect((JSON.parse(read(manifest)) as typeof saved).forks.tool!.base).toBe(vendor.head());
     expect(names(m.at(".claude/skills"))).toEqual(["mine", "tool"]);
+  });
+
+  it("4f. merge replaces a folder upstream turned into a file, or reports a conflict when the folder has local edits", async () => {
+    for (const edited of [false, true]) {
+      const { m, vendor } = await editedVendoredSkill({ scheduler: "empty" });
+      vendor.commit({ "skills/tool/topic/notes.md": "notes v1\n" });
+      await m.run("sync");
+      expect((await m.run("merge", "tool")).code).toBe(0);
+      if (edited) writeFileSync(m.at(".claude/skills/tool/topic/notes.md"), "notes (mine)\n");
+      rmSync(join(vendor.work, "skills/tool/topic"), { recursive: true });
+      vendor.commit({ "skills/tool/ref.md": "ref v2\n", "skills/tool/topic": "topic v2\n" });
+      await m.run("sync");
+      const dry = await m.run("merge", "tool", "--dry-run");
+      expect(dry.code, dry.stdout + dry.stderr).toBe(0);
+      expect(dry.stdout).toContain(edited ? "would conflict: topic" : "would merge: ref.md, topic");
+      expect(read(m.at(".claude/skills/tool/ref.md"))).toBe("ref v1\n");
+      const merge = await m.run("merge", "tool");
+      expect(read(m.at(".claude/skills/tool/ref.md"))).toBe("ref v2\n");
+      if (!edited) {
+        expect(merge.code, merge.stdout + merge.stderr).toBe(0);
+        expect(read(m.at(".claude/skills/tool/topic"))).toBe("topic v2\n");
+        expect((await m.json("sync")).pending).toEqual([]);
+        continue;
+      }
+      expect(merge.code, merge.stdout + merge.stderr).toBe(1);
+      expect(merge.stdout).toContain("conflicts: topic");
+      expect(read(m.at(".claude/skills/tool/topic/notes.md"))).toBe("notes (mine)\n");
+      expect(read(m.at(".claude/skills/tool/topic.upstream"))).toBe("topic v2\n");
+      // Resolved by taking upstream's file: the next merge records it.
+      rmSync(m.at(".claude/skills/tool/topic"), { recursive: true });
+      renameSync(m.at(".claude/skills/tool/topic.upstream"), m.at(".claude/skills/tool/topic"));
+      const done = await m.run("merge", "tool");
+      expect(done.code, done.stdout + done.stderr).toBe(0);
+      expect((await m.json("sync")).held).toEqual([]);
+    }
   });
 
   it("4e. an unedited vendored skill updates in place", async () => {
