@@ -489,6 +489,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       candidate?.loaded ??
       (await loadManifest(policy.spec, {
         offline,
+        readOnly: dryRun && offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
       }));
     // The repository has no manifest at the new default place yet, so the policy's spec loaded the

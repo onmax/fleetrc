@@ -135,10 +135,12 @@ export async function fetchClone(
   root: string,
   {
     offline = false,
+    readOnly = false,
     check,
     cacheUrl = url,
   }: {
     offline?: boolean;
+    readOnly?: boolean;
     cacheUrl?: string;
     /** Why `url` may not be fetched, asked in the cache's own repository right before each fetch. */
     check?: (url: string, cwd: string) => Promise<string | undefined>;
@@ -150,6 +152,13 @@ export async function fetchClone(
     tree: join(root, key),
     marker: join(root, `${key}.json`),
   };
+  if (readOnly) {
+    const marked = markedCommit(cache.marker);
+    if (!marked) throw new UserError(`${url} has never been fetched and --offline is set`);
+    if (!existsSync(cache.tree))
+      throw new UserError(`${url} has no cached checkout; run sync without --dry-run to repair it`);
+    return { dir: cache.tree, ...marked };
+  }
   await recoverTree(cache, root, key);
   let written = readMarker(cache.marker, cache.tree);
   if (written && written.skipsRefused !== SKIPS_REFUSED && written.refused.length > 0)
