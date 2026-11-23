@@ -19,6 +19,7 @@ export interface ExecOptions {
   holdStdin?: boolean;
   timeoutMs?: number;
   shell?: boolean;
+  signal?: AbortSignal;
   /** Characters of stdout and of stderr to keep, from the end. Defaults to 1 MiB each. */
   maxOutput?: number;
 }
@@ -53,9 +54,9 @@ class Tail {
   }
 }
 
-// Shell commands (hooks, report.run) run in their own process group on POSIX, so a timeout can kill
-// everything they started. Those groups no longer get the terminal's Ctrl-C, so it is passed on.
-// Other commands stay in ours: a new session would cut git's ssh off from the terminal it prompts on.
+// Shell commands and cancellable background jobs run in their own process group on POSIX, so
+// stopping them also stops their children. Those groups don't get Ctrl-C, so it is passed on.
+// Ordinary foreground commands stay in ours so SSH can still prompt on the terminal.
 const groups = new Set<number>();
 const FORWARDED = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 function forward(signal: NodeJS.Signals) {
@@ -96,8 +97,10 @@ function killTree(child: ChildProcess) {
  * back once the command exits, even if something it started still holds its output open.
  */
 export function exec(command: string, args: readonly string[], options: ExecOptions = {}) {
-  return new Promise<ExecResult>((resolve) => {
-    const group = process.platform !== "win32" && options.shell === true;
+  return new Promise<ExecResult>((resolve, reject) => {
+    const { signal } = options;
+    signal?.throwIfAborted();
+    const group = process.platform !== "win32" && (options.shell === true || signal !== undefined);
     const spawnOptions: SpawnOptions = {
       cwd: options.cwd,
       env: options.env ?? process.env,
@@ -112,6 +115,8 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
     const stderr = new Tail(max);
     let timedOut = false;
     let done = false;
+    let stopping: Promise<void> | undefined;
+    let exited = false;
     if (group && child.pid !== undefined) {
       if (groups.size === 0) for (const name of FORWARDED) process.on(name, forward);
       groups.add(child.pid);
@@ -121,11 +126,16 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
       done = true;
       running.delete(child);
       clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
       if (child.pid !== undefined && groups.delete(child.pid) && groups.size === 0)
         for (const name of FORWARDED) process.removeListener(name, forward);
       child.stdin?.destroy();
       child.stdout?.destroy();
       child.stderr?.destroy();
+      if (signal?.aborted) {
+        reject(signal.reason);
+        return;
+      }
       const err = stderr.toString();
       resolve({
         code,
@@ -136,6 +146,29 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
         spawnError: (error as NodeJS.ErrnoException | undefined)?.code,
       });
     };
+    const finishStopped = () => {
+      if (exited && stopping) void stopping.then(() => finish(null));
+    };
+    const abort = () => {
+      clearTimeout(timer);
+      stopping = new Promise<void>((stopped) => {
+        if (process.platform !== "win32" || child.pid === undefined) {
+          killTree(child);
+          stopped();
+          return;
+        }
+        const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+        killer.on("error", () => child.kill("SIGKILL"));
+        killer.on("close", (code) => {
+          if (code !== 0) child.kill("SIGKILL");
+          stopped();
+        });
+      });
+      finishStopped();
+    };
     child.stdout?.setEncoding("utf8").on("data", (chunk: string) => stdout.push(chunk));
     child.stderr?.setEncoding("utf8").on("data", (chunk: string) => stderr.push(chunk));
     const timer = options.timeoutMs
@@ -144,12 +177,21 @@ export function exec(command: string, args: readonly string[], options: ExecOpti
           killTree(child);
         }, options.timeoutMs)
       : undefined;
-    child.on("error", (error) => finish(null, error));
-    child.on("close", (code) => finish(code));
+    child.on("error", (error) => {
+      exited = true;
+      if (stopping) finishStopped();
+      else finish(null, error);
+    });
+    child.on("close", (code) => {
+      if (!stopping) finish(code);
+    });
     // After a timeout, output pipes held by orphaned grandchildren must not keep us waiting.
     child.on("exit", (code) => {
-      if (timedOut) finish(code);
+      exited = true;
+      if (stopping) finishStopped();
+      else if (timedOut) finish(code);
     });
+    signal?.addEventListener("abort", abort, { once: true });
     child.stdin?.on("error", () => {});
     if (options.holdStdin) child.stdin?.write(options.input ?? "");
     else child.stdin?.end(options.input ?? "");
@@ -179,7 +221,13 @@ export class GitError extends Error {
 /** Runs git without prompts; throws GitError on a non-zero exit unless `allowFail`. */
 export async function git(
   args: readonly string[],
-  options: { cwd?: string; timeoutMs?: number; allowFail?: boolean; input?: string } = {},
+  options: {
+    cwd?: string;
+    timeoutMs?: number;
+    allowFail?: boolean;
+    input?: string;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<ExecResult> {
   const env: NodeJS.ProcessEnv = { ...process.env, ...GIT_ENV };
   for (const key of Object.keys(env)) if (key.toUpperCase() === "GIT_CONFIG") delete env[key];
@@ -191,10 +239,12 @@ export async function git(
     cwd: options.cwd,
     input: options.input,
     timeoutMs: options.timeoutMs ?? 120_000,
+    signal: options.signal,
     env,
     // File lists are parsed whole; a cut one would be wrong, not just short.
     maxOutput: Number.POSITIVE_INFINITY,
   });
+  options.signal?.throwIfAborted();
   if (result.code !== 0 && !options.allowFail) throw new GitError(args, result);
   return result;
 }

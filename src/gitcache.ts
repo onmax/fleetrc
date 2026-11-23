@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { UserError } from "./errors.ts";
-import { git, GitError, gitOut } from "./exec.ts";
+import { git, GitError } from "./exec.ts";
 import { isRecord, isRunning, readJsonOrNothing, sha256, writeJson } from "./fs.ts";
 import { checkoutProblem, GIT_FOLDER, nameKey } from "./names.ts";
 
@@ -122,6 +122,7 @@ export function hasCachedClone(url: string, ref: string | undefined, root: strin
 interface FetchOptions {
   offline?: boolean;
   cacheUrl?: string;
+  signal?: AbortSignal;
   /** Why `url` may not be fetched, asked in the cache's own repository right before each fetch. */
   check?: (url: string, cwd: string) => Promise<string | undefined>;
 }
@@ -140,21 +141,31 @@ export async function fetchClone(
   url: string,
   ref: string | undefined,
   root: string,
-  { offline = false, check, cacheUrl = url }: FetchOptions = {},
+  { offline = false, check, cacheUrl = url, signal }: FetchOptions = {},
 ): Promise<CachedClone> {
+  signal?.throwIfAborted();
   const key = cloneKey(cacheUrl, ref);
   const cache = {
     repo: join(root, `${key}.git`),
     tree: join(root, key),
     marker: join(root, `${key}.json`),
   };
-  await recoverTree(cache, root, key);
+  const runGit: typeof git = async (args, options) => {
+    signal?.throwIfAborted();
+    try {
+      return await git(args, { ...options, signal });
+    } catch (error) {
+      if (signal?.aborted) rmSync(cache.repo, { recursive: true, force: true });
+      throw error;
+    }
+  };
+  await recoverTree(cache, root, key, runGit);
   let written = readMarker(cache.marker, cache.tree);
   if (written && written.skipsRefused !== SKIPS_REFUSED && written.refused.length > 0)
     // Written when every system left out what Windows can't write: written again, which needs no
     // network, so this system gets those files too.
     try {
-      written = { commit: written.commit, ...(await writeTree(cache, written.commit)) };
+      written = { commit: written.commit, ...(await writeTree(cache, written.commit, runGit)) };
     } catch (error) {
       if (!(error instanceof GitError)) throw error;
       written = undefined;
@@ -167,18 +178,18 @@ export async function fetchClone(
   if (written && ref && isCommitRef(ref) && written.commit.startsWith(ref.toLowerCase()))
     return { dir: cache.tree, ...written };
   for (let attempt = 0; ; attempt++) {
-    const fresh = !(existsSync(cache.repo) && (await usable(cache.repo)));
+    const fresh = !(existsSync(cache.repo) && (await usable(cache.repo, runGit)));
     if (fresh) {
       rmSync(cache.repo, { recursive: true, force: true });
       mkdirSync(root, { recursive: true });
       // No template: its sample hooks are the deepest files, and nothing here runs hooks.
-      await git(["init", "--quiet", "--bare", "--template=", "--", cache.repo]);
+      await runGit(["init", "--quiet", "--bare", "--template=", "--", cache.repo]);
     }
     let commit: string;
     try {
       const problem = await check?.(url, cache.repo);
       if (problem) throw new UserError(problem);
-      commit = await fetchCommit(url, ref, cache.repo, check ? NO_GIT_REDIRECTS : []);
+      commit = await fetchCommit(url, ref, cache.repo, check ? NO_GIT_REDIRECTS : [], runGit);
     } catch (error) {
       // The network or the remote: a cache with a commit stays for --offline and later runs.
       if (fresh) rmSync(cache.repo, { recursive: true, force: true });
@@ -189,7 +200,7 @@ export async function fetchClone(
       return {
         dir: cache.tree,
         commit,
-        ...(await writeTree(cache, commit)),
+        ...(await writeTree(cache, commit, runGit)),
         repo: cache.repo,
         ...(written ? { previous: written.commit } : {}),
       };
@@ -231,7 +242,7 @@ function markedCommit(marker: string): Marker | undefined {
  * tree goes back when it was moved aside and the new one never arrived. A tree that is missing
  * altogether is written again from the repository, which needs no network, so `--offline` works.
  */
-async function recoverTree(cache: CacheFiles, root: string, key: string) {
+async function recoverTree(cache: CacheFiles, root: string, key: string, runGit: typeof git) {
   if (!existsSync(root)) return;
   // The publication journal precedes both renames. With no temp tree left, the
   // new tree arrived: finish its metadata before considering the old tree garbage.
@@ -261,9 +272,9 @@ async function recoverTree(cache: CacheFiles, root: string, key: string) {
   }
   if (busy || existsSync(cache.tree) || !existsSync(cache.repo)) return;
   const marked = markedCommit(cache.marker);
-  if (!marked || !(await usable(cache.repo))) return;
+  if (!marked || !(await usable(cache.repo, runGit))) return;
   try {
-    await writeTree(cache, marked.commit);
+    await writeTree(cache, marked.commit, runGit);
   } catch (error) {
     // The commit is not in the repository after all: the next fetch writes the tree.
     if (!(error instanceof GitError)) throw error;
@@ -276,6 +287,7 @@ async function fetchCommit(
   ref: string | undefined,
   repo: string,
   config: readonly string[],
+  runGit: typeof git,
 ): Promise<string> {
   const args = [
     ...config,
@@ -288,19 +300,21 @@ async function fetchCommit(
     url,
     ref ?? "HEAD",
   ];
-  const fetched = await git(args, { cwd: repo, allowFail: true, timeoutMs: 600_000 });
+  const fetched = await runGit(args, { cwd: repo, allowFail: true, timeoutMs: 600_000 });
   if (fetched.code === 0) {
-    const commit = await gitOut(["rev-parse", "--verify", "FETCH_HEAD^{commit}"], repo);
+    const parsed = await runGit(["rev-parse", "--verify", "FETCH_HEAD^{commit}"], { cwd: repo });
+    const commit = parsed.stdout.trim();
     // A ref of its own, so the next fetch sends only what changed.
-    await git(["update-ref", "refs/fleetrc/fetched", commit], { cwd: repo });
+    await runGit(["update-ref", "refs/fleetrc/fetched", commit], { cwd: repo });
     return commit;
   }
   // A full commit id is fetched as it is; a remote gives no way to look up a shorter one, so it
   // is found in the history of every branch and tag.
   if (fetched.code === null || !ref || !isCommitRef(ref) || ref.length === 40)
     throw new GitError(args, fetched);
-  const shallow = (await gitOut(["rev-parse", "--is-shallow-repository"], repo)) === "true";
-  await git(
+  const status = await runGit(["rev-parse", "--is-shallow-repository"], { cwd: repo });
+  const shallow = status.stdout.trim() === "true";
+  await runGit(
     [
       ...config,
       "fetch",
@@ -314,7 +328,7 @@ async function fetchCommit(
     ],
     { cwd: repo, timeoutMs: 600_000 },
   );
-  const found = await git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+  const found = await runGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
     cwd: repo,
     allowFail: true,
   });
@@ -339,8 +353,11 @@ interface CacheFiles {
 async function writeTree(
   cache: CacheFiles,
   commit: string,
+  runGit: typeof git,
 ): Promise<Pick<CachedClone, "collisions" | "refused" | "submodules">> {
-  const entries = (await gitOut(["ls-tree", "-r", "-z", "--full-tree", commit], cache.repo))
+  const listed = await runGit(["ls-tree", "-r", "-z", "--full-tree", commit], { cwd: cache.repo });
+  const entries = listed.stdout
+    .trim()
     .split("\0")
     .filter(Boolean)
     .map((line) => {
@@ -370,12 +387,12 @@ async function writeTree(
     ];
     // The index gets only the paths written out: git refuses a whole tree on Windows when one of
     // its paths is one Windows can't write.
-    await git([...at, "read-tree", "--empty"], { cwd: cache.repo });
-    await git([...at, "update-index", "-z", "--index-info"], {
+    await runGit([...at, "read-tree", "--empty"], { cwd: cache.repo });
+    await runGit([...at, "update-index", "-z", "--index-info"], {
       cwd: cache.repo,
       input: kept.map((entry) => `${entry.line}\0`).join(""),
     });
-    await git([...at, "checkout-index", "--all", "--force"], { cwd: cache.repo });
+    await runGit([...at, "checkout-index", "--all", "--force"], { cwd: cache.repo });
     const metadata = { commit, collisions: left, refused, submodules, skipsRefused: SKIPS_REFUSED };
     writeJson(`${cache.tree}.${process.pid}.pending`, metadata);
     // Moved aside, not deleted, so a kill here leaves a whole tree for `recoverTree`.
@@ -397,8 +414,8 @@ async function writeTree(
  * The cache is a repository of its own (git does not climb from a broken one to a parent
  * repository, such as a HOME kept in git). Throws when git can't run.
  */
-async function usable(repo: string): Promise<boolean> {
-  const run = await git(["rev-parse", "--absolute-git-dir"], { cwd: repo, allowFail: true });
+async function usable(repo: string, runGit: typeof git): Promise<boolean> {
+  const run = await runGit(["rev-parse", "--absolute-git-dir"], { cwd: repo, allowFail: true });
   if (run.code === null && !run.timedOut) throw new GitError(["rev-parse"], run);
   const gitDir = run.code === 0 ? run.stdout.trim() : undefined;
   if (gitDir === undefined) return false;

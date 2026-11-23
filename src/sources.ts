@@ -1184,10 +1184,14 @@ const noSkills = (dir: string): SkillSource => ({
 });
 
 /** Fetches a git source into the cache under `cacheDir`. */
-const fetchGitSource = (source: GitSource | CloneSource, cacheDir: string) =>
+const fetchGitSource = (source: GitSource | CloneSource, cacheDir: string, signal?: AbortSignal) =>
   fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
+    signal,
     // A team manifest's repository is checked again with the config of the fetch itself.
-    check: source.kind === "git" && source.via !== undefined ? teamGitProblem : undefined,
+    check:
+      source.kind === "git" && source.via !== undefined
+        ? (url, cwd) => teamGitProblem(url, cwd, signal)
+        : undefined,
   });
 
 const gitSourceKey = (source: GitSource | CloneSource) => cloneKey(gitUrl(source.git), source.ref);
@@ -1215,13 +1219,16 @@ export function prefetchGitSources(sources: Source[], cacheDir: string, dryRun: 
   }
 
   const fetches = new Map<string, Promise<CachedClone>>();
-  const jobs: (() => Promise<void>)[] = [];
+  const foreground = new Map<string, Promise<CachedClone>>();
+  const controller = new AbortController();
+  const { signal } = controller;
+  const jobs: { run: () => Promise<void>; reject: (reason: unknown) => void }[] = [];
   const active = new Set<Promise<void>>();
   const start = () => {
     while (active.size < 4) {
       const job = jobs.shift();
       if (!job) break;
-      const done = job().finally(() => {
+      const done = job.run().finally(() => {
         active.delete(done);
         start();
       });
@@ -1229,9 +1236,13 @@ export function prefetchGitSources(sources: Source[], cacheDir: string, dryRun: 
     }
   };
   const enqueue = (source: GitSource | CloneSource, urgent: boolean) => {
+    if (signal.aborted) return Promise.reject<CachedClone>(signal.reason);
     const { promise, resolve, reject } = Promise.withResolvers<CachedClone>();
     promise.catch(() => {});
-    const job = () => fetchGitSource(source, cacheDir).then(resolve, reject);
+    const job = {
+      run: () => fetchGitSource(source, cacheDir, signal).then(resolve, reject),
+      reject,
+    };
     if (urgent) jobs.unshift(job);
     else jobs.push(job);
     start();
@@ -1241,10 +1252,28 @@ export function prefetchGitSources(sources: Source[], cacheDir: string, dryRun: 
     if (source) fetches.set(key, enqueue(source, false));
   }
   return {
-    fetch: (source: GitSource | CloneSource) =>
-      fetches.get(gitSourceKey(source)) ?? enqueue(source, true),
+    fetch: async (source: GitSource | CloneSource) => {
+      signal.throwIfAborted();
+      const key = gitSourceKey(source);
+      const shared = fetches.get(key);
+      try {
+        return await (shared ?? enqueue(source, true));
+      } catch (error) {
+        if (
+          signal.aborted ||
+          process.platform === "win32" ||
+          (!process.stdin.isTTY && !process.stderr.isTTY) ||
+          !(error instanceof GitError)
+        )
+          throw error;
+        const retry = (shared && foreground.get(key)) || fetchGitSource(source, cacheDir);
+        if (shared) foreground.set(key, retry);
+        return retry;
+      }
+    },
     async finish() {
-      jobs.length = 0;
+      controller.abort();
+      for (const job of jobs.splice(0)) job.reject(signal.reason);
       await Promise.all(active);
     },
   };

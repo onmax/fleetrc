@@ -1,5 +1,5 @@
-import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { isWindows, machine, names, pathWith, remote, skills } from "./fixture.ts";
@@ -116,7 +116,7 @@ describe.skipIf(isWindows)("fetching git sources", () => {
     expect(names(m.at(".claude/skills"))).toEqual(["other", "tool"]);
   });
 
-  it("keeps the sync lock until started fetches finish and drops queued fetches after an error", async () => {
+  it("cancels stalled fetches before unlocking and reports the original checkpoint error", async () => {
     const m = machine();
     const ids = ["first", "two", "three", "four", "five", "six", "seven"];
     const sources = ids.map((id) => ({
@@ -126,17 +126,41 @@ describe.skipIf(isWindows)("fetching git sources", () => {
     const manifest = m.manifest({ agents: ["claude-code"], sources });
     const lock = join(m.stateDir, "sync.lock");
     const slow = slowFetches(m.root, m.env, 0, {
-      before: `case "$*" in *first.git*) mkdir "${join(m.stateDir, "state.json")}";; *) sleep 2;; esac`,
+      before: `case "$*" in
+        *first.git*)
+          until [ -f "${join(m.root, "stalling")}" ]; do sleep 0.05; done
+          mkdir "${join(m.stateDir, "state.json")}";;
+        *)
+          sh -c 'sleep 5; echo survived >> "${join(m.root, "fetches.log")}"' &
+          echo "$!" >> "${join(m.root, "stalling")}"; wait;;
+      esac`,
       after: `if [ ! -f "${lock}" ]; then echo unlocked >> "${join(m.root, "fetches.log")}"; fi`,
     });
-    const sync = await m.runWith({ env: { PATH: slow.PATH } }, "sync", "--manifest", manifest);
+    const sync = await m.runWith(
+      { env: { PATH: slow.PATH, FLEETRC_SYNC_TIMEOUT_MS: "2500" } },
+      "sync",
+      "--manifest",
+      manifest,
+    );
     expect(sync.code).not.toBe(0);
     expect(sync.stdout + sync.stderr).toContain("EISDIR");
+    expect(existsSync(lock)).toBe(false);
     const fetches = slow.fetches();
     expect(fetches).not.toContain("unlocked");
     const starts = fetches.filter((event) => event === "start").length;
     expect(starts).toBeGreaterThan(1);
     expect(starts).toBeLessThan(ids.length);
-    expect(fetches.filter((event) => event === "end")).toHaveLength(starts);
+    expect(fetches.filter((event) => event === "end")).toHaveLength(1);
+    const stalled = readFileSync(join(m.root, "stalling"), "utf8").trim().split("\n");
+    for (const pid of stalled) {
+      await expect
+        .poll(() => {
+          const status = spawnSync("ps", ["-o", "stat=", "-p", pid], { encoding: "utf8" });
+          return (
+            status.status === 1 || (status.status === 0 && status.stdout.trim().startsWith("Z"))
+          );
+        })
+        .toBe(true);
+    }
   });
 });

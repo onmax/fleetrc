@@ -469,16 +469,25 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   // anyway lets go of the lock and says so, and the next timer run starts over.
   let doing = "loading the manifest";
   const limit = syncTimeoutMs();
-  const watchdog = setTimeout(() => {
-    stopAll();
+  let prefetch: ReturnType<typeof prefetchGitSources> | undefined;
+  let onTimeout: Promise<never> | undefined;
+  const cleanUp = () => {
     lock.release();
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
+  };
+  const stopSync = async () => {
+    await prefetch?.finish();
+    stopAll();
+    cleanUp();
     process.stderr.write(
       `fleetrc: the sync was stopped after ${limit >= 60_000 ? `${Math.round(limit / 60_000)} minutes` : `${limit / 1000} s`} while ${doing}; its lock is released, and the next sync starts over\n`,
     );
     process.exit(1);
+  };
+  const watchdog = setTimeout(() => {
+    onTimeout = stopSync();
   }, limit);
   watchdog.unref();
-  let prefetch: ReturnType<typeof prefetchGitSources> | undefined;
   try {
     // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
     const savedSpec = options.loaded?.root.file ?? manifestSpec(options.manifest);
@@ -910,10 +919,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     }
     return report;
   } finally {
-    await prefetch?.finish();
     clearTimeout(watchdog);
-    lock.release();
-    if (scratch) rmSync(scratch, { recursive: true, force: true });
+    if (onTimeout) await onTimeout;
+    await prefetch?.finish();
+    cleanUp();
   }
 }
 
