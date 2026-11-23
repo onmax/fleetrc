@@ -12,7 +12,9 @@
 [![status: early](https://comark-ui.onmax.me/badge.svg?label=status&value=early)](#status)
 [![license: MIT](https://comark-ui.onmax.me/badge.svg?label=license&value=MIT)](https://github.com/onmax/fleetrc/blob/main/LICENSE)
 
-One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode, Cursor and GitHub Copilot, synced on every machine when an agent session starts. It also syncs user-level instruction files, subagents, commands, MCP servers and agent hooks. Watch the [90-second explainer](https://raw.githubusercontent.com/onmax/fleetrc/main/.github/assets/explainer.mp4).
+One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode, Cursor and GitHub Copilot, synced on every machine when an agent session starts. It also syncs user-level instruction files, subagents, commands, MCP servers and agent hooks.
+
+https://github.com/user-attachments/assets/6ac368c2-fb8c-419f-b0dd-cfc4736e670c
 
 - **One copy per skill.** fleetrc fetches `git`, `npm`, `index` and `local` sources and links each skill into every installed agent's folder.
 - **Session-start syncs.** `init` installs `SessionStart` hooks in Claude Code and Codex that start a background sync when none has been tried in the last 15 minutes. Servers without an agent use `--timer`.
