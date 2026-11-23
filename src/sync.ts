@@ -82,7 +82,7 @@ export interface SyncOptions {
   loaded?: LoadedManifest;
   previewSkills?: {
     omit: (dir: string) => boolean;
-    inspect?: (links: readonly DesiredLink[]) => void;
+    inspectConfirmed?: (links: readonly DesiredLink[]) => void;
   };
   /** Leave out the note about a timer whose schedule the manifest changed (init installs it next). */
   skipTimerCheck?: boolean;
@@ -651,7 +651,17 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           : "none of the manifest's agents has a global skills folder, so no skills were linked",
       );
     const desired = [...winners.values()];
-    preview?.inspect?.(desired);
+    if (preview?.inspectConfirmed) {
+      const confirmed = new Set(
+        results
+          .filter(
+            ({ status, previewLimitation }) =>
+              status !== "error" && status !== "offline" && !previewLimitation,
+          )
+          .map(({ id }) => id),
+      );
+      preview.inspectConfirmed(desired.filter(({ source }) => confirmed.has(source)));
+    }
     doing = "linking skills into agent folders";
     // One folder that can't be written must not stop the others.
     const linkInto = (dir: string, links: DesiredLink[]): TargetReport => {

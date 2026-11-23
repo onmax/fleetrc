@@ -615,9 +615,11 @@ export async function syncClone(
     }
     if (ctx.dryRun) {
       out.status = "installed";
-      out.warnings.push(`${source.id}: ${dir} is not cloned yet; sync clones it`);
-      if (existsSync(dir)) out.skills = await discoverInPlace(source, dir, out.warnings);
-      else
+      if (lstatSync(dir, { throwIfNoEntry: false })) {
+        out.previewLimitation = `${source.id}: ${dir} exists and is not a git repository`;
+        out.skills = await discoverInPlace(source, dir, out.warnings);
+      } else {
+        out.warnings.push(`${source.id}: ${dir} is not cloned yet; sync clones it`);
         // What the clone will hold, read from the repository through the (dry run's) git cache,
         // so a plan counts the skills the clone brings.
         try {
@@ -630,10 +632,12 @@ export async function syncClone(
         } catch (error) {
           out.warnings.push(`${source.id}: cannot read ${gitUrl(source.git)}: ${message(error)}`);
         }
+      }
       return out;
     }
     try {
-      if (existsSync(dir)) throw new Error(`${dir} exists and is not a git repository`);
+      if (lstatSync(dir, { throwIfNoEntry: false }))
+        throw new Error(`${dir} exists and is not a git repository`);
       await cloneAt(source, dir);
       await nameClashes(source, dir, out.warnings, true);
       out.status = "installed";

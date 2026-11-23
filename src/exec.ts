@@ -179,10 +179,27 @@ export class GitError extends Error {
 /** Runs git without prompts; throws GitError on a non-zero exit unless `allowFail`. */
 export async function git(
   args: readonly string[],
-  options: { cwd?: string; timeoutMs?: number; allowFail?: boolean; input?: string } = {},
+  options: {
+    cwd?: string;
+    timeoutMs?: number;
+    allowFail?: boolean;
+    input?: string;
+    noFetch?: boolean;
+  } = {},
 ): Promise<ExecResult> {
   const env: NodeJS.ProcessEnv = { ...process.env, ...GIT_ENV };
-  for (const key of Object.keys(env)) if (key.toUpperCase() === "GIT_CONFIG") delete env[key];
+  for (const key of Object.keys(env)) {
+    const name = key.toUpperCase();
+    if (
+      name === "GIT_CONFIG" ||
+      (options.noFetch && (name === "GIT_ALLOW_PROTOCOL" || name === "GIT_NO_LAZY_FETCH"))
+    )
+      delete env[key];
+  }
+  if (options.noFetch) {
+    env.GIT_NO_LAZY_FETCH = "1";
+    env.GIT_ALLOW_PROTOCOL = "";
+  }
   // Git for Windows writes no path past 260 characters without core.longpaths, and fleetrc's
   // cache sits deep under HOME. Other systems ignore it.
   // A remote that stops sending: under 1 KB/s for a minute ends the transfer, over http(s). Other

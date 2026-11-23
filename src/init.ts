@@ -1,12 +1,4 @@
-import {
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  realpathSync,
-  rmSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
@@ -121,21 +113,20 @@ export function readSkillsLock(file: string): LockEntry[] {
 /** Probes the exact filesystem upstream without Git discovering a parent repository. */
 async function hasLocalGitHead(path: string): Promise<boolean> {
   if (!isAbsolute(path)) return false;
-  const result = await git(
-    [
-      "-c",
-      "protocol.allow=never",
-      "-c",
-      "protocol.file.allow=always",
-      "ls-remote",
-      "--exit-code",
-      "--",
-      path,
-      "HEAD",
-    ],
-    { allowFail: true },
-  );
-  return result.code === 0;
+  let upstream: string;
+  try {
+    upstream = realpathSync.native(path);
+  } catch {
+    return false;
+  }
+  const dotGit = join(upstream, ".git");
+  const options = { allowFail: true, noFetch: true };
+  const metadata = await git(["rev-parse", "--resolve-git-dir", dotGit], options);
+  const gitDir = `--git-dir=${metadata.code === 0 ? dotGit : upstream}`;
+  const head = await git([gitDir, "show-ref", "--hash", "--verify", "HEAD"], options);
+  if (head.code !== 0) return false;
+  const object = await git([gitDir, "cat-file", "-t", head.stdout.trim()], options);
+  return object.code === 0 && object.stdout.trim() === "commit";
 }
 
 /**
@@ -156,9 +147,9 @@ async function sameAsUpstream(
     const localFiles = hashDir(local);
     if (!sameTree(localFiles, hashDir(dir))) return false;
     return Object.keys(localFiles).every((file) => {
-      const localStat = lstatSync(join(local, file));
-      const upstreamStat = lstatSync(join(dir, file));
-      if (localStat.isFile() !== upstreamStat.isFile()) return false;
+      const localStat = lstat(join(local, file));
+      const upstreamStat = lstat(join(dir, file));
+      if (!localStat || !upstreamStat || localStat.isFile() !== upstreamStat.isFile()) return false;
       return (
         process.platform === "win32" ||
         !localStat.isFile() ||
@@ -360,7 +351,7 @@ export async function planInit(
         ? undefined
         : {
             omit,
-            inspect: (links: readonly DesiredLink[]) => {
+            inspectConfirmed: (links: readonly DesiredLink[]) => {
               for (const link of links) winners.set(link.name, link);
             },
           };
@@ -370,15 +361,7 @@ export async function planInit(
     for (const { entry, path, within, real, addedSource } of candidates) {
       const winner = winners.get(entry.name);
       const source = winner && augmented.sources.find(({ id }) => id === winner.source);
-      const status = winner && report.sources.find(({ id }) => id === winner.source)?.status;
-      if (
-        source &&
-        "git" in source &&
-        gitUrl(source.git) === gitUrl(entry.source) &&
-        status &&
-        status !== "error" &&
-        status !== "offline"
-      ) {
+      if (source && "git" in source && gitUrl(source.git) === gitUrl(entry.source)) {
         imports.unedited.push({ name: entry.name, path, from: entry.source });
         migrations.push({
           kind: "backup",
@@ -394,7 +377,7 @@ export async function planInit(
         addedSource.include = addedSource.include.filter((name) => name !== entry.name);
       recordFork(imports, entry);
       imports.notes.push(
-        `${entry.name} stays in place as a fork: the configured upstream would not link a replacement`,
+        `${entry.name} stays in place as a fork: the configured upstream could not be confirmed to link a replacement`,
       );
     }
     if (rejected) {
