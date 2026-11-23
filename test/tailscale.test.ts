@@ -1,5 +1,4 @@
 import {
-  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -9,8 +8,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, it } from "vite-plus/test";
+import { dirname, join } from "node:path";
+import { describe, expect, it, vi } from "vite-plus/test";
 import { tailscaleFallbacks, tailscaleStatus } from "../src/tailscale.ts";
 import { machine, type Machine, names, remote, sha256, skills } from "./fixture.ts";
 
@@ -58,25 +57,46 @@ function team(m: Machine, name: string, skill: string) {
 
 describe("finding the tailscale CLI", () => {
   it.skipIf(process.platform === "win32")(
-    "uses an installed CLI that is not on PATH, as the Mac app's is over SSH",
+    "finds usable installers off PATH and runs the Mac app in CLI mode",
     async () => {
       const dir = mkdtempSync(join(tmpdir(), "fleetrc-tailscale-"));
-      const cli = join(dir, "Tailscale");
-      writeFileSync(cli, `#!/bin/sh\necho '{"BackendState":"Running","Self":{}}'\n`);
-      chmodSync(cli, 0o755);
-      const saved = { path: process.env.PATH, custom: process.env.FLEETRC_TAILSCALE };
-      process.env.PATH = join(dir, "empty");
-      delete process.env.FLEETRC_TAILSCALE;
+      const cli = join(dir, "tailscale");
+      const app = join(dir, "Tailscale.app", "Contents", "MacOS", "Tailscale");
+      const broken = join(dir, "broken");
+      const stopped = join(dir, "stopped");
+      const missing = join(dir, "missing");
+      const status = { BackendState: "Running", Self: {} };
+      const printStatus = `echo '${JSON.stringify(status)}'\n`;
       try {
-        expect(await tailscaleStatus([], 5_000, [join(dir, "missing"), cli])).toEqual({
-          status: { BackendState: "Running", Self: {} },
+        mkdirSync(dirname(app), { recursive: true });
+        writeFileSync(
+          app,
+          `#!/bin/sh\n[ "$TAILSCALE_BE_CLI:$FLEETRC_TEST_APP" = 1:yes ] || exit 1\n${printStatus}`,
+          { mode: 0o755 },
+        );
+        writeFileSync(cli, `#!/bin/sh\n[ "$TAILSCALE_BE_CLI" = 0 ] || exit 1\n${printStatus}`, {
+          mode: 0o755,
         });
-        expect(await tailscaleStatus([], 5_000, [join(dir, "missing")])).toEqual({
+        writeFileSync(broken, `#!${missing}\n`, { mode: 0o755 });
+        writeFileSync(stopped, "#!/bin/sh\necho 'not connected' >&2\nexit 1\n", { mode: 0o755 });
+        vi.stubEnv("PATH", join(dir, "empty"));
+        vi.stubEnv("FLEETRC_TAILSCALE", undefined);
+        vi.stubEnv("FLEETRC_TEST_APP", "yes");
+        vi.stubEnv("TAILSCALE_BE_CLI", "0");
+        expect(await tailscaleStatus([], 5_000, [missing, broken, cli])).toEqual({ status });
+        expect(await tailscaleStatus([], 5_000, [app])).toEqual({ status });
+        expect(await tailscaleStatus([], 5_000, [stopped, cli])).toEqual({
+          error: "`tailscale status` failed: not connected",
+        });
+        expect(await tailscaleStatus([], 5_000, [missing, broken])).toEqual({
+          error: "tailscale is not installed, or not on PATH",
+        });
+        vi.stubEnv("FLEETRC_TAILSCALE", "tailscale");
+        expect(await tailscaleStatus([], 5_000, [cli])).toEqual({
           error: "tailscale is not installed, or not on PATH",
         });
       } finally {
-        process.env.PATH = saved.path;
-        if (saved.custom !== undefined) process.env.FLEETRC_TAILSCALE = saved.custom;
+        vi.unstubAllEnvs();
         rmSync(dir, { recursive: true, force: true });
       }
     },

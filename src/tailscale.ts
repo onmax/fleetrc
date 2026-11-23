@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { exec } from "./exec.ts";
 import { isRecord } from "./fs.ts";
@@ -7,6 +6,8 @@ import { LEGACY_CAPABILITY, legacyWarning } from "./legacy.ts";
 
 /** The capability a tailnet policy's `nodeAttrs` grants to hand machines the manifest's location. */
 export const TAILSCALE_CAPABILITY = "github.com/onmax/fleetrc";
+
+const MAC_APP_CLI = "/Tailscale.app/Contents/MacOS/Tailscale";
 
 /**
  * Where Tailscale's installers put its CLI, tried when `tailscale` is not on PATH. The macOS app
@@ -17,7 +18,7 @@ export function tailscaleFallbacks(platform = process.platform, env = process.en
     return [
       "/opt/homebrew/bin/tailscale",
       "/usr/local/bin/tailscale",
-      "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+      `/Applications${MAC_APP_CLI}`,
     ];
   if (platform === "win32")
     return [join(env.ProgramFiles ?? "C:\\Program Files", "Tailscale", "tailscale.exe")];
@@ -30,15 +31,26 @@ export async function tailscaleStatus(
   timeoutMs: number,
   fallbacks = tailscaleFallbacks(),
 ): Promise<{ status: Record<string, unknown> } | { error: string }> {
-  const { command, prefix } = program("FLEETRC_TAILSCALE", "tailscale");
+  const override = "FLEETRC_TAILSCALE";
+  const useFallbacks = !process.env[override];
+  const { command, prefix } = program(override, "tailscale");
+  const statusArgs = ["status", "--json", ...args];
   const options = { timeoutMs, maxOutput: 64 * 1024 * 1024 };
-  let run = await exec(command, [...prefix, "status", "--json", ...args], options);
-  if (run.spawnError === "ENOENT" && command === "tailscale") {
-    const installed = fallbacks.find((file) => existsSync(file));
-    if (installed) run = await exec(installed, ["status", "--json", ...args], options);
+  let run = await exec(command, [...prefix, ...statusArgs], options);
+  if (run.spawnError === "ENOENT" && useFallbacks) {
+    for (const file of fallbacks) {
+      const env = file.endsWith(MAC_APP_CLI)
+        ? { ...process.env, TAILSCALE_BE_CLI: "1" }
+        : undefined;
+      const candidate = await exec(file, statusArgs, { ...options, env });
+      if (!candidate.spawnError || candidate.timedOut) {
+        run = candidate;
+        break;
+      }
+      if (run.spawnError === "ENOENT" && candidate.spawnError !== "ENOENT") run = candidate;
+    }
   }
-  if (run.spawnError === "ENOENT")
-    return { error: notInstalled(command, "tailscale", "FLEETRC_TAILSCALE") };
+  if (run.spawnError === "ENOENT") return { error: notInstalled(command, "tailscale", override) };
   if (run.timedOut)
     return { error: `\`tailscale status\` did not answer within ${timeoutMs / 1000} s` };
   if (run.code !== 0) {
