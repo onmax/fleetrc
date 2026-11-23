@@ -26,6 +26,7 @@ import {
   remote,
   skillMd,
   skills,
+  writeFiles,
 } from "./fixture.ts";
 
 const linkKind = isWindows ? "junction" : "dir";
@@ -506,6 +507,34 @@ describe("init", () => {
     expect(dry.code).toBe(0);
     expect(dry.stdout).toContain("none lost");
     expect(dry.stdout).toContain(`${join("~", ".codex", "skills", "orphan")} stays`);
+  });
+
+  it("keeps imports from plain local folders as personal skills without merge hints", async () => {
+    const m = machine();
+    const folder = m.at("plain-folder");
+    writeFiles(folder, skills("skills/", "tool"));
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: {
+          tool: { source: folder, sourceType: "local", skillPath: "skills/tool/SKILL.md" },
+        },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+    const initialized = await m.run("init", manifest, "--no-hooks");
+    expect(initialized.code, initialized.stdout + initialized.stderr).toBe(0);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    const status = await m.run("status");
+    expect(status.code, status.stderr).toBe(0);
+    expect(status.stdout).not.toContain("`fleetrc diff tool`");
+    expect(status.stdout).not.toContain("`fleetrc merge tool`");
+    expect(JSON.parse(read(manifest)).forks?.tool).toBeUndefined();
   });
 
   it("imports skills-lock.json version 2 entries that are not on disk as sources", async () => {

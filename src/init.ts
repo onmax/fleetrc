@@ -126,6 +126,7 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
   );
   const grouped = new Map<string, Record<string, unknown> & { include: string[] }>();
   for (const entry of lockEntries) {
+    if (entry.sourceType === "local") continue;
     const local = personal ? join(personalSkillsDir(personal), entry.name) : undefined;
     if (local && existsSync(join(local, "SKILL.md"))) {
       if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name))) {
@@ -138,7 +139,6 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
       }
       continue;
     }
-    if (entry.sourceType === "local") continue;
     const spec =
       entry.sourceType === "well-known" ? (entry.sourceUrl ?? entry.source) : entry.source;
     if (known.has(spec)) continue;
