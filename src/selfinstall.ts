@@ -479,8 +479,8 @@ const isExecutable = (file: string) => {
  */
 export function loginShellPath(shell = process.env.SHELL): string[] {
   if (!shell || process.platform === "win32") return [];
-  const probe =
-    'printf "\\000fleetrc-path\\000%s\\000" "$PATH" && command -p pwd -P && printf "\\000"';
+  const physicalPwd = basename(shell) === "fish" ? "builtin pwd -P" : "command -p pwd -P";
+  const probe = `printf "\\000fleetrc-path\\000%s\\000" "$PATH" && ${physicalPwd} && printf "\\000"`;
   const run = spawnSync(shell, ["-l", "-c", probe], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],

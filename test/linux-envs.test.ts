@@ -1,5 +1,6 @@
 // Breaks found by running the packed tarball in Linux containers and over real SSH (test/envs/).
 // Each case states what a user should get; they fail until the matching fix lands.
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -280,6 +281,28 @@ describe("linux environments", () => {
     expect(existsSync(m.at(".local/bin/fleetrc"))).toBe(false);
     expect(init.stdout).toContain("`fleetrc` runs ~/npm/bin/fleetrc, which is on PATH");
   });
+
+  it.skipIf(isWindows || spawnSync("fish", ["--version"]).status !== 0)(
+    "L13. init links ~/.local/bin/fleetrc from a Fish login profile that overrides pwd",
+    async () => {
+      const m = machine();
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      mkdirSync(m.at(".config/fish"), { recursive: true });
+      writeFileSync(
+        m.at(".config/fish/config.fish"),
+        'status is-login; or return\ncd "$HOME"\nset -gx PATH .local/bin\nfunction pwd\n    printf "~/wrong\\n"\nend\n',
+      );
+      const init = await m.runWith(
+        { env: { SHELL: "fish", PATH: pathWithoutFleetrc(m.env) } },
+        "init",
+        manifest,
+        "--no-hooks",
+      );
+      expect(init.code, init.stderr).toBe(0);
+      expect(init.stdout).toContain("through ~/.local/bin/fleetrc");
+      expect(readlinkSync(m.at(".local/bin/fleetrc"))).toBe(join(m.stateDir, "bin", "fleetrc"));
+    },
+  );
 
   it.skipIf(isWindows).each([
     { executableDir: "bin", links: true },
