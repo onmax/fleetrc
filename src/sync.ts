@@ -65,7 +65,7 @@ import type { HookRun, Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
 import {
   failedResult,
-  fetchGitSource,
+  prefetchGitSources,
   type SourceResult,
   sourceFiles,
   syncSource,
@@ -478,6 +478,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     process.exit(1);
   }, limit);
   watchdog.unref();
+  let prefetch: ReturnType<typeof prefetchGitSources> | undefined;
   try {
     // A remote manifest's file is a cache copy (a scratch one in a dry run), so reports name its spec.
     const savedSpec = options.loaded?.root.file ?? manifestSpec(options.manifest);
@@ -540,11 +541,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const cacheDir = scratch ?? paths.cache();
     const fetchedNow = (source: Source) =>
       !offline && (options.only === undefined || options.only === source.id);
-    // Every git source starts fetching now, a few at a time, while the sources sync in order;
-    // each source's own fetch then waits on this one, and reports its error.
-    for (const source of loaded.sources)
-      if (source.kind === "git" && fetchedNow(source))
-        fetchGitSource(source, cacheDir).catch(() => {});
+    prefetch = prefetchGitSources(loaded.sources.filter(fetchedNow), cacheDir, dryRun);
     for (const source of loaded.sources) {
       await yieldToWatchdog();
       const before = state.sources[source.id];
@@ -565,6 +562,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         dryRun,
         apply: options.apply === source.id,
         cacheDir,
+        fetchGit: prefetch.fetch,
         storeDir: paths.store(source.id),
         now: startedAt,
         fileLinks: state.links,
@@ -912,6 +910,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     }
     return report;
   } finally {
+    await prefetch?.finish();
     clearTimeout(watchdog);
     lock.release();
     if (scratch) rmSync(scratch, { recursive: true, force: true });

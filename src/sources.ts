@@ -52,7 +52,16 @@ import {
   targetPath,
   treeLister,
 } from "./files.ts";
-import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
+import {
+  type CachedClone,
+  cloneKey,
+  collisions,
+  fetchClone,
+  gitUrl,
+  isCommitRef,
+  type Refusal,
+  refusals,
+} from "./gitcache.ts";
 import { globBase, globFilter } from "./glob.ts";
 import { isFileKind, ITEM_KINDS, type ItemKind } from "./kinds.ts";
 import {
@@ -127,6 +136,7 @@ export interface SourceContext {
   /** Apply review-mode updates for this source. */
   apply: boolean;
   cacheDir: string;
+  fetchGit?: (source: GitSource | CloneSource) => Promise<CachedClone>;
   storeDir: string;
   now: string;
   fileLinks?: State["links"];
@@ -622,11 +632,7 @@ export async function syncClone(
         // What the clone will hold, read from the repository through the (dry run's) git cache,
         // so a plan counts the skills the clone brings.
         try {
-          const upstream = await fetchClone(
-            gitUrl(source.git),
-            source.ref,
-            join(ctx.cacheDir, "git"),
-          );
+          const upstream = await (ctx.fetchGit?.(source) ?? fetchGitSource(source, ctx.cacheDir));
           out.skills = await discoverInPlace(source, upstream.dir, out.warnings);
         } catch (error) {
           out.warnings.push(`${source.id}: cannot read ${gitUrl(source.git)}: ${message(error)}`);
@@ -1178,11 +1184,71 @@ const noSkills = (dir: string): SkillSource => ({
 });
 
 /** Fetches a git source into the cache under `cacheDir`. */
-export const fetchGitSource = (source: GitSource, cacheDir: string) =>
+const fetchGitSource = (source: GitSource | CloneSource, cacheDir: string) =>
   fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
     // A team manifest's repository is checked again with the config of the fetch itself.
-    check: source.via === undefined ? undefined : teamGitProblem,
+    check: source.kind === "git" && source.via !== undefined ? teamGitProblem : undefined,
   });
+
+const gitSourceKey = (source: GitSource | CloneSource) => cloneKey(gitUrl(source.git), source.ref);
+
+/**
+ * Starts up to four fetches at a time. Sources sharing a cache and fetch policy share a promise.
+ * Mixed policies and clone previews use the cache only in source order, so none can replace a
+ * checkout while another source is still reading it.
+ */
+export function prefetchGitSources(sources: Source[], cacheDir: string, dryRun: boolean) {
+  const byCache = new Map<string, GitSource | null>();
+  for (const source of sources) {
+    if (source.kind === "clone" && dryRun) byCache.set(gitSourceKey(source), null);
+    if (source.kind !== "git") continue;
+    const key = gitSourceKey(source);
+    const first = byCache.get(key);
+    if (first === undefined) byCache.set(key, source);
+    else if (
+      first &&
+      ((first.via === undefined) !== (source.via === undefined) ||
+        gitUrl(first.git) !== gitUrl(source.git) ||
+        first.ref !== source.ref)
+    )
+      byCache.set(key, null);
+  }
+
+  const fetches = new Map<string, Promise<CachedClone>>();
+  const jobs: (() => Promise<void>)[] = [];
+  const active = new Set<Promise<void>>();
+  const start = () => {
+    while (active.size < 4) {
+      const job = jobs.shift();
+      if (!job) break;
+      const done = job().finally(() => {
+        active.delete(done);
+        start();
+      });
+      active.add(done);
+    }
+  };
+  const enqueue = (source: GitSource | CloneSource, urgent: boolean) => {
+    const { promise, resolve, reject } = Promise.withResolvers<CachedClone>();
+    promise.catch(() => {});
+    const job = () => fetchGitSource(source, cacheDir).then(resolve, reject);
+    if (urgent) jobs.unshift(job);
+    else jobs.push(job);
+    start();
+    return promise;
+  };
+  for (const [key, source] of byCache) {
+    if (source) fetches.set(key, enqueue(source, false));
+  }
+  return {
+    fetch: (source: GitSource | CloneSource) =>
+      fetches.get(gitSourceKey(source)) ?? enqueue(source, true),
+    async finish() {
+      jobs.length = 0;
+      await Promise.all(active);
+    },
+  };
+}
 
 /** Fetches a vendored source and returns the skills `skills` would install from it. */
 async function openVendored(
@@ -1193,7 +1259,7 @@ async function openVendored(
 ) {
   switch (source.kind) {
     case "git": {
-      const clone = await fetchGitSource(source, ctx.cacheDir);
+      const clone = await (ctx.fetchGit?.(source) ?? fetchGitSource(source, ctx.cacheDir));
       const looked = lookedAt(source);
       for (const { path, kept } of clone.collisions)
         if (looked(path))
