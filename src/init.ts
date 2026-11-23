@@ -128,12 +128,14 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
   for (const entry of lockEntries) {
     const local = personal ? join(personalSkillsDir(personal), entry.name) : undefined;
     if (local && existsSync(join(local, "SKILL.md"))) {
-      if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name)))
+      if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name))) {
+        const base = entry.commit ?? entry.ref;
         imports.forks[entry.name] = {
           from: entry.source,
           path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
-          base: entry.commit ?? entry.ref ?? "unknown",
+          ...(base === undefined ? {} : { base }),
         };
+      }
       continue;
     }
     if (entry.sourceType === "local") continue;
@@ -367,7 +369,9 @@ export function formatPlan(plan: InitPlan, { errors = true } = {}): string {
   for (const source of plan.imports.sources)
     lines.push(`  add source from skills-lock.json: ${JSON.stringify(source)}`);
   for (const [name, fork] of Object.entries(plan.imports.forks))
-    lines.push(`  record fork ${name}: ${fork.from} ${fork.path} at ${fork.base}`);
+    lines.push(
+      `  record fork ${name}: ${fork.from} ${fork.path}${fork.base === undefined ? "" : ` at ${fork.base}`}`,
+    );
   lines.push(
     `  link ${plan.sync.skills.total} skills into ${plan.sync.targets.length} agent folders: ${plan.sync.targets.map((target) => tildify(target.dir)).join(", ")}`,
   );

@@ -270,6 +270,21 @@ function gitFork(loaded: LoadedManifest, name: string, fork: Fork) {
     );
 }
 
+/**
+ * The base for a fork with none: an empty file for each file both sides have, so git merges them
+ * line by line and each difference becomes a conflict to settle once.
+ */
+function emptyBase(live: string, upstream: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "fleetrc-no-base-"));
+  const ours = hashDir(live);
+  for (const file of Object.keys(hashDir(upstream)))
+    if (Object.hasOwn(ours, file)) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), "");
+    }
+  return dir;
+}
+
 /** The fork's folder in its upstream repository, which must not lead out of the repository. */
 async function forkUpstream(fork: { from: string; path: string }, ref?: string, team = false) {
   const clone = await fetchClone(gitUrl(fork.from), ref, join(paths.cache(), "forks"), {
@@ -315,16 +330,20 @@ export async function checkForks(
     if (known && known.base === fork.base && known.upstream === result.to) continue;
     let files: string[] = [];
     let tree = "";
-    if (!result.to.startsWith(fork.base.toLowerCase()))
+    // Without a base, nothing is known to be in common, so every upstream file counts as changed.
+    if (fork.base === undefined || !result.to.startsWith(fork.base.toLowerCase()))
       try {
         const now = await fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
           offline: true,
         });
-        const base = await forkUpstream(fork, fork.base, source.via !== undefined);
+        const base =
+          fork.base === undefined
+            ? undefined
+            : await forkUpstream(fork, fork.base, source.via !== undefined);
         const dir = join(now.dir, fork.path);
         confine(now.dir, dir, "read it as the fork's upstream");
         const upstream = hashDir(dir);
-        files = changedFiles(hashDir(base.dir), upstream);
+        files = changedFiles(base ? hashDir(base.dir) : {}, upstream);
         tree = sha256(JSON.stringify(upstream));
       } catch (error) {
         warnings.push(
@@ -332,9 +351,14 @@ export async function checkForks(
         );
         continue;
       }
-    forks[name] = { base: fork.base, upstream: result.to, tree, files };
+    forks[name] = {
+      ...(fork.base === undefined ? {} : { base: fork.base }),
+      upstream: result.to,
+      tree,
+      files,
+    };
     // Said once for each new upstream version of the skill, not on every sync.
-    if (files.length > 0 && (known?.base !== fork.base || known.tree !== tree))
+    if (files.length > 0 && (!known || known.base !== fork.base || known.tree !== tree))
       updates.push({ source: source.id, skill: name, files });
   }
   return { updates, warnings };
@@ -677,7 +701,6 @@ export async function mergeSkill(
   if (fork) {
     gitFork(loaded, name, fork.fork);
     const head = await forkUpstream(fork.fork);
-    const base = await forkUpstream(fork.fork, fork.fork.base);
     const live = state.skills[name]!.dir;
     if (source.kind === "clone") confine(source.path, live, "merge into it");
     // Where the new base is recorded, checked before the merge touches a file.
@@ -686,7 +709,18 @@ export async function mergeSkill(
       spec,
       `Set "base" of "forks"."${fork.key}" to "${head.commit}"`,
     );
-    const result = await mergeTrees(live, base.dir, head.dir, dryRun);
+    let result: MergeResult;
+    if (fork.fork.base === undefined) {
+      const empty = emptyBase(live, head.dir);
+      try {
+        result = await mergeTrees(live, empty, head.dir, dryRun);
+      } finally {
+        rmSync(empty, { recursive: true, force: true });
+      }
+    } else {
+      const base = await forkUpstream(fork.fork, fork.fork.base);
+      result = await mergeTrees(live, base.dir, head.dir, dryRun);
+    }
     editManifest(
       manifest.file,
       (raw) => {

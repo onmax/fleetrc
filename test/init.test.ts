@@ -447,7 +447,7 @@ describe("init", () => {
       `move ${join("~", ".codex", "skills", ".nuxt-skills-managed")} to the backup folder`,
     );
     expect(dry.stdout).toContain(`remove the link ${join("~", ".codex", "skills", "unslop")}`);
-    expect(dry.stdout).toContain("record fork council: t3dotgg/tstack skills/council at unknown");
+    expect(dry.stdout).toContain("record fork council: t3dotgg/tstack skills/council");
     expect(dry.stdout).toContain("skill names: 6 before, 6 after; none lost");
     expect(existsSync(cache)).toBe(false);
     expect(snapshot(m.root)).toEqual(before);
@@ -468,7 +468,7 @@ describe("init", () => {
     expect(linkOf(m.at(".agents/skills/unslop"))).toBe(join(work, "skills/unslop"));
     expect(read(m.at(".agents/skills/nuxt/SKILL.md"))).toBe(skillMd("nuxt"));
     expect(JSON.parse(read(manifest)).forks).toEqual({
-      council: { from: "t3dotgg/tstack", path: "skills/council", base: "unknown" },
+      council: { from: "t3dotgg/tstack", path: "skills/council" },
     });
     // The old copies are in the backup folder, not deleted.
     const backups = readdirSync(join(m.stateDir, "backup"));

@@ -171,6 +171,28 @@ describe("edited vendored skills", () => {
     expect(names(m.at(".claude/skills"))).toEqual(["mine", "tool"]);
   });
 
+  it("4d2. a fork without a base merges from nothing in common, then records the base", async () => {
+    const { m, work, vendor, manifest } = await editedVendoredSkill({ scheduler: "empty" });
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const saved = JSON.parse(read(manifest)) as { forks: Record<string, { base?: string }> };
+    delete saved.forks.tool!.base;
+    writeFileSync(manifest, JSON.stringify(saved, null, 2));
+    vendor.commit({
+      "skills/tool/SKILL.md": lines("one", "two", "three", "four", "FIVE (theirs)"),
+    });
+    expect((await m.run("sync")).code).toBe(0);
+    expect((await m.run("status")).stdout).toContain("tool: upstream changed since you forked it");
+
+    const merge = await m.run("merge", "tool");
+    expect(merge.code).toBe(1);
+    expect(merge.stdout).toContain("conflicts: SKILL.md");
+    // git keeps the lines both sides share outside the markers.
+    const text = read(join(work, "skills/tool/SKILL.md"));
+    expect(text).toContain("description: The tool skill\n---\none\n<<<<<<< local\nTWO (mine)\n");
+    expect(text).toContain("FIVE (theirs)\n>>>>>>> upstream\n");
+    expect((JSON.parse(read(manifest)) as typeof saved).forks.tool!.base).toBe(vendor.head());
+  });
+
   it("4e. an unedited vendored skill updates in place", async () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "plain"));

@@ -120,7 +120,8 @@ export interface Hook {
 export interface Fork {
   from: string;
   path: string;
-  base: string;
+  /** The upstream commit the fork was last merged with. Without one, merge starts from nothing in common. */
+  base?: string;
 }
 
 /** A manifest `extends` names, and what the extending manifest leaves out of it. */
@@ -474,10 +475,9 @@ export function parseManifest(
         path:
           optionalString(file, `forks.${name}.path`, fork.path) ??
           fail(file, `forks.${name}.path`, "is required"),
-        base:
-          optionalString(file, `forks.${name}.base`, fork.base) ??
-          fail(file, `forks.${name}.base`, "is required"),
       };
+      const base = optionalString(file, `forks.${name}.base`, fork.base);
+      if (base !== undefined) forks[name]!.base = base;
     }
   }
   if (!Array.isArray(raw.hooks ?? [])) fail(file, "hooks", "must be an array");
