@@ -20,10 +20,21 @@ import {
   markBehind,
   remoteScript,
   resolveFleet,
+  unpublished,
 } from "../src/fleet.ts";
 import { hostManifestSpec, loadManifest, sameManifest } from "../src/manifest.ts";
 import { launchers } from "../src/selfinstall.ts";
-import { cli, isWindows, machine, type Machine, pathWith, remote, skills } from "./fixture.ts";
+import {
+  cli,
+  http,
+  isWindows,
+  machine,
+  type Machine,
+  pathWith,
+  remote,
+  skills,
+  version,
+} from "./fixture.ts";
 
 /**
  * A fake `ssh`: skips options and the `--` after them, takes the host, and runs the remote command with `sh -c` on this
@@ -1663,12 +1674,23 @@ if (process.env.FAKE_ANSWER === "mismatch") {
     expect(npxCalls(m)).toEqual([]);
   });
 
-  it("refuses a development build without FLEETRC_PACKAGE, as fleet upgrade does", async () => {
+  it("refuses a build hosts can't install without FLEETRC_PACKAGE, as fleet upgrade does", async () => {
     const { m } = await controller();
     const { PATH } = initShims(m, { vps2: join(m.root, "vps2") });
-    const run = await m.runWith({ env: { PATH } }, "fleet", "init", "vps2");
+    // A registry without this version, whatever package.json says it is.
+    const registry = await http();
+    const run = await m.runWith(
+      { env: { PATH, npm_config_registry: registry.url } },
+      "fleet",
+      "init",
+      "vps2",
+    );
     expect(run.code).toBe(1);
-    expect(run.stderr).toContain("this fleetrc is a development or preview build (0.0.0)");
+    expect(run.stderr).toContain(
+      version === "0.0.0"
+        ? "this fleetrc is a development or preview build (0.0.0)"
+        : `fleetrc ${version} is not on ${registry.url}`,
+    );
     expect(run.stderr).toContain("FLEETRC_PACKAGE");
     expect(npxCalls(m)).toEqual([]);
   });
@@ -1878,5 +1900,22 @@ describe("markBehind", () => {
     expect(current.behind).toEqual([]);
     expect(holding.behind).toEqual(["held: mine"]);
     expect(old.behind).toEqual(["mine at 69147e3"]);
+  });
+});
+
+describe("unpublished", () => {
+  it("refuses 0.0.0 and a version the registry lacks, and lets a published one through", async () => {
+    const registry = await http();
+    registry.routes.set("/fleetrc/1.2.3", { body: "{}", type: "application/json" });
+    vi.stubEnv("npm_config_registry", `${registry.url}/`);
+    try {
+      expect(await unpublished("0.0.0")).toMatch(/^this fleetrc is a development or preview build/);
+      expect(await unpublished("9.9.9", "init")).toBe(
+        `fleetrc 9.9.9 is not on ${registry.url}; run it from a release, such as \`npx fleetrc@latest fleet init\`, or name a package hosts can install in FLEETRC_PACKAGE`,
+      );
+      expect(await unpublished("1.2.3")).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

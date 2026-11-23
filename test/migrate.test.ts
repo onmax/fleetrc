@@ -30,6 +30,7 @@ import {
   type Report,
   skillMd,
   skills,
+  version,
   systemdShim,
   writeFiles,
 } from "./fixture.ts";
@@ -517,15 +518,15 @@ writeFileSync(${JSON.stringify(out)}, [process.env.FLEETRC_HOOK, process.env.SKI
       encoding: "utf8",
     });
     expect(run.status, run.stdout + run.stderr).toBe(0);
-    expect(run.stderr).toContain("fleetrc-fleet: was 0.0.0");
-    expect(run.stderr).toContain("fleetrc-fleet: now 0.0.0");
+    expect(run.stderr).toContain(`fleetrc-fleet: was ${version}`);
+    expect(run.stderr).toContain(`fleetrc-fleet: now ${version}`);
     // self-install says what it moved first; fleet reads the report from its first brace.
     expect(run.stdout).toContain("skillfleet is now fleetrc");
     const report = JSON.parse(run.stdout.slice(run.stdout.indexOf("{"))) as {
       ok: boolean;
       fleetrc: string;
     };
-    expect(report).toMatchObject({ ok: true, fleetrc: "0.0.0" });
+    expect(report).toMatchObject({ ok: true, fleetrc: version });
     expect(existsSync(oldState(m))).toBe(false);
     expect(existsSync(join(m.stateDir, "bin", "fleetrc"))).toBe(true);
     expect(read(m.at(".claude/settings.json"))).not.toContain("skillfleet");
