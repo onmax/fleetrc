@@ -1,5 +1,6 @@
 import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import {
   clone,
@@ -204,6 +205,71 @@ describe("edited vendored skills", () => {
       expect(done.code, done.stdout + done.stderr).toBe(0);
       expect((await m.json("sync")).held).toEqual([]);
     }
+  });
+
+  it("merges a file over the empty folder left by an earlier merge", async () => {
+    const { m, vendor } = await editedVendoredSkill({ scheduler: "empty" });
+    const topic = m.at(".claude/skills/tool/topic");
+    vendor.commit({ "skills/tool/topic/notes.md": "notes v1\n" });
+    await m.run("sync");
+    expect((await m.run("merge", "tool")).code).toBe(0);
+    vendor.commit({ "skills/tool/topic": null });
+    await m.run("sync");
+    expect((await m.run("merge", "tool")).code).toBe(0);
+    expect(names(topic)).toEqual([]);
+
+    vendor.commit({ "skills/tool/topic": "topic v2\n" });
+    await m.run("sync");
+    const dry = await m.run("merge", "tool", "--dry-run");
+    expect(dry.code, dry.stdout + dry.stderr).toBe(0);
+    expect(names(topic)).toEqual([]);
+    const merge = await m.run("merge", "tool");
+    expect(merge.code, merge.stdout + merge.stderr).toBe(0);
+    expect(dry.stdout, dry.stderr).toContain("would merge: topic");
+    expect(read(topic)).toBe("topic v2\n");
+  });
+
+  it("keeps a save in a folder while an earlier file is being merged", async () => {
+    const { m, vendor } = await editedVendoredSkill({ scheduler: "empty" });
+    const topic = m.at(".claude/skills/tool/topic");
+    const saved = "notes saved during merge\n";
+    vendor.commit({ "skills/tool/topic/notes.md": "notes v1\n" });
+    await m.run("sync");
+    expect((await m.run("merge", "tool")).code).toBe(0);
+    rmSync(join(vendor.work, "skills/tool/topic"), { recursive: true });
+    vendor.commit({
+      "skills/tool/SKILL.md": lines("one", "two", "three", "four", "FIVE (theirs)"),
+      "skills/tool/topic": "topic v2\n",
+    });
+    await m.run("sync");
+
+    const preload = join(m.root, "save-during-merge.mjs");
+    writeFileSync(
+      preload,
+      `
+      import child from "node:child_process";
+      import { writeFileSync } from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      const spawn = child.spawn;
+      child.spawn = (command, args, options) => {
+        const process = spawn(command, args, options);
+        if (command === "git" && args.includes("merge-file")) {
+          writeFileSync(${JSON.stringify(join(topic, "notes.md"))}, ${JSON.stringify(saved)});
+        }
+        return process;
+      };
+      syncBuiltinESMExports();
+      `,
+    );
+    const merge = await m.runWith(
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(preload).href}` } },
+      "merge",
+      "tool",
+    );
+    expect(merge.code, merge.stdout + merge.stderr).toBe(1);
+    expect(merge.stdout).toContain("conflicts: topic");
+    expect(read(join(topic, "notes.md"))).toBe(saved);
+    expect(read(`${topic}.upstream`)).toBe("topic v2\n");
   });
 
   it("4e. an unedited vendored skill updates in place", async () => {

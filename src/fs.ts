@@ -11,6 +11,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  type Dirent,
   type Stats,
   statSync,
   symlinkSync,
@@ -35,12 +36,13 @@ export const lstat = (path: string): Stats | undefined =>
   lstatSync(path, { throwIfNoEntry: false });
 
 /** sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target text. */
-export function hashDir(dir: string): Hashes {
+export function hashDir(dir: string, entries?: Map<string, Dirent>): Hashes {
   const hashes = dict<string>();
   const walk = (current: string) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       const path = join(current, entry.name);
       const key = relative(dir, path).split(sep).join("/");
+      entries?.set(key, entry);
       if (entry.isDirectory()) walk(path);
       else if (entry.isSymbolicLink()) hashes[key] = sha256(`link:${readlinkSync(path)}`);
       else if (entry.isFile()) hashes[key] = sha256(readFileSync(path));

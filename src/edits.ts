@@ -5,7 +5,9 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
+  type Dirent,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -513,6 +515,54 @@ function writeSidecar(target: string, content: Buffer, suffix = ".upstream"): st
   }
 }
 
+function mergeSnapshot(dir: string) {
+  const entries = new Map<string, Dirent>();
+  const hashes = hashDir(dir, entries);
+  return { entries, hashes };
+}
+
+/** Stage the replacement, then check the old unit after moving it aside and before discarding it. */
+function replaceMergeUnit(
+  target: string,
+  stage: (next: string) => void,
+  unchanged: (old: ReturnType<typeof mergeSnapshot>) => boolean,
+): boolean {
+  const parent = dirname(target);
+  mkdirSync(parent, { recursive: true });
+  const scratch = mkdtempSync(join(parent, ".fleetrc-merge-"));
+  const previous = join(scratch, "previous");
+  const saved = join(previous, "unit");
+  const next = join(scratch, "next");
+  const restore = () => {
+    if (lstat(target) !== undefined)
+      throw new UserError(
+        `merge: ${target} reappeared during replacement; previous copy kept at ${saved}`,
+      );
+    renameSync(saved, target);
+  };
+  let moved = false;
+  try {
+    stage(next);
+    mkdirSync(previous);
+    if (lstat(target) !== undefined) {
+      try {
+        renameSync(target, saved);
+      } catch (error) {
+        if (isErrno(error, "ENOENT")) return false;
+        throw error;
+      }
+      moved = true;
+    }
+    if (!unchanged(mergeSnapshot(previous)) || lstat(target) !== undefined) return false;
+    if (lstat(next) !== undefined) renameSync(next, target);
+    moved = false;
+    return true;
+  } finally {
+    if (moved) restore();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 /**
  * Three-way merge of one folder: `base` to `upstream` changes applied onto `live`, file by file,
  * except that a path that is a file on one side and a folder on another merges as one unit with
@@ -527,15 +577,37 @@ async function mergeTrees(
   upstream: string,
   dryRun: boolean,
 ): Promise<MergeResult> {
-  const [hl, hb, hu] = [hashDir(live), hashDir(base), hashDir(upstream)];
+  const [local, previous, next] = [
+    mergeSnapshot(live),
+    mergeSnapshot(base),
+    mergeSnapshot(upstream),
+  ];
+  const [hl, hb, hu] = [local.hashes, previous.hashes, next.hashes];
   const files = new Set([...Object.keys(hl), ...Object.keys(hb), ...Object.keys(hu)]);
-  const within = (root: string) => (file: string) => file === root || file.startsWith(`${root}/`);
-  const folded = [...files].filter((file) =>
-    [...files].some((other) => other.startsWith(`${file}/`)),
+  const collisions = new Set(
+    [...files].filter((file) =>
+      [local, previous, next].some(({ entries }) => entries.get(file)?.isDirectory()),
+    ),
   );
-  const roots = folded.filter((root) => !folded.some((other) => root.startsWith(`${other}/`)));
-  const subtree = (hashes: Record<string, string>, root: string) =>
-    JSON.stringify(Object.entries(hashes).filter(([file]) => within(root)(file)));
+  const groups = new Map<string, string[]>();
+  if (collisions.size > 0) {
+    const paths = new Set([
+      ...local.entries.keys(),
+      ...previous.entries.keys(),
+      ...next.entries.keys(),
+    ]);
+    for (const path of paths) {
+      let root: string | undefined;
+      for (let ancestor = path; ancestor !== "."; ancestor = posix.dirname(ancestor)) {
+        if (collisions.has(ancestor)) root = ancestor;
+      }
+      if (root === undefined) continue;
+      const group = groups.get(root);
+      if (group === undefined) groups.set(root, [path]);
+      else group.push(path);
+      if (path !== root) files.delete(path);
+    }
+  }
   const result: MergeResult = { merged: [], conflicts: [] };
   const markers: Record<string, string> = {};
   /**
@@ -586,35 +658,64 @@ async function mergeTrees(
    * Replaces the unit at `root` with upstream's when the local copy has no edits in it and upstream's
    * holds only plain files, and is a conflict on `root` otherwise.
    */
-  const mergeUnit = (root: string) => {
-    if (subtree(hu, root) === subtree(hb, root) || subtree(hl, root) === subtree(hu, root)) return;
-    const incoming = Object.keys(hu).filter(within(root));
+  const mergeUnit = (root: string, paths: string[]) => {
+    const sameHashes = (left: typeof hl, right: typeof hl) =>
+      paths.every((path) => left[path] === right[path]);
+    if (sameHashes(hu, hb) || sameHashes(hl, hu)) return;
+    const incoming = paths.filter((path) => hu[path] !== undefined);
     const contents = incoming.map((file) => readContent(upstream, file));
+    const upstreamConflict = () =>
+      conflict(
+        root,
+        next.entries.get(root)?.isDirectory() ? "folder" : readContent(upstream, root),
+      );
+    const localEntries = paths.filter((path) => local.entries.has(path));
     if (
-      subtree(hl, root) !== subtree(hb, root) ||
+      !sameHashes(hl, hb) ||
+      localEntries.some((path) => {
+        const entry = local.entries.get(path)!;
+        return !entry.isFile() && !entry.isDirectory();
+      }) ||
       linkedFolder(live, root) !== undefined ||
       !contents.every((content) => Buffer.isBuffer(content))
     ) {
-      conflict(
-        root,
-        hu[root] === undefined && incoming.length > 0 ? "folder" : readContent(upstream, root),
-      );
+      upstreamConflict();
       return;
     }
     if (!dryRun) {
-      rmSync(join(live, root), { recursive: true, force: true });
-      incoming.forEach((file, i) => {
-        mkdirSync(dirname(join(live, file)), { recursive: true });
-        writeFileSync(join(live, file), contents[i] as Buffer);
-      });
+      const replaced = replaceMergeUnit(
+        join(live, root),
+        (staged) => {
+          if (next.entries.get(root)?.isDirectory()) mkdirSync(staged);
+          incoming.forEach((file, index) => {
+            const path = join(staged, file.slice(root.length));
+            mkdirSync(dirname(path), { recursive: true });
+            writeFileSync(path, contents[index] as Buffer);
+          });
+        },
+        (old) =>
+          old.entries.size === localEntries.length &&
+          localEntries.every((path) => {
+            const saved = `unit${path.slice(root.length)}`;
+            const entry = old.entries.get(saved);
+            return (
+              (local.entries.get(path)?.isDirectory() ? entry?.isDirectory() : entry?.isFile()) &&
+              old.hashes[saved] === hl[path]
+            );
+          }),
+      );
+      if (!replaced) {
+        upstreamConflict();
+        return;
+      }
     }
-    const changed = [...files].filter((file) => within(root)(file) && hb[file] !== hu[file]);
+    const changed = paths.filter((file) => hb[file] !== hu[file]);
     result.merged.push(...changed.sort());
   };
   for (const file of [...files].sort()) {
-    const root = roots.find((candidate) => within(candidate)(file));
-    if (root !== undefined) {
-      if (file === root) mergeUnit(root);
+    const group = groups.get(file);
+    if (group !== undefined) {
+      mergeUnit(file, group);
       continue;
     }
     const b = readContent(base, file);
