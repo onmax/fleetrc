@@ -267,7 +267,7 @@ function nonGitFork(loaded: LoadedManifest, fork: Fork): boolean {
   if (fork.upstream !== undefined) return fork.upstream === "index";
   return (
     loaded.sources.some((source) => source.kind === "index" && source.index === fork.from) &&
-    !forkGitSource(loaded, fork)
+    !(isCommitRef(fork.base ?? "") && forkGitSource(loaded, fork))
   );
 }
 

@@ -78,6 +78,7 @@ interface LockEntry {
   source: string;
   sourceType?: string;
   sourceUrl?: string;
+  ref?: string;
   skillPath?: string;
   commit?: string;
 }
@@ -98,6 +99,7 @@ export function readSkillsLock(file: string): LockEntry[] {
         source: entry.source,
         sourceType: text("sourceType"),
         sourceUrl: text("sourceUrl"),
+        ref: text("ref"),
         skillPath: text("skillPath"),
         commit: text("commit"),
       },
@@ -147,7 +149,8 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
     if (local && existsSync(join(local, "SKILL.md"))) {
       if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name))) {
         if (entry.sourceType === "local" && !(await hasLocalGitHead(entry.source))) continue;
-        const base = entry.commit || undefined;
+        const base =
+          entry.commit || (entry.ref && /^[0-9a-f]{40}$/i.test(entry.ref) ? entry.ref : undefined);
         const upstream =
           entry.sourceType === "well-known"
             ? "index"

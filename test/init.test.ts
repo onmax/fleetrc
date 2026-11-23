@@ -652,6 +652,43 @@ describe("init", () => {
     expect((await m.run("status")).stdout).toContain("tool: no recorded merge base");
   });
 
+  it("uses a full commit ID from a legacy lock ref as the fork base", async () => {
+    const m = machine();
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const base = upstream.head();
+    const edited = skillMd("tool", "Local edit");
+    const personal = remote(m, "personal", {
+      "skills/tool/SKILL.md": edited,
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: {
+          tool: {
+            source: upstream.url,
+            sourceType: "git",
+            ref: base,
+            skillPath: "skills/tool/SKILL.md",
+          },
+        },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+
+    const initialized = await m.run("init", manifest, "--no-hooks");
+    expect(initialized.code, initialized.stdout + initialized.stderr).toBe(0);
+    expect(JSON.parse(read(manifest)).forks.tool.base).toBe(base);
+
+    const head = upstream.commit({ "skills/tool/notes.txt": "upstream note\n" });
+    const merged = await m.run("merge", "tool");
+    expect(merged.code, merged.stdout + merged.stderr).toBe(0);
+    expect(read(join(work, "skills/tool/SKILL.md"))).toBe(edited);
+    expect(read(join(work, "skills/tool/notes.txt"))).toBe("upstream note\n");
+    expect(JSON.parse(read(manifest)).forks.tool.base).toBe(head);
+  });
+
   it("does not fetch a local partial clone's missing HEAD during offline init", async () => {
     const m = machine();
     const upstream = remote(m, "upstream", skills("skills/", "tool"));
