@@ -110,21 +110,16 @@ export function readSkillsLock(file: string): LockEntry[] {
 /** Probes the exact filesystem upstream without Git discovering a parent repository. */
 async function hasLocalGitHead(path: string): Promise<boolean> {
   if (!isAbsolute(path)) return false;
-  const result = await git(
-    [
-      "-c",
-      "protocol.allow=never",
-      "-c",
-      "protocol.file.allow=always",
-      "ls-remote",
-      "--exit-code",
-      "--",
-      path,
-      "HEAD",
-    ],
+  const dotGit = join(path, ".git");
+  const metadata = await git(["rev-parse", "--resolve-git-dir", dotGit], { allowFail: true });
+  const gitDir = `--git-dir=${metadata.code === 0 ? dotGit : path}`;
+  const head = await git([gitDir, "show-ref", "--hash", "--verify", "HEAD"], { allowFail: true });
+  if (head.code !== 0) return false;
+  const object = await git(
+    [gitDir, "-c", "protocol.allow=never", "cat-file", "-t", head.stdout.trim()],
     { allowFail: true },
   );
-  return result.code === 0;
+  return object.code === 0 && object.stdout.trim() === "commit";
 }
 
 /** Turns `skills` lock entries into manifest sources and forks. */
