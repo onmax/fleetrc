@@ -446,6 +446,40 @@ describe("npm and local sources", () => {
     expect(asked).toEqual([]);
   });
 
+  it("7a3. updates the linked skill when the registry changes but the pin does not", async () => {
+    const m = machine();
+    const first = await http();
+    const second = await http();
+    for (const [registry, content] of [[first, "first"], [second, "second"]] as const)
+      publishNpm(
+        registry,
+        "@acme/skills",
+        { "1.0.0": { "skills/npm-skill/SKILL.md": skillMd("npm-skill", content) } },
+        "1.0.0",
+      );
+    const manifest = (registry: Http) =>
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "acme", npm: "@acme/skills@1.0.0", registry: registry.url }],
+      });
+    const linked = m.at(".claude/skills/npm-skill/SKILL.md");
+    const init = await m.run("init", manifest(first), "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(read(linked)).toBe(skillMd("npm-skill", "first"));
+
+    manifest(second);
+    const report = await m.json("sync");
+    expect(report.ok).toBe(true);
+    expect(report.sources[0]).toMatchObject({ status: "updated", from: "1.0.0", to: "1.0.0" });
+    expect(read(linked)).toBe(skillMd("npm-skill", "second"));
+
+    const requests: string[] = [];
+    second.before = (path) => void requests.push(path);
+    const warm = await m.json("sync");
+    expect(warm.sources[0]).toMatchObject({ status: "unchanged", to: "1.0.0" });
+    expect(requests).toEqual([]);
+  });
+
   it("7b. rejects an npm tarball whose integrity does not match", async () => {
     const m = machine();
     const registry = await http();

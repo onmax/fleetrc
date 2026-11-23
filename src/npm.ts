@@ -266,7 +266,9 @@ export async function fetchNpm(
   const { name, want } = parseNpmSpec(spec);
   if (!PACKAGE_NAME.test(name)) throw new Error(`npm "${name}" is not a package name`);
   const base = registryUrl(registry);
-  const registryCache = join(cacheRoot, createHash("sha256").update(base).digest("hex"));
+  const registryKey = createHash("sha256").update(base).digest("hex");
+  const registryCache = join(cacheRoot, registryKey);
+  const packageKey = `${registryKey}/${name}`;
   const folder = (version: string) => {
     const dir = join(registryCache, `${name.replace("/", "+")}@${version}`);
     const inside = relative(registryCache, dir);
@@ -277,7 +279,7 @@ export async function fetchNpm(
   // A published version never changes, so one already downloaded from this registry needs no request.
   if (EXACT_VERSION.test(want) && VERSION.test(want)) {
     const dir = folder(want);
-    if (existsSync(dir)) return { dir, version: want };
+    if (existsSync(dir)) return { dir, version: want, packageKey };
   }
   const signal = AbortSignal.timeout(30_000);
   const requestPackument = (accept: string) =>
@@ -304,7 +306,7 @@ export async function fetchNpm(
     throw new Error(`npm ${name}: no version or tag "${want}"`);
   if (!VERSION.test(version)) throw new Error(`npm ${name}: the registry gave an invalid version`);
   const dir = folder(version);
-  if (existsSync(dir)) return { dir, version };
+  if (existsSync(dir)) return { dir, version, packageKey };
   const url = manifest.dist.tarball;
   // The token is for the registry; a packument can point the tarball at any host.
   const tarballOrigin = urlOrigin(url);
@@ -328,5 +330,5 @@ export async function fetchNpm(
   mkdirSync(temp, { recursive: true });
   extractStripped(files, temp);
   renameSync(temp, dir);
-  return { dir, version };
+  return { dir, version, packageKey };
 }

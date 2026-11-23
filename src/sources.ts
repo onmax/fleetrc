@@ -1240,6 +1240,7 @@ async function openVendored(
           return noSkills(pkg.dir);
         }),
         version: pkg.version,
+        npmPackageKey: pkg.packageKey,
         glob: source.skills,
         root: pkg.dir,
         submodules: [],
@@ -1518,12 +1519,14 @@ function nothingNew(
   source: VendoredSource,
   state: SourceState,
   ctx: SourceContext,
-  version: string | undefined,
+  { version, npmPackageKey }: { version: string | undefined; npmPackageKey?: string },
   chosen: readonly Found[],
 ): boolean {
   // A well-known index has no version to compare.
   if (source.kind === "index" || version === undefined) return false;
   if (version !== (source.kind === "npm" ? state.version : state.commit)) return false;
+  if (source.kind === "npm" && (!npmPackageKey || npmPackageKey !== state.npmPackageKey))
+    return false;
   if (Object.keys(state.pending).length > 0) return false;
   if (chosen.length !== Object.keys(state.skills).length) return false;
   return chosen.every(
@@ -1941,7 +1944,7 @@ async function fetchVendored(
         `${source.id}: ${mismatchText(name, digest)}, so ${kept ? "it keeps its last good copy" : "it is not installed"}; the index's other skills update as usual`,
       );
     }
-    if (nothingNew(source, state, ctx, opened.version, chosen)) {
+    if (nothingNew(source, state, ctx, opened, chosen)) {
       out.skills = chosen.map((skill) => ({
         name: skill.name,
         dir: storePaths(ctx.storeDir, skill.name).live,
@@ -2078,8 +2081,10 @@ async function fetchVendored(
     });
     if (opened.root) vendoredFiles(source, state, ctx, out, opened.root, opened.version);
     state.fetchedAt = ctx.now;
-    if (source.kind === "npm") state.version = opened.version;
-    else state.commit = opened.version;
+    if (source.kind === "npm") {
+      state.version = opened.version;
+      state.npmPackageKey = opened.npmPackageKey;
+    } else state.commit = opened.version;
     out.to = opened.version;
   } catch (error) {
     out.status = "error";
