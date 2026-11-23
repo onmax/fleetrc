@@ -432,6 +432,24 @@ appendFileSync(${JSON.stringify(log)}, process.env.FLEETRC_HOOK + "\\n");`,
     expect(readdirSync(m.at(".claude/skills"))).toContain(".fleetrc-manifest.json");
   });
 
+  it("previews an offline sync from what earlier syncs fetched, for a remote manifest and its git sources", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const manifests = remote(m, "manifests", {
+      ".fleetrc/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      }),
+    });
+    expect((await m.run("init", manifests.url, "--no-hooks")).code).toBe(0);
+    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
+    const dry = await m.run("sync", "--offline", "--dry-run");
+    expect(dry.code, dry.stdout + dry.stderr).toBe(0);
+    expect(dry.stderr).not.toMatch(/never been fetched/);
+    // Offline, the preview stays at the commit the last sync fetched.
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
+
   it("a sync that finds nothing new upstream copies no file", async () => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool", "other"));

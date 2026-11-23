@@ -454,7 +454,9 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   const startedAt = new Date().toISOString();
   const dryRun = options.dryRun ?? false;
   const offline = options.offline ?? false;
-  const scratch = dryRun ? mkdtempSync(join(tmpdir(), "fleetrc-dry-")) : undefined;
+  // A dry run fetches into a scratch cache, so the real one never moves past what was synced.
+  // Offline it fetches nothing, so it reads the real cache: a scratch one would be empty.
+  const scratch = dryRun && !offline ? mkdtempSync(join(tmpdir(), "fleetrc-dry-")) : undefined;
   const lock = dryRun ? { release: () => {} } : acquireLock();
   if (!dryRun) sweepJsonTemps();
   const warnings: string[] = lock.note ? [lock.note] : [];
