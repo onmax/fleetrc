@@ -1,6 +1,6 @@
 {
   "name": "fleetrc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The same skills on every agent and every machine, synced when an agent session starts.",
   "keywords": [
     "agent-skills",
