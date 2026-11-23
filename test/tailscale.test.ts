@@ -1,6 +1,17 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { tailscaleFallbacks, tailscaleStatus } from "../src/tailscale.ts";
 import { machine, type Machine, names, remote, sha256, skills } from "./fixture.ts";
 
 /**
@@ -44,6 +55,44 @@ function team(m: Machine, name: string, skill: string) {
     }),
   });
 }
+
+describe("finding the tailscale CLI", () => {
+  it.skipIf(process.platform === "win32")(
+    "uses an installed CLI that is not on PATH, as the Mac app's is over SSH",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "fleetrc-tailscale-"));
+      const cli = join(dir, "Tailscale");
+      writeFileSync(cli, `#!/bin/sh\necho '{"BackendState":"Running","Self":{}}'\n`);
+      chmodSync(cli, 0o755);
+      const saved = { path: process.env.PATH, custom: process.env.FLEETRC_TAILSCALE };
+      process.env.PATH = join(dir, "empty");
+      delete process.env.FLEETRC_TAILSCALE;
+      try {
+        expect(await tailscaleStatus([], 5_000, [join(dir, "missing"), cli])).toEqual({
+          status: { BackendState: "Running", Self: {} },
+        });
+        expect(await tailscaleStatus([], 5_000, [join(dir, "missing")])).toEqual({
+          error: "tailscale is not installed, or not on PATH",
+        });
+      } finally {
+        process.env.PATH = saved.path;
+        if (saved.custom !== undefined) process.env.FLEETRC_TAILSCALE = saved.custom;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("looks where the Mac app and Homebrew install it, and in Program Files", () => {
+    expect(tailscaleFallbacks("darwin")).toContain(
+      "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    );
+    expect(tailscaleFallbacks("darwin")).toContain("/opt/homebrew/bin/tailscale");
+    expect(tailscaleFallbacks("win32", { ProgramFiles: "D:\\Apps" })).toEqual([
+      join("D:\\Apps", "Tailscale", "tailscale.exe"),
+    ]);
+    expect(tailscaleFallbacks("linux")).toEqual([]);
+  });
+});
 
 describe("the manifest from the tailnet policy", () => {
   it("a new machine runs bare init and syncs the manifest the policy names", async () => {

@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { exec } from "./exec.ts";
 import { isRecord } from "./fs.ts";
 import { notInstalled, program } from "./program.ts";
@@ -6,16 +8,35 @@ import { LEGACY_CAPABILITY, legacyWarning } from "./legacy.ts";
 /** The capability a tailnet policy's `nodeAttrs` grants to hand machines the manifest's location. */
 export const TAILSCALE_CAPABILITY = "github.com/onmax/fleetrc";
 
+/**
+ * Where Tailscale's installers put its CLI, tried when `tailscale` is not on PATH. The macOS app
+ * never puts its CLI on PATH, and over SSH a Mac's PATH has no Homebrew folder either.
+ */
+export function tailscaleFallbacks(platform = process.platform, env = process.env): string[] {
+  if (platform === "darwin")
+    return [
+      "/opt/homebrew/bin/tailscale",
+      "/usr/local/bin/tailscale",
+      "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ];
+  if (platform === "win32")
+    return [join(env.ProgramFiles ?? "C:\\Program Files", "Tailscale", "tailscale.exe")];
+  return [];
+}
+
 /** `tailscale status --json` with `args`, parsed, or why Tailscale could not answer. */
 export async function tailscaleStatus(
   args: readonly string[],
   timeoutMs: number,
+  fallbacks = tailscaleFallbacks(),
 ): Promise<{ status: Record<string, unknown> } | { error: string }> {
   const { command, prefix } = program("FLEETRC_TAILSCALE", "tailscale");
-  const run = await exec(command, [...prefix, "status", "--json", ...args], {
-    timeoutMs,
-    maxOutput: 64 * 1024 * 1024,
-  });
+  const options = { timeoutMs, maxOutput: 64 * 1024 * 1024 };
+  let run = await exec(command, [...prefix, "status", "--json", ...args], options);
+  if (run.spawnError === "ENOENT" && command === "tailscale") {
+    const installed = fallbacks.find((file) => existsSync(file));
+    if (installed) run = await exec(installed, ["status", "--json", ...args], options);
+  }
   if (run.spawnError === "ENOENT")
     return { error: notInstalled(command, "tailscale", "FLEETRC_TAILSCALE") };
   if (run.timedOut)
