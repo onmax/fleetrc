@@ -167,7 +167,7 @@ export async function fetchClone(
   }
   // A commit never changes: once written out, a ref that names one needs no fetch.
   if (written && ref && isCommitRef(ref) && written.commit.startsWith(ref.toLowerCase()))
-    return { dir: cache.tree, ...written };
+    return { dir: cache.tree, ...written, repo: cache.repo };
   for (let attempt = 0; ; attempt++) {
     const fresh = !(existsSync(cache.repo) && (await usable(cache.repo)));
     if (fresh) {

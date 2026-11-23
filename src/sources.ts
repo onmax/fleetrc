@@ -52,11 +52,20 @@ import {
   targetPath,
   treeLister,
 } from "./files.ts";
-import { collisions, fetchClone, gitUrl, isCommitRef, type Refusal, refusals } from "./gitcache.ts";
+import {
+  type CachedClone,
+  collisions,
+  fetchClone,
+  gitUrl,
+  isCommitRef,
+  type Refusal,
+  refusals,
+} from "./gitcache.ts";
 import { globBase, globFilter } from "./glob.ts";
 import { isFileKind, ITEM_KINDS, type ItemKind } from "./kinds.ts";
 import {
   type CloneSource,
+  type GitSource,
   type InPlaceSource,
   type Source,
   teamGitProblem,
@@ -1169,15 +1178,68 @@ const filesOnly = (source: VendoredSource, state: SourceState) =>
       (kind) => !!kind && Object.keys(kind.items).length + Object.keys(kind.pending).length > 0,
     ));
 
-/**
- * Whether a source fetched before has none of its installed skills' SKILL.md files in the tree at
- * `dir`: they were removed upstream, or an earlier fetch already removed them all.
- */
-const allGone = (state: SourceState, dir: string) =>
-  state.commit !== undefined &&
-  Object.values(state.skills).every(
-    ({ path }) => path !== undefined && !existsSync(join(dir, path, "SKILL.md")),
+const gitDiscovery = (source: GitSource) =>
+  sha256(JSON.stringify([gitUrl(source.git), source.ref, source.skills]));
+
+async function gitTreePaths(repo: string, commit: string) {
+  const tree = await git(
+    [`--git-dir=${repo}`, "ls-tree", "-r", "-t", "-z", "--full-tree", commit],
+    { allowFail: true },
   );
+  if (tree.code !== 0 || tree.truncated) return undefined;
+  return new Map(
+    tree.stdout
+      .split("\0")
+      .filter(Boolean)
+      .map((entry) => [entry.slice(entry.indexOf("\t") + 1), entry.slice(0, entry.indexOf(" "))]),
+  );
+}
+
+/** Proves empty discovery is an upstream change, not a broken cache or a different source. */
+async function allGone(
+  source: GitSource,
+  state: SourceState,
+  { commit, repo }: CachedClone,
+  missingBase: boolean,
+) {
+  if (state.commit === undefined || repo === undefined) return false;
+  const installed = Object.values(state.skills);
+  if (
+    state.gitDiscovery === undefined
+      ? installed.length === 0
+      : state.gitDiscovery !== gitDiscovery(source)
+  )
+    return false;
+  const matches = source.skills
+    ? globFilter(source.skills, `${source.id}: skills glob`)
+    : () => true;
+  const tree = await gitTreePaths(repo, commit);
+  if (!tree || (missingBase && (!source.skills || tree.has(globBase(source.skills))))) return false;
+  for (const [file, mode] of tree)
+    if (mode !== "040000" && posix.basename(file) === "SKILL.md" && matches(posix.dirname(file)))
+      return false;
+  const prior = new Map<string, Awaited<ReturnType<typeof gitTreePaths>>>();
+  for (const record of installed) {
+    if (record.path === undefined || !matches(record.path)) return false;
+    const manifest = posix.join(record.path, "SKILL.md");
+    if (tree.has(manifest)) return false;
+    for (
+      let folder = posix.dirname(manifest);
+      folder !== "." && folder !== "/";
+      folder = posix.dirname(folder)
+    ) {
+      const mode = tree.get(folder);
+      if (mode === "120000" || mode === "160000") return false;
+    }
+    if (state.gitDiscovery === undefined) {
+      const at = record.commit === undefined ? state.commit : record.commit;
+      if (at === null) return false;
+      if (!prior.has(at)) prior.set(at, await gitTreePaths(repo, at));
+      if (!prior.get(at)?.has(manifest)) return false;
+    }
+  }
+  return true;
+}
 
 /** A source with no skills to discover, for one that gives only files. */
 const noSkills = (dir: string): SkillSource => ({
@@ -1207,17 +1269,17 @@ async function openVendored(
           );
       windowsNames(source, clone.refused, warnings);
       return {
-        handle: await discover(clone.dir, source.skills).catch((error: unknown): SkillSource => {
-          // Only the linked-folder pass, the files of a source of files, or a tree where every
-          // installed skill is gone can rescue this specific empty discovery result.
+        handle: await discover(clone.dir, source.skills).catch(async (error: unknown) => {
+          const empty = isDiagnostic(error, "SKILLS_NO_VALID_SKILLS");
+          const missingBase = isDiagnostic(error, "SKILLS_LOCAL_PATH_NOT_FOUND");
           if (
-            !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
-            (!filesOnly(source, state) &&
-              !allGone(state, clone.dir) &&
-              (!source.skills || linkedFolders(source, clone.dir, [], []).length === 0))
+            (empty &&
+              (filesOnly(source, state) ||
+                (source.skills && linkedFolders(source, clone.dir, [], []).length > 0))) ||
+            ((empty || missingBase) && (await allGone(source, state, clone, missingBase)))
           )
-            throw error;
-          return noSkills(clone.dir);
+            return noSkills(clone.dir);
+          throw error;
         }),
         version: clone.commit,
         glob: source.skills,
@@ -1886,7 +1948,7 @@ async function fetchVendored(
     out.warnings.push(
       `${source.id}: state.json had no install record of ${rebuilt.join(", ")}, so fleetrc rebuilt it from the copy it kept in the store`,
     );
-  const firstRun = Object.keys(state.skills).length === 0;
+  const firstRun = state.commit === undefined && Object.keys(state.skills).length === 0;
   // Local edits are checked on every run, online or not.
   lookForEdits(source, state, ctx, out);
   if (ctx.offline) {
@@ -1960,6 +2022,7 @@ async function fetchVendored(
       }));
       if (opened.root) vendoredFiles(source, state, ctx, out, opened.root, opened.version);
       state.fetchedAt = ctx.now;
+      if (source.kind === "git") state.gitDiscovery = gitDiscovery(source);
       out.to = opened.version;
       return out;
     }
@@ -2090,7 +2153,10 @@ async function fetchVendored(
     if (opened.root) vendoredFiles(source, state, ctx, out, opened.root, opened.version);
     state.fetchedAt = ctx.now;
     if (source.kind === "npm") state.version = opened.version;
-    else state.commit = opened.version;
+    else {
+      state.commit = opened.version;
+      if (source.kind === "git") state.gitDiscovery = gitDiscovery(source);
+    }
     out.to = opened.version;
   } catch (error) {
     out.status = "error";
