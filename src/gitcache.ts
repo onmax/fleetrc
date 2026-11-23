@@ -129,20 +129,54 @@ export function hasCachedClone(url: string, ref: string | undefined, root: strin
  * macOS, where the file system folds case and Unicode normalization, and `git clean` then deletes
  * files it took for untracked.
  */
-export async function fetchClone(
+export function fetchClone(
   url: string,
   ref: string | undefined,
   root: string,
-  {
-    offline = false,
-    check,
-    cacheUrl = url,
-  }: {
-    offline?: boolean;
-    cacheUrl?: string;
-    /** Why `url` may not be fetched, asked in the cache's own repository right before each fetch. */
-    check?: (url: string, cwd: string) => Promise<string | undefined>;
-  } = {},
+  options: FetchOptions = {},
+): Promise<CachedClone> {
+  if (options.offline) return fetchCloneNow(url, ref, root, options);
+  // One fetch per cache folder in a run: sources that read the same repository and ref share it,
+  // and two fetches into one shallow repository at once fail on its shallow.lock.
+  const key = `${join(root, cloneKey(options.cacheUrl ?? url, ref))}${options.check ? "\0checked" : ""}`;
+  let fetch = fetches.get(key);
+  if (!fetch) fetches.set(key, (fetch = fewAtOnce(() => fetchCloneNow(url, ref, root, options))));
+  return fetch;
+}
+
+const fetches = new Map<string, Promise<CachedClone>>();
+
+/** Fetches that run at once. They wait on the network, and more than 4 gains little. */
+const FETCH_JOBS = 4;
+let fetching = 0;
+const queued: (() => void)[] = [];
+
+/** Runs `work` once fewer than FETCH_JOBS run, in the order they were asked for. */
+async function fewAtOnce<T>(work: () => Promise<T>): Promise<T> {
+  if (fetching < FETCH_JOBS) fetching++;
+  else await new Promise<void>((resolve) => queued.push(resolve));
+  try {
+    return await work();
+  } finally {
+    // The slot goes straight to the next fetch, if one waits.
+    const next = queued.shift();
+    if (next) next();
+    else fetching--;
+  }
+}
+
+interface FetchOptions {
+  offline?: boolean;
+  cacheUrl?: string;
+  /** Why `url` may not be fetched, asked in the cache's own repository right before each fetch. */
+  check?: (url: string, cwd: string) => Promise<string | undefined>;
+}
+
+async function fetchCloneNow(
+  url: string,
+  ref: string | undefined,
+  root: string,
+  { offline = false, check, cacheUrl = url }: FetchOptions,
 ): Promise<CachedClone> {
   const key = cloneKey(cacheUrl, ref);
   const cache = {

@@ -57,6 +57,7 @@ import { globBase, globFilter } from "./glob.ts";
 import { isFileKind, ITEM_KINDS, type ItemKind } from "./kinds.ts";
 import {
   type CloneSource,
+  type GitSource,
   type InPlaceSource,
   type Source,
   teamGitProblem,
@@ -1176,6 +1177,13 @@ const noSkills = (dir: string): SkillSource => ({
   dispose: async () => {},
 });
 
+/** Fetches a git source into the cache under `cacheDir`. */
+export const fetchGitSource = (source: GitSource, cacheDir: string) =>
+  fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
+    // A team manifest's repository is checked again with the config of the fetch itself.
+    check: source.via === undefined ? undefined : teamGitProblem,
+  });
+
 /** Fetches a vendored source and returns the skills `skills` would install from it. */
 async function openVendored(
   source: VendoredSource,
@@ -1185,10 +1193,7 @@ async function openVendored(
 ) {
   switch (source.kind) {
     case "git": {
-      const clone = await fetchClone(gitUrl(source.git), source.ref, join(ctx.cacheDir, "git"), {
-        // A team manifest's repository is checked again with the config of the fetch itself.
-        check: source.via === undefined ? undefined : teamGitProblem,
-      });
+      const clone = await fetchGitSource(source, ctx.cacheDir);
       const looked = lookedAt(source);
       for (const { path, kept } of clone.collisions)
         if (looked(path))

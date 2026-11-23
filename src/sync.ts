@@ -53,6 +53,7 @@ import {
   readConfig,
   remoteManifest,
   sameManifest,
+  type Source,
   stagePolicyManifest,
   tailnetManifestSpec,
   writeConfig,
@@ -62,7 +63,13 @@ import { paths, tildify } from "./paths.ts";
 import { LOCK_MAX_AGE_MS, LockHeldError, lockText, readLock, takeLock } from "./lock.ts";
 import type { HookRun, Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
-import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sources.ts";
+import {
+  failedResult,
+  fetchGitSource,
+  type SourceResult,
+  sourceFiles,
+  syncSource,
+} from "./sources.ts";
 import { loadState, sourceState, type State, StateFile } from "./state.ts";
 import { scheduleDrift } from "./timer.ts";
 import { version } from "./version.ts";
@@ -530,6 +537,14 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         .map(([name, record]) => ({ name, dir: record.dir }));
     const backupRoot = join(paths.backup(), startedAt.replace(/[:.]/g, "-"));
     const results: SourceResult[] = [];
+    const cacheDir = scratch ?? paths.cache();
+    const fetchedNow = (source: Source) =>
+      !offline && (options.only === undefined || options.only === source.id);
+    // Every git source starts fetching now, a few at a time, while the sources sync in order;
+    // each source's own fetch then waits on this one, and reports its error.
+    for (const source of loaded.sources)
+      if (source.kind === "git" && fetchedNow(source))
+        fetchGitSource(source, cacheDir).catch(() => {});
     for (const source of loaded.sources) {
       await yieldToWatchdog();
       const before = state.sources[source.id];
@@ -545,11 +560,11 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           }
       }
       const ctx = {
-        offline: offline || (options.only !== undefined && options.only !== source.id),
+        offline: !fetchedNow(source),
         offlineRequested: offline,
         dryRun,
         apply: options.apply === source.id,
-        cacheDir: scratch ?? paths.cache(),
+        cacheDir,
         storeDir: paths.store(source.id),
         now: startedAt,
         fileLinks: state.links,
