@@ -5,12 +5,13 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { isWindows, machine, type Machine, remote, skills } from "./fixture.ts";
+import { isWindows, machine, type Machine, pathWithoutFleetrc, remote, skills } from "./fixture.ts";
 
 const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
 
@@ -229,6 +230,28 @@ describe("linux environments", () => {
     const onPath = existsSync(m.at(".local/bin/fleetrc"));
     expect(onPath || /PATH/.test(init.stdout), init.stdout).toBe(true);
   });
+
+  // L13: over SSH, sshd's PATH lacks the ~/.local/bin that Ubuntu's ~/.profile adds, so `fleet
+  // upgrade` left a host without the `fleetrc` command its login shells would have found.
+  it.skipIf(isWindows)(
+    "L13. init links ~/.local/bin/fleetrc when only the login shell has it on PATH",
+    async () => {
+      const m = machine();
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      const shell = join(m.root, "login-shell");
+      writeFileSync(shell, `#!/bin/sh\nprintf "%s" "$HOME/.local/bin:$PATH"\n`);
+      chmodSync(shell, 0o755);
+      const init = await m.runWith(
+        { env: { SHELL: shell, PATH: pathWithoutFleetrc(m.env) } },
+        "init",
+        manifest,
+        "--no-hooks",
+      );
+      expect(init.code, init.stderr).toBe(0);
+      expect(readlinkSync(m.at(".local/bin/fleetrc"))).toBe(join(m.stateDir, "bin", "fleetrc"));
+      expect(init.stdout).toContain("through ~/.local/bin/fleetrc");
+    },
+  );
 
   // L14: a reachable host with node but without fleetrc falls back to `npx -y fleetrc`; the
   // error is the last three lines of npm's log (a 404 today, "no manifest yet" once published).

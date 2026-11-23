@@ -473,11 +473,27 @@ const isExecutable = (file: string) => {
 };
 
 /**
+ * PATH as the user's login shell sets it, or nothing when it does not say. A command run over
+ * SSH gets sshd's PATH, without the folders the shell's startup files add, such as the
+ * `~/.local/bin` that Ubuntu's ~/.profile adds.
+ */
+export function loginShellPath(shell = process.env.SHELL): string[] {
+  if (!shell || process.platform === "win32") return [];
+  const run = spawnSync(shell, ["-l", "-c", 'printf "%s" "$PATH"'], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 5_000,
+  });
+  return run.status === 0 ? run.stdout.split(delimiter).filter(Boolean) : [];
+}
+
+/**
  * Makes `fleetrc` a command in new shells, and says how. A `fleetrc` already on PATH, such
- * as a global npm install, is left alone. Otherwise, when `~/.local/bin` is on PATH (Linux, and
- * macOS when the user put it there), `~/.local/bin/fleetrc` links to the launcher; failing
- * that, the message says which folder to add to PATH. npx and `pnpm dlx` put their own temporary
- * `node_modules/.bin` on PATH, which a new shell does not have, so those folders do not count.
+ * as a global npm install, is left alone. Otherwise, when `~/.local/bin` is on PATH, here or in
+ * the login shell (Linux, and macOS when the user put it there), `~/.local/bin/fleetrc` links
+ * to the launcher; failing that, the message says which folder to add to PATH. npx and
+ * `pnpm dlx` put their own temporary `node_modules/.bin` on PATH, which a new shell does not
+ * have, so those folders do not count.
  */
 export function commandOnPath(launcher = launcherPath()): string {
   const bin = dirname(launcher);
@@ -495,7 +511,8 @@ export function commandOnPath(launcher = launcherPath()): string {
   if (process.platform !== "win32") {
     const local = join(homedir(), ".local", "bin");
     const link = join(local, "fleetrc");
-    if (dirs.some((dir) => resolve(dir) === local)) {
+    const inLocal = (dir: string) => resolve(dir) === local;
+    if (dirs.some(inLocal) || loginShellPath().some(inLocal)) {
       const existing = lstat(link);
       if (!existing) {
         mkdirSync(local, { recursive: true });
