@@ -1,12 +1,20 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { confine, personalSkillsDir, personalSource } from "./edits.ts";
 import { UserError } from "./errors.ts";
-import { dict, hashDir, isRecord, lstat, moveDir, readJsonFile, sameTree } from "./fs.ts";
-import { linkTarget, readTargetManifest, removeLink } from "./linker.ts";
+import { dict, hashDir, inside, isRecord, lstat, moveDir, readJsonFile, sameTree } from "./fs.ts";
+import { type DesiredLink, linkTarget, readTargetManifest, removeLink } from "./linker.ts";
 import {
   defaultSourceId,
   editManifest,
@@ -20,7 +28,7 @@ import {
   remoteManifest,
   writeConfig,
 } from "./manifest.ts";
-import { nameKey } from "./names.ts";
+import { nameKey, segmentProblem } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
@@ -34,7 +42,7 @@ export type Migration =
   | { kind: "clone"; source: string; git: string; ref?: string; path: string }
   | { kind: "unfold"; dir: string; target: string }
   | { kind: "unlink"; path: string; target: string }
-  | { kind: "backup"; path: string; reason: string }
+  | { kind: "backup"; path: string; reason: string; within?: string }
   /** `within`: the working clone `to` is in, which `to` must not lead out of through a link. */
   | { kind: "adopt"; path: string; to: string; within?: string };
 
@@ -93,7 +101,7 @@ export function readSkillsLock(file: string): LockEntry[] {
   if (!isRecord(raw) || (raw.version !== 1 && raw.version !== 2) || !isRecord(raw.skills))
     return [];
   return Object.entries(raw.skills).flatMap(([name, entry]) => {
-    if (!isRecord(entry) || typeof entry.source !== "string") return [];
+    if (segmentProblem(name) || !isRecord(entry) || typeof entry.source !== "string") return [];
     const text = (key: string) =>
       typeof entry[key] === "string" ? (entry[key] as string) : undefined;
     return [
@@ -145,13 +153,50 @@ async function sameAsUpstream(
     const clone = await fetchClone(gitUrl(entry.source), entry.commit ?? entry.ref, cacheRoot);
     const dir = join(clone.dir, entry.skillPath ? dirname(entry.skillPath) : entry.name);
     confine(clone.dir, dir, "compare it with the local copy");
-    return sameTree(hashDir(local), hashDir(dir));
+    const localFiles = hashDir(local);
+    if (!sameTree(localFiles, hashDir(dir))) return false;
+    return Object.keys(localFiles).every((file) => {
+      const localStat = lstatSync(join(local, file));
+      const upstreamStat = lstatSync(join(dir, file));
+      if (localStat.isFile() !== upstreamStat.isFile()) return false;
+      return (
+        process.platform === "win32" ||
+        !localStat.isFile() ||
+        (localStat.mode & 0o111) === (upstreamStat.mode & 0o111)
+      );
+    });
   } catch (error) {
     notes.push(
       `could not compare ${entry.name} with ${entry.source} (${(error as Error).message}), so it is recorded as a fork`,
     );
     return undefined;
   }
+}
+
+interface LockCopy {
+  entry: LockEntry;
+  path: string;
+  within: string;
+  real: string;
+  addedSource?: Record<string, unknown> & { include: string[] };
+}
+
+function backupPath(within: string, path: string): string {
+  if (!lstat(path)?.isDirectory())
+    throw new UserError(`${tildify(path)} is not a directory to back up`);
+  const real = realpathSync(path);
+  if (!inside(within, real) || within === real)
+    throw new UserError(`${tildify(path)} is not inside the personal source ${tildify(within)}`);
+  return real;
+}
+
+function recordFork(imports: Imports, entry: LockEntry) {
+  const base = entry.commit ?? entry.ref;
+  imports.forks[entry.name] = {
+    from: entry.source,
+    path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
+    ...(base === undefined ? {} : { base }),
+  };
 }
 
 /**
@@ -162,77 +207,104 @@ async function sameAsUpstream(
 async function collectImports(
   loaded: LoadedManifest,
   { compare, cacheRoot }: { compare: boolean; cacheRoot: string },
-): Promise<Imports> {
+): Promise<{ imports: Imports; candidates: LockCopy[]; localCopies: Set<string> }> {
   const imports: Imports = { sources: [], forks: dict(), unedited: [], notes: [] };
+  const candidates: LockCopy[] = [];
+  const localCopies = new Set<string>();
   const personal = personalSource(loaded.sources);
-  const lockEntries: LockEntry[] = [];
+  const personalRoot = personal?.kind === "clone" ? personal.path : personal?.local;
+  const lockEntries = new Map<string, LockEntry[]>();
   for (const source of loaded.sources)
     if (source.kind === "clone" || source.kind === "local")
-      lockEntries.push(
-        ...readSkillsLock(
-          join(source.kind === "clone" ? source.path : source.local, "skills-lock.json"),
-        ),
-      );
+      for (const entry of readSkillsLock(
+        join(source.kind === "clone" ? source.path : source.local, "skills-lock.json"),
+      )) {
+        const key = nameKey(entry.name);
+        const entries = lockEntries.get(key) ?? [];
+        entries.push(entry);
+        lockEntries.set(key, entries);
+      }
+  const forked = new Set(Object.keys(loaded.root.forks).map(nameKey));
   const known = new Set(
     loaded.sources.flatMap((source) =>
-      "git" in source ? [source.git] : "index" in source ? [source.index] : [],
+      "git" in source
+        ? [`git:${gitUrl(source.git)}`]
+        : "index" in source
+          ? [`index:${source.index}`]
+          : [],
     ),
   );
   const grouped = new Map<string, Record<string, unknown> & { include: string[] }>();
-  for (const entry of lockEntries) {
-    const local = personal ? join(personalSkillsDir(personal), entry.name) : undefined;
-    const forked = Object.keys(loaded.root.forks).some(
-      (key) => nameKey(key) === nameKey(entry.name),
-    );
-    if (local && existsSync(join(local, "SKILL.md"))) {
-      if (forked) continue;
-      // An unedited copy is an install: it goes on to the source below, which links it.
-      if (compare && (await sameAsUpstream(entry, local, cacheRoot, imports.notes)) === true)
-        imports.unedited.push({ name: entry.name, path: local, from: entry.source });
-      else {
-        if (entry.sourceType === "local" && !(await hasLocalGitHead(entry.source))) continue;
-        const base = entry.commit ?? entry.ref;
-        imports.forks[entry.name] = {
-          from: entry.source,
-          path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
-          ...(base === undefined ? {} : { base }),
-        };
-        continue;
-      }
-    }
-    if (entry.sourceType === "local") continue;
+  const addSource = (entry: LockEntry) => {
     const spec =
       entry.sourceType === "well-known" ? (entry.sourceUrl ?? entry.source) : entry.source;
-    if (known.has(spec)) continue;
-    const key = entry.sourceType === "well-known" ? `index:${spec}` : `git:${spec}`;
+    const key = entry.sourceType === "well-known" ? `index:${spec}` : `git:${gitUrl(spec)}`;
+    if (known.has(key)) return;
     const group = grouped.get(key) ?? {
       ...(entry.sourceType === "well-known" ? { index: spec } : { git: spec }),
       include: [],
     };
-    group.include.push(entry.name);
+    if (!group.include.includes(entry.name)) group.include.push(entry.name);
     grouped.set(key, group);
+    return group;
+  };
+  for (const [key, entries] of lockEntries) {
+    const localEntry =
+      personal &&
+      entries.find(({ name }) => existsSync(join(personalSkillsDir(personal), name, "SKILL.md")));
+    if (!localEntry || !personal || !personalRoot) {
+      for (const entry of entries) if (entry.sourceType !== "local") addSource(entry);
+      continue;
+    }
+    const local = join(personalSkillsDir(personal), localEntry.name);
+    localCopies.add(realpathSync(local));
+    if (forked.has(key)) continue;
+    if (compare && entries.every((entry) => JSON.stringify(entry) === JSON.stringify(localEntry))) {
+      const within = realpathSync(personalRoot);
+      let real: string | undefined;
+      try {
+        real = backupPath(within, local);
+      } catch (error) {
+        if (!(error instanceof UserError)) throw error;
+        imports.notes.push(`${error.message}; the local copy stays in place`);
+      }
+      if (real && (await sameAsUpstream(localEntry, local, cacheRoot, imports.notes))) {
+        candidates.push({
+          entry: localEntry,
+          path: local,
+          within,
+          real,
+          addedSource: addSource(localEntry),
+        });
+        continue;
+      }
+    }
+    for (const entry of [localEntry, ...entries.filter((entry) => entry !== localEntry)]) {
+      if (entry.sourceType === "local" && !(await hasLocalGitHead(entry.source))) continue;
+      if (entry.name === localEntry.name) recordFork(imports, entry);
+      else recordFork(imports, { ...entry, name: localEntry.name });
+      break;
+    }
   }
   // Skills installed globally with `npx skills add -g`, as `skills` itself lists them.
   try {
     const global = await listSkills({ scope: "global", config: { telemetry: false } });
     for (const skill of global.skills) {
-      if (!skill.source || !/^[\w.-]+\/[\w.-]+$/.test(skill.source) || known.has(skill.source))
+      if (!skill.source || !/^[\w.-]+\/[\w.-]+$/.test(skill.source) || segmentProblem(skill.name))
         continue;
-      const group = grouped.get(`git:${skill.source}`) ?? { git: skill.source, include: [] };
-      if (!group.include.includes(skill.name)) group.include.push(skill.name);
-      grouped.set(`git:${skill.source}`, group);
+      addSource({ name: skill.name, source: skill.source });
     }
   } catch (error) {
     imports.notes.push(`could not read the global skills lock: ${(error as Error).message}`);
   }
-  const ids = new Set(loaded.sources.map((source) => source.id));
+  const ids = new Set(loaded.sources.map((source) => nameKey(source.id)));
   for (const group of grouped.values()) {
     let id = defaultSourceId(group);
-    for (let n = 2; ids.has(id); n++) id = `${defaultSourceId(group)}-${n}`;
-    ids.add(id);
-    imports.sources.push({ id, ...group });
+    for (let n = 2; ids.has(nameKey(id)); n++) id = `${defaultSourceId(group)}-${n}`;
+    ids.add(nameKey(id));
+    imports.sources.push(Object.assign(group, { id }));
   }
-  return imports;
+  return { imports, candidates, localCopies };
 }
 
 export async function planInit(
@@ -255,28 +327,88 @@ export async function planInit(
     const cache = dryRun ? { cacheRoot: join(scratch, "manifests") } : { checkout };
     const manifestFile = await locateManifest(spec, { offline, ...cache });
     const loaded = await loadManifest(spec, { offline, ...cache });
-    const imports = await collectImports(loaded, {
+    const { imports, candidates, localCopies } = await collectImports(loaded, {
       compare: !offline && !remoteManifest(spec),
       cacheRoot: dryRun ? join(scratch, "forks") : join(paths.cache(), "forks"),
     });
     // Plan the sync against the manifest as it will be once the imports are added.
     const raw = readJsonFile(manifestFile);
     if (!isRecord(raw)) throw new Error(`${manifestFile} is not a JSON object`);
-    const root = parseManifest(manifestFile, {
-      ...raw,
-      sources: [...(Array.isArray(raw.sources) ? raw.sources : []), ...imports.sources],
-      forks: { ...(isRecord(raw.forks) ? raw.forks : {}), ...imports.forks },
-    });
-    const augmented: LoadedManifest = {
-      root,
-      sources: [
-        ...root.sources,
-        ...loaded.sources.filter((source) => source.origin !== manifestFile),
-      ],
-      warnings: loaded.warnings,
-      failed: loaded.failed,
+    const planManifest = (): LoadedManifest => {
+      const root = parseManifest(manifestFile, {
+        ...raw,
+        sources: [...(Array.isArray(raw.sources) ? raw.sources : []), ...imports.sources],
+        forks: { ...(isRecord(raw.forks) ? raw.forks : {}), ...imports.forks },
+      });
+      return {
+        root,
+        sources: [
+          ...root.sources,
+          ...loaded.sources.filter((source) => source.origin !== manifestFile),
+        ],
+        warnings: loaded.warnings,
+        failed: loaded.failed,
+      };
     };
-    const report = await sync({ loaded: augmented, dryRun: true, offline, copy });
+    const augmented = planManifest();
+    const omitted = new Set(candidates.map((candidate) => candidate.real));
+    const winners = new Map<string, DesiredLink>();
+    const omit = (dir: string) =>
+      omitted.size > 0 && existsSync(dir) && omitted.has(realpathSync(dir));
+    const previewSkills =
+      candidates.length === 0
+        ? undefined
+        : {
+            omit,
+            inspect: (links: readonly DesiredLink[]) => {
+              for (const link of links) winners.set(link.name, link);
+            },
+          };
+    let report = await sync({ loaded: augmented, dryRun: true, offline, copy, previewSkills });
+    let rejected = false;
+    const migrations: Migration[] = [];
+    for (const { entry, path, within, real, addedSource } of candidates) {
+      const winner = winners.get(entry.name);
+      const source = winner && augmented.sources.find(({ id }) => id === winner.source);
+      const status = winner && report.sources.find(({ id }) => id === winner.source)?.status;
+      if (
+        source &&
+        "git" in source &&
+        gitUrl(source.git) === gitUrl(entry.source) &&
+        status &&
+        status !== "error" &&
+        status !== "offline"
+      ) {
+        imports.unedited.push({ name: entry.name, path, from: entry.source });
+        migrations.push({
+          kind: "backup",
+          path,
+          within,
+          reason: `it has no edits, so ${entry.source} links ${entry.name} instead; commit its removal`,
+        });
+        continue;
+      }
+      rejected = true;
+      omitted.delete(real);
+      if (addedSource)
+        addedSource.include = addedSource.include.filter((name) => name !== entry.name);
+      recordFork(imports, entry);
+      imports.notes.push(
+        `${entry.name} stays in place as a fork: the configured upstream would not link a replacement`,
+      );
+    }
+    if (rejected) {
+      imports.sources = imports.sources.filter(
+        (source) => !Array.isArray(source.include) || source.include.length > 0,
+      );
+      report = await sync({
+        loaded: planManifest(),
+        dryRun: true,
+        offline,
+        copy,
+        previewSkills: { omit },
+      });
+    }
     // A remote manifest's file is a cache copy, or in a dry run a scratch one this function deletes.
     report.manifest = remoteManifest(spec) ? spec : manifestFile;
     const provided = new Set(report.skills.names);
@@ -306,15 +438,15 @@ export async function planInit(
         warnings.push(`${error.message}; the skills there stay where they are`);
         adoptInto = undefined;
       }
-    const migrations: Migration[] = imports.unedited.map((copy) => ({
-      kind: "backup",
-      path: copy.path,
-      reason: `it has no edits, so ${copy.from} links ${copy.name} instead; commit its removal`,
-    }));
     const kept = new Set<string>();
     const adopted = new Set<string>();
 
     const handleReal = (path: string, name: string, removeEvenIfKept: boolean) => {
+      const real = localCopies.size > 0 ? realpathSync(path) : path;
+      if (localCopies.has(real)) {
+        if (!omitted.has(real)) kept.add(name);
+        return;
+      }
       const hasSkill = existsSync(join(path, "SKILL.md"));
       if (provided.has(name)) {
         migrations.push({ kind: "backup", path, reason: `the manifest provides ${name}` });
@@ -396,7 +528,7 @@ export async function planInit(
       kept: [...kept].sort(),
       sync: report,
       warnings,
-      timer: root.timer,
+      timer: augmented.root.timer,
     };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
@@ -533,6 +665,13 @@ function checkMoves(migrations: readonly Migration[]) {
   for (const migration of migrations) {
     if (migration.kind !== "adopt" && migration.kind !== "backup") continue;
     if (!lstat(migration.path)) problems.push(`${tildify(migration.path)} is gone`);
+    if (migration.kind === "backup" && migration.within)
+      try {
+        backupPath(migration.within, migration.path);
+      } catch (error) {
+        if (!(error instanceof UserError)) throw error;
+        problems.push(error.message);
+      }
     if (migration.kind !== "adopt") continue;
     // The clone is made after the plan, so what it holds is checked again here.
     if (migration.within)

@@ -673,6 +673,145 @@ describe("init", () => {
     expect(Object.keys(saved.forks)).toEqual(["tool"]);
   });
 
+  type LockImportPlan = {
+    lost: string[];
+    imports: { sources: object[]; forks: object };
+    migrations: { kind: string; path: string }[];
+  };
+
+  it.each(["removed upstream", "excluded by the source"])(
+    "keeps a matching personal copy when the replacement is %s",
+    async (why) => {
+      const m = machine({ scheduler: "empty" });
+      const upstream = remote(m, "upstream", skills("skills/", "tool", "other"));
+      const base = upstream.head();
+      const personal = remote(m, "personal", {
+        ...skills("skills/", "tool"),
+        "skills-lock.json": JSON.stringify({
+          version: 2,
+          skills: {
+            tool: { source: upstream.url, skillPath: "skills/tool/SKILL.md", commit: base },
+          },
+        }),
+      });
+      const work = clone(m, personal, "code/skills");
+      if (why === "removed upstream") upstream.commit({ "skills/tool/SKILL.md": null });
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+          ...(why === "excluded by the source"
+            ? [{ id: "upstream", git: upstream.url, exclude: ["tool"] }]
+            : []),
+        ],
+      });
+      const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+      expect(plan.lost).toEqual([]);
+      expect(plan.imports.sources).toEqual([]);
+      expect(plan.imports.forks).toEqual({
+        tool: { from: upstream.url, path: "skills/tool", base },
+      });
+      expect(plan.migrations).not.toContainEqual(
+        expect.objectContaining({ path: join(work, "skills/tool") }),
+      );
+      const init = await m.run("init", manifest, "--no-hooks");
+      expect(init.code, init.stdout + init.stderr).toBe(0);
+      expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+      expect(existsSync(join(work, "skills/tool"))).toBe(true);
+    },
+  );
+
+  it("plans one backup for duplicate lock entries and preserves copies with conflicting entries", async () => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "tool", "conflict"));
+    const other = remote(m, "other", {
+      "skills/conflict/SKILL.md": skillMd("conflict", "different"),
+    });
+    const lock = (source: string) =>
+      JSON.stringify({
+        version: 1,
+        skills: {
+          tool: { source: upstream.url, skillPath: "skills/tool/SKILL.md" },
+          conflict: { source, skillPath: "skills/conflict/SKILL.md" },
+        },
+      });
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool", "conflict"),
+      "skills-lock.json": lock(upstream.url),
+    });
+    const work = clone(m, personal, "code/skills");
+    const extra = m.at("extra");
+    writeFiles(extra, { "skills-lock.json": lock(other.url) });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+        { id: "extra", local: extra },
+      ],
+    });
+    const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+    expect(plan.migrations.filter(({ kind }) => kind === "backup")).toEqual([
+      expect.objectContaining({ path: join(work, "skills/tool") }),
+    ]);
+    expect(plan.imports.forks).toHaveProperty("conflict");
+    const init = await m.run("init", manifest, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["conflict", "tool"]);
+    expect(existsSync(join(work, "skills/conflict"))).toBe(true);
+    expect(existsSync(join(work, "skills/tool"))).toBe(false);
+  });
+
+  it.skipIf(isWindows)("preserves local executable-mode edits to a lock copy", async () => {
+    const m = machine({ scheduler: "empty" });
+    const files = { ...skills("skills/", "tool"), "skills/tool/helper.sh": "#!/bin/sh\n" };
+    const upstream = remote(m, "upstream", files);
+    const personal = remote(m, "personal", {
+      ...files,
+      "skills-lock.json": JSON.stringify({
+        version: 1,
+        skills: { tool: { source: upstream.url, skillPath: "skills/tool/SKILL.md" } },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    chmodSync(join(work, "skills/tool/helper.sh"), 0o755);
+    const plan = await m.json<LockImportPlan>(
+      "init",
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+        ],
+      }),
+      "--dry-run",
+    );
+    expect(plan.imports.forks).toHaveProperty("tool");
+    expect(plan.migrations).not.toContainEqual(
+      expect.objectContaining({ path: join(work, "skills/tool") }),
+    );
+  });
+
+  it("does not plan a backup through a skills folder linked outside the personal clone", async () => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const personal = remote(m, "personal", {
+      "skills-lock.json": JSON.stringify({
+        version: 1,
+        skills: { tool: { source: upstream.url, skillPath: "skills/tool/SKILL.md" } },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const outside = m.at("outside");
+    writeFiles(outside, skills("", "tool"));
+    symlinkSync(outside, join(work, "skills"), linkKind);
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true }],
+    });
+    const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+    expect(plan.migrations.filter(({ kind }) => kind === "backup")).toEqual([]);
+    expect(read(join(outside, "tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
+
   describe("R2-1. agent folders linked to one another are one folder", () => {
     // [the link, the folder it points to]. Codex reads ~/.agents/skills and ~/.codex/skills.
     const layouts: [string, string][] = [

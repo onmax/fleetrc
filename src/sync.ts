@@ -80,6 +80,10 @@ export interface SyncOptions {
   manifest?: string;
   /** An already loaded manifest (init plans with one that is not on disk yet). */
   loaded?: LoadedManifest;
+  previewSkills?: {
+    omit: (dir: string) => boolean;
+    inspect?: (links: readonly DesiredLink[]) => void;
+  };
   /** Leave out the note about a timer whose schedule the manifest changed (init installs it next). */
   skipTimerCheck?: boolean;
 }
@@ -607,8 +611,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const winners = new Map<string, DesiredLink>();
     const byKey = new Map<string, DesiredLink>();
     const shadowed: Report["shadowed"] = [];
+    const preview = dryRun ? options.previewSkills : undefined;
     for (const result of results) {
       for (const skill of result.skills) {
+        if (preview?.omit(skill.dir)) continue;
         // ~/.claude/skills/fleetrc is the plugin that carries Claude Code's hooks (entrysync.ts).
         if (nameKey(skill.name) === nameKey(CLAUDE_PLUGIN_NAME)) {
           warnings.push(
@@ -633,7 +639,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       }
     }
     for (const link of carried)
-      if (!byKey.has(nameKey(link.name))) {
+      if (!preview?.omit(link.target) && !byKey.has(nameKey(link.name))) {
         winners.set(link.name, link);
         byKey.set(nameKey(link.name), link);
       }
@@ -645,6 +651,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           : "none of the manifest's agents has a global skills folder, so no skills were linked",
       );
     const desired = [...winners.values()];
+    preview?.inspect?.(desired);
     doing = "linking skills into agent folders";
     // One folder that can't be written must not stop the others.
     const linkInto = (dir: string, links: DesiredLink[]): TargetReport => {
