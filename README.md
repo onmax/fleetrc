@@ -22,7 +22,7 @@ Copy this prompt into Claude Code, Codex or another agent. The agent looks at yo
 Set up fleetrc (https://github.com/onmax/fleetrc) on this machine. fleetrc keeps one config in a git repository and links my skills, instruction files, subagents, commands, MCP servers and agent hooks into every agent I use, on every machine.
 
 1. Read https://github.com/onmax/fleetrc#readme and https://unpkg.com/fleetrc/schema.json. Use only the fields the schema defines.
-2. Check that Node.js is 22.12 or newer and that git is installed. fleetrc runs with `npx fleetrc`, so nothing else needs installing. `gh` helps with step 4 but is optional.
+2. Check that Node.js is 22.12 or newer and that git is installed. fleetrc runs with `npx fleetrc`, so nothing else needs installing. `gh` helps with steps 3 and 4 but is optional.
 3. Look at what I have now, and change nothing yet:
    - Run `npx fleetrc agents` to see my installed agents and the folders each one reads.
    - List the skills in those folders (a skill is a folder with a SKILL.md), and note which are links and where they point.
