@@ -16,18 +16,18 @@ One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode
 
 ## Set up with your agent
 
-Copy this prompt into Claude Code, Codex or another agent. The agent looks at your current setup and asks you what it can't find out. Then it writes the config and runs `init` after you approve the preview.
+Copy this prompt into Claude Code, Codex or another agent. The agent looks at your current setup and asks you what it can't find out. It shows what will go into Git before pushing, then previews the local changes before running `init`.
 
 ```md
 Set up fleetrc (https://github.com/onmax/fleetrc) on this machine. fleetrc keeps one config in a git repository and links my skills, instruction files, subagents, commands, MCP servers and agent hooks into every agent I use, on every machine.
 
-1. Read https://github.com/onmax/fleetrc#readme and https://unpkg.com/fleetrc/schema.json. Use only the fields the schema defines.
-2. Check that Node.js is 22.12 or newer and that git is installed. fleetrc runs with `npx fleetrc`, so nothing else needs installing. `gh` helps with steps 3 and 4 but is optional.
+1. Read https://github.com/onmax/fleetrc#readme. Check that Node.js is 22.12 or newer and that git is installed. `gh` is optional for finding, creating and cloning my GitHub repo.
+2. If the official `fleetrc` npm package and its schema are available, use `npx fleetrc@<version>` and read `https://unpkg.com/fleetrc@<version>/schema.json` with that same version. If there's no usable release, ask before building from source: in a separate checkout of https://github.com/onmax/fleetrc, use the pnpm version in its package.json, run `pnpm install --frozen-lockfile --ignore-scripts` and `pnpm build`, and use `node <absolute-path-to-checkout>/dist/cli.mjs` instead of `npx fleetrc` below. Read `schema.json` from that same checkout. Use only the fields your schema defines.
 3. Look at what I have now, and change nothing yet:
-   - Run `npx fleetrc agents` to see my installed agents and the folders each one reads.
+   - Run `npx fleetrc agents` (using the CLI chosen in step 2) to see my installed agents and the folders each one reads.
    - List the skills in those folders (a skill is a folder with a SKILL.md), and note which are links and where they point.
    - Find my user-level instruction files (such as ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md), subagents (~/.claude/agents), commands (~/.claude/commands) and MCP servers (~/.claude.json, ~/.codex/config.toml).
-   - With `gh`, list my GitHub repositories that hold skills, dotfiles or agent config.
+   - If `gh` is available and signed in, list my GitHub repositories that hold skills, dotfiles or agent config.
 4. Show me what you found, then ask me, in one message, everything you still need:
    - Which repository holds the config: one of mine, or a new private one you create? Where should its working clone live on this machine?
    - Which of my current skills, instruction files, subagents, commands and MCP servers go into it?
@@ -35,12 +35,13 @@ Set up fleetrc (https://github.com/onmax/fleetrc) on this machine. fleetrc keeps
    - Is there a team config to extend?
    - Should every installed agent get them, or only some?
    - Should other machines sync too, as SSH hosts or Tailscale tags? Which servers have no agent and need the timer?
-5. Wait for my answers. Then write .fleetrc/manifest.json in that repository:
-   - Keep my hand-made skills with a git source that has a `path` and `"adopt": true`. init moves them into the working clone.
-   - Write secrets in MCP servers as ${VAR}, never as values.
-   - Commit and push.
-6. Run `npx fleetrc init <repository> --dry-run` and show me what it will move, link and back up. When I agree, run it without --dry-run, then commit and push any skills it adopted.
-7. Run `npx fleetrc doctor` and tell me the result. If I use Codex, tell me to open /hooks once to approve the hook. If I named other machines, offer to run `npx fleetrc fleet init <host>` for each.
+5. Wait for my answers. In the working clone, write .fleetrc/manifest.json and copy only the selected hand-made skill folders and instruction files, subagents and commands. Keep the originals in place for now.
+   - Use a git source for those files, with `path` pointing to the working clone (prefer a portable `~/…` path) and globs or per-agent mappings for the selected files. Leave `adopt` off: it can move unselected skills even if you set `include`.
+   - For the selected MCP servers, write a separate file for the `mcp` source field and use ${VAR} placeholders, never secret values. Do not copy whole agent config files.
+   - Show me the exact files and destination repository before pushing. Check the staged diff for secrets and unrelated changes, then commit and push only the approved files. Make sure the manifest and files are reachable from the repository ref you'll pass to `init`.
+6. Run `npx fleetrc init <repository> --dry-run`. Show me what fleetrc will move, link and back up, plus any manual moves needed to clear unmanaged destinations for the selected files. Name each original and its backup path outside the repo and agent folders. If the plan would change an unselected item, revise the plan or stop.
+   - After I approve the plan, move only the approved conflicts to their backup paths and rerun the preview. If it now shows unexpected changes, stop and ask again. Otherwise run `init` without `--dry-run`. Keep the backups and verify each selected skill and file is managed at its intended destination (a link or a managed copy); report anything skipped and help restore originals if migration fails.
+7. Run `npx fleetrc doctor` and tell me the result. If I use Codex, tell me to open /hooks once to approve the hook. If I named other machines, offer to run `npx fleetrc fleet init <host-or-tag>` for each, adding `--timer` only where I asked for it. If using the source build, remote enrollment also needs an installable package: use `FLEETRC_PACKAGE` with an approved tarball URL the hosts can reach, or defer remote enrollment until a release is available.
 ```
 
 [Watch or download the explainer (MP4)](.github/assets/explainer.mp4)
