@@ -60,6 +60,7 @@ import {
   isCommitRef,
   type Refusal,
   refusals,
+  withGitTree,
 } from "./gitcache.ts";
 import { globBase, globFilter } from "./glob.ts";
 import { isFileKind, ITEM_KINDS, type ItemKind } from "./kinds.ts";
@@ -1195,6 +1196,49 @@ async function gitTreePaths(repo: string, commit: string) {
   );
 }
 
+function ancestorHasMode(tree: ReadonlyMap<string, string>, file: string, mode: string) {
+  for (let folder = posix.dirname(file); folder !== "."; folder = posix.dirname(folder)) {
+    if (tree.get(folder) === mode) return true;
+    if (folder === "/") break;
+  }
+  return false;
+}
+
+function hasInTreeManifest(root: string, file: string) {
+  try {
+    const real = realpathSync(join(root, file));
+    return inside(realpathSync(root), real) && statSync(real).isFile();
+  } catch (error) {
+    if (isRecord(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) return false;
+    throw error;
+  }
+}
+
+async function noCommittedSkills(
+  source: GitSource,
+  root: string,
+  matches: (path: string) => boolean,
+) {
+  const handle = await discover(root, source.skills).catch((error: unknown) => {
+    if (isDiagnostic(error, "SKILLS_NO_VALID_SKILLS")) return noSkills(root);
+    if (isDiagnostic(error, "SKILLS_LOCAL_PATH_NOT_FOUND")) return undefined;
+    throw error;
+  });
+  if (!handle) return true;
+  try {
+    const found = handle.skills.map((skill) => ({
+      name: skill.name,
+      path: withBase(source.skills, skill.path),
+    }));
+    return (
+      !found.some(({ path }) => path === undefined || matches(path)) &&
+      linkedFolders(source, root, found, []).length === 0
+    );
+  } finally {
+    await handle.dispose();
+  }
+}
+
 /** Proves empty discovery is an upstream change, not a broken cache or a different source. */
 async function allGone(
   source: GitSource,
@@ -1215,30 +1259,34 @@ async function allGone(
     : () => true;
   const tree = await gitTreePaths(repo, commit);
   if (!tree || (missingBase && (!source.skills || tree.has(globBase(source.skills))))) return false;
-  for (const [file, mode] of tree)
-    if (mode !== "040000" && posix.basename(file) === "SKILL.md" && matches(posix.dirname(file)))
-      return false;
   const prior = new Map<string, Awaited<ReturnType<typeof gitTreePaths>>>();
+  const manifests: string[] = [];
   for (const record of installed) {
     if (record.path === undefined || !matches(record.path)) return false;
     const manifest = posix.join(record.path, "SKILL.md");
-    if (tree.has(manifest)) return false;
-    for (
-      let folder = posix.dirname(manifest);
-      folder !== "." && folder !== "/";
-      folder = posix.dirname(folder)
-    ) {
-      const mode = tree.get(folder);
-      if (mode === "120000" || mode === "160000") return false;
-    }
+    if (tree.has(manifest) || ancestorHasMode(tree, manifest, "160000")) return false;
+    manifests.push(manifest);
     if (state.gitDiscovery === undefined) {
       const at = record.commit === undefined ? state.commit : record.commit;
       if (at === null) return false;
       if (!prior.has(at)) prior.set(at, await gitTreePaths(repo, at));
-      if (!prior.get(at)?.has(manifest)) return false;
+      const earlier = prior.get(at);
+      if (!earlier) return false;
+      if (
+        !earlier.has(manifest) &&
+        (!ancestorHasMode(earlier, manifest, "120000") ||
+          !(await withGitTree(repo, at, (root) => hasInTreeManifest(root, manifest))))
+      )
+        return false;
     }
   }
-  return true;
+  if (![...tree].some(([file, mode]) => mode === "120000" || posix.basename(file) === "SKILL.md"))
+    return true;
+  return withGitTree(repo, commit, (root) =>
+    manifests.some((manifest) => hasInTreeManifest(root, manifest))
+      ? false
+      : noCommittedSkills(source, root, matches),
+  );
 }
 
 /** A source with no skills to discover, for one that gives only files. */

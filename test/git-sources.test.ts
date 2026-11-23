@@ -3,13 +3,14 @@
 // On macOS (APFS folds case and Unicode normalization) these reproduce what happens there for real;
 // on Linux and Windows they check that every machine of a fleet ends up with the same skills.
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { sha256 } from "../src/fs.ts";
 import { collisions, refusals } from "../src/gitcache.ts";
 import {
   clone,
+  isWindows,
   type Machine,
   machine,
   names,
@@ -731,9 +732,16 @@ describe("a sync of one source", () => {
 });
 
 describe("the last skill of a repository", () => {
-  const lastSkill = async (options: { skills?: string; update?: "review" } = {}) => {
+  const lastSkill = async (
+    options: { skills?: string; update?: "review" } = {},
+    files: Record<string, string> = {},
+  ) => {
     const m = machine();
-    const vendor = remote(m, "vendor", { ...skills("skills/", "tool"), "README.md": "readme\n" });
+    const vendor = remote(m, "vendor", {
+      ...skills("skills/", "tool"),
+      "README.md": "readme\n",
+      ...files,
+    });
     const manifest = m.manifest({
       agents: ["claude-code"],
       sources: [{ id: "vendor", git: vendor.url, ...options }],
@@ -751,6 +759,13 @@ describe("the last skill of a repository", () => {
         >;
       }
     ).sources.vendor!;
+
+  function forgetDiscovery(m: Machine) {
+    const path = join(m.stateDir, "state.json");
+    const legacy = JSON.parse(read(path)) as { sources: { vendor: ReturnType<typeof state> } };
+    delete legacy.sources.vendor.gitDiscovery;
+    writeFileSync(path, JSON.stringify(legacy));
+  }
 
   it.each([undefined, "skills/*"])("LAST1. reconciles last deletion with glob %s", async (glob) => {
     const { m, vendor } = await lastSkill(glob ? { skills: glob } : {});
@@ -783,12 +798,39 @@ describe("the last skill of a repository", () => {
 
   it("LAST1. proves deletion for an existing install without a discovery fingerprint", async () => {
     const { m, vendor } = await lastSkill({ skills: "skills/*" });
-    const path = join(m.stateDir, "state.json");
-    const legacy = JSON.parse(read(path)) as { sources: { vendor: ReturnType<typeof state> } };
-    delete legacy.sources.vendor.gitDiscovery;
-    writeFileSync(path, JSON.stringify(legacy));
+    forgetDiscovery(m);
     vendor.commit({ "skills/tool": null });
     expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
+  });
+
+  it.skipIf(isWindows)("LAST1. proves deletion of a legacy linked folder", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "shared/tool/SKILL.md": skillMd("tool") });
+    mkdirSync(join(vendor.work, "skills"));
+    symlinkSync("../shared/tool", join(vendor.work, "skills/tool"));
+    m.git(vendor.work, "add", "-A");
+    m.git(vendor.work, "commit", "--quiet", "-m", "linked collection");
+    m.git(vendor.work, "push", "--quiet", "origin", "main");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
+    });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+    forgetDiscovery(m);
+    vendor.commit({ "skills/tool": null });
+    expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
+  });
+
+  it.each([
+    ["node_modules/fixture/SKILL.md", skillMd("fixture")],
+    ["templates/draft/SKILL.md", "# A template without skill metadata\n"],
+  ])("LAST1. an undiscoverable %s does not veto deletion", async (path, content) => {
+    const { m, vendor } = await lastSkill({}, { [path]: content });
+    const head = vendor.commit({ "skills/tool": null });
+    expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
+    expect(state(m).commit).toBe(head);
+    expect((await m.json("sync")).warnings).toEqual([]);
   });
 
   it("LAST1. a new source whose repository has no skills says so", async () => {
@@ -833,6 +875,19 @@ describe("the last skill of a repository", () => {
     expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
   });
 
+  it("LAST1. a missing cached replacement does not count as empty discovery", async () => {
+    const { m, vendor } = await lastSkill({ update: "review" });
+    vendor.commit({ "skills/tool": null, "skills/next/SKILL.md": skillMd("next") });
+    expect((await m.json("sync")).sources.find((entry) => entry.id === "vendor")?.status).toBe(
+      "review",
+    );
+    const key = sha256(`${vendor.url}#`).slice(0, 16);
+    rmSync(join(m.stateDir, "cache", "git", key, "skills", "next", "SKILL.md"));
+    const report = await m.json("update", "vendor");
+    expect(report.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
+
   it("LAST1. changing the remote does not count as a deletion", async () => {
     const { m, vendor } = await lastSkill();
     const other = remote(m, "other", { "README.md": "readme\n" });
@@ -852,7 +907,7 @@ describe("the last skill of a repository", () => {
     expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
     expect((await m.json("update", "vendor")).skills.removed).toEqual(["tool"]);
     expect(names(m.at(".claude/skills"))).toEqual([]);
-    vendor.commit(skills("skills/", "next"));
+    vendor.commit({ "skills/next/SKILL.md": skillMd("next") });
     expect((await m.json("sync")).sources.find((entry) => entry.id === "vendor")?.status).toBe(
       "review",
     );
