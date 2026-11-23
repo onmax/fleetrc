@@ -537,6 +537,43 @@ describe("init", () => {
     expect(JSON.parse(read(manifest)).forks?.tool).toBeUndefined();
   });
 
+  it("imports an absolute local Git upstream as a fork and records its first merge", async () => {
+    const m = machine();
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: {
+          tool: {
+            source: upstream.work,
+            sourceType: "local",
+            skillPath: "skills/tool/SKILL.md",
+          },
+        },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+
+    const initialized = await m.run("init", manifest, "--no-hooks");
+    expect(initialized.code, initialized.stdout + initialized.stderr).toBe(0);
+    const fork = { from: upstream.work, path: "skills/tool" };
+    expect(JSON.parse(read(manifest)).forks?.tool).toEqual(fork);
+    const status = await m.run("status");
+    expect(status.code, status.stderr).toBe(0);
+    expect(status.stdout).toContain("`fleetrc merge tool`");
+
+    const base = upstream.commit({ "skills/tool/notes.txt": "upstream note\n" });
+    const merged = await m.run("merge", "tool");
+    expect(merged.code, merged.stdout + merged.stderr).toBe(0);
+    expect(read(join(work, "skills/tool/notes.txt"))).toBe("upstream note\n");
+    expect(JSON.parse(read(manifest)).forks?.tool).toEqual({ ...fork, base });
+  });
+
   it("imports skills-lock.json version 2 entries that are not on disk as sources", async () => {
     const m = machine();
     const upstream = remote(m, "upstream", skills("skills/", "ag-dev", "ag-update", "ag-other"));

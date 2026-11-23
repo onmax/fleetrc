@@ -24,7 +24,7 @@ import { nameKey } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
-import { GitError } from "./exec.ts";
+import { git, GitError } from "./exec.ts";
 import { cloneAt } from "./sources.ts";
 import { sync } from "./sync.ts";
 
@@ -107,6 +107,26 @@ export function readSkillsLock(file: string): LockEntry[] {
   });
 }
 
+/** Probes the exact filesystem upstream without Git discovering a parent repository. */
+async function hasLocalGitHead(path: string): Promise<boolean> {
+  if (!isAbsolute(path)) return false;
+  const result = await git(
+    [
+      "-c",
+      "protocol.allow=never",
+      "-c",
+      "protocol.file.allow=always",
+      "ls-remote",
+      "--exit-code",
+      "--",
+      path,
+      "HEAD",
+    ],
+    { allowFail: true },
+  );
+  return result.code === 0;
+}
+
 /** Turns `skills` lock entries into manifest sources and forks. */
 async function collectImports(loaded: LoadedManifest): Promise<Imports> {
   const imports: Imports = { sources: [], forks: dict(), notes: [] };
@@ -126,10 +146,10 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
   );
   const grouped = new Map<string, Record<string, unknown> & { include: string[] }>();
   for (const entry of lockEntries) {
-    if (entry.sourceType === "local") continue;
     const local = personal ? join(personalSkillsDir(personal), entry.name) : undefined;
     if (local && existsSync(join(local, "SKILL.md"))) {
       if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name))) {
+        if (entry.sourceType === "local" && !(await hasLocalGitHead(entry.source))) continue;
         const base = entry.commit ?? entry.ref;
         imports.forks[entry.name] = {
           from: entry.source,
@@ -139,6 +159,7 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
       }
       continue;
     }
+    if (entry.sourceType === "local") continue;
     const spec =
       entry.sourceType === "well-known" ? (entry.sourceUrl ?? entry.source) : entry.source;
     if (known.has(spec)) continue;
