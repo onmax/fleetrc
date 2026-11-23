@@ -1,5 +1,13 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { cloneKey } from "../src/gitcache.ts";
@@ -132,10 +140,9 @@ describe.skipIf(isWindows)("fetching git sources", () => {
       writeFileSync(wrapper, command);
       const env = { ...m.env, PATH: slow.PATH };
       const args = [wrapper, process.execPath, cli, manifest];
-      const unattended = spawnSync("sh", args, {
+      const unattended = spawnSync("setsid", ["--wait", "sh", ...args], {
         cwd: m.root,
         env,
-        detached: true,
         timeout: 10_000,
       });
       expect(unattended.status).toBe(1);
@@ -156,6 +163,33 @@ describe.skipIf(isWindows)("fetching git sources", () => {
       expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
     },
   );
+
+  it("compacts persistent Git caches after successful prefetches", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    const config = {
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: "fetch.unpackLimit",
+      GIT_CONFIG_VALUE_0: "1",
+      GIT_CONFIG_KEY_1: "gc.autoPackLimit",
+      GIT_CONFIG_VALUE_1: "2",
+    };
+    const repo = join(m.stateDir, "cache", "git", `${cloneKey(vendor.url)}.git`);
+    for (let version = 0; version < 7; version++) {
+      vendor.commit({ "version.txt": String(version) });
+      const sync = await m.runWith({ env: config }, "sync", "--manifest", manifest);
+      expect(sync.code, sync.stdout + sync.stderr).toBe(0);
+    }
+    const packs = readdirSync(join(repo, "objects", "pack")).filter((name) =>
+      name.endsWith(".pack"),
+    );
+    expect(packs.length).toBeGreaterThan(0);
+    expect(packs.length).toBeLessThan(7);
+  });
 
   it("cancels stalled fetches without losing cached history or hiding the checkpoint error", async () => {
     const m = machine();

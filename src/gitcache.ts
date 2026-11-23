@@ -192,6 +192,19 @@ export async function fetchClone(
         runGit,
         signal !== undefined,
       );
+      if (signal)
+        await runGit(
+          [
+            "-c",
+            "maintenance.autoDetach=false",
+            "-c",
+            "gc.autoDetach=false",
+            "maintenance",
+            "run",
+            "--auto",
+          ],
+          { cwd: cache.repo, allowFail: true },
+        );
     } catch (error) {
       // The network or the remote: a cache with a commit stays for --offline and later runs.
       if (fresh) rmSync(cache.repo, { recursive: true, force: true });
@@ -298,7 +311,14 @@ async function recoverTree(
 
 /** Removes uncommitted locks after Git has stopped, leaving published refs and objects intact. */
 function removeInterruptedFetchLocks(repo: string) {
-  for (const lock of ["shallow.lock", "packed-refs.lock", "reftable/tables.list.lock"])
+  for (const lock of [
+    "shallow.lock",
+    "packed-refs.lock",
+    "reftable/tables.list.lock",
+    "objects/maintenance.lock",
+    "gc.pid.lock",
+    "gc.log.lock",
+  ])
     rmSync(join(repo, lock), { force: true });
   const refs = join(repo, "refs", "fleetrc");
   if (!existsSync(refs)) return;
