@@ -1900,12 +1900,15 @@ describe.skipIf(isWindows)("the command ssh hands the login shell", () => {
     .join("\n");
 
   it.each(loginShells)("reaches sh byte for byte from a %s login shell", (_, shell) => {
+    const m = machine();
     // A script that prints itself, so what sh read is what it prints.
     const run = spawnSync(shell, ["-c", shCommand(`cat <<'EOF'\n${script}\nEOF`)], {
+      cwd: m.root,
       encoding: "utf8",
     });
     expect(run.stderr).toBe("");
     expect(run.stdout).toBe(`${script}\n`);
+    for (const file of ["P", "Q"]) expect(existsSync(join(m.root, file))).toBe(false);
   });
 });
 
