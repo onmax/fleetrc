@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
@@ -110,21 +110,20 @@ export function readSkillsLock(file: string): LockEntry[] {
 /** Probes the exact filesystem upstream without Git discovering a parent repository. */
 async function hasLocalGitHead(path: string): Promise<boolean> {
   if (!isAbsolute(path)) return false;
-  const result = await git(
-    [
-      "-c",
-      "protocol.allow=never",
-      "-c",
-      "protocol.file.allow=always",
-      "ls-remote",
-      "--exit-code",
-      "--",
-      path,
-      "HEAD",
-    ],
-    { allowFail: true },
-  );
-  return result.code === 0;
+  let upstream: string;
+  try {
+    upstream = realpathSync.native(path);
+  } catch {
+    return false;
+  }
+  const dotGit = join(upstream, ".git");
+  const options = { allowFail: true, noFetch: true };
+  const metadata = await git(["rev-parse", "--resolve-git-dir", dotGit], options);
+  const gitDir = `--git-dir=${metadata.code === 0 ? dotGit : upstream}`;
+  const head = await git([gitDir, "show-ref", "--hash", "--verify", "HEAD"], options);
+  if (head.code !== 0) return false;
+  const object = await git([gitDir, "cat-file", "-t", head.stdout.trim()], options);
+  return object.code === 0 && object.stdout.trim() === "commit";
 }
 
 /** Turns `skills` lock entries into manifest sources and forks. */

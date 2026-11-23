@@ -200,8 +200,12 @@ describe("edited vendored skills", () => {
   it("4d3. a fork of a repository no source reads still hears of upstream changes", async () => {
     const { m, vendor, manifest } = await editedVendoredSkill({ scheduler: "empty" });
     expect((await m.run("fork", "tool")).code).toBe(0);
-    const saved = JSON.parse(read(manifest)) as { sources: { id: string }[] };
+    const saved = JSON.parse(read(manifest)) as {
+      sources: { id: string }[];
+      forks: Record<string, { base: string }>;
+    };
     saved.sources = saved.sources.filter((source) => source.id !== "vendor");
+    saved.forks.tool!.base = vendor.head().slice(0, 9);
     writeFileSync(manifest, JSON.stringify(saved, null, 2));
     expect((await m.run("sync")).code).toBe(0);
     expect(
@@ -279,6 +283,36 @@ describe("edited vendored skills", () => {
     const report = await m.json("sync");
     expect(report.pending).toEqual([]);
     expect(report.warnings.join("\n")).not.toContain("could not tell whether tool");
+  });
+
+  it("honors explicit Git fork provenance when an index uses the same URL", async () => {
+    const { m, vendor, manifest } = await editedVendoredSkill();
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const site = await http();
+    serveIndexV2(site, [{ name: "drop", files: { "SKILL.md": skillMd("drop") } }]);
+    m.git(m.root, "config", "--global", `url.${vendor.url}.insteadOf`, site.url);
+    const saved = JSON.parse(read(manifest)) as {
+      sources: { id: string; index?: string }[];
+      forks: Record<string, { from: string; upstream?: string }>;
+    };
+    saved.sources = saved.sources.filter((source) => source.id !== "vendor");
+    saved.sources.push({ id: "site", index: site.url });
+    Object.assign(saved.forks.tool!, { from: site.url, upstream: "git" });
+    writeFileSync(manifest, JSON.stringify(saved));
+
+    vendor.commit({ "skills/tool/ref.md": "ref v2\n" });
+    const report = await m.json("sync");
+    expect(report.pending).toContainEqual({
+      source: `${site.url}/`,
+      skill: "tool",
+      reason: "fork",
+      files: ["ref.md"],
+    });
+    expect(read(m.at(".claude/skills/drop/SKILL.md"))).toBe(skillMd("drop"));
+    for (const command of ["diff", "merge"]) {
+      const result = await m.run(command, "tool");
+      expect(result.code, result.stdout + result.stderr).toBe(0);
+    }
   });
 
   it("reports both directions of empty-file conflicts without a fork base", async () => {

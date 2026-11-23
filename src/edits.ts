@@ -24,7 +24,7 @@ import {
   sha256,
 } from "./fs.ts";
 import { itemName, itemPath, parseItemId } from "./files.ts";
-import { fetchClone, gitUrl, repoKey } from "./gitcache.ts";
+import { fetchClone, gitUrl, isCommitRef, repoKey } from "./gitcache.ts";
 import { globBase } from "./glob.ts";
 import {
   checkedOutPath,
@@ -257,11 +257,9 @@ async function diffDirs(name: string, from: Side, to: Side): Promise<string> {
 }
 
 function nonGitFork(loaded: LoadedManifest, fork: Fork): boolean {
-  return (
-    fork.upstream === "index" ||
-    fork.from.startsWith("npm:") ||
-    loaded.sources.some((source) => source.kind === "index" && source.index === fork.from)
-  );
+  if (fork.from.startsWith("npm:")) return true;
+  if (fork.upstream !== undefined) return fork.upstream === "index";
+  return loaded.sources.some((source) => source.kind === "index" && source.index === fork.from);
 }
 
 /** Index and npm forks have no Git history to compare with. */
@@ -381,7 +379,7 @@ export async function checkForks(
         !fetchStandalone ||
         (fork.upstream !== "git" &&
           gitUrl(fork.from) === fork.from &&
-          !/^[a-f\d]{40}$/i.test(fork.base ?? ""))
+          !isCommitRef(fork.base ?? ""))
       )
         continue;
       try {
