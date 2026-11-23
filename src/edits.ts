@@ -1,7 +1,9 @@
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -521,27 +523,78 @@ function mergeSnapshot(dir: string) {
   return { entries, hashes };
 }
 
+/** Publish without replacing an existing entry, including an empty directory. */
+function publishMergeUnit(from: string, to: string) {
+  const entry = lstat(from)!;
+  if (!entry.isDirectory()) {
+    linkSync(from, to);
+    return;
+  }
+  mkdirSync(to, { mode: entry.mode });
+  for (const name of readdirSync(from)) publishMergeUnit(join(from, name), join(to, name));
+}
+
+const mergeScratchPrefix = (live: string) => `.fleetrc-merge-${sha256(basename(live))}-`;
+const savedMergeUnit = (scratch: string) => join(scratch, "previous", "unit");
+
+/** Restore without clobbering a save; keep the backup discoverable if restoration cannot finish. */
+function restoreMergeUnit(saved: string, target: string) {
+  try {
+    publishMergeUnit(saved, target);
+  } catch (error) {
+    throw new UserError(
+      `merge: could not restore ${target} (${(error as Error).message}); previous copy kept at ${saved}. Reconcile the two copies, move the saved copy out of the recovery folder, then retry.`,
+    );
+  }
+}
+
+/** Recover before hashing the live skill; the scratch directory itself is outside that tree. */
+function recoverMergeUnits(live: string, dryRun: boolean) {
+  const parent = dirname(live);
+  const prefix = mergeScratchPrefix(live);
+  for (const entry of readdirSync(parent, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+    const scratch = join(parent, entry.name);
+    const journal = join(scratch, "target");
+    if (!lstat(journal)?.isFile()) continue;
+    const root = readFileSync(journal, "utf8");
+    const target = join(live, root);
+    const saved = savedMergeUnit(scratch);
+    if (lstat(saved)) {
+      if (
+        dryRun ||
+        root === "" ||
+        relative(live, target).split(sep).join("/") !== root ||
+        !inside(live, target) ||
+        linkedFolder(live, root) !== undefined
+      ) {
+        throw new UserError(
+          `merge: interrupted replacement of ${target}; previous copy kept at ${saved}${dryRun ? "; rerun without --dry-run to recover" : ""}`,
+        );
+      }
+      restoreMergeUnit(saved, target);
+      renameSync(saved, join(scratch, "discarded"));
+    }
+    if (!dryRun) rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 /** Stage the replacement, then check the old unit after moving it aside and before discarding it. */
 function replaceMergeUnit(
-  target: string,
+  live: string,
+  root: string,
   stage: (next: string) => void,
   unchanged: (old: ReturnType<typeof mergeSnapshot>) => boolean,
 ): boolean {
-  const parent = dirname(target);
-  mkdirSync(parent, { recursive: true });
-  const scratch = mkdtempSync(join(parent, ".fleetrc-merge-"));
+  const target = join(live, root);
+  mkdirSync(dirname(target), { recursive: true });
+  const scratch = mkdtempSync(join(dirname(live), mergeScratchPrefix(live)));
   const previous = join(scratch, "previous");
-  const saved = join(previous, "unit");
+  const saved = savedMergeUnit(scratch);
   const next = join(scratch, "next");
-  const restore = () => {
-    if (lstat(target) !== undefined)
-      throw new UserError(
-        `merge: ${target} reappeared during replacement; previous copy kept at ${saved}`,
-      );
-    renameSync(saved, target);
-  };
   let moved = false;
   try {
+    writeFileSync(join(scratch, "target"), root);
     stage(next);
     mkdirSync(previous);
     if (lstat(target) !== undefined) {
@@ -554,11 +607,20 @@ function replaceMergeUnit(
       moved = true;
     }
     if (!unchanged(mergeSnapshot(previous)) || lstat(target) !== undefined) return false;
-    if (lstat(next) !== undefined) renameSync(next, target);
+    try {
+      if (lstat(next) !== undefined) publishMergeUnit(next, target);
+    } catch (error) {
+      if (isErrno(error, "EEXIST")) return false;
+      throw error;
+    }
+    if (moved) renameSync(saved, join(scratch, "discarded"));
     moved = false;
     return true;
   } finally {
-    if (moved) restore();
+    if (moved) {
+      restoreMergeUnit(saved, target);
+      renameSync(saved, join(scratch, "discarded"));
+    }
     rmSync(scratch, { recursive: true, force: true });
   }
 }
@@ -577,6 +639,8 @@ async function mergeTrees(
   upstream: string,
   dryRun: boolean,
 ): Promise<MergeResult> {
+  const realLive = existsSync(live) ? realpathSync(live) : live;
+  if (existsSync(dirname(realLive))) recoverMergeUnits(realLive, dryRun);
   const [local, previous, next] = [
     mergeSnapshot(live),
     mergeSnapshot(base),
@@ -684,7 +748,8 @@ async function mergeTrees(
     }
     if (!dryRun) {
       const replaced = replaceMergeUnit(
-        join(live, root),
+        realLive,
+        root,
         (staged) => {
           if (next.entries.get(root)?.isDirectory()) mkdirSync(staged);
           incoming.forEach((file, index) => {

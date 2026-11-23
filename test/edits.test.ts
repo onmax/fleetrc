@@ -41,6 +41,45 @@ async function editedVendoredSkill(options: Parameters<typeof machine>[0] = {}) 
   return { m, work, vendor, manifest, local };
 }
 
+async function pendingTopicReplacement(upstreamIsFolder = false) {
+  const { m, vendor } = await editedVendoredSkill({ scheduler: "empty" });
+  const topic = m.at(".claude/skills/tool/topic");
+  vendor.commit(
+    upstreamIsFolder
+      ? { "skills/tool/topic": "topic v1\n" }
+      : { "skills/tool/topic/notes.md": "notes v1\n" },
+  );
+  await m.run("sync");
+  expect((await m.run("merge", "tool")).code).toBe(0);
+  rmSync(join(vendor.work, "skills/tool/topic"), { recursive: true });
+  vendor.commit(
+    upstreamIsFolder
+      ? { "skills/tool/topic/notes.md": "notes v2\n" }
+      : { "skills/tool/topic": "topic v2\n" },
+  );
+  await m.run("sync");
+  return { m, topic };
+}
+
+function mergeWithFilesystemHook(m: ReturnType<typeof machine>, hook: string) {
+  const preload = join(m.root, "merge-hook.mjs");
+  writeFileSync(
+    preload,
+    `
+    import fs from "node:fs";
+    import { basename, dirname } from "node:path";
+    import { syncBuiltinESMExports } from "node:module";
+    ${hook}
+    syncBuiltinESMExports();
+  `,
+  );
+  return m.runWith(
+    { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(preload).href}` } },
+    "merge",
+    "tool",
+  );
+}
+
 describe("edited vendored skills", () => {
   it("4a. are never overwritten, and diff shows local against upstream", async () => {
     const { m, vendor, local } = await editedVendoredSkill();
@@ -270,6 +309,83 @@ describe("edited vendored skills", () => {
     expect(merge.stdout).toContain("conflicts: topic");
     expect(read(join(topic, "notes.md"))).toBe(saved);
     expect(read(`${topic}.upstream`)).toBe("topic v2\n");
+  });
+
+  it.each([false, true])("keeps a save at publication (folder: %s)", async (upstreamIsFolder) => {
+    const { m, topic } = await pendingTopicReplacement(upstreamIsFolder);
+    const saved = join(m.root, "saved-path");
+    const merge = await mergeWithFilesystemHook(
+      m,
+      `
+      const mkdir = fs.mkdirSync;
+      const rename = fs.renameSync;
+      const link = fs.linkSync;
+      const save = (path) => {
+        if (basename(path) !== "topic") return;
+        if (${upstreamIsFolder}) mkdir(path);
+        else fs.writeFileSync(path, "saved at publication\\n");
+      };
+      fs.mkdirSync = (path, ...args) => {
+        save(path);
+        return mkdir(path, ...args);
+      };
+      fs.renameSync = (from, to) => {
+        if (basename(to) === "unit" && basename(from) === "topic") {
+          fs.writeFileSync(${JSON.stringify(saved)}, to);
+        }
+        if (basename(from) === "next") save(to);
+        return rename(from, to);
+      };
+      fs.linkSync = (from, to) => {
+        if (basename(from) === "next") save(to);
+        return link(from, to);
+      };
+    `,
+    );
+    if (upstreamIsFolder) expect(names(topic)).toEqual([]);
+    else expect(read(topic)).toBe("saved at publication\n");
+    expect(merge.code, merge.stdout + merge.stderr).toBe(1);
+    expect(merge.stderr).toContain(read(saved));
+    expect(read(upstreamIsFolder ? read(saved) : join(read(saved), "notes.md"))).toBe(
+      upstreamIsFolder ? "topic v1\n" : "notes v1\n",
+    );
+  });
+
+  it.each([false, true])("recovers an interrupted replacement (new save: %s)", async (newSave) => {
+    const { m, topic } = await pendingTopicReplacement();
+    const saved = join(m.root, "saved-path");
+    const interrupted = await mergeWithFilesystemHook(
+      m,
+      `
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (basename(from) === "topic" && basename(to) === "unit") {
+          fs.writeFileSync(${JSON.stringify(saved)}, to);
+          process.exit(99);
+        }
+      };
+    `,
+    );
+    expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+    expect(existsSync(topic)).toBe(false);
+    const liveNames = names(m.at(".claude/skills/tool"));
+    expect(liveNames.some((name) => name.startsWith(".fleetrc-merge-"))).toBe(false);
+    const dry = await m.run("merge", "tool", "--dry-run");
+    expect(dry.stderr).toContain("rerun without --dry-run to recover");
+    expect(existsSync(topic)).toBe(false);
+    if (newSave) writeFileSync(topic, "saved after interruption\n");
+    const retry = await m.run("merge", "tool");
+    if (newSave) {
+      expect(retry.code, retry.stdout + retry.stderr).toBe(1);
+      expect(retry.stderr).toContain(read(saved));
+      expect(read(topic)).toBe("saved after interruption\n");
+      expect(read(join(read(saved), "notes.md"))).toBe("notes v1\n");
+    } else {
+      expect(retry.code, retry.stdout + retry.stderr).toBe(0);
+      expect(read(topic)).toBe("topic v2\n");
+      expect(existsSync(read(saved))).toBe(false);
+    }
   });
 
   it("4e. an unedited vendored skill updates in place", async () => {
