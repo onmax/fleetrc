@@ -9,7 +9,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import type { Report } from "../src/report.ts";
@@ -509,51 +509,69 @@ describe("init", () => {
     expect(dry.stdout).toContain(`${join("~", ".codex", "skills", "orphan")} stays`);
   });
 
-  it.each(["plain folder", "adjacent Git repository", "parent Git repository", "unborn HEAD"])(
-    "keeps a local import with %s as a personal skill without merge hints",
-    async (layout) => {
-      const m = machine();
-      const upstream = remote(m, "upstream", skills("skills/", "tool"));
-      let folder = m.at("plain-folder");
-      if (layout === "adjacent Git repository") folder = upstream.url.slice(0, -".git".length);
-      if (layout === "parent Git repository") folder = join(upstream.work, "plain-folder");
-      if (layout === "unborn HEAD") {
-        folder = upstream.work;
-        m.git(folder, "branch", "topic/HEAD");
-        m.git(folder, "symbolic-ref", "HEAD", "refs/heads/unborn");
-      }
-      writeFiles(folder, skills("skills/", "tool"));
-      const personal = remote(m, "personal", {
-        ...skills("skills/", "tool"),
-        "skills-lock.json": JSON.stringify({
-          version: 2,
-          skills: {
-            tool: { source: folder, sourceType: "local", skillPath: "skills/tool/SKILL.md" },
-          },
-        }),
-      });
-      const work = clone(m, personal, "code/skills");
-      const manifest = m.manifest({
-        agents: ["claude-code"],
-        sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
-      });
-      const initialized = await m.run("init", manifest, "--no-hooks");
-      expect(initialized.code, initialized.stdout + initialized.stderr).toBe(0);
-      expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
-      const status = await m.run("status");
-      expect(status.code, status.stderr).toBe(0);
-      expect(status.stdout).not.toContain("`fleetrc diff tool`");
-      expect(status.stdout).not.toContain("`fleetrc merge tool`");
-      expect(JSON.parse(read(manifest)).forks?.tool).toBeUndefined();
-    },
-  );
+  it.each([
+    "plain folder",
+    "adjacent Git repository",
+    "parent Git repository",
+    "unborn HEAD",
+    ...(isWindows ? [] : ["symlink followed by .."]),
+  ])("keeps a local import with %s as a personal skill without merge hints", async (layout) => {
+    const m = machine();
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    let folder = m.at("plain-folder");
+    if (layout === "adjacent Git repository") folder = upstream.url.slice(0, -".git".length);
+    if (layout === "parent Git repository") folder = join(upstream.work, "plain-folder");
+    if (layout === "unborn HEAD") {
+      folder = upstream.work;
+      m.git(folder, "branch", "topic/HEAD");
+      m.git(folder, "symbolic-ref", "HEAD", "refs/heads/unborn");
+    }
+    writeFiles(folder, skills("skills/", "tool"));
+    if (layout === "symlink followed by ..") {
+      const target = m.at("elsewhere/child");
+      mkdirSync(target, { recursive: true });
+      writeFiles(m.at("elsewhere", basename(upstream.work)), skills("skills/", "tool"));
+      const alias = join(dirname(upstream.work), "alias");
+      symlinkSync(target, alias, "dir");
+      folder = `${alias}/../${basename(upstream.work)}`;
+    }
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: {
+          tool: { source: folder, sourceType: "local", skillPath: "skills/tool/SKILL.md" },
+        },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+    const initialized = await m.run("init", manifest, "--no-hooks");
+    expect(initialized.code, initialized.stdout + initialized.stderr).toBe(0);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    const status = await m.run("status");
+    expect(status.code, status.stderr).toBe(0);
+    expect(status.stdout).not.toContain("`fleetrc diff tool`");
+    expect(status.stdout).not.toContain("`fleetrc merge tool`");
+    expect(JSON.parse(read(manifest)).forks?.tool).toBeUndefined();
+  });
 
-  it.each(["work", "url"] as const)(
+  it.each(["work", "url", ...(isWindows ? [] : (["symlink"] as const))] as const)(
     "imports an absolute local Git upstream (%s) as a fork and records its first merge",
     async (kind) => {
       const m = machine();
       const upstream = remote(m, "upstream", skills("skills/", "tool"));
-      const from = upstream[kind];
+      let from: string;
+      if (kind === "symlink") {
+        const target = join(dirname(upstream.work), "child");
+        mkdirSync(target);
+        const alias = m.at("alias");
+        symlinkSync(target, alias, "dir");
+        from = `${alias}/../${basename(upstream.work)}`;
+      } else from = upstream[kind];
       const personal = remote(m, "personal", {
         ...skills("skills/", "tool"),
         "skills-lock.json": JSON.stringify({
@@ -588,6 +606,40 @@ describe("init", () => {
       expect(JSON.parse(read(manifest)).forks?.tool).toEqual({ ...fork, base });
     },
   );
+
+  it("does not fetch a local partial clone's missing HEAD during offline init", async () => {
+    const m = machine();
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const partial = m.at("partial");
+    mkdirSync(partial);
+    m.git(partial, "init");
+    m.git(partial, "remote", "add", "origin", upstream.url);
+    m.git(partial, "config", "remote.origin.promisor", "true");
+    writeFiles(partial, { ".git/refs/heads/main": `${upstream.head()}\n` });
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: {
+          tool: { source: partial, sourceType: "local", skillPath: "skills/tool/SKILL.md" },
+        },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+
+    const dry = await m.json<{ imports: { forks: Record<string, unknown> } }>(
+      "init",
+      manifest,
+      "--dry-run",
+      "--offline",
+    );
+    expect(readdirSync(join(partial, ".git/objects/pack"))).toEqual([]);
+    expect(dry.imports.forks.tool).toBeUndefined();
+  });
 
   it("imports skills-lock.json version 2 entries that are not on disk as sources", async () => {
     const m = machine();
