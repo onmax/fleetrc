@@ -802,30 +802,46 @@ async function updateClone(
   const tracking = upstream.stdout.trim();
   if (ctx.dryRun) {
     const checkedOut = await gitOut(["symbolic-ref", "HEAD"], dir);
-    const [remote, remoteRef] = (
+    const [remote, remoteRef, trackingRef] = (
       await gitOut(
-        ["for-each-ref", "--format=%(upstream:remotename)%00%(upstream:remoteref)", checkedOut],
+        [
+          "for-each-ref",
+          "--format=%(upstream:remotename)%00%(upstream:remoteref)%00%(upstream)",
+          checkedOut,
+        ],
         dir,
       )
     ).split("\0");
     const remoteHead =
       remote && remoteRef
-        ? await git(["ls-remote", "--", remote, remoteRef], {
+        ? await git(["ls-remote", "--refs", "--", remote, remoteRef], {
             cwd: dir,
             allowFail: true,
             timeoutMs: 30_000,
           })
         : undefined;
-    const head = remoteHead?.code === 0 ? remoteHead.stdout.split(/\s/)[0] : undefined;
-    if (head === before) return;
-    if (head) {
-      const ancestor = await git(["merge-base", "--is-ancestor", head, before], {
+    const advertised =
+      remoteHead?.code === 0
+        ? remoteHead.stdout
+            .split(/\r?\n/)
+            .map((line) => line.split("\t"))
+            .find(([, ref]) => ref === remoteRef)?.[0]
+        : undefined;
+    if (advertised === before && remoteRef?.startsWith("refs/heads/")) {
+      const prefix = `refs/remotes/${remote}/`;
+      const branch = remoteRef.slice("refs/heads/".length);
+      const fetch = await git(["config", "--get-all", `remote.${remote}.fetch`], {
         cwd: dir,
         allowFail: true,
       });
-      if (ancestor.code === 0) return;
+      if (fetch.code === 0 && trackingRef === `${prefix}${branch}`) {
+        const mapping = fetch.stdout.trim().replace(/^\+/, "");
+        if (mapping === `refs/heads/*:${prefix}*` || mapping === `${remoteRef}:${trackingRef}`) {
+          if ((await gitOut(["rev-parse", "@{u}"], dir)) === before) return;
+        }
+      }
     }
-    const note = head
+    const note = advertised
       ? `${source.id}: ${tracking} may update the working clone; the preview uses its current checkout`
       : `${source.id}: cannot verify the upstream of the working clone ${dir}`;
     out.warnings.push(note);

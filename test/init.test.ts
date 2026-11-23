@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import type { Report } from "../src/report.ts";
 import {
@@ -238,6 +239,70 @@ describe("init", () => {
     for (const path of skillCopies) expect(read(path)).toBe(updatedSkill);
     for (const path of fileCopies) expect(read(path)).toBe("updated\n");
     expect(await preview()).toMatchObject({ ok: true, previewLimitations: [] });
+  });
+
+  it("flags a newer cached upstream excluded from fetch even when the advertised tip matches HEAD", async () => {
+    const setup = machine();
+    const repo = remote(setup, "mine", { "instructions.md": "original\n" });
+    const working = clone(setup, repo, "mine");
+    const manifest = setup.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "mine", git: repo.url, path: working, instructions: "instructions.md" }],
+    });
+    await setup.json("init", manifest, "--no-hooks", "--copy");
+    const before = repo.head();
+    const incoming = repo.commit({ "instructions.md": "updated\n" });
+    setup.git(working, "fetch", "--quiet");
+    setup.git(repo.work, "push", "--quiet", "--force", "origin", `${before}:refs/heads/main`);
+    setup.git(working, "config", "--add", "remote.origin.fetch", "^refs/heads/main");
+
+    const { sync } = await setup.json<{ sync: Report }>(
+      "init",
+      manifest,
+      "--no-hooks",
+      "--dry-run",
+    );
+    expect(sync).toMatchObject({
+      ok: true,
+      previewLimitations: [expect.stringContaining("working clone")],
+    });
+    expect(setup.git(working, "rev-parse", "HEAD")).toBe(before);
+    expect(setup.git(working, "rev-parse", "@{u}")).toBe(incoming);
+    expect(read(setup.at(".claude/CLAUDE.md"))).toBe("original\n");
+
+    await setup.json("init", manifest, "--no-hooks");
+    expect(setup.git(working, "rev-parse", "HEAD")).toBe(incoming);
+    expect(read(setup.at(".claude/CLAUDE.md"))).toBe("updated\n");
+  });
+
+  it("flags an unfetched tip without fetching missing objects into a partial clone", async () => {
+    const setup = machine();
+    const repo = remote(setup, "mine", skills("skills/", "example"));
+    setup.git(repo.url, "config", "uploadpack.allowFilter", "true");
+    setup.git(repo.url, "config", "uploadpack.allowReachableSHA1InWant", "true");
+    const url = pathToFileURL(repo.url).href;
+    const working = setup.at("mine");
+    setup.git(setup.home, "clone", "--quiet", "--filter=blob:none", url, working);
+    const manifest = setup.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "mine", git: url, path: working }],
+    });
+    repo.commit({ "skills/example/SKILL.md": skillMd("example", "incoming update") });
+    const packDir = join(working, ".git", "objects", "pack");
+    const packs = readdirSync(packDir).sort();
+    expect(packs.some((name) => name.endsWith(".promisor"))).toBe(true);
+
+    const { sync } = await setup.json<{ sync: Report }>(
+      "init",
+      manifest,
+      "--no-hooks",
+      "--dry-run",
+    );
+    expect(sync).toMatchObject({
+      ok: true,
+      previewLimitations: [expect.stringContaining("working clone")],
+    });
+    expect(readdirSync(packDir).sort()).toEqual(packs);
   });
 
   it.skipIf(isWindows)(
