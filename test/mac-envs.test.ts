@@ -128,8 +128,10 @@ describe("mac environments", () => {
     async () => {
       const m = machine();
       const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      const shell = join(m.root, "zsh");
+      executable(shell, '#!/bin/sh\nexec /bin/sh -c "$3"\n');
       const init = await m.runWith(
-        { env: { SHELL: "/bin/zsh", PATH: pathWithoutFleetrc(m.env) } },
+        { env: { SHELL: shell, PATH: pathWithoutFleetrc(m.env) } },
         "init",
         manifest,
         "--no-hooks",

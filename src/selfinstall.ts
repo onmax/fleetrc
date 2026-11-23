@@ -479,12 +479,16 @@ const isExecutable = (file: string) => {
  */
 export function loginShellPath(shell = process.env.SHELL): string[] {
   if (!shell || process.platform === "win32") return [];
-  const run = spawnSync(shell, ["-l", "-c", 'printf "%s" "$PATH"'], {
+  const run = spawnSync(shell, ["-l", "-c", 'printf "\\000fleetrc-path\\000%s\\000" "$PATH"'], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
     timeout: 5_000,
+    killSignal: "SIGKILL",
   });
-  return run.status === 0 ? run.stdout.split(delimiter).filter(Boolean) : [];
+  if (run.status !== 0) return [];
+  const record = run.stdout.split("\0fleetrc-path\0")[1];
+  const end = record?.indexOf("\0") ?? -1;
+  return record && end >= 0 ? record.slice(0, end).split(delimiter).filter(Boolean) : [];
 }
 
 /**
@@ -497,22 +501,33 @@ export function loginShellPath(shell = process.env.SHELL): string[] {
  */
 export function commandOnPath(launcher = launcherPath()): string {
   const bin = dirname(launcher);
-  const dirs = (process.env.PATH ?? "")
-    .split(delimiter)
-    .filter((dir) => dir && !resolve(dir).endsWith(`${sep}node_modules${sep}.bin`));
+  const persistent = (dir: string) => dir && !resolve(dir).endsWith(`${sep}node_modules${sep}.bin`);
   const names = process.platform === "win32" ? ["fleetrc.cmd", "fleetrc.exe"] : ["fleetrc"];
-  const found = dirs
-    .flatMap((dir) => names.map((name) => join(dir, name)))
-    .find((file) => lstat(file) && isExecutable(file));
+  const findCommand = (dirs: string[]) =>
+    dirs
+      .flatMap((dir) => names.map((name) => join(dir, name)))
+      .find((file) => {
+        try {
+          return statSync(file).isFile() && isExecutable(file);
+        } catch {
+          return false;
+        }
+      });
+  const local = process.platform === "win32" ? undefined : join(homedir(), ".local", "bin");
+  const inLocal = (dir: string) => resolve(dir) === local;
+  let dirs = (process.env.PATH ?? "").split(delimiter).filter(persistent);
+  let found = findCommand(dirs);
+  if (!found && local && !dirs.some(inLocal)) {
+    dirs = loginShellPath().filter(persistent);
+    found = findCommand(dirs);
+  }
   if (found)
     return realpathSync(found) === realpathSync(launcher)
       ? `\`fleetrc\` runs ${tildify(launcher)}${found === launcher ? "" : `, through ${tildify(found)}`}`
       : `\`fleetrc\` runs ${tildify(found)}, which is on PATH; the timer runs ${tildify(launcher)}`;
-  if (process.platform !== "win32") {
-    const local = join(homedir(), ".local", "bin");
+  if (local) {
     const link = join(local, "fleetrc");
-    const inLocal = (dir: string) => resolve(dir) === local;
-    if (dirs.some(inLocal) || loginShellPath().some(inLocal)) {
+    if (dirs.some(inLocal)) {
       const existing = lstat(link);
       if (!existing) {
         mkdirSync(local, { recursive: true });
