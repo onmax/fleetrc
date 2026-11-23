@@ -14,6 +14,8 @@
 
 One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode, Cursor and GitHub Copilot, synced on every machine when an agent session starts. It also syncs user-level instruction files, subagents, commands, MCP servers and agent hooks.
 
+[Watch or download the explainer (MP4)](.github/assets/explainer.mp4). The inline preview below is an earlier cut: tailnet discovery does not enroll SSH hosts, and without a tailnet policy new users should pass their config repository to `init`.
+
 https://github.com/user-attachments/assets/4ff6674e-3cd5-4586-b430-65a29ebc60fe
 
 - **One copy per skill.** fleetrc fetches `git`, `npm`, `index` and `local` sources and links each skill into every installed agent's folder.
