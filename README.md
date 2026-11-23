@@ -19,10 +19,10 @@ One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode
 Paste this into Claude Code, Codex or another agent:
 
 ```md
-Set up fleetrc on this machine by following https://raw.githubusercontent.com/onmax/fleetrc/main/docs/agent-setup.md
+Set up fleetrc on all my machines by following https://raw.githubusercontent.com/onmax/fleetrc/main/docs/agent-setup.md
 ```
 
-The agent looks at your current setup, asks you what it can't find out, and shows you what will go into Git and what will change on this machine before it does anything. The [setup guide](./docs/agent-setup.md) has every step it follows.
+The agent asks which machines to include, looks at what each one has, and shows you what will go into Git and what will change on each machine before it does anything. The [setup guide](./docs/agent-setup.md) has every step it follows.
 
 [Watch or download the explainer (MP4)](.github/assets/explainer.mp4)
 
