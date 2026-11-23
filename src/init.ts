@@ -80,7 +80,6 @@ interface LockEntry {
   sourceUrl?: string;
   skillPath?: string;
   commit?: string;
-  ref?: string;
 }
 
 /** Entries of a `skills-lock.json` (versions 1 and 2 share these fields). */
@@ -101,7 +100,6 @@ export function readSkillsLock(file: string): LockEntry[] {
         sourceUrl: text("sourceUrl"),
         skillPath: text("skillPath"),
         commit: text("commit"),
-        ref: text("ref"),
       },
     ];
   });
@@ -149,7 +147,7 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
     if (local && existsSync(join(local, "SKILL.md"))) {
       if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name))) {
         if (entry.sourceType === "local" && !(await hasLocalGitHead(entry.source))) continue;
-        const base = entry.commit ?? entry.ref;
+        const base = entry.commit || undefined;
         const upstream =
           entry.sourceType === "well-known"
             ? "index"

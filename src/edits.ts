@@ -256,10 +256,19 @@ async function diffDirs(name: string, from: Side, to: Side): Promise<string> {
   }
 }
 
+function forkGitSource(loaded: LoadedManifest, fork: Fork) {
+  return loaded.sources.find(
+    (candidate) => candidate.kind === "git" && repoKey(candidate.git) === repoKey(fork.from),
+  );
+}
+
 function nonGitFork(loaded: LoadedManifest, fork: Fork): boolean {
   if (fork.from.startsWith("npm:")) return true;
   if (fork.upstream !== undefined) return fork.upstream === "index";
-  return loaded.sources.some((source) => source.kind === "index" && source.index === fork.from);
+  return (
+    loaded.sources.some((source) => source.kind === "index" && source.index === fork.from) &&
+    !forkGitSource(loaded, fork)
+  );
 }
 
 /** Index and npm forks have no Git history to compare with. */
@@ -355,9 +364,7 @@ export async function checkForks(
   for (const [name, fork] of Object.entries(loaded.root.forks)) {
     if (nonGitFork(loaded, fork)) continue;
     let head: ForkHead;
-    const source = loaded.sources.find(
-      (candidate) => candidate.kind === "git" && repoKey(candidate.git) === repoKey(fork.from),
-    );
+    const source = forkGitSource(loaded, fork);
     if (source?.kind === "git") {
       const result = results.find((candidate) => candidate.id === source.id);
       if (!result?.to || result.status === "error") continue;
@@ -424,9 +431,12 @@ export async function checkForks(
 }
 
 /** What `status` says of forks that need a first merge or have upstream changes. */
-export function forkLines(state: State, forks?: Record<string, Fork>): string[] {
+export function forkLines(state: State, loaded?: LoadedManifest): string[] {
+  const forks = loaded?.root.forks;
+  const mergeable = (name: string) =>
+    loaded === undefined || (forks?.[name] !== undefined && !nonGitFork(loaded, forks[name]));
   const missing = Object.entries(forks ?? state.forks ?? {})
-    .filter(([, fork]) => fork.base === undefined)
+    .filter(([name, fork]) => fork.base === undefined && mergeable(name))
     .map(
       ([name]) =>
         `${name}: no recorded merge base; \`fleetrc diff ${name}\` / \`fleetrc merge ${name}\``,
@@ -436,6 +446,7 @@ export function forkLines(state: State, forks?: Record<string, Fork>): string[] 
       ([name, fork]) =>
         fork.base !== undefined &&
         fork.files.length > 0 &&
+        mergeable(name) &&
         (forks === undefined || forks[name]?.base === fork.base),
     )
     .map(
@@ -870,6 +881,7 @@ export async function forkSkill(
     from: source.git,
     path: installed.path,
     base,
+    upstream: "git",
   };
   const excluded = source.origin === loaded.root.file;
   const manifest = manifestToEdit(

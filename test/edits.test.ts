@@ -19,7 +19,7 @@ import {
 const lines = (...body: string[]) =>
   `---\nname: tool\ndescription: The tool skill\n---\n${body.join("\n")}\n`;
 
-async function editedVendoredSkill(options: Parameters<typeof machine>[0] = {}) {
+async function editedVendoredSkill(options: Parameters<typeof machine>[0] = {}, index?: string) {
   const m = machine(options);
   const personal = remote(m, "personal", skills("skills/", "mine"));
   const work = clone(m, personal, "code/skills");
@@ -27,11 +27,13 @@ async function editedVendoredSkill(options: Parameters<typeof machine>[0] = {}) 
     "skills/tool/SKILL.md": lines("one", "two", "three", "four", "five"),
     "skills/tool/ref.md": "ref v1\n",
   });
+  if (index) m.git(m.root, "config", "--global", `url.${vendor.url}.insteadOf`, index);
   const manifest = m.manifest({
     agents: ["claude-code", "codex"],
     sources: [
       { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
-      { id: "vendor", git: vendor.url },
+      { id: "vendor", git: index ?? vendor.url },
+      ...(index ? [{ id: "site", index }] : []),
     ],
   });
   expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
@@ -153,7 +155,12 @@ describe("edited vendored skills", () => {
       forks: Record<string, { from: string; path: string; base: string }>;
       sources: { exclude?: string[] }[];
     };
-    expect(saved.forks.tool).toEqual({ from: vendor.url, path: "skills/tool", base });
+    expect(saved.forks.tool).toEqual({
+      from: vendor.url,
+      path: "skills/tool",
+      base,
+      upstream: "git",
+    });
     expect(saved.sources[1]!.exclude).toEqual(["tool"]);
     expect(existsSync(join(m.stateDir, "store", "vendor", "live", "tool"))).toBe(false);
 
@@ -285,22 +292,39 @@ describe("edited vendored skills", () => {
     expect(report.warnings.join("\n")).not.toContain("could not tell whether tool");
   });
 
-  it("honors explicit Git fork provenance when an index uses the same URL", async () => {
-    const { m, vendor, manifest } = await editedVendoredSkill();
-    expect((await m.run("fork", "tool")).code).toBe(0);
+  it("checks new and source-backed legacy Git forks when an index uses the same URL", async () => {
     const site = await http();
     serveIndexV2(site, [{ name: "drop", files: { "SKILL.md": skillMd("drop") } }]);
-    m.git(m.root, "config", "--global", `url.${vendor.url}.insteadOf`, site.url);
+    const { m, vendor, manifest } = await editedVendoredSkill({}, site.url);
+    const fork = await m.run("fork", "tool");
+    expect(fork.code, fork.stdout + fork.stderr).toBe(0);
+    const recorded = read(manifest);
     const saved = JSON.parse(read(manifest)) as {
       sources: { id: string; index?: string }[];
-      forks: Record<string, { from: string; upstream?: string }>;
+      forks: Record<string, { from: string; path: string; upstream?: string }>;
     };
-    saved.sources = saved.sources.filter((source) => source.id !== "vendor");
-    saved.sources.push({ id: "site", index: site.url });
-    Object.assign(saved.forks.tool!, { from: site.url, upstream: "git" });
+    const provenance = saved.forks.tool!.upstream;
+    delete saved.forks.tool!.upstream;
+    saved.forks.drop = { from: site.url, path: "drop", upstream: "index" };
     writeFileSync(manifest, JSON.stringify(saved));
-
     vendor.commit({ "skills/tool/ref.md": "ref v2\n" });
+    expect((await m.json("sync")).pending).toContainEqual({
+      source: "vendor",
+      skill: "tool",
+      reason: "fork",
+      files: ["ref.md"],
+    });
+    const legacyDiff = await m.run("diff", "tool");
+    expect(legacyDiff.code, legacyDiff.stdout + legacyDiff.stderr).toBe(0);
+    const indexDiff = await m.run("diff", "drop");
+    expect(indexDiff.stderr).toContain("is not a git repository");
+    expect((await m.run("status")).stdout).not.toContain("`fleetrc merge drop`");
+
+    expect(provenance).toBe("git");
+    const standalone = JSON.parse(recorded) as typeof saved;
+    standalone.sources = standalone.sources.filter((source) => source.id !== "vendor");
+    writeFileSync(manifest, JSON.stringify(standalone));
+    vendor.commit({ "skills/tool/ref.md": "ref v3\n" });
     const report = await m.json("sync");
     expect(report.pending).toContainEqual({
       source: `${site.url}/`,

@@ -652,7 +652,7 @@ async function status() {
   const loaded = config?.manifest
     ? await loadManifest(config.manifest, { offline: true }).catch(() => undefined)
     : undefined;
-  for (const line of [...forkLines(state, loaded?.root.forks), ...conflictLines(state)]) say(line);
+  for (const line of [...forkLines(state, loaded), ...conflictLines(state)]) say(line);
   say(`syncs start from: ${describeTrigger(hooks, withTimer)}`);
   if (timerState !== undefined)
     say(

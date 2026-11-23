@@ -615,6 +615,43 @@ describe("init", () => {
     },
   );
 
+  it("checks ref-only Git imports without assuming their branch is the installed base", async () => {
+    const m = machine();
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: {
+          tool: {
+            source: upstream.url,
+            sourceType: "git",
+            ref: "main",
+            skillPath: "skills/tool/SKILL.md",
+          },
+        },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+
+    const initialized = await m.run("init", manifest, "--no-hooks");
+    expect(initialized.code, initialized.stdout + initialized.stderr).toBe(0);
+    const head = upstream.commit({ "skills/tool/notes.txt": "upstream note\n" });
+    await m.json("sync");
+    const status = await m.json<{ forks: Record<string, { files: string[] }> }>("status");
+    expect(status.forks.tool).toMatchObject({ upstream: head, files: ["SKILL.md", "notes.txt"] });
+    expect(JSON.parse(read(manifest)).forks.tool).toEqual({
+      from: upstream.url,
+      path: "skills/tool",
+      upstream: "git",
+    });
+    expect((await m.run("status")).stdout).toContain("tool: no recorded merge base");
+  });
+
   it("does not fetch a local partial clone's missing HEAD during offline init", async () => {
     const m = machine();
     const upstream = remote(m, "upstream", skills("skills/", "tool"));
