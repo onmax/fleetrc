@@ -14,7 +14,7 @@
 
 One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode, Cursor and GitHub Copilot, synced on every machine when an agent session starts. It also syncs user-level instruction files, subagents, commands, MCP servers and agent hooks.
 
-https://github.com/user-attachments/assets/6ac368c2-fb8c-419f-b0dd-cfc4736e670c
+https://github.com/user-attachments/assets/4ff6674e-3cd5-4586-b430-65a29ebc60fe
 
 - **One copy per skill.** fleetrc fetches `git`, `npm`, `index` and `local` sources and links each skill into every installed agent's folder.
 - **Session-start syncs.** `init` installs `SessionStart` hooks in Claude Code and Codex that start a background sync when none has been tried in the last 15 minutes. Servers without an agent use `--timer`.
