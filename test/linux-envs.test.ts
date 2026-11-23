@@ -281,6 +281,39 @@ describe("linux environments", () => {
     expect(init.stdout).toContain("`fleetrc` runs ~/npm/bin/fleetrc, which is on PATH");
   });
 
+  it.skipIf(isWindows).each([
+    { executableDir: "bin", links: true },
+    { executableDir: "login/bin", links: false },
+  ])(
+    "L13. init resolves relative login PATH entries with fleetrc in $executableDir",
+    async ({ executableDir, links }) => {
+      const m = machine();
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      const shell = join(m.root, "login-shell");
+      mkdirSync(m.at("login"), { recursive: true });
+      mkdirSync(m.at(executableDir), { recursive: true });
+      writeFileSync(m.at(`${executableDir}/fleetrc`), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      writeFileSync(
+        shell,
+        '#!/bin/sh\ncd "$HOME/login" || exit 1\nexport PATH="$HOME/.local/bin:bin"\nexec /bin/sh -c "$3"\n',
+        { mode: 0o755 },
+      );
+      const init = await m.runWith(
+        { env: { SHELL: shell, PATH: pathWithoutFleetrc(m.env) } },
+        "init",
+        manifest,
+        "--no-hooks",
+      );
+      expect(init.code, init.stderr).toBe(0);
+      expect(existsSync(m.at(".local/bin/fleetrc"))).toBe(links);
+      expect(init.stdout).toContain(
+        links
+          ? "through ~/.local/bin/fleetrc"
+          : "`fleetrc` runs ~/login/bin/fleetrc, which is on PATH",
+      );
+    },
+  );
+
   it.skipIf(isWindows)("L13. init times out a login shell that ignores SIGTERM", async () => {
     const m = machine();
     const manifest = m.manifest({ agents: ["claude-code"], sources: [] });

@@ -473,22 +473,27 @@ const isExecutable = (file: string) => {
 };
 
 /**
- * PATH as the user's login shell sets it, or nothing when it does not say. A command run over
- * SSH gets sshd's PATH, without the folders the shell's startup files add, such as the
- * `~/.local/bin` that Ubuntu's ~/.profile adds.
+ * PATH as the user's login shell sets it, resolved from its working directory after startup.
+ * A command run over SSH gets sshd's PATH, without the folders the shell's startup files add,
+ * such as the `~/.local/bin` that Ubuntu's ~/.profile adds.
  */
 export function loginShellPath(shell = process.env.SHELL): string[] {
   if (!shell || process.platform === "win32") return [];
-  const run = spawnSync(shell, ["-l", "-c", 'printf "\\000fleetrc-path\\000%s\\000" "$PATH"'], {
+  const probe = 'printf "\\000fleetrc-path\\000%s\\000" "$PATH" && pwd -P && printf "\\000"';
+  const run = spawnSync(shell, ["-l", "-c", probe], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"],
     timeout: 5_000,
     killSignal: "SIGKILL",
   });
   if (run.status !== 0) return [];
-  const record = run.stdout.split("\0fleetrc-path\0")[1];
-  const end = record?.indexOf("\0") ?? -1;
-  return record && end >= 0 ? record.slice(0, end).split(delimiter).filter(Boolean) : [];
+  const record = run.stdout.split("\0fleetrc-path\0")[1]?.split("\0", 3);
+  if (record?.length !== 3) return [];
+  const [path, pwd] = record;
+  if (!path || !pwd?.endsWith("\n")) return [];
+  const cwd = pwd.slice(0, -1);
+  if (!isAbsolute(cwd)) return [];
+  return path.split(delimiter).map((dir) => (isAbsolute(dir) ? dir : resolve(cwd, dir)));
 }
 
 /**
