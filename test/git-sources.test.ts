@@ -728,3 +728,78 @@ describe("a sync of one source", () => {
     expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool", "v2"));
   });
 });
+
+describe("the last skill of a repository", () => {
+  const lastSkill = async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { ...skills("skills/", "tool"), "README.md": "readme\n" });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+    return { m, vendor };
+  };
+  const state = (m: Machine) =>
+    (
+      JSON.parse(read(join(m.stateDir, "state.json"))) as {
+        sources: Record<string, { commit?: string; skills: Record<string, unknown> }>;
+      }
+    ).sources.vendor!;
+
+  it("LAST1. removed upstream, it is removed here and the source moves to the new commit", async () => {
+    const { m, vendor } = await lastSkill();
+    const head = vendor.commit({ "skills/tool": null });
+    const report = await m.json("sync");
+    const source = report.sources.find((entry) => entry.id === "vendor");
+    expect(source?.status, JSON.stringify(report, null, 2)).not.toBe("error");
+    expect(report.skills.removed).toEqual(["tool"]);
+    expect(names(m.at(".claude/skills"))).toEqual([]);
+    expect(state(m).commit).toBe(head);
+    expect(state(m).skills).toEqual({});
+
+    const again = await m.json("sync");
+    expect(again.warnings).toEqual([]);
+    expect(again.sources.find((entry) => entry.id === "vendor")?.status).not.toBe("error");
+  });
+
+  it("LAST1. removed upstream while edited here, it stays with its edit", async () => {
+    const { m, vendor } = await lastSkill();
+    const edited = skillMd("tool", "mine");
+    writeFileSync(m.at(".claude/skills/tool/SKILL.md"), edited);
+    const head = vendor.commit({ "skills/tool": null });
+    const report = await m.json("sync");
+    expect(report.warnings).toContain(
+      "vendor: tool is gone upstream but has local edits, so it stays",
+    );
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(edited);
+    expect(state(m).commit).toBe(head);
+  });
+
+  it("LAST1. a new source whose repository has no skills says so", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "README.md": "readme\n" });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    const report = await m.json<{ sync: { sources: { id: string; status: string }[] } }>(
+      "init",
+      manifest,
+      "--no-hooks",
+    );
+    expect(report.sync.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+  });
+
+  it("LAST1. a skills glob that matches nothing keeps the skills it linked", async () => {
+    const { m, vendor } = await lastSkill();
+    m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url, skills: "wrong/*" }],
+    });
+    const report = await m.json("sync");
+    expect(report.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
+});

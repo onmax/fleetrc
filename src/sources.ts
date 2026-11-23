@@ -1169,6 +1169,16 @@ const filesOnly = (source: VendoredSource, state: SourceState) =>
       (kind) => !!kind && Object.keys(kind.items).length + Object.keys(kind.pending).length > 0,
     ));
 
+/**
+ * Whether a source fetched before has none of its installed skills' SKILL.md files in the tree at
+ * `dir`: they were removed upstream, or an earlier fetch already removed them all.
+ */
+const allGone = (state: SourceState, dir: string) =>
+  state.commit !== undefined &&
+  Object.values(state.skills).every(
+    ({ path }) => path !== undefined && !existsSync(join(dir, path, "SKILL.md")),
+  );
+
 /** A source with no skills to discover, for one that gives only files. */
 const noSkills = (dir: string): SkillSource => ({
   source: { input: dir, type: "local", url: dir },
@@ -1198,11 +1208,12 @@ async function openVendored(
       windowsNames(source, clone.refused, warnings);
       return {
         handle: await discover(clone.dir, source.skills).catch((error: unknown): SkillSource => {
-          // Only the linked-folder pass, or the files of a source of files, can rescue this
-          // specific empty discovery result.
+          // Only the linked-folder pass, the files of a source of files, or a tree where every
+          // installed skill is gone can rescue this specific empty discovery result.
           if (
             !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
             (!filesOnly(source, state) &&
+              !allGone(state, clone.dir) &&
               (!source.skills || linkedFolders(source, clone.dir, [], []).length === 0))
           )
             throw error;
