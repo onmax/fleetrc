@@ -450,7 +450,10 @@ describe("npm and local sources", () => {
     const m = machine();
     const first = await http();
     const second = await http();
-    for (const [registry, content] of [[first, "first"], [second, "second"]] as const)
+    for (const [registry, content] of [
+      [first, "first"],
+      [second, "second"],
+    ] as const)
       publishNpm(
         registry,
         "@acme/skills",
