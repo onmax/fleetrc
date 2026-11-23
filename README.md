@@ -14,6 +14,35 @@
 
 One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode, Cursor and GitHub Copilot, synced on every machine when an agent session starts. It also syncs user-level instruction files, subagents, commands, MCP servers and agent hooks.
 
+## Set up with your agent
+
+Copy this prompt into Claude Code, Codex or another agent. The agent looks at your current setup and asks you what it can't find out. Then it writes the config and runs `init` after you approve the preview.
+
+```md
+Set up fleetrc (https://github.com/onmax/fleetrc) on this machine. fleetrc keeps one config in a git repository and links my skills, instruction files, subagents, commands, MCP servers and agent hooks into every agent I use, on every machine.
+
+1. Read https://github.com/onmax/fleetrc#readme and https://unpkg.com/fleetrc/schema.json. Use only the fields the schema defines.
+2. Check that Node.js is 22.12 or newer and that git is installed. fleetrc runs with `npx fleetrc`, so nothing else needs installing. `gh` helps with step 4 but is optional.
+3. Look at what I have now, and change nothing yet:
+   - Run `npx fleetrc agents` to see my installed agents and the folders each one reads.
+   - List the skills in those folders (a skill is a folder with a SKILL.md), and note which are links and where they point.
+   - Find my user-level instruction files (such as ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md), subagents (~/.claude/agents), commands (~/.claude/commands) and MCP servers (~/.claude.json, ~/.codex/config.toml).
+   - With `gh`, list my GitHub repositories that hold skills, dotfiles or agent config.
+4. Show me what you found, then ask me, in one message, everything you still need:
+   - Which repository holds the config: one of mine, or a new private one you create? Where should its working clone live on this machine?
+   - Which of my current skills, instruction files, subagents, commands and MCP servers go into it?
+   - Which other skills to add: any GitHub repository (all of its skills, or only some), an npm package, or a site that serves /.well-known/agent-skills/index.json? Should their updates wait for my review?
+   - Is there a team config to extend?
+   - Should every installed agent get them, or only some?
+   - Should other machines sync too, as SSH hosts or Tailscale tags? Which servers have no agent and need the timer?
+5. Wait for my answers. Then write .fleetrc/manifest.json in that repository:
+   - Keep my hand-made skills with a git source that has a `path` and `"adopt": true`. init moves them into the working clone.
+   - Write secrets in MCP servers as ${VAR}, never as values.
+   - Commit and push.
+6. Run `npx fleetrc init <repository> --dry-run` and show me what it will move, link and back up. When I agree, run it without --dry-run, then commit and push any skills it adopted.
+7. Run `npx fleetrc doctor` and tell me the result. If I use Codex, tell me to open /hooks once to approve the hook. If I named other machines, offer to run `npx fleetrc fleet init <host>` for each.
+```
+
 [Watch or download the explainer (MP4)](.github/assets/explainer.mp4)
 
 https://github.com/user-attachments/assets/d51e096f-9e02-49c3-85d4-9986b0aa1169
