@@ -25,7 +25,7 @@ import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
 import { git, GitError } from "./exec.ts";
-import { fetchClone, gitUrl } from "./gitcache.ts";
+import { fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
 import { cloneAt } from "./sources.ts";
 import { sync } from "./sync.ts";
 
@@ -81,6 +81,7 @@ interface LockEntry {
   source: string;
   sourceType?: string;
   sourceUrl?: string;
+  ref?: string;
   skillPath?: string;
   commit?: string;
 }
@@ -101,6 +102,7 @@ export function readSkillsLock(file: string): LockEntry[] {
         source: entry.source,
         sourceType: text("sourceType"),
         sourceUrl: text("sourceUrl"),
+        ref: text("ref"),
         skillPath: text("skillPath"),
         commit: text("commit"),
       },
@@ -129,7 +131,7 @@ async function hasLocalGitHead(path: string): Promise<boolean> {
 
 /**
  * Whether the local copy of a lock entry has the same files as its upstream folder, at the
- * commit the lock records or, without one, upstream's latest. Undefined when that can't be told.
+ * lock's commit, its ref, or the default HEAD, in that order. Undefined when that can't be told.
  */
 async function sameAsUpstream(
   entry: LockEntry,
@@ -139,7 +141,12 @@ async function sameAsUpstream(
 ): Promise<boolean | undefined> {
   if (entry.sourceType === "local" || entry.sourceType === "well-known") return undefined;
   try {
-    const clone = await fetchClone(gitUrl(entry.source), entry.commit || undefined, cacheRoot);
+    if (entry.ref?.startsWith("-")) return undefined;
+    const clone = await fetchClone(
+      gitUrl(entry.source),
+      entry.commit || entry.ref || undefined,
+      cacheRoot,
+    );
     const dir = join(clone.dir, entry.skillPath ? dirname(entry.skillPath) : entry.name);
     confine(clone.dir, dir, "compare it with the local copy");
     const localFiles = hashDir(local);
@@ -164,6 +171,7 @@ async function sameAsUpstream(
 
 interface LockCopy {
   entry: LockEntry;
+  ref?: string;
   path: string;
   within: string;
   real: string;
@@ -180,7 +188,8 @@ function backupPath(within: string, path: string): string {
 }
 
 function recordFork(imports: Imports, entry: LockEntry) {
-  const base = entry.commit || undefined;
+  const base =
+    entry.commit || (entry.ref && /^[0-9a-f]{40}$/i.test(entry.ref) ? entry.ref : undefined);
   const upstream =
     entry.sourceType === "well-known"
       ? "index"
@@ -231,17 +240,19 @@ async function collectImports(
     ),
   );
   const grouped = new Map<string, Record<string, unknown> & { include: string[] }>();
-  const addSource = (entry: LockEntry) => {
+  const addSource = (entry: LockEntry, ref?: string) => {
     const spec =
       entry.sourceType === "well-known" ? (entry.sourceUrl ?? entry.source) : entry.source;
     const key = entry.sourceType === "well-known" ? `index:${spec}` : `git:${gitUrl(spec)}`;
     if (known.has(key)) return;
-    const group = grouped.get(key) ?? {
+    const groupKey = JSON.stringify([key, ref]);
+    const group = grouped.get(groupKey) ?? {
       ...(entry.sourceType === "well-known" ? { index: spec } : { git: spec }),
+      ...(ref ? { ref } : {}),
       include: [],
     };
     if (!group.include.includes(entry.name)) group.include.push(entry.name);
-    grouped.set(key, group);
+    grouped.set(groupKey, group);
     return group;
   };
   for (const [key, entries] of lockEntries) {
@@ -265,12 +276,14 @@ async function collectImports(
         imports.notes.push(`${error.message}; the local copy stays in place`);
       }
       if (real && (await sameAsUpstream(localEntry, local, cacheRoot, imports.notes))) {
+        const ref = localEntry.ref && !isCommitRef(localEntry.ref) ? localEntry.ref : undefined;
         candidates.push({
           entry: localEntry,
+          ref,
           path: local,
           within,
           real,
-          addedSource: addSource(localEntry),
+          addedSource: addSource(localEntry, ref),
         });
         continue;
       }
@@ -366,10 +379,15 @@ export async function planInit(
     let rejected = false;
     const migrations: Migration[] = [];
     const warnings: string[] = [];
-    for (const { entry, path, within, real, addedSource } of candidates) {
+    for (const { entry, ref, path, within, real, addedSource } of candidates) {
       const winner = winners.get(entry.name);
       const source = winner && augmented.sources.find(({ id }) => id === winner.source);
-      if (source && "git" in source && gitUrl(source.git) === gitUrl(entry.source)) {
+      if (
+        source &&
+        "git" in source &&
+        gitUrl(source.git) === gitUrl(entry.source) &&
+        (!ref || source.ref === ref)
+      ) {
         imports.unedited.push({ name: entry.name, path, from: entry.source });
         migrations.push({
           kind: "backup",

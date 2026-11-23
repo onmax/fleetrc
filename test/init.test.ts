@@ -654,6 +654,43 @@ describe("init", () => {
     expect((await m.run("status")).stdout).toContain("tool: no recorded merge base");
   });
 
+  it("uses a full commit ID from a legacy lock ref as the fork base", async () => {
+    const m = machine();
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const base = upstream.head();
+    const edited = skillMd("tool", "Local edit");
+    const personal = remote(m, "personal", {
+      "skills/tool/SKILL.md": edited,
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: {
+          tool: {
+            source: upstream.url,
+            sourceType: "git",
+            ref: base,
+            skillPath: "skills/tool/SKILL.md",
+          },
+        },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+
+    const initialized = await m.run("init", manifest, "--no-hooks");
+    expect(initialized.code, initialized.stdout + initialized.stderr).toBe(0);
+    expect(JSON.parse(read(manifest)).forks.tool.base).toBe(base);
+
+    const head = upstream.commit({ "skills/tool/notes.txt": "upstream note\n" });
+    const merged = await m.run("merge", "tool");
+    expect(merged.code, merged.stdout + merged.stderr).toBe(0);
+    expect(read(join(work, "skills/tool/SKILL.md"))).toBe(edited);
+    expect(read(join(work, "skills/tool/notes.txt"))).toBe("upstream note\n");
+    expect(JSON.parse(read(manifest)).forks.tool.base).toBe(head);
+  });
+
   it("does not fetch a local partial clone's missing HEAD during offline init", async () => {
     const m = machine();
     const upstream = remote(m, "upstream", skills("skills/", "tool"));
@@ -788,6 +825,65 @@ describe("init", () => {
     imports: { sources: object[]; forks: object };
     migrations: { kind: string; path: string }[];
   };
+
+  it.each(["stable", "main", undefined])(
+    "compares ref-only lock copies with stable (configured ref: %s)",
+    async (configuredRef) => {
+      const m = machine({ scheduler: "empty" });
+      const upstream = remote(m, "upstream", skills("skills/", "untouched", "edited"));
+      m.git(upstream.work, "push", "origin", "HEAD:refs/heads/stable");
+      const edited = skillMd("edited", "local edit matching main");
+      upstream.commit({
+        "skills/untouched/SKILL.md": skillMd("untouched", "main only"),
+        "skills/edited/SKILL.md": edited,
+      });
+      const entry = (name: string) => ({
+        source: upstream.url,
+        sourceType: "git",
+        ref: "stable",
+        skillPath: `skills/${name}/SKILL.md`,
+      });
+      const personal = remote(m, "personal", {
+        ...skills("skills/", "untouched"),
+        "skills/edited/SKILL.md": edited,
+        "skills-lock.json": JSON.stringify({
+          version: 2,
+          skills: { untouched: entry("untouched"), edited: entry("edited") },
+        }),
+      });
+      const work = clone(m, personal, "code/skills");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+          ...(configuredRef
+            ? [
+                {
+                  id: "upstream",
+                  git: upstream.url,
+                  ref: configuredRef,
+                  include: ["untouched", "edited"],
+                },
+              ]
+            : []),
+        ],
+      });
+
+      const init = await m.run("init", manifest, "--no-hooks");
+      expect(init.code, init.stdout + init.stderr).toBe(0);
+      expect(read(join(work, "skills/edited/SKILL.md"))).toBe(edited);
+      expect(existsSync(join(work, "skills/untouched"))).toBe(configuredRef === "main");
+      expect(read(m.at(".claude/skills/untouched/SKILL.md"))).toBe(skillMd("untouched"));
+      const saved = JSON.parse(read(manifest));
+      expect(saved.sources[1]).toMatchObject({ git: upstream.url, ref: configuredRef ?? "stable" });
+      expect(saved.forks).toEqual({
+        edited: { from: upstream.url, path: "skills/edited", upstream: "git" },
+        ...(configuredRef === "main"
+          ? { untouched: { from: upstream.url, path: "skills/untouched", upstream: "git" } }
+          : {}),
+      });
+    },
+  );
 
   it("can migrate a matching copy after adopting an unrelated copied command edit", async () => {
     const m = machine({ scheduler: "empty" });

@@ -301,7 +301,7 @@ describe("edited vendored skills", () => {
     const recorded = read(manifest);
     const saved = JSON.parse(read(manifest)) as {
       sources: { id: string; index?: string }[];
-      forks: Record<string, { from: string; path: string; upstream?: string }>;
+      forks: Record<string, { from: string; path: string; upstream?: string; base?: string }>;
     };
     const provenance = saved.forks.tool!.upstream;
     delete saved.forks.tool!.upstream;
@@ -318,6 +318,16 @@ describe("edited vendored skills", () => {
     expect(legacyDiff.code, legacyDiff.stdout + legacyDiff.stderr).toBe(0);
     const indexDiff = await m.run("diff", "drop");
     expect(indexDiff.stderr).toContain("is not a git repository");
+    expect((await m.run("status")).stdout).not.toContain("`fleetrc merge drop`");
+
+    saved.forks.drop = { from: site.url, path: "skills/tool", base: "unknown" };
+    writeFileSync(manifest, JSON.stringify(saved));
+    expect((await m.json("sync")).warnings.join("\n")).not.toContain("could not tell whether drop");
+    for (const command of ["diff", "merge"]) {
+      expect((await m.run(command, "drop")).stderr).toContain("is not a git repository");
+    }
+    delete saved.forks.drop.base;
+    writeFileSync(manifest, JSON.stringify(saved));
     expect((await m.run("status")).stdout).not.toContain("`fleetrc merge drop`");
 
     expect(provenance).toBe("git");
