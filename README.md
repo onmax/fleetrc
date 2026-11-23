@@ -15,7 +15,7 @@
 One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode, Cursor and GitHub Copilot, synced on every machine when an agent session starts. It also syncs user-level instruction files, subagents, commands, MCP servers and agent hooks. Watch the [90-second explainer](https://raw.githubusercontent.com/onmax/fleetrc/main/.github/assets/explainer.mp4).
 
 - **One copy per skill.** fleetrc fetches `git`, `npm`, `index` and `local` sources and links each skill into every installed agent's folder.
-- **Session-start syncs.** `init` installs `SessionStart` hooks in Claude Code and Codex that run a background sync when 15 minutes have passed. Servers without an agent use `--timer`.
+- **Session-start syncs.** `init` installs `SessionStart` hooks in Claude Code and Codex that start a background sync when none has been tried in the last 15 minutes. Servers without an agent use `--timer`.
 - **Safe edits and reviews.** Upstream changes wait for `diff` and `merge` when you edit a skill locally, and `"update": "review"` holds third-party updates until you run `fleetrc update`.
 - **Shared team configs.** `"extends"` inherits sources from a team repo while ignoring `hooks`, `report`, `fleet`, `path`, `local`, `mcp` and `agentHooks`, so a team config cannot run commands on your machine.
 
@@ -33,9 +33,9 @@ The argument can be a repository like `owner/repo`, `github:owner/repo`, `gitlab
 
 ## Quick start
 
-### Minimal config
+### Write your config
 
-Put `.fleetrc/manifest.json` in a git repository:
+Your config is `.fleetrc/manifest.json` in a git repository, usually the one that holds your own skills:
 
 ```json
 {
@@ -56,7 +56,7 @@ Put `.fleetrc/manifest.json` in a git repository:
 }
 ```
 
-Then run `npx fleetrc init me/skills`. Sources are listed in precedence order, so your first matching skill wins.
+Then run `npx fleetrc init me/skills` on each machine. When two sources have a skill with the same name, the first one wins, and your `sources` come before the ones from `extends`.
 
 ### Add a machine
 
@@ -110,15 +110,15 @@ Run `fleetrc <command> --help` for full options. Most commands accept `--dry-run
 
 See [`schema.json`](./schema.json) for every field, type and constraint.
 
-| Field                                               | Purpose                                                                                                                                                                                                                                    |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `extends`                                           | Team manifests to inherit sources from. Use `{ "manifest": "...", "exclude": [...], "excludeSources": [...] }` to drop items.                                                                                                              |
-| `agents`                                            | `"all"` by default for every installed agent, or a list of ids from `fleetrc agents`.                                                                                                                                                      |
-| `sources[]`                                         | `git` (with `ref`, `path`, `adopt`, `followLinks`), `index` (`/.well-known/agent-skills/index.json` or v0.1), `npm` (with `registry`), or `local`. Common fields: `id`, `skills`, `include`, `exclude`, `update` (`"auto"` or `"review"`). |
-| `sources[].instructions`, `subagents`, `commands`   | Globs or per-agent maps for user-level instruction files, subagents and commands. Files are linked verbatim.                                                                                                                               |
-| `sources[].mcp`                                     | Path to a Claude Code-format `{"mcpServers": {...}}` file translated into each agent's config. Secrets must use `${VAR}`. Root config only.                                                                                                |
-| `sources[].agentHooks`                              | Path for Claude Code or per-agent map of hook files in each agent's native format. Root config only.                                                                                                                                       |
-| `fleet`, `timer`, `hooks`, `report`, `hub`, `forks` | SSH or Tailscale hosts, cron schedule (`*/30 * * * *` default), post-sync shell commands (`FLEETRC_CHANGED`, JSON on stdin), report command or URL, and tracked forks.                                                                     |
+| Field                                               | Purpose                                                                                                                                                                                                                                                                        |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `extends`                                           | Team manifests to inherit sources from. Use `{ "manifest": "...", "exclude": [...], "excludeSources": [...] }` to drop items.                                                                                                                                                  |
+| `agents`                                            | `"all"` by default for every installed agent, or a list of ids from `fleetrc agents`.                                                                                                                                                                                          |
+| `sources[]`                                         | `git` (with `ref`, `path`, `adopt`, `followLinks`), `index` (`/.well-known/agent-skills/index.json` or v0.1), `npm` (with `registry`), or `local`. Common fields: `id`, `skills`, `include`, `exclude`, `update` (`"auto"` or `"review"`).                                     |
+| `sources[].instructions`, `subagents`, `commands`   | Globs or per-agent maps for user-level instruction files, subagents and commands. Files are linked verbatim.                                                                                                                                                                   |
+| `sources[].mcp`                                     | Path to a Claude Code-format `{"mcpServers": {...}}` file translated into each agent's config. Secrets must use `${VAR}`. Root config only.                                                                                                                                    |
+| `sources[].agentHooks`                              | Path for Claude Code or per-agent map of hook files in each agent's native format. Root config only.                                                                                                                                                                           |
+| `fleet`, `timer`, `hooks`, `report`, `hub`, `forks` | SSH or Tailscale hosts, cron schedule (`*/30 * * * *` default), shell commands to run when a source's files change (`FLEETRC_CHANGED`, JSON report on stdin), a command (`report.run`) and a URL (`hub`) that receive each run's report, and the forks `fleetrc fork` records. |
 
 ## Supported agents
 
@@ -132,7 +132,7 @@ Works on Linux with systemd, macOS with launchd, and Windows with Task Scheduler
 
 fleetrc is at 0.1.0, so expect changes before 1.0. `hub` currently receives sync reports only.
 
-**Moving from skillfleet.** The first command that writes state migrates an existing `skillfleet` install automatically, and `fleetrc fleet upgrade` migrates SSH hosts too. Rename `.skillfleet/manifest.json`, `github.com/onmax/skillfleet` and `SKILLFLEET_*` before the next release.
+**Moving from skillfleet.** The first `fleetrc` command that changes anything moves an existing `skillfleet` install, and `fleetrc fleet upgrade` moves every host in `fleet`. For one release fleetrc still reads `.skillfleet/manifest.json`, the `github.com/onmax/skillfleet` tailnet capability and `SKILLFLEET_*` hook variables, with a warning. Rename them before the next release.
 
 **Develop.** Run `pnpm install` and `pnpm ready` to format, build, check and test.
 
