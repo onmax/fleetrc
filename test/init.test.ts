@@ -1,4 +1,5 @@
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
@@ -56,6 +57,11 @@ function snapshot(dir: string): string[] {
  * clone, copies an old installer listed in .nuxt-skills-managed, a stray hand-made skill and .system.
  */
 function legacyLayout(m: Machine) {
+  // init compares the local council with t3dotgg/tstack's; that fetch fails here, so it stays a fork.
+  appendFileSync(
+    join(m.root, "gitconfig"),
+    '[url "https://git.fleetrc.test/offline/"]\n\tinsteadOf = https://github.com/\n',
+  );
   const personal = remote(m, "skills-private", {
     ...skills("skills/", "check-your-work", "council", "unslop"),
     "skills-lock.json": JSON.stringify({
@@ -619,6 +625,52 @@ describe("init", () => {
       git: upstream.url,
       include: ["ag-dev", "ag-update"],
     });
+  });
+
+  it("links unedited local copies from their source and keeps edited ones as forks", async () => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "ag-dev", "tool"));
+    const entry = (name: string) => ({
+      source: upstream.url,
+      sourceType: "git",
+      skillPath: `skills/${name}/SKILL.md`,
+      computedHash: "x",
+    });
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "mine", "ag-dev"),
+      "skills/tool/SKILL.md": skillMd("tool", "my edit"),
+      "skills-lock.json": JSON.stringify({
+        version: 1,
+        skills: { "ag-dev": entry("ag-dev"), tool: entry("tool") },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true }],
+    });
+    const dry = await m.json<{
+      imports: { sources: object[]; forks: object };
+      migrations: { kind: string; path: string }[];
+    }>("init", manifest, "--dry-run");
+    expect(dry.imports.sources).toEqual([
+      { id: "upstream", git: upstream.url, include: ["ag-dev"] },
+    ]);
+    expect(dry.imports.forks).toEqual({ tool: { from: upstream.url, path: "skills/tool" } });
+    expect(dry.migrations).toContainEqual(
+      expect.objectContaining({ kind: "backup", path: join(work, "skills/ag-dev") }),
+    );
+    expect(existsSync(join(work, "skills/ag-dev"))).toBe(true);
+
+    const init = await m.run("init", manifest, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(existsSync(join(work, "skills/ag-dev"))).toBe(false);
+    expect(names(m.at(".claude/skills"))).toEqual(["ag-dev", "mine", "tool"]);
+    expect(linkOf(m.at(".claude/skills/ag-dev"))).not.toContain(work);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool", "my edit"));
+    const saved = JSON.parse(read(manifest));
+    expect(saved.sources[1]).toEqual({ id: "upstream", git: upstream.url, include: ["ag-dev"] });
+    expect(Object.keys(saved.forks)).toEqual(["tool"]);
   });
 
   describe("R2-1. agent folders linked to one another are one folder", () => {

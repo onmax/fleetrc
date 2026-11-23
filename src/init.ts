@@ -5,7 +5,7 @@ import { listSkills } from "skills";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { confine, personalSkillsDir, personalSource } from "./edits.ts";
 import { UserError } from "./errors.ts";
-import { dict, isRecord, lstat, moveDir, readJsonFile } from "./fs.ts";
+import { dict, hashDir, isRecord, lstat, moveDir, readJsonFile, sameTree } from "./fs.ts";
 import { linkTarget, readTargetManifest, removeLink } from "./linker.ts";
 import {
   defaultSourceId,
@@ -25,6 +25,7 @@ import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
 import { git, GitError } from "./exec.ts";
+import { fetchClone, gitUrl } from "./gitcache.ts";
 import { cloneAt } from "./sources.ts";
 import { sync } from "./sync.ts";
 
@@ -42,6 +43,8 @@ const ADOPTED_ELSEWHERE = "is adopted from another folder";
 export interface Imports {
   sources: Record<string, unknown>[];
   forks: Record<string, Fork>;
+  /** Local copies with no edits, which init backs up so the upstream source links the skill. */
+  unedited: { name: string; path: string; from: string }[];
   notes: string[];
 }
 
@@ -127,9 +130,40 @@ async function hasLocalGitHead(path: string): Promise<boolean> {
   return result.code === 0;
 }
 
-/** Turns `skills` lock entries into manifest sources and forks. */
-async function collectImports(loaded: LoadedManifest): Promise<Imports> {
-  const imports: Imports = { sources: [], forks: dict(), notes: [] };
+/**
+ * Whether the local copy of a lock entry has the same files as its upstream folder, at the
+ * commit the lock records or, without one, upstream's latest. Undefined when that can't be told.
+ */
+async function sameAsUpstream(
+  entry: LockEntry,
+  local: string,
+  cacheRoot: string,
+  notes: string[],
+): Promise<boolean | undefined> {
+  if (entry.sourceType === "local" || entry.sourceType === "well-known") return undefined;
+  try {
+    const clone = await fetchClone(gitUrl(entry.source), entry.commit ?? entry.ref, cacheRoot);
+    const dir = join(clone.dir, entry.skillPath ? dirname(entry.skillPath) : entry.name);
+    confine(clone.dir, dir, "compare it with the local copy");
+    return sameTree(hashDir(local), hashDir(dir));
+  } catch (error) {
+    notes.push(
+      `could not compare ${entry.name} with ${entry.source} (${(error as Error).message}), so it is recorded as a fork`,
+    );
+    return undefined;
+  }
+}
+
+/**
+ * Turns `skills` lock entries into manifest sources and forks. A local copy with edits becomes a
+ * fork; one without edits is an install, which the upstream source links instead. That takes a
+ * fetch, so offline, or with a manifest init can't edit, every local copy is a fork.
+ */
+async function collectImports(
+  loaded: LoadedManifest,
+  { compare, cacheRoot }: { compare: boolean; cacheRoot: string },
+): Promise<Imports> {
+  const imports: Imports = { sources: [], forks: dict(), unedited: [], notes: [] };
   const personal = personalSource(loaded.sources);
   const lockEntries: LockEntry[] = [];
   for (const source of loaded.sources)
@@ -147,8 +181,15 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
   const grouped = new Map<string, Record<string, unknown> & { include: string[] }>();
   for (const entry of lockEntries) {
     const local = personal ? join(personalSkillsDir(personal), entry.name) : undefined;
+    const forked = Object.keys(loaded.root.forks).some(
+      (key) => nameKey(key) === nameKey(entry.name),
+    );
     if (local && existsSync(join(local, "SKILL.md"))) {
-      if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name))) {
+      if (forked) continue;
+      // An unedited copy is an install: it goes on to the source below, which links it.
+      if (compare && (await sameAsUpstream(entry, local, cacheRoot, imports.notes)) === true)
+        imports.unedited.push({ name: entry.name, path: local, from: entry.source });
+      else {
         if (entry.sourceType === "local" && !(await hasLocalGitHead(entry.source))) continue;
         const base = entry.commit ?? entry.ref;
         imports.forks[entry.name] = {
@@ -156,8 +197,8 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
           path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
           ...(base === undefined ? {} : { base }),
         };
+        continue;
       }
-      continue;
     }
     if (entry.sourceType === "local") continue;
     const spec =
@@ -214,7 +255,10 @@ export async function planInit(
     const cache = dryRun ? { cacheRoot: join(scratch, "manifests") } : { checkout };
     const manifestFile = await locateManifest(spec, { offline, ...cache });
     const loaded = await loadManifest(spec, { offline, ...cache });
-    const imports = await collectImports(loaded);
+    const imports = await collectImports(loaded, {
+      compare: !offline && !remoteManifest(spec),
+      cacheRoot: dryRun ? join(scratch, "forks") : join(paths.cache(), "forks"),
+    });
     // Plan the sync against the manifest as it will be once the imports are added.
     const raw = readJsonFile(manifestFile);
     if (!isRecord(raw)) throw new Error(`${manifestFile} is not a JSON object`);
@@ -262,7 +306,11 @@ export async function planInit(
         warnings.push(`${error.message}; the skills there stay where they are`);
         adoptInto = undefined;
       }
-    const migrations: Migration[] = [];
+    const migrations: Migration[] = imports.unedited.map((copy) => ({
+      kind: "backup",
+      path: copy.path,
+      reason: `it has no edits, so ${copy.from} links ${copy.name} instead; commit its removal`,
+    }));
     const kept = new Set<string>();
     const adopted = new Set<string>();
 
