@@ -196,6 +196,33 @@ describe("edited vendored skills", () => {
     expect((await m.run("status")).stdout).not.toContain("no recorded merge base");
   });
 
+  it("4d3. a fork of a repository no source reads still hears of upstream changes", async () => {
+    const { m, vendor, manifest } = await editedVendoredSkill({ scheduler: "empty" });
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const saved = JSON.parse(read(manifest)) as { sources: { id: string }[] };
+    saved.sources = saved.sources.filter((source) => source.id !== "vendor");
+    writeFileSync(manifest, JSON.stringify(saved, null, 2));
+    expect((await m.run("sync")).code).toBe(0);
+    expect(
+      (await m.json<{ forks: { tool: { files: string[] } } }>("status")).forks.tool.files,
+    ).toEqual([]);
+
+    vendor.commit({
+      "skills/tool/SKILL.md": lines("one", "two", "three", "four", "FIVE (theirs)"),
+    });
+    const sync = await m.run("sync");
+    expect(sync.code, sync.stdout + sync.stderr).toBe(0);
+    expect(sync.stdout).toContain(
+      `fork tool: ${vendor.url} changed it since you forked it (SKILL.md)`,
+    );
+    const status = await m.json<{ forks: { tool: { upstream: string; files: string[] } } }>(
+      "status",
+    );
+    expect(status.forks.tool).toMatchObject({ upstream: vendor.head(), files: ["SKILL.md"] });
+    // Said once for each upstream version.
+    expect((await m.run("sync")).stdout).not.toContain("fork tool:");
+  });
+
   it("reports both directions of empty-file conflicts without a fork base", async () => {
     const { m, work, vendor, manifest } = await editedVendoredSkill();
     expect((await m.run("fork", "tool")).code).toBe(0);
