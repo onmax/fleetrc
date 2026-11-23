@@ -241,6 +241,35 @@ describe("init", () => {
     expect(await preview()).toMatchObject({ ok: true, previewLimitations: [] });
   });
 
+  it("previews a published working clone without refreshing its stale tracking ref", async () => {
+    const setup = machine();
+    const repo = remote(setup, "mine", { "instructions.md": "original\n" });
+    const working = clone(setup, repo, "mine");
+    const manifest = setup.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "mine", git: repo.url, path: working, instructions: "instructions.md" }],
+    });
+    const cached = setup.git(working, "rev-parse", "@{u}");
+    writeFileSync(join(working, "instructions.md"), "published\n");
+    setup.git(working, "add", "instructions.md");
+    setup.git(working, "commit", "--quiet", "-m", "Publish setup");
+    const published = setup.git(working, "rev-parse", "HEAD");
+    setup.git(working, "push", "--quiet", pathToFileURL(repo.url).href, "HEAD:refs/heads/main");
+
+    const args = ["init", manifest, "--no-hooks", "--copy"];
+    const { sync: preview } = await setup.json<{ sync: Report }>(...args, "--dry-run");
+    expect(setup.git(working, "rev-parse", "HEAD")).toBe(published);
+    expect(setup.git(working, "rev-parse", "@{u}")).toBe(cached);
+    expect(existsSync(setup.at(".claude/CLAUDE.md"))).toBe(false);
+
+    const { sync: applied } = await setup.json<{ sync: Report }>(...args);
+    expect(applied.ok).toBe(true);
+    expect(setup.git(working, "rev-parse", "HEAD")).toBe(published);
+    expect(setup.git(working, "rev-parse", "@{u}")).toBe(published);
+    expect(read(setup.at(".claude/CLAUDE.md"))).toBe("published\n");
+    expect(preview).toMatchObject({ ok: true, previewLimitations: [] });
+  });
+
   it("flags a newer cached upstream excluded from fetch even when the advertised tip matches HEAD", async () => {
     const setup = machine();
     const repo = remote(setup, "mine", { "instructions.md": "original\n" });

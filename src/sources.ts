@@ -835,9 +835,11 @@ async function updateClone(
         allowFail: true,
       });
       if (fetch.code === 0 && trackingRef === `${prefix}${branch}`) {
-        const mapping = fetch.stdout.trim().replace(/^\+/, "");
+        const refspec = fetch.stdout.trim();
+        const mapping = refspec.replace(/^\+/, "");
         if (mapping === `refs/heads/*:${prefix}*` || mapping === `${remoteRef}:${trackingRef}`) {
-          if ((await gitOut(["rev-parse", "@{u}"], dir)) === before) return;
+          if (refspec.startsWith("+") || (await gitOut(["rev-parse", "@{u}"], dir)) === before)
+            return;
         }
       }
     }
