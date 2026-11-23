@@ -1910,6 +1910,38 @@ describe.skipIf(isWindows)("the command ssh hands the login shell", () => {
     expect(run.stdout).toBe(`${script}\n`);
     for (const file of ["P", "Q"]) expect(existsSync(join(m.root, file))).toBe(false);
   });
+
+  it.each(["missing", "broken", "fallback"] as const)(
+    "handles a %s base64 decoder without evaluating failed output",
+    (mode) => {
+      const m = machine();
+      const bin = join(m.root, "decode-bin");
+      mkdirSync(bin);
+      const shell = which("sh");
+      symlinkSync(shell, join(bin, "sh"));
+      if (mode !== "missing") {
+        const decoder = join(bin, "base64");
+        const fallback = mode === "fallback" ? 'printf "printf complete"; exit 0' : ":";
+        writeFileSync(
+          decoder,
+          `#!/bin/sh\nif [ "$1" = -D ]; then ${fallback}; fi\nprintf "printf partial"\nexit 1\n`,
+        );
+        chmodSync(decoder, 0o755);
+      }
+      const run = spawnSync(shell, ["-c", shCommand("printf complete")], {
+        env: { PATH: bin },
+        encoding: "utf8",
+      });
+      if (mode === "fallback") {
+        expect(run.status, run.stderr).toBe(0);
+        expect(run.stdout).toBe("complete");
+      } else {
+        expect(run.status).toBe(1);
+        expect(run.stdout).toBe("");
+        expect(run.stderr).toContain("could not decode the remote script with base64");
+      }
+    },
+  );
 });
 
 describe("markBehind", () => {

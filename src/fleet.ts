@@ -364,7 +364,7 @@ const sshRemoteCommand = (
  * so the script goes as base64. Older macOS decodes with -D.
  */
 export const shCommand = (script: string) =>
-  `sh -c 'e=${Buffer.from(script).toString("base64")}; eval "$(printf %s "$e" | base64 -d 2>/dev/null || printf %s "$e" | base64 -D)"'`;
+  `sh -c 'e=${Buffer.from(script).toString("base64")}; if decoded=$(printf %s "$e" | base64 -d 2>/dev/null) || decoded=$(printf %s "$e" | base64 -D); then eval "$decoded"; else echo "fleetrc: could not decode the remote script with base64" >&2; exit 1; fi'`;
 
 async function runOnHost(
   host: string,
