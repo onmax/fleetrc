@@ -373,6 +373,8 @@ export function formatPlan(plan: InitPlan, { errors = true } = {}): string {
   );
   for (const shadow of plan.sync.shadowed)
     lines.push(`  shadowed: ${shadow.skill} from ${shadow.loser} (${shadow.winner} wins)`);
+  for (const reason of plan.sync.previewLimitations ?? [])
+    lines.push(`  preview incomplete: ${reason}`);
   if (errors) for (const error of plan.sync.errors) lines.push(`  error: ${error}`);
   for (const warning of new Set(plan.warnings)) lines.push(`  warning: ${warning}`);
   lines.push(

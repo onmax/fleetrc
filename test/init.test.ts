@@ -120,6 +120,74 @@ describe("init", () => {
     expect(replaced(applied.sync)).toEqual([]);
   });
 
+  it("flags a copied skill update whose destinations the preview cannot establish", async () => {
+    const machineSetup = machine();
+    const repo = remote(machineSetup, "upstream-skills", skills("skills/", "example"));
+    const manifest = machineSetup.manifest({
+      agents: ["claude-code", "codex"],
+      sources: [{ id: "shared", git: repo.url }],
+    });
+    await machineSetup.json("init", manifest, "--no-hooks", "--copy");
+    const preview = async () => {
+      const { sync } = await machineSetup.json<{ sync: Report }>(
+        "init",
+        manifest,
+        "--no-hooks",
+        "--dry-run",
+      );
+      return sync;
+    };
+    expect(await preview()).toMatchObject({ ok: true, previewLimitations: [] });
+
+    const updated = skillMd("example", "incoming update");
+    repo.commit({ "skills/example/SKILL.md": updated });
+    const destinations = [
+      machineSetup.at(".claude/skills/example/SKILL.md"),
+      machineSetup.at(".agents/skills/example/SKILL.md"),
+    ];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const report = await preview();
+      expect(report.ok).toBe(true);
+      expect(report.skills.updated).toEqual(["example"]);
+      expect(report.targets.flatMap((target) => target.replaced)).toEqual([]);
+      expect(report).toMatchObject({ previewLimitations: [expect.stringContaining("example")] });
+      for (const path of destinations) expect(read(path)).not.toBe(updated);
+    }
+    await machineSetup.json("init", manifest, "--no-hooks");
+    for (const path of destinations) expect(read(path)).toBe(updated);
+    expect(await preview()).toMatchObject({ ok: true, previewLimitations: [] });
+  });
+
+  it("flags copy-edit adoption that would propagate to another agent", async () => {
+    const machineSetup = machine();
+    const repo = remote(machineSetup, "mine", { "instructions.md": "original\n" });
+    const working = clone(machineSetup, repo, "mine");
+    const manifest = machineSetup.manifest({
+      agents: ["claude-code", "codex"],
+      sources: [{ id: "mine", git: repo.url, path: working, instructions: "instructions.md" }],
+    });
+    await machineSetup.json("init", manifest, "--no-hooks", "--copy");
+    const edited = machineSetup.at(".claude/CLAUDE.md");
+    const other = machineSetup.at(".codex/AGENTS.md");
+    writeFileSync(edited, "local edit\n");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { sync } = await machineSetup.json<{ sync: Report }>(
+        "init",
+        manifest,
+        "--no-hooks",
+        "--dry-run",
+      );
+      expect(sync.ok).toBe(true);
+      expect(sync.files.replaced).toEqual([]);
+      expect(sync).toMatchObject({ previewLimitations: [expect.stringContaining("CLAUDE.md")] });
+      expect(read(join(working, "instructions.md"))).toBe("original\n");
+      expect(read(other)).toBe("original\n");
+    }
+    const { sync } = await machineSetup.json<{ sync: Report }>("init", manifest, "--no-hooks");
+    expect(sync.files.replaced).toEqual([other]);
+    expect(read(other)).toBe("local edit\n");
+  });
+
   it.skipIf(isWindows)(
     "reports rewriting a managed copy from a different same-byte source",
     async () => {

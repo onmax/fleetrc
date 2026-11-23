@@ -19,6 +19,8 @@ export interface Report {
   dryRun: boolean;
   offline: boolean;
   ok: boolean;
+  /** Changes whose full destination effects the dry run did not model. */
+  previewLimitations?: string[];
   sources: Omit<SourceResult, "skills" | "files">[];
   skills: {
     total: number;

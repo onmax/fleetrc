@@ -499,7 +499,7 @@ export function adoptFileCopyEdits(state: State, dryRun: boolean): string[] {
       record.hash = now;
     }
     said.push(
-      `took the edit of ${tildify(path)} into ${record.item} (${record.source}), so every agent gets it`,
+      `${dryRun ? "would take" : "took"} the edit of ${tildify(path)} into ${record.item} (${record.source}), so every agent gets it`,
     );
   }
   return said;
