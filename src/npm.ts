@@ -247,7 +247,7 @@ export function guardedFetch(
 }
 
 /**
- * Downloads an npm package into `cacheRoot/<name>@<version>` and returns that folder.
+ * Downloads an npm package into `cacheRoot/<registry hash>/<name>@<version>` and returns that folder.
  * `skills` has no npm source type; it discovers skills in the unpacked folder like any local path.
  */
 export async function fetchNpm(
@@ -266,25 +266,32 @@ export async function fetchNpm(
   const { name, want } = parseNpmSpec(spec);
   if (!PACKAGE_NAME.test(name)) throw new Error(`npm "${name}" is not a package name`);
   const base = registryUrl(registry);
+  const registryCache = join(cacheRoot, createHash("sha256").update(base).digest("hex"));
   const folder = (version: string) => {
-    const dir = join(cacheRoot, `${name.replace("/", "+")}@${version}`);
-    const inside = relative(cacheRoot, dir);
+    const dir = join(registryCache, `${name.replace("/", "+")}@${version}`);
+    const inside = relative(registryCache, dir);
     if (!inside || inside.startsWith("..") || /[/\\]/.test(inside))
       throw new Error(`npm ${name}@${version}: the cache folder would be outside the cache`);
     return dir;
   };
-  // A published version never changes, so one already downloaded needs no registry. A tag can't
-  // look like a version, so `want` is one.
-  if (EXACT_VERSION.test(want) && existsSync(folder(want)))
-    return { dir: folder(want), version: want };
-  const response = await fetch(`${base}/${name.replace("/", "%2f")}`, {
-    // The abbreviated packument npm installs from: about half the size, with the same dist fields.
-    headers: {
-      accept: "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8",
-      ...headers(sendToken),
-    },
-    signal: AbortSignal.timeout(30_000),
-  });
+  // A published version never changes, so one already downloaded from this registry needs no request.
+  if (EXACT_VERSION.test(want) && VERSION.test(want)) {
+    const dir = folder(want);
+    if (existsSync(dir)) return { dir, version: want };
+  }
+  const signal = AbortSignal.timeout(30_000);
+  const requestPackument = (accept: string) =>
+    fetch(`${base}/${name.replace("/", "%2f")}`, {
+      headers: { accept, ...headers(sendToken) },
+      signal,
+    });
+  let response = await requestPackument(
+    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8",
+  );
+  if (response.status === 406 || response.status === 404) {
+    await response.body?.cancel();
+    response = await requestPackument("application/json");
+  }
   if (!response.ok) throw new Error(`npm ${name}: registry answered ${response.status}`);
   const packument: unknown = await response.json();
   if (!isRecord(packument) || !isRecord(packument.versions))

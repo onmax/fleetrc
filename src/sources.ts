@@ -1244,7 +1244,7 @@ async function openVendored(
         root: pkg.dir,
         submodules: [],
         earlier: async (path: string, live: string) =>
-          earlierPackages(join(ctx.cacheDir, "npm"), source.npm, pkg.dir).some((dir) =>
+          earlierPackages(dirname(pkg.dir), source.npm, pkg.dir).some((dir) =>
             sameCopy(join(dir, path), live),
           ),
       };
