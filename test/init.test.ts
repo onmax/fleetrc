@@ -188,6 +188,58 @@ describe("init", () => {
     expect(read(other)).toBe("local edit\n");
   });
 
+  it("flags a working clone update before and after fetching it", async () => {
+    const setup = machine();
+    const originalSkill = skillMd("example");
+    const repo = remote(setup, "mine", {
+      "skills/example/SKILL.md": originalSkill,
+      "instructions.md": "original\n",
+    });
+    const working = clone(setup, repo, "mine");
+    const manifest = setup.manifest({
+      agents: ["claude-code", "codex"],
+      sources: [{ id: "mine", git: repo.url, path: working, instructions: "instructions.md" }],
+    });
+    await setup.json("init", manifest, "--no-hooks", "--copy");
+    const preview = async () => {
+      const { sync } = await setup.json<{ sync: Report }>(
+        "init",
+        manifest,
+        "--no-hooks",
+        "--dry-run",
+      );
+      return sync;
+    };
+    expect(await preview()).toMatchObject({ ok: true, previewLimitations: [] });
+    const before = setup.git(working, "rev-parse", "HEAD");
+    const updatedSkill = skillMd("example", "incoming update");
+    const incoming = repo.commit({
+      "skills/example/SKILL.md": updatedSkill,
+      "instructions.md": "updated\n",
+    });
+    const skillCopies = [
+      setup.at(".claude/skills/example/SKILL.md"),
+      setup.at(".agents/skills/example/SKILL.md"),
+    ];
+    const fileCopies = [setup.at(".claude/CLAUDE.md"), setup.at(".codex/AGENTS.md")];
+    for (const trackingTip of [before, incoming]) {
+      expect(await preview()).toMatchObject({
+        ok: true,
+        previewLimitations: [expect.stringContaining("working clone")],
+      });
+      expect(setup.git(working, "rev-parse", "HEAD")).toBe(before);
+      expect(setup.git(working, "rev-parse", "@{u}")).toBe(trackingTip);
+      for (const path of skillCopies) expect(read(path)).toBe(originalSkill);
+      for (const path of fileCopies) expect(read(path)).toBe("original\n");
+      if (trackingTip === before) setup.git(working, "fetch", "--quiet");
+    }
+    await setup.json("init", manifest, "--no-hooks");
+    expect(setup.git(working, "rev-parse", "HEAD")).toBe(incoming);
+    for (const path of skillCopies) expect(read(path)).toBe(updatedSkill);
+    for (const path of fileCopies) expect(read(path)).toBe("updated\n");
+    expect(await preview()).toMatchObject({ ok: true, previewLimitations: [] });
+  });
+
   it.skipIf(isWindows)(
     "reports rewriting a managed copy from a different same-byte source",
     async () => {

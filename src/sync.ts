@@ -730,6 +730,9 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const forked = new Set(Object.keys(loaded.root.forks).map(nameKey));
     const sourceWon = (result: SourceResult, skill: string) =>
       winners.get(skill)?.source === result.id;
+    if (dryRun)
+      for (const { previewLimitation } of results)
+        if (previewLimitation) previewLimitations.push(previewLimitation);
     if (dryRun && options.copy) {
       for (const result of results) {
         if (!isVendoredKind(result.kind)) continue;
@@ -760,7 +763,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       offline,
       ok: true,
       ...(dryRun ? { previewLimitations } : {}),
-      sources: results.map(({ skills: _skills, files: _files, ...rest }) => rest),
+      sources: results.map(
+        ({ skills: _skills, files: _files, previewLimitation: _previewLimitation, ...rest }) =>
+          rest,
+      ),
       skills: {
         total: winners.size,
         names: [...winners.keys()].sort(),

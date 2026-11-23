@@ -115,6 +115,7 @@ export interface SourceResult {
   files: FileEntry[];
   error?: string;
   warnings: string[];
+  previewLimitation?: string;
 }
 
 export interface SourceContext {
@@ -733,6 +734,8 @@ async function updatePinned(
   if (before.startsWith(ref.toLowerCase())) return;
   if (ctx.dryRun) {
     out.warnings.push(`${source.id}: ${dir} is at ${before.slice(0, 7)}; sync checks out ${ref}`);
+    if (source.update !== "review" || ctx.apply)
+      out.previewLimitation = `${source.id}: checking out ${ref} in the working clone may change destinations not reflected in the preview`;
     return;
   }
   let commit = await findCommit(dir, ref);
@@ -798,17 +801,35 @@ async function updateClone(
   }
   const tracking = upstream.stdout.trim();
   if (ctx.dryRun) {
-    const [remote, ...branch] = tracking.split("/");
-    const remoteHead = await git(["ls-remote", "--", remote!, `refs/heads/${branch.join("/")}`], {
-      cwd: dir,
-      allowFail: true,
-      timeoutMs: 30_000,
-    });
-    const head = remoteHead.stdout.split(/\s/)[0];
-    if (remoteHead.code !== 0)
-      out.warnings.push(`${source.id}: cannot reach ${remote}: ${remoteHead.stderr.trim()}`);
-    else if (head && head !== (await gitOut(["rev-parse", "@{u}"], dir)))
-      out.warnings.push(`${source.id}: ${tracking} has new commits; sync fetches them`);
+    const checkedOut = await gitOut(["symbolic-ref", "HEAD"], dir);
+    const [remote, remoteRef] = (
+      await gitOut(
+        ["for-each-ref", "--format=%(upstream:remotename)%00%(upstream:remoteref)", checkedOut],
+        dir,
+      )
+    ).split("\0");
+    const remoteHead =
+      remote && remoteRef
+        ? await git(["ls-remote", "--", remote, remoteRef], {
+            cwd: dir,
+            allowFail: true,
+            timeoutMs: 30_000,
+          })
+        : undefined;
+    const head = remoteHead?.code === 0 ? remoteHead.stdout.split(/\s/)[0] : undefined;
+    if (head === before) return;
+    if (head) {
+      const ancestor = await git(["merge-base", "--is-ancestor", head, before], {
+        cwd: dir,
+        allowFail: true,
+      });
+      if (ancestor.code === 0) return;
+    }
+    const note = head
+      ? `${source.id}: ${tracking} may update the working clone; the preview uses its current checkout`
+      : `${source.id}: cannot verify the upstream of the working clone ${dir}`;
+    out.warnings.push(note);
+    if (source.update !== "review" || ctx.apply) out.previewLimitation = note;
     return;
   }
   const fetched = await git(["fetch", "--quiet"], {
