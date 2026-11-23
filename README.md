@@ -16,7 +16,7 @@ One config for your agent skills across Claude Code, Codex, Gemini CLI, OpenCode
 
 - **One copy per skill.** fleetrc fetches `git`, `npm`, `index` and `local` sources and links each skill into every installed agent's folder.
 - **Session-start syncs.** `init` installs `SessionStart` hooks in Claude Code and Codex that start a background sync when none has been tried in the last 15 minutes. Servers without an agent use `--timer`.
-- **Safe edits and reviews.** Upstream changes wait for `diff` and `merge` when you edit a skill locally, and `"update": "review"` holds third-party updates until you run `fleetrc update`.
+- **Safe edits and reviews.** Upstream changes wait for `diff` and `merge` when you edit a skill locally. `"update": "review"` holds later changes until you run `fleetrc update`; the first fetch links skills immediately, so review third-party sources before adding them.
 - **Shared team configs.** `"extends"` inherits sources from a team repo while ignoring `hooks`, `report`, `fleet`, `path`, `local`, `mcp` and `agentHooks`, so a team config cannot run commands on your machine.
 
 ## Install
@@ -63,9 +63,14 @@ Then run `npx fleetrc init me/skills` on each machine. When two sources have a s
 From a machine that is already set up, initialize another over SSH and add it to `fleet`:
 
 ```sh
-fleetrc fleet init vps2          # or tag:servers on Tailscale
-fleetrc fleet init vps2 --timer  # headless server with no agent
-fleetrc fleet sync               # sync every machine in fleet
+fleetrc fleet init vps2          # or tag:servers on Tailscale; add --timer for a headless server
+```
+
+If fleetrc prints an entry to add instead of editing a working clone, add it to `fleet` in the manifest. Commit and push any enrollment change, then refresh the manifest on the controller before syncing the fleet:
+
+```sh
+fleetrc sync
+fleetrc fleet sync
 ```
 
 The config must live in a git repository, and the remote host needs Node.js 22.12 or newer.
@@ -80,7 +85,7 @@ On Tailscale, set the config once in your tailnet policy's `nodeAttrs`:
 ]
 ```
 
-Then run `npx fleetrc init` with no arguments on each machine. Only follow a tailnet policy whose editors you trust, because the root config can run local commands through `hooks`, `report`, `mcp` and `agentHooks`.
+Then run `npx fleetrc init` on a fresh machine or one already following the policy. To switch an existing machine from its own manifest, run `npx fleetrc init tailscale:`; bare `init` keeps its current manifest. Only follow a tailnet policy whose editors you trust, because the root config can run local commands through `hooks`, `report`, `mcp` and `agentHooks`.
 
 ## Commands
 
