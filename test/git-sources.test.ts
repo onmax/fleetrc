@@ -803,7 +803,7 @@ describe("the last skill of a repository", () => {
     expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
   });
 
-  it.skipIf(isWindows)("LAST1. proves deletion of a legacy linked folder", async () => {
+  async function linkedLastSkill() {
     const m = machine();
     const vendor = remote(m, "vendor", { "shared/tool/SKILL.md": skillMd("tool") });
     mkdirSync(join(vendor.work, "skills"));
@@ -817,8 +817,26 @@ describe("the last skill of a repository", () => {
     });
     expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
     expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+    return { m, vendor };
+  }
+
+  it.skipIf(isWindows)("LAST1. proves deletion of a legacy linked folder", async () => {
+    const { m, vendor } = await linkedLastSkill();
     forgetDiscovery(m);
     vendor.commit({ "skills/tool": null });
+    expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
+  });
+
+  it.skipIf(isWindows)("LAST1. a plain-file checkout of a link is not a deletion", async () => {
+    const { m, vendor } = await linkedLastSkill();
+    m.git(vendor.work, "config", "--global", "core.symlinks", "false");
+    vendor.commit({ "README.md": "changed\n" });
+    const report = await m.json("sync");
+    expect(report.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+    expect(report.skills.removed).toEqual([]);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+
+    vendor.commit({ "shared/tool": null });
     expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
   });
 
@@ -830,7 +848,11 @@ describe("the last skill of a repository", () => {
     const head = vendor.commit({ "skills/tool": null });
     expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
     expect(state(m).commit).toBe(head);
+    const trace = join(m.root, "git-trace");
+    m.env.GIT_TRACE = trace;
     expect((await m.json("sync")).warnings).toEqual([]);
+    expect(read(trace)).toContain("fetch");
+    expect(read(trace)).not.toContain("checkout-index");
   });
 
   it("LAST1. a new source whose repository has no skills says so", async () => {

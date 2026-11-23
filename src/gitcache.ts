@@ -412,6 +412,7 @@ async function checkoutTree(repo: string, commit: string, dir: string, indexFile
     "core.precomposeunicode=false",
     "-c",
     "core.ignorecase=false",
+    ...(indexFile === undefined ? [] : ["-c", "core.symlinks=true"]),
     `--work-tree=${dir}`,
   ];
   // The index gets only the paths written out: git refuses paths Windows can't write.

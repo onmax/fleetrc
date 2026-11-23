@@ -30,6 +30,8 @@ export interface SourceState {
   commit?: string;
   /** Fingerprint of the Git repository, ref and glob at the last successful discovery. */
   gitDiscovery?: string;
+  /** The last Git commit and discovery fingerprint were verified to yield no skills. */
+  gitEmpty?: true;
   /** npm package version. */
   version?: string;
   fetchedAt?: string;
@@ -301,6 +303,7 @@ function sourceRecord(record: unknown): SourceState | undefined {
   return {
     kind: record.kind as Source["kind"],
     ...strings(record, "commit", "gitDiscovery", "version", "fetchedAt"),
+    ...(record.gitEmpty === true ? { gitEmpty: true } : {}),
     skills: records(record.skills, installedCopy),
     pending: records(record.pending, pendingUpdate),
     ...(isRecord(record.files)

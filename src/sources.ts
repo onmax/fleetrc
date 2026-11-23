@@ -1254,6 +1254,13 @@ async function allGone(
       : state.gitDiscovery !== gitDiscovery(source)
   )
     return false;
+  if (
+    state.gitEmpty &&
+    commit === state.commit &&
+    installed.length === 0 &&
+    Object.keys(state.pending).length === 0
+  )
+    return true;
   const matches = source.skills
     ? globFilter(source.skills, `${source.id}: skills glob`)
     : () => true;
@@ -1316,19 +1323,25 @@ async function openVendored(
             `${source.id}: left out ${path}: macOS and Windows keep it in the same folder as ${kept}`,
           );
       windowsNames(source, clone.refused, warnings);
+      let gitEmpty = false;
+      const handle = await discover(clone.dir, source.skills).catch(async (error: unknown) => {
+        const empty = isDiagnostic(error, "SKILLS_NO_VALID_SKILLS");
+        const missingBase = isDiagnostic(error, "SKILLS_LOCAL_PATH_NOT_FOUND");
+        if (
+          empty &&
+          (filesOnly(source, state) ||
+            (source.skills && linkedFolders(source, clone.dir, [], []).length > 0))
+        )
+          return noSkills(clone.dir);
+        if ((empty || missingBase) && (await allGone(source, state, clone, missingBase))) {
+          gitEmpty = true;
+          return noSkills(clone.dir);
+        }
+        throw error;
+      });
       return {
-        handle: await discover(clone.dir, source.skills).catch(async (error: unknown) => {
-          const empty = isDiagnostic(error, "SKILLS_NO_VALID_SKILLS");
-          const missingBase = isDiagnostic(error, "SKILLS_LOCAL_PATH_NOT_FOUND");
-          if (
-            (empty &&
-              (filesOnly(source, state) ||
-                (source.skills && linkedFolders(source, clone.dir, [], []).length > 0))) ||
-            ((empty || missingBase) && (await allGone(source, state, clone, missingBase)))
-          )
-            return noSkills(clone.dir);
-          throw error;
-        }),
+        handle,
+        gitEmpty,
         version: clone.commit,
         glob: source.skills,
         root: clone.dir,
@@ -2028,6 +2041,12 @@ async function fetchVendored(
     return out;
   }
   let staging: string | undefined;
+  const rememberGitDiscovery = () => {
+    if (source.kind !== "git") return;
+    state.gitDiscovery = gitDiscovery(source);
+    if ("gitEmpty" in opened && opened.gitEmpty) state.gitEmpty = true;
+    else delete state.gitEmpty;
+  };
   try {
     const escaping = opened.root
       ? escapingSkills(
@@ -2070,7 +2089,7 @@ async function fetchVendored(
       }));
       if (opened.root) vendoredFiles(source, state, ctx, out, opened.root, opened.version);
       state.fetchedAt = ctx.now;
-      if (source.kind === "git") state.gitDiscovery = gitDiscovery(source);
+      rememberGitDiscovery();
       out.to = opened.version;
       return out;
     }
@@ -2201,10 +2220,8 @@ async function fetchVendored(
     if (opened.root) vendoredFiles(source, state, ctx, out, opened.root, opened.version);
     state.fetchedAt = ctx.now;
     if (source.kind === "npm") state.version = opened.version;
-    else {
-      state.commit = opened.version;
-      if (source.kind === "git") state.gitDiscovery = gitDiscovery(source);
-    }
+    else state.commit = opened.version;
+    rememberGitDiscovery();
     out.to = opened.version;
   } catch (error) {
     out.status = "error";
