@@ -1,8 +1,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { isWindows, machine, names, pathWith, remote, skills } from "./fixture.ts";
+import { cloneKey } from "../src/gitcache.ts";
+import { cli, isWindows, machine, names, pathWith, remote, skills } from "./fixture.ts";
 
 /**
  * A git first on PATH that logs when each fetch starts and ends, and makes it take `ms` longer, so
@@ -116,23 +117,75 @@ describe.skipIf(isWindows)("fetching git sources", () => {
     expect(names(m.at(".claude/skills"))).toEqual(["other", "tool"]);
   });
 
-  it("cancels stalled fetches before unlocking and reports the original checkpoint error", async () => {
+  it.skipIf(process.platform !== "linux")(
+    "retries with a controlling terminal even when all streams are redirected",
+    async () => {
+      const m = machine();
+      const vendor = remote(m, "vendor", skills("skills/", "tool"));
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      });
+      const slow = slowFetches(m.root, m.env, 0, { before: `(: </dev/tty) || exit 1` });
+      const command = `exec "$1" "$2" sync --manifest "$3" </dev/null >stdout 2>stderr`;
+      const wrapper = join(m.root, "redirect.sh");
+      writeFileSync(wrapper, command);
+      const env = { ...m.env, PATH: slow.PATH };
+      const args = [wrapper, process.execPath, cli, manifest];
+      const unattended = spawnSync("sh", args, {
+        cwd: m.root,
+        env,
+        detached: true,
+        timeout: 10_000,
+      });
+      expect(unattended.status).toBe(1);
+      expect(slow.fetches()).toEqual(["start"]);
+      const interactive = spawnSync(
+        "script",
+        [
+          "-q",
+          "-e",
+          "-c",
+          `sh ${args.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(" ")}`,
+          "/dev/null",
+        ],
+        { cwd: m.root, env, timeout: 10_000 },
+      );
+      expect(interactive.status, readFileSync(join(m.root, "stderr"), "utf8")).toBe(0);
+      expect(slow.fetches()).toEqual(["start", "start", "start", "end"]);
+      expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+    },
+  );
+
+  it("cancels stalled fetches without losing cached history or hiding the checkpoint error", async () => {
     const m = machine();
     const ids = ["first", "two", "three", "four", "five", "six", "seven"];
-    const sources = ids.map((id) => ({
+    const remotes = ids.map((id) => remote(m, id, skills("skills/", `${id}-skill`)));
+    const sources = ids.map((id, index) => ({
       id,
-      git: remote(m, id, skills("skills/", `${id}-skill`)).url,
+      git: remotes[index]!.url,
     }));
+    const warm = remotes[1]!;
+    const seed = m.manifest({ agents: ["claude-code"], sources: [sources[1]] });
+    const seeded = await m.run("sync", "--manifest", seed);
+    expect(seeded.code, seeded.stdout + seeded.stderr).toBe(0);
+    const oldCommit = warm.head();
+    const repo = join(m.stateDir, "cache", "git", `${cloneKey(warm.url)}.git`);
+    expect(m.git(repo, "rev-parse", "refs/fleetrc/fetched")).toBe(oldCommit);
+    rmSync(join(m.stateDir, "state.json"));
     const manifest = m.manifest({ agents: ["claude-code"], sources });
     const lock = join(m.stateDir, "sync.lock");
     const slow = slowFetches(m.root, m.env, 0, {
       before: `case "$*" in
         *first.git*)
-          until [ -f "${join(m.root, "stalling")}" ]; do sleep 0.05; done
+          until [ -f "${join(m.root, "warm-stalling")}" ]; do sleep 0.05; done
           mkdir "${join(m.stateDir, "state.json")}";;
         *)
+          case "$*" in *two.git*) touch shallow.lock;; esac
           sh -c 'sleep 5; echo survived >> "${join(m.root, "fetches.log")}"' &
-          echo "$!" >> "${join(m.root, "stalling")}"; wait;;
+          echo "$!" >> "${join(m.root, "stalling")}"
+          case "$*" in *two.git*) touch "${join(m.root, "warm-stalling")}";; esac
+          wait;;
       esac`,
       after: `if [ ! -f "${lock}" ]; then echo unlocked >> "${join(m.root, "fetches.log")}"; fi`,
     });
@@ -162,5 +215,7 @@ describe.skipIf(isWindows)("fetching git sources", () => {
         })
         .toBe(true);
     }
+    expect(existsSync(join(repo, "shallow.lock"))).toBe(false);
+    expect(m.git(repo, "cat-file", "-t", oldCommit)).toBe("commit");
   });
 });

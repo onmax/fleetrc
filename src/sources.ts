@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -1196,6 +1198,16 @@ const fetchGitSource = (source: GitSource | CloneSource, cacheDir: string, signa
 
 const gitSourceKey = (source: GitSource | CloneSource) => cloneKey(gitUrl(source.git), source.ref);
 
+function hasControllingTerminal(): boolean {
+  if (process.platform === "win32") return false;
+  try {
+    closeSync(openSync("/dev/tty", "r"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Starts up to four fetches at a time. Sources sharing a cache and fetch policy share a promise.
  * Mixed policies and clone previews use the cache only in source order, so none can replace a
@@ -1259,12 +1271,7 @@ export function prefetchGitSources(sources: Source[], cacheDir: string, dryRun: 
       try {
         return await (shared ?? enqueue(source, true));
       } catch (error) {
-        if (
-          signal.aborted ||
-          process.platform === "win32" ||
-          (!process.stdin.isTTY && !process.stderr.isTTY) ||
-          !(error instanceof GitError)
-        )
+        if (signal.aborted || !(error instanceof GitError) || !hasControllingTerminal())
           throw error;
         const retry = (shared && foreground.get(key)) || fetchGitSource(source, cacheDir);
         if (shared) foreground.set(key, retry);
