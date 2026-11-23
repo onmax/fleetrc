@@ -181,7 +181,9 @@ describe("edited vendored skills", () => {
       "skills/tool/SKILL.md": lines("one", "two", "three", "four", "FIVE (theirs)"),
     });
     expect((await m.run("sync")).code).toBe(0);
-    expect((await m.run("status")).stdout).toContain("tool: upstream changed since you forked it");
+    const status = await m.json<{ forks: { tool: { files: string[] } } }>("status");
+    expect(status.forks.tool.files).toContain("SKILL.md");
+    expect((await m.run("status")).stdout).toContain("tool: no recorded merge base");
 
     const merge = await m.run("merge", "tool");
     expect(merge.code).toBe(1);
@@ -190,6 +192,45 @@ describe("edited vendored skills", () => {
     const text = read(join(work, "skills/tool/SKILL.md"));
     expect(text).toContain("description: The tool skill\n---\none\n<<<<<<< local\nTWO (mine)\n");
     expect(text).toContain("FIVE (theirs)\n>>>>>>> upstream\n");
+    expect((JSON.parse(read(manifest)) as typeof saved).forks.tool!.base).toBe(vendor.head());
+    expect((await m.run("status")).stdout).not.toContain("no recorded merge base");
+  });
+
+  it("reports both directions of empty-file conflicts without a fork base", async () => {
+    const { m, work, vendor, manifest } = await editedVendoredSkill();
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const saved = JSON.parse(read(manifest)) as { forks: Record<string, { base?: string }> };
+    delete saved.forks.tool!.base;
+    writeFileSync(manifest, JSON.stringify(saved, null, 2));
+    const dir = join(work, "skills/tool");
+    writeFileSync(join(dir, "ref.md"), "");
+    writeFileSync(join(dir, "notes.md"), "local notes\n");
+    vendor.commit({ "skills/tool/notes.md": "" });
+
+    const merge = await m.run("merge", "tool");
+    expect(merge.stdout, merge.stderr).toContain("conflicts: SKILL.md, notes.md, ref.md");
+    expect(merge.code).toBe(1);
+    expect(read(join(dir, "ref.md"))).toBe("");
+    expect(read(join(dir, "ref.md.upstream"))).toBe("ref v1\n");
+    expect(read(join(dir, "notes.md"))).toBe("local notes\n");
+    expect(read(join(dir, "notes.md.upstream"))).toBe("");
+  });
+
+  it("explains how to recover a legacy placeholder without reserving the ref name", async () => {
+    const { m, vendor, manifest } = await editedVendoredSkill();
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const saved = JSON.parse(read(manifest)) as { forks: Record<string, { base: string }> };
+    saved.forks.tool!.base = "unknown";
+    writeFileSync(manifest, JSON.stringify(saved, null, 2));
+
+    const missing = await m.run("merge", "tool");
+    expect(missing.code).toBe(1);
+    expect(missing.stderr).toContain('remove "base" from "forks"."tool"');
+    expect(read(manifest)).toContain('"base": "unknown"');
+
+    m.git(vendor.work, "push", "origin", "HEAD:refs/heads/unknown");
+    const valid = await m.run("merge", "tool");
+    expect(valid.code, valid.stdout + valid.stderr).toBe(0);
     expect((JSON.parse(read(manifest)) as typeof saved).forks.tool!.base).toBe(vendor.head());
   });
 

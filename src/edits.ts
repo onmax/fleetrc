@@ -270,21 +270,6 @@ function gitFork(loaded: LoadedManifest, name: string, fork: Fork) {
     );
 }
 
-/**
- * The base for a fork with none: an empty file for each file both sides have, so git merges them
- * line by line and each difference becomes a conflict to settle once.
- */
-function emptyBase(live: string, upstream: string): string {
-  const dir = mkdtempSync(join(tmpdir(), "fleetrc-no-base-"));
-  const ours = hashDir(live);
-  for (const file of Object.keys(hashDir(upstream)))
-    if (Object.hasOwn(ours, file)) {
-      mkdirSync(dirname(join(dir, file)), { recursive: true });
-      writeFileSync(join(dir, file), "");
-    }
-  return dir;
-}
-
 /** The fork's folder in its upstream repository, which must not lead out of the repository. */
 async function forkUpstream(fork: { from: string; path: string }, ref?: string, team = false) {
   const clone = await fetchClone(gitUrl(fork.from), ref, join(paths.cache(), "forks"), {
@@ -293,6 +278,24 @@ async function forkUpstream(fork: { from: string; path: string }, ref?: string, 
   const dir = join(clone.dir, fork.path);
   confine(clone.dir, dir, `read it as the fork's upstream`);
   return { dir, commit: clone.commit };
+}
+
+/** Resolves a fork's base, with recovery guidance for the old importer's placeholder. */
+async function forkBase(fork: Fork, key: string, team = false): Promise<string | undefined> {
+  if (fork.base === undefined) return undefined;
+  try {
+    return (await forkUpstream(fork, fork.base, team)).dir;
+  } catch (error) {
+    if (
+      fork.base === "unknown" &&
+      error instanceof GitError &&
+      error.result.stderr.split(/\r?\n/).includes("fatal: couldn't find remote ref unknown")
+    )
+      throw new UserError(
+        `the upstream has no ref named "unknown"; if an older fleetrc imported this fork without a known base, remove "base" from "forks".${JSON.stringify(key)} in your manifest and run \`fleetrc merge ${key}\` again`,
+      );
+    throw error;
+  }
 }
 
 /** A fork that changed upstream, as a sync reports it. */
@@ -336,14 +339,11 @@ export async function checkForks(
         const now = await fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
           offline: true,
         });
-        const base =
-          fork.base === undefined
-            ? undefined
-            : await forkUpstream(fork, fork.base, source.via !== undefined);
+        const base = await forkBase(fork, name, source.via !== undefined);
         const dir = join(now.dir, fork.path);
         confine(now.dir, dir, "read it as the fork's upstream");
         const upstream = hashDir(dir);
-        files = changedFiles(base ? hashDir(base.dir) : {}, upstream);
+        files = changedFiles(base ? hashDir(base) : {}, upstream);
         tree = sha256(JSON.stringify(upstream));
       } catch (error) {
         warnings.push(
@@ -364,14 +364,26 @@ export async function checkForks(
   return { updates, warnings };
 }
 
-/** What `status` says of each fork that changed upstream since it was forked or last merged. */
-export function forkLines(state: State): string[] {
-  return Object.entries(state.forks ?? {})
-    .filter(([, fork]) => fork.files.length > 0)
+/** What `status` says of forks that need a first merge or have upstream changes. */
+export function forkLines(state: State, forks?: Record<string, Fork>): string[] {
+  const missing = Object.entries(forks ?? state.forks ?? {})
+    .filter(([, fork]) => fork.base === undefined)
+    .map(
+      ([name]) =>
+        `${name}: no recorded merge base; \`fleetrc diff ${name}\` / \`fleetrc merge ${name}\``,
+    );
+  const changed = Object.entries(state.forks ?? {})
+    .filter(
+      ([name, fork]) =>
+        fork.base !== undefined &&
+        fork.files.length > 0 &&
+        (forks === undefined || forks[name]?.base === fork.base),
+    )
     .map(
       ([name]) =>
         `${name}: upstream changed since you forked it; \`fleetrc diff ${name}\` / \`fleetrc merge ${name}\``,
     );
+  return [...missing, ...changed];
 }
 
 /**
@@ -540,18 +552,19 @@ function writeSidecar(target: string, content: Buffer, suffix = ".upstream"): st
 /**
  * Three-way merge of one folder: `base` to `upstream` changes applied onto `live`, file by file.
  * Links are compared by their targets and never followed, read through or written: a file that is
- * a link, or sits in a linked folder, on any side, and changed upstream, is a conflict. A dry run
- * works out the same result and writes nothing.
+ * a link, or sits in a linked folder, on any side, and changed upstream, is a conflict. Without
+ * a base, merge shared text files against empty content, but report empty versus nonempty as a
+ * conflict rather than treating the empty side as unchanged. A dry run writes nothing.
  */
 async function mergeTrees(
   live: string,
-  base: string,
+  base: string | undefined,
   upstream: string,
   dryRun: boolean,
 ): Promise<MergeResult> {
   const files = new Set([
     ...Object.keys(hashDir(live)),
-    ...Object.keys(hashDir(base)),
+    ...(base === undefined ? [] : Object.keys(hashDir(base))),
     ...Object.keys(hashDir(upstream)),
   ]);
   const result: MergeResult = { merged: [], conflicts: [] };
@@ -593,7 +606,7 @@ async function mergeTrees(
     markers[file] = relative(live, written).split(sep).join("/");
   };
   for (const file of [...files].sort()) {
-    const b = readContent(base, file);
+    const b = base === undefined ? undefined : readContent(base, file);
     const l = readContent(live, file);
     const u = readContent(upstream, file);
     const target = join(live, file);
@@ -604,8 +617,8 @@ async function mergeTrees(
       conflict(file, u);
       continue;
     }
-    const [lb, bb, ub] = [l, b, u] as (Buffer | undefined)[];
-    if (sameContent(lb, bb)) {
+    const [lb, baseBytes, ub] = [l, b, u] as (Buffer | undefined)[];
+    if (sameContent(lb, baseBytes)) {
       if (!dryRun && ub === undefined) rmSync(target, { force: true });
       else if (!dryRun) {
         mkdirSync(dirname(target), { recursive: true });
@@ -614,14 +627,14 @@ async function mergeTrees(
       result.merged.push(file);
       continue;
     }
-    if (lb === undefined || ub === undefined || bb === undefined) {
+    if (lb === undefined || ub === undefined || (base !== undefined && baseBytes === undefined)) {
       // Added or deleted on one side and changed on the other: keep the local file, put upstream's
       // beside it, or a note that upstream deleted it.
       conflict(file, ub);
       continue;
     }
-    // git merges text only; a binary file keeps the local side, with upstream's beside it.
-    if ([lb, bb, ub].some(binary)) {
+    const bb = baseBytes ?? Buffer.alloc(0);
+    if ((base === undefined && (lb.length === 0 || ub.length === 0)) || [lb, bb, ub].some(binary)) {
       conflict(file, ub);
       continue;
     }
@@ -709,18 +722,8 @@ export async function mergeSkill(
       spec,
       `Set "base" of "forks"."${fork.key}" to "${head.commit}"`,
     );
-    let result: MergeResult;
-    if (fork.fork.base === undefined) {
-      const empty = emptyBase(live, head.dir);
-      try {
-        result = await mergeTrees(live, empty, head.dir, dryRun);
-      } finally {
-        rmSync(empty, { recursive: true, force: true });
-      }
-    } else {
-      const base = await forkUpstream(fork.fork, fork.fork.base);
-      result = await mergeTrees(live, base.dir, head.dir, dryRun);
-    }
+    const base = await forkBase(fork.fork, fork.key);
+    const result = await mergeTrees(live, base, head.dir, dryRun);
     editManifest(
       manifest.file,
       (raw) => {

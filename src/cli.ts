@@ -649,7 +649,10 @@ async function status() {
   if (!report) say("no sync has run on this machine yet");
   else
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
-  for (const line of [...forkLines(state), ...conflictLines(state)]) say(line);
+  const loaded = config?.manifest
+    ? await loadManifest(config.manifest, { offline: true }).catch(() => undefined)
+    : undefined;
+  for (const line of [...forkLines(state, loaded?.root.forks), ...conflictLines(state)]) say(line);
   say(`syncs start from: ${describeTrigger(hooks, withTimer)}`);
   if (timerState !== undefined)
     say(

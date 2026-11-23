@@ -414,7 +414,7 @@ describe("init", () => {
   );
 
   it("9. migrates the legacy layout: a dry run changes nothing, the real run keeps every name and empties ~/.codex/skills", async () => {
-    const m = machine();
+    const m = machine({ scheduler: "empty" });
     const { work, manifest, codex } = legacyLayout(m);
     const cache = m.at(".cache");
     expect(existsSync(cache)).toBe(false);
@@ -470,6 +470,10 @@ describe("init", () => {
     expect(JSON.parse(read(manifest)).forks).toEqual({
       council: { from: "t3dotgg/tstack", path: "skills/council" },
     });
+    const status = await m.run("status");
+    expect(status.code, status.stderr).toBe(0);
+    expect(status.stdout).toContain("council: no recorded merge base");
+    expect(status.stdout).toContain("`fleetrc merge council`");
     // The old copies are in the backup folder, not deleted.
     const backups = readdirSync(join(m.stateDir, "backup"));
     expect(backups).toHaveLength(1);
