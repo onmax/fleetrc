@@ -35,11 +35,15 @@ export function dict<T>(entries: Iterable<readonly [string, T]> = []): Record<st
 export const lstat = (path: string): Stats | undefined =>
   lstatSync(path, { throwIfNoEntry: false });
 
+export const isMergeScratch = (name: string) =>
+  /^\.fleetrc-merge-[a-f0-9]{64}-[a-zA-Z0-9]{6}(?:-done)?$/.test(name);
+
 /** sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target text. */
 export function hashDir(dir: string, entries?: Map<string, Dirent>): Hashes {
   const hashes = dict<string>();
   const walk = (current: string) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory() && isMergeScratch(entry.name)) continue;
       const path = join(current, entry.name);
       const key = relative(dir, path).split(sep).join("/");
       entries?.set(key, entry);
@@ -59,9 +63,11 @@ const sorted = (hashes: Hashes): Hashes =>
 export function listFiles(dir: string): string[] {
   const files: string[] = [];
   const walk = (current: string, prefix: string) => {
-    for (const entry of readdirSync(current, { withFileTypes: true }))
-      if (entry.isDirectory()) walk(join(current, entry.name), `${prefix}${entry.name}/`);
-      else files.push(`${prefix}${entry.name}`);
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (!isMergeScratch(entry.name)) walk(join(current, entry.name), `${prefix}${entry.name}/`);
+      } else files.push(`${prefix}${entry.name}`);
+    }
   };
   if (existsSync(dir)) walk(dir, "");
   return files;
@@ -141,7 +147,7 @@ function ownFolders(root: string, budget: ReturnType<typeof skillBudget>): Set<s
   const own = new Set<string>([root]);
   const walk = (dir: string, rel: string) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() || isMergeScratch(entry.name)) continue;
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       budget.depth(childRel);
       own.add(join(dir, entry.name));
@@ -189,6 +195,7 @@ function resolvedTree(dir: string, within: string | undefined, dropped: DroppedL
         }
       }
       if (stat.isDirectory()) {
+        if (isMergeScratch(basename(target))) continue;
         if (open.some((folder) => inside(target, folder))) {
           dropped.push({ path: childRel, reason: "loop" });
           continue;
@@ -253,7 +260,10 @@ function copyTree(from: string, to: string) {
   if (stat.isSymbolicLink()) symlinkSync(readlinkSync(from), to);
   else if (stat.isDirectory()) {
     mkdirSync(to, { recursive: true });
-    for (const name of readdirSync(from)) copyTree(join(from, name), join(to, name));
+    for (const entry of readdirSync(from, { withFileTypes: true })) {
+      if (entry.isDirectory() && isMergeScratch(entry.name)) continue;
+      copyTree(join(from, entry.name), join(to, entry.name));
+    }
   } else {
     copyFileSync(from, to, constants.COPYFILE_FICLONE);
     copiedFiles++;

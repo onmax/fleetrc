@@ -1,7 +1,17 @@
-import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  chmodSync,
+  existsSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
+import { hashDir, listFiles } from "../src/fs.ts";
 import {
   clone,
   http,
@@ -54,7 +64,10 @@ async function pendingTopicReplacement(upstreamIsFolder = false) {
   rmSync(join(vendor.work, "skills/tool/topic"), { recursive: true });
   vendor.commit(
     upstreamIsFolder
-      ? { "skills/tool/topic/notes.md": "notes v2\n" }
+      ? {
+          "skills/tool/topic/notes.md": "notes v2\n",
+          "skills/tool/topic/extra.md": "extra v2\n",
+        }
       : { "skills/tool/topic": "topic v2\n" },
   );
   await m.run("sync");
@@ -369,7 +382,7 @@ describe("edited vendored skills", () => {
     );
     expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
     expect(existsSync(topic)).toBe(false);
-    const liveNames = names(m.at(".claude/skills/tool"));
+    const liveNames = readdirSync(m.at(".claude/skills/tool"));
     expect(liveNames.some((name) => name.startsWith(".fleetrc-merge-"))).toBe(false);
     const dry = await m.run("merge", "tool", "--dry-run");
     expect(dry.stderr).toContain("rerun without --dry-run to recover");
@@ -387,6 +400,100 @@ describe("edited vendored skills", () => {
       expect(existsSync(read(saved))).toBe(false);
     }
   });
+
+  it.each([false, true])(
+    "resumes publication after its first link (folder: %s)",
+    async (folder) => {
+      const { m, topic } = await pendingTopicReplacement(folder);
+      const interrupted = await mergeWithFilesystemHook(
+        m,
+        `
+      const link = fs.linkSync;
+      fs.linkSync = (from, to) => {
+        link(from, to);
+        if (basename(from) === "next" || basename(dirname(from)) === "next") process.exit(99);
+      };
+    `,
+      );
+      expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+      if (folder) expect(names(topic)).toHaveLength(1);
+      const retry = await m.run("merge", "tool");
+      expect(retry.code, retry.stdout + retry.stderr).toBe(0);
+      if (folder) {
+        expect(read(join(topic, "notes.md"))).toBe("notes v2\n");
+        expect(read(join(topic, "extra.md"))).toBe("extra v2\n");
+      } else expect(read(topic)).toBe("topic v2\n");
+    },
+  );
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "resumes restoring a read-only subdirectory without losing a saved draft",
+    async () => {
+      const { m, topic } = await pendingTopicReplacement();
+      const interrupted = await mergeWithFilesystemHook(
+        m,
+        `
+        const rename = fs.renameSync;
+        const link = fs.linkSync;
+        fs.renameSync = (from, to) => {
+          if (basename(from) === "topic" && basename(to) === "unit") {
+            fs.mkdirSync(from + "/nested");
+            fs.writeFileSync(from + "/nested/draft.md", "draft");
+            fs.chmodSync(from + "/nested", 0o555);
+          }
+          return rename(from, to);
+        };
+        fs.linkSync = (from, to) => {
+          link(from, to);
+          if (basename(from) === "draft.md") process.exit(99);
+        };
+      `,
+      );
+      try {
+        expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+        const retry = await m.run("merge", "tool");
+        expect(retry.stdout).toContain("conflicts: topic");
+        expect(read(join(topic, "nested/draft.md"))).toBe("draft");
+        expect(statSync(join(topic, "nested")).mode & 0o777).toBe(0o555);
+        expect(read(`${topic}.upstream`)).toBe("topic v2\n");
+      } finally {
+        if (existsSync(join(topic, "nested"))) chmodSync(join(topic, "nested"), 0o755);
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "stages and recovers a replacement when the skill's parent is read-only",
+    async () => {
+      const { m, topic } = await pendingTopicReplacement();
+      const live = realpathSync(dirname(topic));
+      const parent = dirname(live);
+      chmodSync(parent, 0o555);
+      try {
+        const interrupted = await mergeWithFilesystemHook(
+          m,
+          `
+          const rename = fs.renameSync;
+          fs.renameSync = (from, to) => {
+            rename(from, to);
+            if (basename(from) === "topic" && basename(to) === "unit") process.exit(99);
+          };
+        `,
+        );
+        expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+        const scratch = readdirSync(live).find((name) => name.startsWith(".fleetrc-merge-"));
+        expect(scratch).toBeDefined();
+        expect(Object.keys(hashDir(live))).toEqual(["SKILL.md", "ref.md"]);
+        expect(listFiles(live).sort()).toEqual(["SKILL.md", "ref.md"]);
+        const retry = await m.run("merge", "tool");
+        expect(retry.code, retry.stdout + retry.stderr).toBe(0);
+        expect(read(topic)).toBe("topic v2\n");
+        expect(readdirSync(live)).not.toContain(scratch);
+      } finally {
+        chmodSync(parent, 0o755);
+      }
+    },
+  );
 
   it("4e. an unedited vendored skill updates in place", async () => {
     const m = machine();

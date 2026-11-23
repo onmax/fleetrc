@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   linkSync,
   mkdirSync,
@@ -9,7 +10,9 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   type Dirent,
+  type Stats,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,6 +25,7 @@ import {
   hashDir,
   inside,
   isErrno,
+  isMergeScratch,
   isRecord,
   lstat,
   moveDir,
@@ -523,60 +527,142 @@ function mergeSnapshot(dir: string) {
   return { entries, hashes };
 }
 
-/** Publish without replacing an existing entry, including an empty directory. */
-function publishMergeUnit(from: string, to: string) {
-  const entry = lstat(from)!;
-  if (!entry.isDirectory()) {
-    linkSync(from, to);
-    return;
-  }
-  mkdirSync(to, { mode: entry.mode });
-  for (const name of readdirSync(from)) publishMergeUnit(join(from, name), join(to, name));
+const mergeScratchPrefix = (live: string) => `.fleetrc-merge-${sha256(basename(live))}-`;
+const mergeRecoveryPointer = (live: string) =>
+  join(dirname(paths.state()), "merge-recovery", sha256(live));
+const savedMergeUnit = (scratch: string) => join(scratch, "previous", "unit");
+const mergeIncoming = (scratch: string) => join(scratch, "incoming");
+const mergeIdentity = (entry: Stats) => `${entry.dev}:${entry.ino}:${entry.birthtimeMs}`;
+
+/** Fill an empty or partially installed unit, accepting only entries made by this transaction. */
+function publishMergeUnit(scratch: string, unit: string, target: string) {
+  const dirs = join(scratch, "dirs");
+  mkdirSync(dirs, { recursive: true });
+  const put = (from: string, to: string) => {
+    const entry = lstat(from)!;
+    const dest = lstat(to);
+    const occupied = () => new Error(`${to} is occupied by another entry`);
+    if (!entry.isDirectory()) {
+      if (dest === undefined) linkSync(from, to);
+      else if (mergeIdentity(dest) !== mergeIdentity(entry)) throw occupied();
+      return;
+    }
+    const record = join(dirs, sha256(relative(unit, from)));
+    if (dest === undefined) {
+      if (existsSync(record)) throw occupied();
+      mkdirSync(to, { mode: 0o700 });
+      writeFileSync(record, mergeIdentity(lstat(to)!), { flag: "wx" });
+    } else if (
+      !dest.isDirectory() ||
+      !existsSync(record) ||
+      readFileSync(record, "utf8") !== mergeIdentity(dest)
+    ) {
+      throw occupied();
+    }
+    const children = new Set(readdirSync(from));
+    if (readdirSync(to).some((name) => !children.has(name))) throw occupied();
+    for (const name of children) put(join(from, name), join(to, name));
+    chmodSync(to, entry.mode & 0o7777);
+  };
+  put(unit, target);
 }
 
-const mergeScratchPrefix = (live: string) => `.fleetrc-merge-${sha256(basename(live))}-`;
-const savedMergeUnit = (scratch: string) => join(scratch, "previous", "unit");
+function cleanMergeScratch(scratch: string) {
+  function makeRemovable(dir: string) {
+    const entry = lstat(dir);
+    if (!entry?.isDirectory()) return;
+    if ((entry.mode & 0o700) !== 0o700) chmodSync(dir, entry.mode | 0o700);
+    for (const name of readdirSync(dir)) makeRemovable(join(dir, name));
+  }
+  makeRemovable(scratch);
+  rmSync(scratch, { recursive: true, force: true });
+}
 
-/** Restore without clobbering a save; keep the backup discoverable if restoration cannot finish. */
-function restoreMergeUnit(saved: string, target: string) {
+function retireMergeScratch(scratch: string) {
+  const done = `${scratch}-done`;
+  renameSync(scratch, done);
+  cleanMergeScratch(done);
+}
+
+/** An approved publication is resumed; an unapproved move is restored, never overwritten. */
+function finishMergeUnit(scratch: string, target: string) {
+  const saved = savedMergeUnit(scratch);
+  const publishing = join(scratch, "publish");
   try {
-    publishMergeUnit(saved, target);
+    if (existsSync(publishing)) {
+      const incoming = mergeIncoming(scratch);
+      const next = join(incoming, "next");
+      const expected = readFileSync(publishing, "utf8");
+      const check = () => {
+        if (JSON.stringify(mergeSnapshot(incoming).hashes) !== expected)
+          throw new Error("the published files changed");
+      };
+      check();
+      if (lstat(next) !== undefined) publishMergeUnit(scratch, next, target);
+      else if (lstat(target) !== undefined)
+        throw new Error(`${target} is occupied by another entry`);
+      check();
+    } else if (lstat(saved) !== undefined) {
+      publishMergeUnit(scratch, saved, target);
+    }
   } catch (error) {
     throw new UserError(
-      `merge: could not restore ${target} (${(error as Error).message}); previous copy kept at ${saved}. Reconcile the two copies, move the saved copy out of the recovery folder, then retry.`,
+      `merge: could not finish replacing ${target} (${(error as Error).message}); ${lstat(saved) ? `previous copy kept at ${saved}. Reconcile the copies, then move the recovery folder ${scratch} aside and retry.` : `move the recovery folder ${scratch} aside and retry.`}`,
     );
   }
+  retireMergeScratch(scratch);
 }
 
-/** Recover before hashing the live skill; the scratch directory itself is outside that tree. */
-function recoverMergeUnits(live: string, dryRun: boolean) {
-  const parent = dirname(live);
-  const prefix = mergeScratchPrefix(live);
-  for (const entry of readdirSync(parent, { withFileTypes: true })) {
-    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
-    const scratch = join(parent, entry.name);
-    const journal = join(scratch, "target");
-    if (!lstat(journal)?.isFile()) continue;
-    const root = readFileSync(journal, "utf8");
-    const target = join(live, root);
+/** Recover before hashing; fallback workspaces beside the target are excluded from skill copies. */
+function recoverMergeUnit(live: string, dryRun: boolean) {
+  const pointer = mergeRecoveryPointer(live);
+  if (!existsSync(pointer)) return;
+  const scratch = readFileSync(pointer, "utf8");
+  const scratchParent = dirname(scratch);
+  if (
+    !isMergeScratch(basename(scratch)) ||
+    (scratchParent !== dirname(live) &&
+      (!inside(live, scratchParent) || realpathSync(scratchParent) !== scratchParent))
+  ) {
+    throw new UserError(`merge: invalid recovery pointer at ${pointer}`);
+  }
+  if (lstat(scratch)?.isDirectory()) {
     const saved = savedMergeUnit(scratch);
-    if (lstat(saved)) {
+    if (lstat(saved) || existsSync(join(scratch, "publish"))) {
+      const root = readFileSync(join(scratch, "target"), "utf8");
+      const target = join(live, root);
       if (
         dryRun ||
-        root === "" ||
+        target === live ||
         relative(live, target).split(sep).join("/") !== root ||
         !inside(live, target) ||
+        (scratchParent !== dirname(live) && scratchParent !== dirname(target)) ||
         linkedFolder(live, root) !== undefined
       ) {
         throw new UserError(
-          `merge: interrupted replacement of ${target}; previous copy kept at ${saved}${dryRun ? "; rerun without --dry-run to recover" : ""}`,
+          `merge: interrupted replacement of ${target}; recovery folder ${scratch}${dryRun ? "; rerun without --dry-run to recover" : ""}`,
         );
       }
-      restoreMergeUnit(saved, target);
-      renameSync(saved, join(scratch, "discarded"));
-    }
-    if (!dryRun) rmSync(scratch, { recursive: true, force: true });
+      finishMergeUnit(scratch, target);
+    } else if (!dryRun) retireMergeScratch(scratch);
+  } else if (!dryRun) {
+    cleanMergeScratch(`${scratch}-done`);
   }
+  if (!dryRun) rmSync(pointer);
+}
+
+function makeMergeScratch(live: string, targetParent: string) {
+  const parent = dirname(live);
+  const prefix = mergeScratchPrefix(live);
+  if (statSync(parent).dev === statSync(targetParent).dev) {
+    try {
+      return mkdtempSync(join(parent, prefix));
+    } catch (error) {
+      if (!isErrno(error, "EACCES") && !isErrno(error, "EPERM") && !isErrno(error, "EROFS"))
+        throw error;
+    }
+  }
+  return mkdtempSync(join(targetParent, prefix));
 }
 
 /** Stage the replacement, then check the old unit after moving it aside and before discarding it. */
@@ -588,13 +674,18 @@ function replaceMergeUnit(
 ): boolean {
   const target = join(live, root);
   mkdirSync(dirname(target), { recursive: true });
-  const scratch = mkdtempSync(join(dirname(live), mergeScratchPrefix(live)));
+  const pointer = mergeRecoveryPointer(live);
+  mkdirSync(dirname(pointer), { recursive: true });
+  const scratch = makeMergeScratch(live, dirname(target));
   const previous = join(scratch, "previous");
   const saved = savedMergeUnit(scratch);
-  const next = join(scratch, "next");
-  let moved = false;
+  const incoming = mergeIncoming(scratch);
+  const next = join(incoming, "next");
   try {
+    writeFileSync(`${pointer}.tmp`, scratch);
+    renameSync(`${pointer}.tmp`, pointer);
     writeFileSync(join(scratch, "target"), root);
+    mkdirSync(incoming);
     stage(next);
     mkdirSync(previous);
     if (lstat(target) !== undefined) {
@@ -604,24 +695,14 @@ function replaceMergeUnit(
         if (isErrno(error, "ENOENT")) return false;
         throw error;
       }
-      moved = true;
     }
     if (!unchanged(mergeSnapshot(previous)) || lstat(target) !== undefined) return false;
-    try {
-      if (lstat(next) !== undefined) publishMergeUnit(next, target);
-    } catch (error) {
-      if (isErrno(error, "EEXIST")) return false;
-      throw error;
-    }
-    if (moved) renameSync(saved, join(scratch, "discarded"));
-    moved = false;
+    writeFileSync(join(scratch, "ready"), JSON.stringify(mergeSnapshot(incoming).hashes));
+    renameSync(join(scratch, "ready"), join(scratch, "publish"));
     return true;
   } finally {
-    if (moved) {
-      restoreMergeUnit(saved, target);
-      renameSync(saved, join(scratch, "discarded"));
-    }
-    rmSync(scratch, { recursive: true, force: true });
+    finishMergeUnit(scratch, target);
+    rmSync(pointer, { force: true });
   }
 }
 
@@ -640,7 +721,7 @@ async function mergeTrees(
   dryRun: boolean,
 ): Promise<MergeResult> {
   const realLive = existsSync(live) ? realpathSync(live) : live;
-  if (existsSync(dirname(realLive))) recoverMergeUnits(realLive, dryRun);
+  recoverMergeUnit(realLive, dryRun);
   const [local, previous, next] = [
     mergeSnapshot(live),
     mergeSnapshot(base),
