@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -10,6 +11,7 @@ import {
 } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import type { Report } from "../src/report.ts";
 import {
   AGENT_DIRS,
   clone,
@@ -93,6 +95,64 @@ function legacyLayout(m: Machine) {
 }
 
 describe("init", () => {
+  it("previews skill replacements using saved copy mode and explicit overrides", async () => {
+    const m = machine();
+    const repo = remote(m, "mine", skills("skills/", "example"));
+    const working = clone(m, repo, "mine");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "mine", git: repo.url, path: working }],
+    });
+    await m.json("init", manifest, "--no-hooks", "--copy");
+    const replaced = (sync: Report) => sync.targets.flatMap((target) => target.replaced);
+    for (const flags of [[], ["--copy"], ["--no-copy"]]) {
+      const preview = await m.json<{ sync: Report }>(
+        "init",
+        manifest,
+        "--no-hooks",
+        "--dry-run",
+        ...flags,
+      );
+      expect(preview.sync.ok).toBe(true);
+      expect(replaced(preview.sync)).toEqual(flags.includes("--no-copy") ? ["example"] : []);
+    }
+    const applied = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
+    expect(replaced(applied.sync)).toEqual([]);
+  });
+
+  it.skipIf(isWindows)(
+    "reports rewriting a managed copy from a different same-byte source",
+    async () => {
+      const m = machine();
+      const repo = remote(m, "mine", { "old.md": "instructions\n", "new.md": "instructions\n" });
+      const working = clone(m, repo, "mine");
+      chmodSync(join(working, "new.md"), 0o644);
+      const writeManifest = (instructions: string) =>
+        m.manifest({
+          agents: ["claude-code"],
+          sources: [{ id: "mine", git: repo.url, path: working, instructions }],
+        });
+      const manifest = writeManifest("old.md");
+      await m.json("init", manifest, "--no-hooks", "--copy");
+      const destination = m.at(".claude/CLAUDE.md");
+      chmodSync(destination, 0o600);
+      writeManifest("new.md");
+      const preview = await m.json<{ sync: Report }>("init", manifest, "--no-hooks", "--dry-run");
+      expect(preview.sync.ok).toBe(true);
+      expect(preview.sync.files).toMatchObject({
+        added: [],
+        updated: [],
+        removed: [],
+        replaced: [destination],
+      });
+      expect(statSync(destination).mode & 0o777).toBe(0o600);
+      const applied = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
+      expect(applied.sync.files.replaced).toEqual([destination]);
+      expect(read(destination)).toBe("instructions\n");
+      expect(statSync(destination).mode & 0o777).toBe(0o644);
+    },
+  );
+
   it("9. migrates the legacy layout: a dry run changes nothing, the real run keeps every name and empties ~/.codex/skills", async () => {
     const m = machine();
     const { work, manifest, codex } = legacyLayout(m);

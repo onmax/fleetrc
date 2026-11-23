@@ -765,6 +765,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           ),
         ].sort(),
         removed: fileLinks.removed,
+        replaced: fileLinks.replaced,
         adopted: fileLinks.adopted,
         foreign: fileLinks.foreign,
       },

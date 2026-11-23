@@ -387,10 +387,16 @@ function reportText(report: Report): string {
   return process.env.FLEETRC_TIMER ? `${report.finishedAt} ${text}` : text;
 }
 
-async function syncReport(
-  options: { only?: string; apply?: string; skipTimerCheck?: boolean; manifest?: string } = {},
-): Promise<Report> {
-  const copy = copyMode();
+async function syncReport({
+  copy = copyMode(),
+  ...options
+}: {
+  copy?: boolean;
+  only?: string;
+  apply?: string;
+  skipTimerCheck?: boolean;
+  manifest?: string;
+} = {}): Promise<Report> {
   const report = await sync({
     manifest: values.manifest,
     ...options,
@@ -972,7 +978,7 @@ function pendingInitTimer(path: string): boolean {
 
 async function init() {
   if (rest.length > 1) usage("init takes one manifest");
-  copyMode();
+  const copy = copyMode();
   const config = readConfig();
   const named = rest[0] ?? values.manifest;
   // With no manifest, a new machine, or one that took its manifest from the tailnet, asks the tailnet.
@@ -996,7 +1002,12 @@ async function init() {
   const withHooks = !values["no-hooks"];
   const spec = canonicalManifestSpec(given);
   const route = manifestCheckoutRoute(spec);
-  const plan = await planInit(spec, { offline: values.offline, dryRun, checkout: route.checkout });
+  const plan = await planInit(spec, {
+    offline: values.offline,
+    dryRun,
+    copy,
+    checkout: route.checkout,
+  });
   if (dryRun) {
     const launcher = `would install ${tildify(launcherPath())}, the copy new shells, the hooks, the timer and \`fleet\` run (node ${stableNode()})`;
     const hooks = withHooks ? addHooks(undefined) : undefined;
@@ -1034,7 +1045,7 @@ async function init() {
     applied.push("the manifest is the one the tailnet policy names; each sync asks again");
   say(...applied.map((line) => `  ${line}`));
   // init installs the timer from the manifest next, so the sync need not say it differs.
-  const report = await syncReport({ manifest: plan.manifestSpec, skipTimerCheck: withTimer });
+  const report = await syncReport({ manifest: plan.manifestSpec, skipTimerCheck: withTimer, copy });
   if (!json) console.log(reportText(report));
   // The copy that new shells, the hooks, the timer and `fleet` run.
   const installed = selfInstall();

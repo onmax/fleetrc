@@ -176,10 +176,12 @@ export async function planInit(
   {
     offline = false,
     dryRun = false,
+    copy = false,
     checkout,
   }: {
     offline?: boolean;
     dryRun?: boolean;
+    copy?: boolean;
     checkout?: ReturnType<typeof manifestCheckoutRoute>["checkout"];
   } = {},
 ): Promise<InitPlan> {
@@ -207,7 +209,7 @@ export async function planInit(
       warnings: loaded.warnings,
       failed: loaded.failed,
     };
-    const report = await sync({ loaded: augmented, dryRun: true, offline });
+    const report = await sync({ loaded: augmented, dryRun: true, offline, copy });
     // A remote manifest's file is a cache copy, or in a dry run a scratch one this function deletes.
     report.manifest = remoteManifest(spec) ? spec : manifestFile;
     const provided = new Set(report.skills.names);
