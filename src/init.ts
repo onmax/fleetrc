@@ -83,7 +83,6 @@ interface LockEntry {
   sourceUrl?: string;
   skillPath?: string;
   commit?: string;
-  ref?: string;
 }
 
 /** Entries of a `skills-lock.json` (versions 1 and 2 share these fields). */
@@ -104,7 +103,6 @@ export function readSkillsLock(file: string): LockEntry[] {
         sourceUrl: text("sourceUrl"),
         skillPath: text("skillPath"),
         commit: text("commit"),
-        ref: text("ref"),
       },
     ];
   });
@@ -141,7 +139,7 @@ async function sameAsUpstream(
 ): Promise<boolean | undefined> {
   if (entry.sourceType === "local" || entry.sourceType === "well-known") return undefined;
   try {
-    const clone = await fetchClone(gitUrl(entry.source), entry.commit ?? entry.ref, cacheRoot);
+    const clone = await fetchClone(gitUrl(entry.source), entry.commit || undefined, cacheRoot);
     const dir = join(clone.dir, entry.skillPath ? dirname(entry.skillPath) : entry.name);
     confine(clone.dir, dir, "compare it with the local copy");
     const localFiles = hashDir(local);
@@ -182,11 +180,18 @@ function backupPath(within: string, path: string): string {
 }
 
 function recordFork(imports: Imports, entry: LockEntry) {
-  const base = entry.commit ?? entry.ref;
+  const base = entry.commit || undefined;
+  const upstream =
+    entry.sourceType === "well-known"
+      ? "index"
+      : ["git", "github", "gitlab", "local"].includes(entry.sourceType ?? "")
+        ? "git"
+        : undefined;
   imports.forks[entry.name] = {
     from: entry.source,
     path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
     ...(base === undefined ? {} : { base }),
+    ...(upstream === undefined ? {} : { upstream }),
   };
 }
 
@@ -344,6 +349,7 @@ export async function planInit(
     const augmented = planManifest();
     const omitted = new Set(candidates.map((candidate) => candidate.real));
     const winners = new Map<string, DesiredLink>();
+    let pendingCopyEdits = false;
     const omit = (dir: string) =>
       omitted.size > 0 && existsSync(dir) && omitted.has(realpathSync(dir));
     const previewSkills =
@@ -351,13 +357,15 @@ export async function planInit(
         ? undefined
         : {
             omit,
-            inspectConfirmed: (links: readonly DesiredLink[]) => {
+            inspectConfirmed: (links: readonly DesiredLink[], pending: boolean) => {
+              pendingCopyEdits = pending;
               for (const link of links) winners.set(link.name, link);
             },
           };
     let report = await sync({ loaded: augmented, dryRun: true, offline, copy, previewSkills });
     let rejected = false;
     const migrations: Migration[] = [];
+    const warnings: string[] = [];
     for (const { entry, path, within, real, addedSource } of candidates) {
       const winner = winners.get(entry.name);
       const source = winner && augmented.sources.find(({ id }) => id === winner.source);
@@ -375,6 +383,12 @@ export async function planInit(
       omitted.delete(real);
       if (addedSource)
         addedSource.include = addedSource.include.filter((name) => name !== entry.name);
+      if (pendingCopyEdits) {
+        warnings.push(
+          `${entry.name} stays in place while copy edits are pending; rerun init after the edits are adopted to check its replacement`,
+        );
+        continue;
+      }
       recordFork(imports, entry);
       imports.notes.push(
         `${entry.name} stays in place as a fork: the configured upstream could not be confirmed to link a replacement`,
@@ -400,7 +414,7 @@ export async function planInit(
     const folders = targets.includes(legacy) ? targets : [...targets, legacy];
     const before = new Set(folders.flatMap(entries));
     const personal = personalSource(loaded.sources);
-    const warnings: string[] = [...report.warnings];
+    warnings.push(...report.warnings);
     let adoptInto = personal?.adopt ? personalSkillsDir(personal) : undefined;
     // Skills are adopted into a working clone only once it is one: init clones it first, and a
     // folder there that is not a clone gets nothing, since sync could never update it.

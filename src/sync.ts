@@ -82,7 +82,7 @@ export interface SyncOptions {
   loaded?: LoadedManifest;
   previewSkills?: {
     omit: (dir: string) => boolean;
-    inspectConfirmed?: (links: readonly DesiredLink[]) => void;
+    inspectConfirmed?: (links: readonly DesiredLink[], pendingCopyEdits: boolean) => void;
   };
   /** Leave out the note about a timer whose schedule the manifest changed (init installs it next). */
   skipTimerCheck?: boolean;
@@ -653,7 +653,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       );
     const desired = [...winners.values()];
     if (preview?.inspectConfirmed && pendingCopyEdits) {
-      preview.inspectConfirmed([]);
+      preview.inspectConfirmed([], true);
     } else if (preview?.inspectConfirmed) {
       const confirmed = new Set(
         results
@@ -663,7 +663,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           )
           .map(({ id }) => id),
       );
-      preview.inspectConfirmed(desired.filter(({ source }) => confirmed.has(source)));
+      preview.inspectConfirmed(
+        desired.filter(({ source }) => confirmed.has(source)),
+        false,
+      );
     }
     doing = "linking skills into agent folders";
     // One folder that can't be written must not stop the others.
@@ -746,7 +749,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const forks =
       dryRun || offline
         ? { updates: [], warnings: [] }
-        : await checkForks(loaded, results, state, paths.cache());
+        : await checkForks(loaded, results, state, paths.cache(), options.only === undefined);
     const forked = new Set(Object.keys(loaded.root.forks).map(nameKey));
     const sourceWon = (result: SourceResult, skill: string) =>
       winners.get(skill)?.source === result.id;
