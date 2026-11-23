@@ -71,6 +71,10 @@
             "minLength": 1,
             "description": "Skill folder inside that repository."
           },
+          "upstream": {
+            "enum": ["git", "index"],
+            "description": "Upstream type. Use git to let full online sync check a standalone repository whose origin is otherwise ambiguous. Index forks are not checked."
+          },
           "base": {
             "type": "string",
             "minLength": 1,

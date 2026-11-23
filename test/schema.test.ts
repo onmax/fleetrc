@@ -62,7 +62,7 @@ const samples: Record<string, unknown> = {
   extends: ["./team.json"],
   agents: "all",
   sources: [],
-  forks: { x: { from: "a/b", path: "skills/x", base: "abc" } },
+  forks: { x: { from: "a/b", path: "skills/x", base: "abc", upstream: "git" } },
   hooks: [{ name: "h", run: "true", on: ["personal:**"] }],
   fleet: ["host", "tag:servers"],
   hub: "https://hub.example",

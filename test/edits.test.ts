@@ -10,6 +10,7 @@ import {
   names,
   read,
   remote,
+  type Report,
   serveIndexV2,
   skillMd,
   skills,
@@ -194,6 +195,124 @@ describe("edited vendored skills", () => {
     expect(text).toContain("FIVE (theirs)\n>>>>>>> upstream\n");
     expect((JSON.parse(read(manifest)) as typeof saved).forks.tool!.base).toBe(vendor.head());
     expect((await m.run("status")).stdout).not.toContain("no recorded merge base");
+  });
+
+  it("4d3. a fork of a repository no source reads still hears of upstream changes", async () => {
+    const { m, vendor, manifest } = await editedVendoredSkill({ scheduler: "empty" });
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const saved = JSON.parse(read(manifest)) as {
+      sources: { id: string }[];
+      forks: Record<string, { base: string }>;
+    };
+    saved.sources = saved.sources.filter((source) => source.id !== "vendor");
+    saved.forks.tool!.base = vendor.head().slice(0, 9);
+    writeFileSync(manifest, JSON.stringify(saved, null, 2));
+    expect((await m.run("sync")).code).toBe(0);
+    expect(
+      (await m.json<{ forks: { tool: { files: string[] } } }>("status")).forks.tool.files,
+    ).toEqual([]);
+
+    vendor.commit({
+      "skills/tool/SKILL.md": lines("one", "two", "three", "four", "FIVE (theirs)"),
+    });
+    for (const command of ["sync", "update"]) {
+      const targeted = await m.json(command, "personal");
+      expect(targeted.pending).toEqual([]);
+      expect(targeted.warnings.join("\n")).not.toContain("could not tell whether tool");
+    }
+    const sync = await m.run("sync");
+    expect(sync.code, sync.stdout + sync.stderr).toBe(0);
+    expect(sync.stdout).toContain(
+      `fork tool: ${vendor.url} changed it since you forked it (SKILL.md)`,
+    );
+    const status = await m.json<{ forks: { tool: { upstream: string; files: string[] } } }>(
+      "status",
+    );
+    expect(status.forks.tool).toMatchObject({ upstream: vendor.head(), files: ["SKILL.md"] });
+    // Said once for each upstream version.
+    expect((await m.run("sync")).stdout).not.toContain("fork tool:");
+  });
+
+  it("keeps credentials out of standalone fork reports after successful and failed fetches", async () => {
+    const { m, vendor, manifest } = await editedVendoredSkill();
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const saved = JSON.parse(read(manifest)) as {
+      sources: { id: string }[];
+      forks: Record<string, { from: string }>;
+    };
+    saved.sources = saved.sources.filter((source) => source.id !== "vendor");
+    const authenticated = "https://fixture-user:fixture-secret@fork.invalid/vendor.git";
+    saved.forks.tool!.from = authenticated;
+    writeFileSync(manifest, JSON.stringify(saved));
+    m.git(m.root, "config", "--global", "protocol.https.allow", "never");
+    m.git(m.root, "config", "--global", `url.${vendor.url}.insteadOf`, authenticated);
+    vendor.commit({ "skills/tool/ref.md": "ref v2\n" });
+
+    const checkReport = async () => {
+      const result = await m.run("sync", "--json");
+      expect(result.code).toBe(0);
+      expect(result.stdout + result.stderr).not.toMatch(/fixture-user|fixture-secret/);
+      expect(read(join(m.stateDir, "last-run.json"))).not.toMatch(/fixture-user|fixture-secret/);
+      return JSON.parse(result.stdout) as Report;
+    };
+    expect((await checkReport()).pending).toContainEqual({
+      source: "https://fork.invalid/vendor.git",
+      skill: "tool",
+      reason: "fork",
+      files: ["ref.md"],
+    });
+
+    m.git(m.root, "config", "--global", "--unset", `url.${vendor.url}.insteadOf`);
+    const failed = await checkReport();
+    expect(failed.warnings.join("\n")).toContain("could not tell whether tool changed upstream");
+    expect(failed.pending).toEqual([]);
+  });
+
+  it("does not fetch a legacy index fork after its source is removed", async () => {
+    const m = machine();
+    const personal = remote(m, "personal", skills("skills/", "tool"));
+    const work = clone(m, personal, "code/skills");
+    const index = "https://index.invalid/catalog";
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work }],
+      forks: { tool: { from: index, path: "tool", base: "unknown" } },
+    });
+    m.git(m.root, "config", "--global", "protocol.https.allow", "never");
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    const report = await m.json("sync");
+    expect(report.pending).toEqual([]);
+    expect(report.warnings.join("\n")).not.toContain("could not tell whether tool");
+  });
+
+  it("honors explicit Git fork provenance when an index uses the same URL", async () => {
+    const { m, vendor, manifest } = await editedVendoredSkill();
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const site = await http();
+    serveIndexV2(site, [{ name: "drop", files: { "SKILL.md": skillMd("drop") } }]);
+    m.git(m.root, "config", "--global", `url.${vendor.url}.insteadOf`, site.url);
+    const saved = JSON.parse(read(manifest)) as {
+      sources: { id: string; index?: string }[];
+      forks: Record<string, { from: string; upstream?: string }>;
+    };
+    saved.sources = saved.sources.filter((source) => source.id !== "vendor");
+    saved.sources.push({ id: "site", index: site.url });
+    Object.assign(saved.forks.tool!, { from: site.url, upstream: "git" });
+    writeFileSync(manifest, JSON.stringify(saved));
+
+    vendor.commit({ "skills/tool/ref.md": "ref v2\n" });
+    const report = await m.json("sync");
+    expect(report.pending).toContainEqual({
+      source: `${site.url}/`,
+      skill: "tool",
+      reason: "fork",
+      files: ["ref.md"],
+    });
+    expect(read(m.at(".claude/skills/drop/SKILL.md"))).toBe(skillMd("drop"));
+    for (const command of ["diff", "merge"]) {
+      const result = await m.run(command, "tool");
+      expect(result.code, result.stdout + result.stderr).toBe(0);
+    }
   });
 
   it("reports both directions of empty-file conflicts without a fork base", async () => {

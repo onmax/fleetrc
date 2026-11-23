@@ -24,7 +24,7 @@ import {
   sha256,
 } from "./fs.ts";
 import { itemName, itemPath, parseItemId } from "./files.ts";
-import { fetchClone, gitUrl, repoKey } from "./gitcache.ts";
+import { fetchClone, gitUrl, isCommitRef, repoKey } from "./gitcache.ts";
 import { globBase } from "./glob.ts";
 import {
   checkedOutPath,
@@ -256,15 +256,15 @@ async function diffDirs(name: string, from: Side, to: Side): Promise<string> {
   }
 }
 
-/**
- * Throws for a fork of an index or npm source, which an older fleetrc recorded: they have no
- * history to compare with.
- */
+function nonGitFork(loaded: LoadedManifest, fork: Fork): boolean {
+  if (fork.from.startsWith("npm:")) return true;
+  if (fork.upstream !== undefined) return fork.upstream === "index";
+  return loaded.sources.some((source) => source.kind === "index" && source.index === fork.from);
+}
+
+/** Index and npm forks have no Git history to compare with. */
 function gitFork(loaded: LoadedManifest, name: string, fork: Fork) {
-  if (
-    fork.from.startsWith("npm:") ||
-    loaded.sources.some((source) => source.kind === "index" && source.index === fork.from)
-  )
+  if (nonGitFork(loaded, fork))
     throw new UserError(
       `${name} was forked from ${fork.from}, which is not a git repository, so fleetrc has no upstream version to compare with; compare by hand, or fork it again from a git source`,
     );
@@ -298,68 +298,127 @@ async function forkBase(fork: Fork, key: string, team = false): Promise<string |
   }
 }
 
+function forkRepositoryLabel(from: string): string {
+  if (/^[a-z][\w+.-]*:\/\//i.test(from)) {
+    try {
+      const url = new URL(from);
+      url.username = "";
+      url.password = "";
+      url.search = "";
+      url.hash = "";
+      return url.href;
+    } catch {
+      return "upstream repository";
+    }
+  }
+  if (from.includes("::") || from.includes("://")) return "upstream repository";
+  return from.replace(/^[^@/:\\]+@(?=[^/:\\]+:)/, "");
+}
+
 /** A fork that changed upstream, as a sync reports it. */
 export interface ForkUpdate {
-  /** The source the fork came from. */
+  /** Where the fork came from: its source's id, or a credential-free repository label. */
   source: string;
   skill: string;
   files: string[];
 }
 
+/** Where a fork's upstream folder is now: the commit, and the folder at that commit. */
+interface ForkHead {
+  source: string;
+  commit: string;
+  team: boolean;
+  dir: () => Promise<string>;
+}
+
 /**
- * Compares each fork's `base` with the skill's folder at the commit its git source has now, and
- * records what it found in `state.forks`. Returns the forks whose upstream moved since the last
- * sync that looked, so a sync says so once; `status` says it until the fork is merged. Only a
- * fork of a git source has a base commit to compare. A fork whose source did not update this run
- * keeps what was found before.
+ * Compares each fork's `base` with the skill's folder at the commit upstream has now, and records
+ * what it found in `state.forks`. Returns the forks whose upstream moved since the last sync that
+ * looked, so a sync says so once; `status` says it until the fork is merged. A fork of a git
+ * source in the manifest reads the commit that source synced to, and keeps what was found before
+ * when that source did not update this run. A full online sync also checks standalone Git forks
+ * with known Git provenance. Legacy forks with ambiguous origins are not fetched automatically.
  */
 export async function checkForks(
   loaded: LoadedManifest,
   results: readonly { id: string; status: string; to?: string }[],
   state: State,
   cacheDir: string,
+  fetchStandalone: boolean,
 ): Promise<{ updates: ForkUpdate[]; warnings: string[] }> {
   const updates: ForkUpdate[] = [];
   const warnings: string[] = [];
   const forks = (state.forks ??= {});
+  const couldNotTell = (name: string, reason: string) =>
+    warnings.push(`could not tell whether ${name} changed upstream since you forked it: ${reason}`);
   for (const name of Object.keys(forks)) if (!(name in loaded.root.forks)) delete forks[name];
   for (const [name, fork] of Object.entries(loaded.root.forks)) {
+    if (nonGitFork(loaded, fork)) continue;
+    let head: ForkHead;
     const source = loaded.sources.find(
       (candidate) => candidate.kind === "git" && repoKey(candidate.git) === repoKey(fork.from),
     );
-    const result = source && results.find((candidate) => candidate.id === source.id);
-    if (!source || source.kind !== "git" || !result?.to || result.status === "error") continue;
+    if (source?.kind === "git") {
+      const result = results.find((candidate) => candidate.id === source.id);
+      if (!result?.to || result.status === "error") continue;
+      head = {
+        source: source.id,
+        commit: result.to,
+        team: source.via !== undefined,
+        async dir() {
+          const now = await fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
+            offline: true,
+          });
+          const dir = join(now.dir, fork.path);
+          confine(now.dir, dir, "read it as the fork's upstream");
+          return dir;
+        },
+      };
+    } else {
+      if (
+        !fetchStandalone ||
+        (fork.upstream !== "git" &&
+          gitUrl(fork.from) === fork.from &&
+          !isCommitRef(fork.base ?? ""))
+      )
+        continue;
+      try {
+        const upstream = await forkUpstream(fork);
+        head = {
+          source: forkRepositoryLabel(fork.from),
+          commit: upstream.commit,
+          team: false,
+          dir: async () => upstream.dir,
+        };
+      } catch {
+        couldNotTell(name, "could not fetch or read the upstream skill");
+        continue;
+      }
+    }
     const known = forks[name];
-    if (known && known.base === fork.base && known.upstream === result.to) continue;
+    if (known && known.base === fork.base && known.upstream === head.commit) continue;
     let files: string[] = [];
     let tree = "";
     // Without a base, nothing is known to be in common, so every upstream file counts as changed.
-    if (fork.base === undefined || !result.to.startsWith(fork.base.toLowerCase()))
+    if (fork.base === undefined || !head.commit.startsWith(fork.base.toLowerCase()))
       try {
-        const now = await fetchClone(gitUrl(source.git), source.ref, join(cacheDir, "git"), {
-          offline: true,
-        });
-        const base = await forkBase(fork, name, source.via !== undefined);
-        const dir = join(now.dir, fork.path);
-        confine(now.dir, dir, "read it as the fork's upstream");
-        const upstream = hashDir(dir);
+        const base = await forkBase(fork, name, head.team);
+        const upstream = hashDir(await head.dir());
         files = changedFiles(base ? hashDir(base) : {}, upstream);
         tree = sha256(JSON.stringify(upstream));
-      } catch (error) {
-        warnings.push(
-          `could not tell whether ${name} changed upstream since you forked it: ${(error as Error).message}`,
-        );
+      } catch {
+        couldNotTell(name, "could not compare the upstream skill with the recorded base");
         continue;
       }
     forks[name] = {
       ...(fork.base === undefined ? {} : { base: fork.base }),
-      upstream: result.to,
+      upstream: head.commit,
       tree,
       files,
     };
     // Said once for each new upstream version of the skill, not on every sync.
     if (files.length > 0 && (!known || known.base !== fork.base || known.tree !== tree))
-      updates.push({ source: source.id, skill: name, files });
+      updates.push({ source: head.source, skill: name, files });
   }
   return { updates, warnings };
 }

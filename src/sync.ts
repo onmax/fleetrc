@@ -726,7 +726,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const forks =
       dryRun || offline
         ? { updates: [], warnings: [] }
-        : await checkForks(loaded, results, state, paths.cache());
+        : await checkForks(loaded, results, state, paths.cache(), options.only === undefined);
     const forked = new Set(Object.keys(loaded.root.forks).map(nameKey));
     const sourceWon = (result: SourceResult, skill: string) =>
       winners.get(skill)?.source === result.id;
