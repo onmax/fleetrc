@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import {
@@ -496,4 +505,63 @@ appendFileSync(${JSON.stringify(log)}, process.env.FLEETRC_HOOK + "\\n");`,
       );
     },
   );
+});
+
+describe.skipIf(isWindows)("the executable bit", () => {
+  const executable = (path: string) => (statSync(path).mode & 0o111) !== 0;
+
+  /** A vendored source whose skill `tool` ships `scripts/run.sh` without the executable bit. */
+  async function vendoredScript(...flags: string[]) {
+    const m = machine();
+    const vendor = remote(m, "vendor", {
+      ...skills("skills/", "tool"),
+      "skills/tool/scripts/run.sh": "#!/bin/sh\necho run\n",
+    });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
+    });
+    const init = await m.run("init", manifest, "--no-hooks", ...flags);
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const script = join(vendor.work, "skills/tool/scripts/run.sh");
+    const chmodUpstream = (mode: number) => {
+      chmodSync(script, mode);
+      vendor.commit({}, `chmod ${mode.toString(8)}`);
+    };
+    return {
+      m,
+      chmodUpstream,
+      store: join(m.stateDir, "store", "vendor", "live", "tool", "scripts", "run.sh"),
+      agent: m.at(".claude/skills/tool/scripts/run.sh"),
+    };
+  }
+
+  it.each([
+    { how: "linked", flags: [] },
+    { how: "copied", flags: ["--copy"] },
+  ])("follows an upstream commit that only changes it, $how", async ({ flags }) => {
+    const { m, chmodUpstream, store, agent } = await vendoredScript(...flags);
+    expect(executable(store)).toBe(false);
+    expect(executable(agent)).toBe(false);
+
+    chmodUpstream(0o755);
+    const added = await m.json("sync");
+    expect(added.ok, JSON.stringify(added.errors)).toBe(true);
+    expect(executable(store)).toBe(true);
+    expect(executable(agent)).toBe(true);
+    expect(added.edited).toEqual([]);
+    expect(added.skills.updated).toEqual(["tool"]);
+    expect(added.sources[0]?.changed).toEqual(["skills/tool/scripts/run.sh"]);
+
+    const again = await m.json("sync");
+    expect(again.skills.updated).toEqual([]);
+    expect(again.edited).toEqual([]);
+
+    chmodUpstream(0o644);
+    const removed = await m.json("sync");
+    expect(executable(store)).toBe(false);
+    expect(executable(agent)).toBe(false);
+    expect(removed.edited).toEqual([]);
+    expect(removed.skills.updated).toEqual(["tool"]);
+  });
 });

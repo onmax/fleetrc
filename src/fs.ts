@@ -1,5 +1,6 @@
 import {
   appendFileSync,
+  chmodSync,
   constants,
   copyFileSync,
   existsSync,
@@ -63,6 +64,34 @@ export function listFiles(dir: string): string[] {
   };
   if (existsSync(dir)) walk(dir, "");
   return files;
+}
+
+const runnable = (stat: Stats) => (stat.mode & 0o111) !== 0;
+
+/**
+ * Files under `dir` with an executable bit, as `/`-separated relative paths. Hashes hold content
+ * only, so this is how a change to the bit alone shows. Windows keeps no such bit.
+ */
+export function executables(dir: string): string[] {
+  if (process.platform === "win32") return [];
+  return listFiles(dir)
+    .filter((rel) => {
+      const stat = lstat(join(dir, rel));
+      return stat?.isFile() === true && runnable(stat);
+    })
+    .sort();
+}
+
+/** Files executable in one list and not the other. */
+export const changedModes = (before: string[], after: string[]) =>
+  [
+    ...before.filter((file) => !after.includes(file)),
+    ...after.filter((file) => !before.includes(file)),
+  ].sort();
+
+/** Gives the file `to` the permissions of `from`, unless `to` is no longer a file. */
+export function copyMode(from: string, to: string) {
+  if (lstat(to)?.isFile()) chmodSync(to, statSync(from).mode & 0o7777);
 }
 
 /** node:crypto, loaded on first use: the session hook and `list --json` never hash. */
@@ -220,6 +249,15 @@ export function resolvedHashes(dir: string, within?: string): Hashes {
   for (const entry of resolvedTree(dir, within, []))
     if (!entry.dir) hashes[entry.rel] = sha256(readFileSync(entry.real));
   return sorted(hashes);
+}
+
+/** `executables` of the copy `copyResolved(dir, within)` makes, without making it. */
+export function resolvedExecutables(dir: string, within?: string): string[] {
+  if (process.platform === "win32" || !existsSync(dir)) return [];
+  return resolvedTree(dir, within, [])
+    .filter((entry) => !entry.dir && runnable(statSync(entry.real)))
+    .map((entry) => entry.rel)
+    .sort();
 }
 
 /** Files whose hash differs between two trees, including added and removed ones. */

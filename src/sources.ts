@@ -18,10 +18,13 @@ import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "sk
 import { git, GitError, gitOut } from "./exec.ts";
 import {
   changedFiles,
+  changedModes,
+  copyMode,
   copyResolved,
   type Hashes,
   countCopies,
   dict,
+  executables,
   hashDir,
   inside,
   isRecord,
@@ -2364,6 +2367,14 @@ function applyVendored(
     }
     const files = changedFiles(record.hashes, incoming);
     if (files.length === 0) {
+      // The hashes leave the executable bit out, so a change to it alone is applied here, edits or not.
+      const modes = existsSync(paths.base)
+        ? changedModes(executables(paths.base), executables(from))
+        : [];
+      if (write)
+        for (const file of modes)
+          for (const dir of [paths.base, paths.live]) copyMode(join(from, file), join(dir, file));
+      if (modes.length > 0) reportVendoredUpdate(source, out, skill, modes);
       if (write) rmSync(paths.upstream, { recursive: true, force: true });
       delete state.pending[skill.name];
       if (write) state.skills[skill.name] = installed(incoming, skill.path);
