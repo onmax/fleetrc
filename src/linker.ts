@@ -3,6 +3,7 @@ import {
   constants,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readlinkSync,
   realpathSync,
@@ -182,14 +183,14 @@ export function makeLink(
   }
   // Made beside `path` and renamed into place whole: a copy cut short would read as the user
   // deleting the files it missed, and the next sync would delete them from the skill.
-  const temp = join(dirname(path), `.${basename(path)}.${process.pid}.new`);
-  rmSync(temp, { recursive: true, force: true });
+  const staging = mkdtempSync(join(dirname(path), ".fleetrc-copy-"));
   try {
+    const temp = join(staging, "skill");
     const dropped = copyResolved(link.target, temp, link.root);
     renameSync(temp, path);
     return { kind: "copy", dropped };
   } finally {
-    rmSync(temp, { recursive: true, force: true });
+    rmSync(staging, { recursive: true, force: true });
   }
 }
 

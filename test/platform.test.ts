@@ -13,6 +13,7 @@ import {
   remote,
   skillMd,
   skills,
+  writeFiles,
 } from "./fixture.ts";
 
 describe("links on each OS", () => {
@@ -180,6 +181,21 @@ describe("links on each OS", () => {
     const again = await m.json("sync");
     expect(again.warnings).toEqual([]);
     expect(again.targets.flatMap((target) => [...target.created, ...target.removed])).toEqual([]);
+  });
+
+  it.skipIf(isWindows)("--copy publishes a local skill with a 255-byte name", async () => {
+    const m = machine();
+    const local = join(m.root, "local-skills");
+    const name = "a".repeat(255);
+    const files = { "SKILL.md": skillMd(name), "notes.md": "notes\n" };
+    writeFiles(join(local, name), files);
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [{ id: "loc", local }] });
+    const init = await m.run("init", manifest, "--no-hooks", "--copy");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const target = m.at(".claude/skills", name);
+    expect(isLink(target)).toBe(false);
+    for (const [file, content] of Object.entries(files))
+      expect(read(join(target, file))).toBe(content);
   });
 
   it.skipIf(isWindows || process.getuid?.() === 0)(
