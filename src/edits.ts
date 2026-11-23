@@ -256,15 +256,17 @@ async function diffDirs(name: string, from: Side, to: Side): Promise<string> {
   }
 }
 
-/**
- * Throws for a fork of an index or npm source, which an older fleetrc recorded: they have no
- * history to compare with.
- */
-function gitFork(loaded: LoadedManifest, name: string, fork: Fork) {
-  if (
+function nonGitFork(loaded: LoadedManifest, fork: Fork): boolean {
+  return (
+    fork.upstream === "index" ||
     fork.from.startsWith("npm:") ||
     loaded.sources.some((source) => source.kind === "index" && source.index === fork.from)
-  )
+  );
+}
+
+/** Index and npm forks have no Git history to compare with. */
+function gitFork(loaded: LoadedManifest, name: string, fork: Fork) {
+  if (nonGitFork(loaded, fork))
     throw new UserError(
       `${name} was forked from ${fork.from}, which is not a git repository, so fleetrc has no upstream version to compare with; compare by hand, or fork it again from a git source`,
     );
@@ -298,9 +300,26 @@ async function forkBase(fork: Fork, key: string, team = false): Promise<string |
   }
 }
 
+function forkRepositoryLabel(from: string): string {
+  if (/^[a-z][\w+.-]*:\/\//i.test(from)) {
+    try {
+      const url = new URL(from);
+      url.username = "";
+      url.password = "";
+      url.search = "";
+      url.hash = "";
+      return url.href;
+    } catch {
+      return "upstream repository";
+    }
+  }
+  if (from.includes("::") || from.includes("://")) return "upstream repository";
+  return from.replace(/^[^@/:\\]+@(?=[^/:\\]+:)/, "");
+}
+
 /** A fork that changed upstream, as a sync reports it. */
 export interface ForkUpdate {
-  /** Where the fork came from: its source's id, or the fork's `from` when no source reads that repository. */
+  /** Where the fork came from: its source's id, or a credential-free repository label. */
   source: string;
   skill: string;
   files: string[];
@@ -308,7 +327,6 @@ export interface ForkUpdate {
 
 /** Where a fork's upstream folder is now: the commit, and the folder at that commit. */
 interface ForkHead {
-  /** Names the upstream in what a sync reports: the source's id, or the fork's `from`. */
   source: string;
   commit: string;
   team: boolean;
@@ -320,24 +338,24 @@ interface ForkHead {
  * what it found in `state.forks`. Returns the forks whose upstream moved since the last sync that
  * looked, so a sync says so once; `status` says it until the fork is merged. A fork of a git
  * source in the manifest reads the commit that source synced to, and keeps what was found before
- * when that source did not update this run; any other git fork fetches its upstream. A fork of an
- * index or npm source has no base commit to compare.
+ * when that source did not update this run. A full online sync also checks standalone Git forks
+ * with known Git provenance. Legacy forks with ambiguous origins are not fetched automatically.
  */
 export async function checkForks(
   loaded: LoadedManifest,
   results: readonly { id: string; status: string; to?: string }[],
   state: State,
   cacheDir: string,
+  fetchStandalone: boolean,
 ): Promise<{ updates: ForkUpdate[]; warnings: string[] }> {
   const updates: ForkUpdate[] = [];
   const warnings: string[] = [];
   const forks = (state.forks ??= {});
-  const couldNotTell = (name: string, error: unknown) =>
-    warnings.push(
-      `could not tell whether ${name} changed upstream since you forked it: ${(error as Error).message}`,
-    );
+  const couldNotTell = (name: string, reason: string) =>
+    warnings.push(`could not tell whether ${name} changed upstream since you forked it: ${reason}`);
   for (const name of Object.keys(forks)) if (!(name in loaded.root.forks)) delete forks[name];
   for (const [name, fork] of Object.entries(loaded.root.forks)) {
+    if (nonGitFork(loaded, fork)) continue;
     let head: ForkHead;
     const source = loaded.sources.find(
       (candidate) => candidate.kind === "git" && repoKey(candidate.git) === repoKey(fork.from),
@@ -360,22 +378,22 @@ export async function checkForks(
       };
     } else {
       if (
-        fork.from.startsWith("npm:") ||
-        loaded.sources.some(
-          (candidate) => candidate.kind === "index" && candidate.index === fork.from,
-        )
+        !fetchStandalone ||
+        (fork.upstream !== "git" &&
+          gitUrl(fork.from) === fork.from &&
+          !/^[a-f\d]{40}$/i.test(fork.base ?? ""))
       )
         continue;
       try {
         const upstream = await forkUpstream(fork);
         head = {
-          source: fork.from,
+          source: forkRepositoryLabel(fork.from),
           commit: upstream.commit,
           team: false,
           dir: async () => upstream.dir,
         };
-      } catch (error) {
-        couldNotTell(name, error);
+      } catch {
+        couldNotTell(name, "could not fetch or read the upstream skill");
         continue;
       }
     }
@@ -390,8 +408,8 @@ export async function checkForks(
         const upstream = hashDir(await head.dir());
         files = changedFiles(base ? hashDir(base) : {}, upstream);
         tree = sha256(JSON.stringify(upstream));
-      } catch (error) {
-        couldNotTell(name, error);
+      } catch {
+        couldNotTell(name, "could not compare the upstream skill with the recorded base");
         continue;
       }
     forks[name] = {

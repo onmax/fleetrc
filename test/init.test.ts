@@ -56,6 +56,14 @@ function snapshot(dir: string): string[] {
  * clone, copies an old installer listed in .nuxt-skills-managed, a stray hand-made skill and .system.
  */
 function legacyLayout(m: Machine) {
+  const council = remote(m, "tstack", skills("skills/", "council"));
+  m.git(
+    m.root,
+    "config",
+    "--global",
+    `url.${council.url}.insteadOf`,
+    "https://github.com/t3dotgg/tstack.git",
+  );
   const personal = remote(m, "skills-private", {
     ...skills("skills/", "check-your-work", "council", "unslop"),
     "skills-lock.json": JSON.stringify({
@@ -469,7 +477,7 @@ describe("init", () => {
     expect(linkOf(m.at(".agents/skills/unslop"))).toBe(join(work, "skills/unslop"));
     expect(read(m.at(".agents/skills/nuxt/SKILL.md"))).toBe(skillMd("nuxt"));
     expect(JSON.parse(read(manifest)).forks).toEqual({
-      council: { from: "t3dotgg/tstack", path: "skills/council" },
+      council: { from: "t3dotgg/tstack", path: "skills/council", upstream: "git" },
     });
     const status = await m.run("status");
     expect(status.code, status.stderr).toBe(0);
@@ -561,7 +569,7 @@ describe("init", () => {
 
     const initialized = await m.run("init", manifest, "--no-hooks");
     expect(initialized.code, initialized.stdout + initialized.stderr).toBe(0);
-    const fork = { from: upstream.work, path: "skills/tool" };
+    const fork = { from: upstream.work, path: "skills/tool", upstream: "git" };
     expect(JSON.parse(read(manifest)).forks?.tool).toEqual(fork);
     const status = await m.run("status");
     expect(status.code, status.stderr).toBe(0);

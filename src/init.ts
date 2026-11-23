@@ -151,10 +151,17 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
       if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name))) {
         if (entry.sourceType === "local" && !(await hasLocalGitHead(entry.source))) continue;
         const base = entry.commit ?? entry.ref;
+        const upstream =
+          entry.sourceType === "well-known"
+            ? "index"
+            : ["git", "github", "gitlab", "local"].includes(entry.sourceType ?? "")
+              ? "git"
+              : undefined;
         imports.forks[entry.name] = {
           from: entry.source,
           path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
           ...(base === undefined ? {} : { base }),
+          ...(upstream === undefined ? {} : { upstream }),
         };
       }
       continue;

@@ -120,6 +120,7 @@ export interface Hook {
 export interface Fork {
   from: string;
   path: string;
+  upstream?: "git" | "index";
   /** The upstream commit the fork was last merged with. Without one, merge starts from nothing in common. */
   base?: string;
 }
@@ -478,6 +479,12 @@ export function parseManifest(
       };
       const base = optionalString(file, `forks.${name}.base`, fork.base);
       if (base !== undefined) forks[name]!.base = base;
+      const upstream = fork.upstream;
+      if (upstream !== undefined) {
+        if (upstream !== "git" && upstream !== "index")
+          fail(file, `forks.${name}.upstream`, 'must be "git" or "index"');
+        forks[name]!.upstream = upstream;
+      }
     }
   }
   if (!Array.isArray(raw.hooks ?? [])) fail(file, "hooks", "must be an array");
