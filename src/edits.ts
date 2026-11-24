@@ -30,6 +30,7 @@ import {
   changedModes,
   copyDir,
   copyExecuteBits,
+  executables,
   hashDir,
   inside,
   isErrno,
