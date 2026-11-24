@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import {
   AGENT_DIRS,
@@ -511,15 +512,16 @@ describe.skipIf(isWindows)("the executable bit", () => {
   const executable = (path: string) => (statSync(path).mode & 0o111) !== 0;
 
   /** A vendored source whose skill `tool` ships `scripts/run.sh` without the executable bit. */
-  async function vendoredScript(...flags: string[]) {
+  async function vendoredScript(update: "review" | undefined, ...flags: string[]) {
     const m = machine();
     const vendor = remote(m, "vendor", {
       ...skills("skills/", "tool"),
       "skills/tool/scripts/run.sh": "#!/bin/sh\necho run\n",
+      "skills/tool/scripts/other.sh": "#!/bin/sh\necho other\n",
     });
     const manifest = m.manifest({
       agents: ["claude-code"],
-      sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
+      sources: [{ id: "vendor", git: vendor.url, skills: "skills/*", update }],
     });
     const init = await m.run("init", manifest, "--no-hooks", ...flags);
     expect(init.code, init.stdout + init.stderr).toBe(0);
@@ -530,7 +532,9 @@ describe.skipIf(isWindows)("the executable bit", () => {
     };
     return {
       m,
+      vendor,
       chmodUpstream,
+      base: join(m.stateDir, "store", "vendor", "base", "tool", "scripts", "run.sh"),
       store: join(m.stateDir, "store", "vendor", "live", "tool", "scripts", "run.sh"),
       agent: m.at(".claude/skills/tool/scripts/run.sh"),
     };
@@ -540,7 +544,7 @@ describe.skipIf(isWindows)("the executable bit", () => {
     { how: "linked", flags: [] },
     { how: "copied", flags: ["--copy"] },
   ])("follows an upstream commit that only changes it, $how", async ({ flags }) => {
-    const { m, chmodUpstream, store, agent } = await vendoredScript(...flags);
+    const { m, chmodUpstream, store, agent } = await vendoredScript(undefined, ...flags);
     expect(executable(store)).toBe(false);
     expect(executable(agent)).toBe(false);
 
@@ -563,5 +567,86 @@ describe.skipIf(isWindows)("the executable bit", () => {
     expect(executable(agent)).toBe(false);
     expect(removed.edited).toEqual([]);
     expect(removed.skills.updated).toEqual(["tool"]);
+  });
+
+  it("holds mode-only changes for review and refreshes a staged mode-only diff", async () => {
+    const { m, vendor, chmodUpstream, store, agent } = await vendoredScript("review", "--copy");
+    chmodUpstream(0o755);
+    expect((await m.json("sync")).pending).toMatchObject([
+      { skill: "tool", reason: "review", files: ["scripts/run.sh"] },
+    ]);
+    expect(executable(store)).toBe(false);
+    expect(executable(agent)).toBe(false);
+    const diff = await m.run("diff", "tool");
+    expect(diff.stdout).toContain("old mode 100644\nnew mode 100755");
+
+    chmodSync(join(vendor.work, "skills/tool/scripts/other.sh"), 0o755);
+    chmodUpstream(0o644);
+    const pending = [{ skill: "tool", reason: "review", files: ["scripts/other.sh"] }];
+    expect((await m.json("sync")).pending).toMatchObject(pending);
+    expect((await m.json("sync", "--offline")).pending).toMatchObject(pending);
+    const refreshed = await m.run("diff");
+    expect(refreshed.stdout).toContain("scripts/other.sh");
+    expect(refreshed.stdout).not.toContain("scripts/run.sh");
+
+    const applied = await m.json("update", "vendor");
+    expect(applied.pending).toEqual([]);
+    expect(applied.sources[0]?.changed).toEqual(["skills/tool/scripts/other.sh"]);
+    expect(executable(join(store, "../other.sh"))).toBe(true);
+    expect(executable(join(agent, "../other.sh"))).toBe(true);
+    expect(executable(store)).toBe(false);
+  });
+
+  it("keeps local contents and non-execute permissions", async () => {
+    const { m, chmodUpstream, store } = await vendoredScript(undefined);
+    const edited = "#!/bin/sh\necho private\n";
+    writeFileSync(store, edited);
+    chmodSync(store, 0o600);
+    chmodUpstream(0o755);
+    expect((await m.json("sync")).skills.updated).toEqual(["tool"]);
+    expect(read(store)).toBe(edited);
+    expect(statSync(store).mode & 0o666).toBe(0o600);
+    expect(executable(store)).toBe(true);
+  });
+
+  it("retries a mode-only update interrupted before the live chmod", async () => {
+    const { m, chmodUpstream, base, store } = await vendoredScript(undefined);
+    chmodUpstream(0o755);
+    const stop = join(m.root, "stop.mjs");
+    writeFileSync(
+      stop,
+      `
+      import fs from "node:fs";
+      import { syncBuiltinESMExports } from "node:module";
+      const chmod = fs.chmodSync;
+      fs.chmodSync = (path, mode) => {
+        if (path === ${JSON.stringify(store)}) process.exit(86);
+        chmod(path, mode);
+      };
+      syncBuiltinESMExports();
+    `,
+    );
+    const stopped = await m.runWith(
+      { env: { NODE_OPTIONS: `${m.env.NODE_OPTIONS} --import=${pathToFileURL(stop).href}` } },
+      "sync",
+    );
+    expect(stopped.code, stopped.stdout + stopped.stderr).toBe(86);
+    expect(executable(base)).toBe(false);
+    expect(executable(store)).toBe(false);
+    expect((await m.json("sync")).skills.updated).toEqual(["tool"]);
+    expect(executable(base)).toBe(true);
+    expect(executable(store)).toBe(true);
+  });
+
+  it("reports executable-only paths alongside content changes", async () => {
+    const { m, vendor, store } = await vendoredScript(undefined);
+    chmodSync(join(vendor.work, "skills/tool/scripts/run.sh"), 0o755);
+    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "new text") });
+    const report = await m.json("sync");
+    expect(executable(store)).toBe(true);
+    expect(report.sources[0]?.changed).toEqual([
+      "skills/tool/SKILL.md",
+      "skills/tool/scripts/run.sh",
+    ]);
   });
 });

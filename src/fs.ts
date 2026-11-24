@@ -83,15 +83,25 @@ export function executables(dir: string): string[] {
 }
 
 /** Files executable in one list and not the other. */
-export const changedModes = (before: string[], after: string[]) =>
-  [
-    ...before.filter((file) => !after.includes(file)),
-    ...after.filter((file) => !before.includes(file)),
-  ].sort();
+export function changedModes(before: string[], after: string[]): string[] {
+  const changed = new Set(before);
+  for (const file of after) if (!changed.delete(file)) changed.add(file);
+  return [...changed].sort();
+}
 
-/** Gives the file `to` the permissions of `from`, unless `to` is no longer a file. */
-export function copyMode(from: string, to: string) {
-  if (lstat(to)?.isFile()) chmodSync(to, statSync(from).mode & 0o7777);
+/** Copies only execute bits, without following locally replaced links within the destination. */
+export function copyExecuteBits(from: string, to: string, file: string) {
+  const path = join(to, file);
+  for (let parent = dirname(path); ; parent = dirname(parent)) {
+    if (!lstat(parent)?.isDirectory()) return;
+    if (parent === to) break;
+  }
+  const dest = lstat(path);
+  const source = lstat(join(from, file));
+  if (dest?.isFile() && source?.isFile()) {
+    const mode = (dest.mode & 0o7666) | (source.mode & 0o111);
+    if (mode !== (dest.mode & 0o7777)) chmodSync(path, mode);
+  }
 }
 
 /** node:crypto, loaded on first use: the session hook and `list --json` never hash. */
