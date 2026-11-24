@@ -752,19 +752,13 @@ export function applyCloneBackups(
   results: readonly SourceResult[],
   done: string[],
 ) {
-  const backups = plan.migrations.filter(
-    (migration) => migration.kind === "backup" && migration.replacement !== undefined,
-  );
-  const omitted = new Set<string>();
-  if (backups.length === 0) return omitted;
+  const backups = plan.migrations.filter((migration) => migration.kind === "backup");
+  if (!backups.some((backup) => backup.replacement)) return false;
   const skills = results.flatMap((result) =>
-    result.skills.map(({ name, dir }) => ({
-      name,
-      dir,
-      real: existsSync(dir) ? realpathSync(dir) : undefined,
-      result,
-    })),
+    result.skills.map(({ name, dir }) => ({ name, dir, result })),
   );
+  const protectedPaths: string[] = [];
+  let moved = false;
   const backupRoot = join(paths.backup(), new Date().toISOString().replace(/[:.]/g, "-"));
   for (const backup of backups) {
     const replacement = backup.replacement;
@@ -772,11 +766,13 @@ export function applyCloneBackups(
     const real = existsSync(backup.path) ? realpathSync(backup.path) : undefined;
     const winner = skills.find(
       (skill) =>
-        skill.real !== undefined &&
-        skill.real !== real &&
-        !omitted.has(skill.dir) &&
-        nameKey(skill.name) === nameKey(replacement.name),
+        nameKey(skill.name) === nameKey(replacement.name) &&
+        existsSync(join(skill.dir, "SKILL.md")) &&
+        realpathSync(skill.dir) !== real,
     );
+    const winnerPaths = winner
+      ? [winner.dir, join(winner.dir, "SKILL.md")].flatMap((path) => [path, realpathSync(path)])
+      : [];
     if (
       winner?.name === replacement.name &&
       winner.result.id === replacement.source &&
@@ -784,11 +780,15 @@ export function applyCloneBackups(
       winner.result.status !== "error" &&
       winner.result.status !== "offline" &&
       real !== undefined &&
+      ![...protectedPaths, ...winnerPaths].some(
+        (path) => inside(backup.path, path) || inside(real, path),
+      ) &&
       treeSignature(real) === replacement.localTree
     ) {
       checkMoves([backup]);
       done.push(backUp(backup.path, backupRoot));
-      for (const skill of skills) if (skill.real === real) omitted.add(skill.dir);
+      protectedPaths.push(...winnerPaths);
+      moved = true;
     } else {
       plan.migrations = plan.migrations.filter((migration) => migration !== backup);
       plan.imports.unedited = plan.imports.unedited.filter(({ path }) => path !== backup.path);
@@ -797,7 +797,7 @@ export function applyCloneBackups(
       done.push(note);
     }
   }
-  return omitted;
+  return moved;
 }
 
 /** Carries out non-deferred moves and writes config and imports. Sync runs after. */

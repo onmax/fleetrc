@@ -84,8 +84,8 @@ export interface SyncOptions {
     omit: (dir: string) => boolean;
     inspectConfirmed?: (links: readonly DesiredLink[], pendingCopyEdits: boolean) => void;
   };
-  /** Apply init's deferred backups against live discovery before choosing links. */
-  initBackups?: (results: readonly SourceResult[]) => ReadonlySet<string>;
+  /** Apply init's deferred backups against live discovery; returns whether any directory moved. */
+  initBackups?: (results: readonly SourceResult[]) => boolean;
   /** Leave out the note about a timer whose schedule the manifest changed (init installs it next). */
   skipTimerCheck?: boolean;
 }
@@ -615,10 +615,16 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const byKey = new Map<string, DesiredLink>();
     const shadowed: Report["shadowed"] = [];
     const preview = dryRun ? options.previewSkills : undefined;
-    const moved = dryRun ? undefined : options.initBackups?.(results);
+    const moved = !dryRun && options.initBackups?.(results);
+    if (moved) {
+      for (const result of results) {
+        result.skills = result.skills.filter(({ dir }) => existsSync(join(dir, "SKILL.md")));
+        result.files = result.files.filter(({ file }) => existsSync(file));
+      }
+    }
     for (const result of results) {
       for (const skill of result.skills) {
-        if (preview?.omit(skill.dir) || moved?.has(skill.dir)) continue;
+        if (preview?.omit(skill.dir)) continue;
         // ~/.claude/skills/fleetrc is the plugin that carries Claude Code's hooks (entrysync.ts).
         if (nameKey(skill.name) === nameKey(CLAUDE_PLUGIN_NAME)) {
           warnings.push(
@@ -643,7 +649,11 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       }
     }
     for (const link of carried)
-      if (!preview?.omit(link.target) && !byKey.has(nameKey(link.name))) {
+      if (
+        !preview?.omit(link.target) &&
+        (!moved || existsSync(join(link.target, "SKILL.md"))) &&
+        !byKey.has(nameKey(link.name))
+      ) {
         winners.set(link.name, link);
         byKey.set(nameKey(link.name), link);
       }

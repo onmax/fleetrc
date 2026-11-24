@@ -961,8 +961,8 @@ describe("init", () => {
     expect(JSON.parse(read(manifest)).sources[1]).toMatchObject({ git: upstream.url, ref });
   });
 
-  it.skipIf(isWindows).each(["keeps", "moves"] as const)(
-    "checks a live hook that %s the replacement",
+  it.skipIf(isWindows).each(["keeps", "moves", "links to personal", "links elsewhere"] as const)(
+    "checks the replacement after the live checkout hook: %s",
     async (hook) => {
       const m = machine({ scheduler: "empty" });
       const upstream = remote(m, "upstream", skills("skills/", "tool"));
@@ -976,6 +976,11 @@ describe("init", () => {
         }),
       });
       const work = clone(m, personal, "code/skills");
+      const linkedSkill =
+        hook === "links to personal"
+          ? join(work, "skills/tool/SKILL.md")
+          : m.at("external/SKILL.md");
+      if (hook === "links elsewhere") writeFiles(m.root, { "external/SKILL.md": skillMd("tool") });
       const manifest = m.manifest({
         agents: ["claude-code"],
         sources: [
@@ -986,6 +991,7 @@ describe("init", () => {
             ref,
             path: m.at("code/upstream"),
             skills: "skills/*",
+            followLinks: hook.startsWith("links"),
           },
         ],
       });
@@ -995,6 +1001,11 @@ describe("init", () => {
           "#!/bin/sh",
           'echo checkout >> "$HOME/checkouts"',
           ...(hook === "moves" ? [`if [ "$2" = "${ref}" ]; then mv skills/tool ./tool; fi`] : []),
+          ...(hook.startsWith("links")
+            ? [
+                `if [ "$2" = "${ref}" ]; then rm skills/tool/SKILL.md; ln -s "${linkedSkill}" skills/tool/SKILL.md; fi`,
+              ]
+            : []),
           "",
         ].join("\n"),
       });
@@ -1009,10 +1020,57 @@ describe("init", () => {
       const init = await m.run("init", manifest, "--no-hooks");
       expect(init.code, init.stdout + init.stderr).toBe(0);
       expect(read(m.at("checkouts"))).toBe("checkout\ncheckout\n");
-      expect(existsSync(join(work, "skills/tool"))).toBe(hook === "moves");
+      expect(existsSync(join(work, "skills/tool"))).toBe(
+        hook === "moves" || hook === "links to personal",
+      );
       expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
     },
   );
+
+  it("links commands from the replacement after backing up a matching copy", async () => {
+    const m = machine({ scheduler: "empty" });
+    const files = {
+      ...skills("skills/", "tool"),
+      "skills/tool/review.md": "Review the changes.\n",
+    };
+    const upstream = remote(m, "upstream", files);
+    const personal = remote(m, "personal", {
+      ...files,
+      "skills-lock.json": JSON.stringify({
+        version: 1,
+        skills: { tool: { source: upstream.url, skillPath: "skills/tool/SKILL.md" } },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const replacement = m.at("code/upstream");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        {
+          id: "personal",
+          git: personal.url,
+          path: work,
+          skills: "skills/*",
+          commands: "skills/*/review.md",
+          adopt: true,
+        },
+        {
+          id: "upstream",
+          git: upstream.url,
+          path: replacement,
+          skills: "skills/*",
+          commands: "skills/*/review.md",
+        },
+      ],
+    });
+    const init = await m.run("init", manifest, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(existsSync(join(work, "skills/tool"))).toBe(false);
+    expect(read(m.at(".claude/commands/tool/review.md"))).toBe(files["skills/tool/review.md"]);
+    expect(linkOf(m.at(".claude/commands/tool/review.md"))).toBe(
+      join(replacement, "skills/tool/review.md"),
+    );
+  });
 
   it("can migrate a matching copy after adopting an unrelated copied command edit", async () => {
     const m = machine({ scheduler: "empty" });
