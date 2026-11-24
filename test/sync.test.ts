@@ -517,6 +517,7 @@ describe.skipIf(isWindows)("the executable bit", () => {
     const m = machine();
     const vendor = remote(m, "vendor", {
       ...skills("skills/", "tool"),
+      "skills/tool/a.txt": "base\n",
       [`skills/tool/${script}`]: "#!/bin/sh\necho run\n",
       "skills/tool/scripts/nested/other.sh": "#!/bin/sh\necho other\n",
     });
@@ -646,18 +647,31 @@ describe.skipIf(isWindows)("the executable bit", () => {
     }
   });
 
-  it("keeps an unapplied staged mode change when its local file is missing", async () => {
-    const { m, chmodUpstream, base, store } = await vendoredScript("review");
+  it("rejects a missing mode-only target before writing merge conflicts", async () => {
+    const { m, vendor, base, store } = await vendoredScript("review");
+    const localText = m.at(".claude/skills/tool/a.txt");
+    writeFileSync(localText, "mine\n");
     rmSync(store);
-    chmodUpstream(0o755);
-    expect((await m.json("sync")).pending).toMatchObject([{ files: [script] }]);
+    chmodSync(join(vendor.work, "skills/tool", script), 0o755);
+    vendor.commit({ "skills/tool/a.txt": "theirs\n" });
+    const pending = [{ files: ["a.txt", script] }];
+    expect((await m.json("sync")).pending).toMatchObject(pending);
 
     const merged = await m.run("merge", "tool");
     expect(merged.code).not.toBe(0);
     expect(merged.stderr).toContain(script);
+    expect(read(localText)).toBe("mine\n");
     expect(existsSync(store)).toBe(false);
     expect(executable(base)).toBe(false);
-    expect((await m.json("sync", "--offline")).pending).toMatchObject([{ files: [script] }]);
+    expect((await m.json("sync", "--offline")).pending).toMatchObject(pending);
+
+    writeFileSync(store, read(base));
+    const retry = await m.run("merge", "tool");
+    expect(retry.stdout).toContain("conflicts: a.txt");
+    expect(read(localText)).toBe("<<<<<<< local\nmine\n=======\ntheirs\n>>>>>>> upstream\n");
+    expect(executable(store)).toBe(true);
+    const unresolved = await m.run("merge", "tool");
+    expect(unresolved.stderr).toContain("still has merge conflicts in a.txt");
   });
 
   it("retries a mode-only update interrupted before the live chmod", async () => {

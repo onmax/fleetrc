@@ -533,7 +533,20 @@ async function mergeTrees(
     ...Object.keys(hashDir(base)),
     ...Object.keys(hashDir(upstream)),
   ]);
-  const modes = new Set(changedModes(executables(base), executables(upstream)));
+  const modeOnly = new Set(
+    changedModes(executables(base), executables(upstream)).filter((file) => {
+      const incoming = readContent(upstream, file);
+      return Buffer.isBuffer(incoming) && sameContent(incoming, readContent(base, file));
+    }),
+  );
+  const mergeMode = (file: string, validateOnly: boolean) => {
+    if (!copyExecuteBits(upstream, live, file, validateOnly))
+      throw new UserError(
+        `cannot merge the executable bit for ${file}: restore the local path to a regular file and retry`,
+      );
+  };
+  for (const file of modeOnly) mergeMode(file, true);
+  if (!dryRun) for (const file of modeOnly) mergeMode(file, false);
   const result: MergeResult = { merged: [], conflicts: [] };
   const markers: Record<string, string> = {};
   /**
@@ -573,16 +586,12 @@ async function mergeTrees(
     markers[file] = relative(live, written).split(sep).join("/");
   };
   for (const file of [...files].sort()) {
-    const b = readContent(base, file);
-    const u = readContent(upstream, file);
-    if (modes.has(file) && Buffer.isBuffer(u) && sameContent(u, b)) {
-      if (!copyExecuteBits(upstream, live, file, dryRun))
-        throw new UserError(
-          `cannot merge the executable bit for ${file}: restore the local path to a regular file and retry`,
-        );
+    if (modeOnly.has(file)) {
       result.merged.push(file);
       continue;
     }
+    const b = readContent(base, file);
+    const u = readContent(upstream, file);
     if (sameContent(u, b)) continue;
     const l = readContent(live, file);
     const target = join(live, file);
