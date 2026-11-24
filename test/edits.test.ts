@@ -1,10 +1,11 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import {
   clone,
   http,
   isLink,
+  isWindows,
   linkOf,
   machine,
   names,
@@ -177,6 +178,32 @@ describe("edited vendored skills", () => {
     );
     expect((JSON.parse(read(manifest)) as typeof saved).forks.tool!.base).toBe(vendor.head());
     expect(names(m.at(".claude/skills"))).toEqual(["mine", "tool"]);
+  });
+
+  it.skipIf(isWindows)("notifies once about a fork's upstream execute-bit change", async () => {
+    const { m, work, vendor } = await editedVendoredSkill({ scheduler: "empty" });
+    expect((await m.run("fork", "tool")).code).toBe(0);
+    const upstream = join(vendor.work, "skills/tool/ref.md");
+    const live = join(work, "skills/tool/ref.md");
+    writeFileSync(live, "local edit\n");
+    chmodSync(live, 0o600);
+    chmodSync(upstream, 0o755);
+    vendor.commit({}, "make ref executable");
+
+    const sync = await m.run("sync");
+    expect(sync.code, sync.stdout + sync.stderr).toBe(0);
+    expect(sync.stdout).toContain("fork tool: vendor changed it since you forked it (ref.md)");
+    expect((await m.run("sync")).stdout).not.toContain("fork tool:");
+    vendor.commit({ "README.md": "unrelated\n" });
+    expect((await m.run("sync")).stdout).not.toContain("fork tool:");
+    expect((await m.run("status")).stdout).toContain("`fleetrc merge tool`");
+
+    const merge = await m.run("merge", "tool");
+    expect(merge.code, merge.stdout + merge.stderr).toBe(0);
+    expect(read(live)).toBe("local edit\n");
+    expect(statSync(live).mode & 0o666).toBe(0o600);
+    expect(statSync(live).mode & 0o100).toBe(0o100);
+    expect((await m.run("status")).stdout).not.toContain("`fleetrc merge tool`");
   });
 
   it("4d2. a fork without a base merges from nothing in common, then records the base", async () => {

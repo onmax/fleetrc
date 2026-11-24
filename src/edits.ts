@@ -343,6 +343,8 @@ interface ForkHead {
   dir: () => Promise<string>;
 }
 
+const FORK_TREE_VERSION = "v2:";
+
 /**
  * Compares each fork's `base` with the skill's folder at the commit upstream has now, and records
  * what it found in `state.forks`. Returns the forks whose upstream moved since the last sync that
@@ -406,16 +408,29 @@ export async function checkForks(
       }
     }
     const known = forks[name];
-    if (known && known.base === fork.base && known.upstream === head.commit) continue;
+    if (
+      known &&
+      known.base === fork.base &&
+      known.upstream === head.commit &&
+      known.tree.startsWith(FORK_TREE_VERSION)
+    )
+      continue;
     let files: string[] = [];
-    let tree = "";
+    let tree = FORK_TREE_VERSION;
+    let legacyTree: string | undefined;
     // Without a base, nothing is known to be in common, so every upstream file counts as changed.
     if (fork.base === undefined || !head.commit.startsWith(fork.base.toLowerCase()))
       try {
         const base = await forkBase(fork, name, head.team);
-        const upstream = hashDir(await head.dir());
-        files = changedFiles(base ? hashDir(base) : {}, upstream);
-        tree = sha256(JSON.stringify(upstream));
+        const dir = await head.dir();
+        const upstream = hashDir(dir);
+        const modes = executables(dir);
+        const modeChanges = changedModes(base ? executables(base) : [], modes);
+        const contentChanges = changedFiles(base ? hashDir(base) : {}, upstream);
+        files = [...new Set([...contentChanges, ...modeChanges])].sort();
+        tree += sha256(JSON.stringify([upstream, modes]));
+        if (base === undefined || modeChanges.length === 0)
+          legacyTree = sha256(JSON.stringify(upstream));
       } catch {
         couldNotTell(name, "could not compare the upstream skill with the recorded base");
         continue;
@@ -427,7 +442,10 @@ export async function checkForks(
       files,
     };
     // Said once for each new upstream version of the skill, not on every sync.
-    if (files.length > 0 && (!known || known.base !== fork.base || known.tree !== tree))
+    if (
+      files.length > 0 &&
+      (!known || known.base !== fork.base || (known.tree !== tree && known.tree !== legacyTree))
+    )
       updates.push({ source: head.source, skill: name, files });
   }
   return { updates, warnings };
