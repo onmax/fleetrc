@@ -545,6 +545,33 @@ const mergeInventory = ({ entries, hashes }: ReturnType<typeof mergeSnapshot>) =
 const mergeFingerprint = (snapshot: ReturnType<typeof mergeSnapshot>) =>
   sha256(JSON.stringify(mergeInventory(snapshot)));
 
+/** Preserve an ambiguous directory, or remove it only if the filesystem confirms it is empty. */
+function preserveUnconfirmedDirectory(target: string) {
+  const backupRoot = paths.backup();
+  mkdirSync(backupRoot, { recursive: true });
+  const backup = mkdtempSync(join(backupRoot, "merge-unconfirmed-"));
+  const preserved = join(backup, basename(target));
+  try {
+    renameSync(target, preserved);
+  } catch (error) {
+    rmdirSync(backup);
+    if (isErrno(error, "EXDEV")) {
+      try {
+        rmdirSync(target);
+        return;
+      } catch (removeError) {
+        throw new Error(`cannot preserve ${target} across filesystems; left it in place`, {
+          cause: removeError,
+        });
+      }
+    }
+    throw new Error(`cannot move ${target} safely to ${preserved}; left it in place`, {
+      cause: error,
+    });
+  }
+  process.stderr.write(`merge: preserving unconfirmed directory ${target} at ${preserved}\n`);
+}
+
 /** Fill an empty or partially installed unit, accepting only entries made by this transaction. */
 function publishMergeUnit(scratch: string, unit: string, target: string) {
   const dirs = join(scratch, "dirs");
@@ -562,18 +589,7 @@ function publishMergeUnit(scratch: string, unit: string, target: string) {
     const intent = `${record}.creating`;
     if (dest?.isDirectory() && !existsSync(record) && existsSync(intent)) {
       if (readdirSync(to).length > 0) throw occupied();
-      const backupRoot = paths.backup();
-      mkdirSync(backupRoot, { recursive: true });
-      const backup = mkdtempSync(join(backupRoot, "merge-unconfirmed-"));
-      const preserved = join(backup, basename(to));
-      process.stderr.write(`merge: preserving unconfirmed directory ${to} at ${preserved}\n`);
-      try {
-        renameSync(to, preserved);
-      } catch (error) {
-        throw new Error(`cannot move ${to} safely to ${preserved}; left it in place`, {
-          cause: error,
-        });
-      }
+      preserveUnconfirmedDirectory(to);
       dest = undefined;
     }
     if (dest === undefined) {
@@ -1158,7 +1174,7 @@ export async function forkSkill(
   if (!existsSync(store.live))
     throw new UserError(`${name} has no copy on this machine yet; run \`fleetrc sync\``);
   const recovery = readMergeRecoveryPointer(mergeRecoveryPointer(realpathSync(store.live)));
-  if (recovery !== undefined)
+  if (recovery !== undefined && lstat(recovery) !== undefined)
     throw new UserError(
       `${name} has an interrupted merge at ${recovery}; run \`fleetrc merge ${name}\` before forking`,
     );

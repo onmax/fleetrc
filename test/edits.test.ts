@@ -73,7 +73,7 @@ async function pendingTopicReplacement(upstreamIsFolder = false) {
       : { "skills/tool/topic": "topic v2\n" },
   );
   await m.run("sync");
-  return { m, topic };
+  return { m, topic, vendor };
 }
 
 function mergeWithFilesystemHook(m: ReturnType<typeof machine>, hook: string) {
@@ -472,9 +472,14 @@ describe("edited vendored skills", () => {
     expect(read(join(read(saved), "notes.md"))).toBe("notes v1\nsaved after approval\n");
   });
 
-  it.each([false, true])(
-    "resumes after creating a directory before recording its identity (publish: %s)",
-    async (publishing) => {
+  it.each([
+    { publishing: false, crossDevice: false, lateSave: false },
+    { publishing: true, crossDevice: false, lateSave: false },
+    { publishing: true, crossDevice: true, lateSave: false },
+    { publishing: true, crossDevice: true, lateSave: true },
+  ])(
+    "recovers before the directory receipt (publish: $publishing, EXDEV: $crossDevice, save: $lateSave)",
+    async ({ publishing, crossDevice, lateSave }) => {
       const { m, topic } = await pendingTopicReplacement(publishing);
       const interrupted = await mergeWithFilesystemHook(
         m,
@@ -496,8 +501,29 @@ describe("edited vendored skills", () => {
       );
       expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
       expect(names(topic)).toEqual([]);
-      const retry = await m.run("merge", "tool");
-      if (publishing) {
+      const retry = crossDevice
+        ? await mergeWithFilesystemHook(
+            m,
+            `
+            const rename = fs.renameSync;
+            fs.renameSync = (from, to) => {
+              if (basename(from) === "topic" && basename(dirname(to)).startsWith("merge-unconfirmed-")) {
+                if (${lateSave}) fs.writeFileSync(from + "/draft.md", "late save");
+                throw Object.assign(new Error("different filesystem"), { code: "EXDEV" });
+              }
+              return rename(from, to);
+            };
+            `,
+          )
+        : await m.run("merge", "tool");
+      if (lateSave) {
+        expect(retry.code, retry.stdout + retry.stderr).toBe(1);
+        expect(retry.stderr).toContain("left it in place");
+        const fork = await m.run("fork", "tool");
+        expect(fork.code, fork.stdout + fork.stderr).toBe(1);
+        expect(fork.stderr).toContain("has an interrupted merge");
+        expect(read(join(topic, "draft.md"))).toBe("late save");
+      } else if (publishing) {
         expect(retry.code, retry.stdout + retry.stderr).toBe(0);
         expect(read(join(topic, "notes.md"))).toBe("notes v2\n");
       } else {
@@ -506,6 +532,30 @@ describe("edited vendored skills", () => {
       }
     },
   );
+
+  it("can fork after scratch cleanup is interrupted and sync clears the pending update", async () => {
+    const { m, topic, vendor } = await pendingTopicReplacement();
+    const interrupted = await mergeWithFilesystemHook(
+      m,
+      `
+      const rmdir = fs.rmdirSync;
+      fs.rmdirSync = (path, ...args) => {
+        rmdir(path, ...args);
+        if (basename(path).startsWith(".fleetrc-merge-")) process.exit(99);
+      };
+      `,
+    );
+    expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+    expect(read(topic)).toBe("topic v2\n");
+    rmSync(join(vendor.work, "skills/tool/topic"));
+    vendor.commit({ "skills/tool/topic/notes.md": "notes v1\n" });
+    expect((await m.json("sync")).pending).toEqual([]);
+    const merge = await m.run("merge", "tool");
+    expect(merge.stderr).toContain("has no upstream change to merge");
+    const fork = await m.run("fork", "tool");
+    expect(fork.code, fork.stdout + fork.stderr).toBe(0);
+    expect(read(m.at("code/skills/skills/tool/topic"))).toBe("topic v2\n");
+  });
 
   it.each(["unchanged", "edited", "partially removed"])(
     "checks the saved original on retirement retry (%s)",
