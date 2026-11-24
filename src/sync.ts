@@ -638,6 +638,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     // Unicode normalization count as one, since macOS and Windows keep them in one folder.
     const winners = new Map<string, DesiredLink>();
     const byKey = new Map<string, DesiredLink>();
+    const retainedRemovals = new Set<DesiredLink>();
     const shadowed: Report["shadowed"] = [];
     const preview = dryRun ? options.previewSkills : undefined;
     const moved = !dryRun && options.initBackups?.(results);
@@ -671,6 +672,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         };
         winners.set(skill.name, link);
         byKey.set(nameKey(skill.name), link);
+        if (skill.retainedRemoval) retainedRemovals.add(link);
       }
     }
     for (const link of carried)
@@ -702,7 +704,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           .map(({ id }) => id),
       );
       preview.inspectConfirmed(
-        desired.filter(({ source }) => confirmed.has(source)),
+        desired.filter((link) => confirmed.has(link.source) && !retainedRemovals.has(link)),
         false,
       );
     }

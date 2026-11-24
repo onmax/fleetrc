@@ -814,9 +814,7 @@ export function applySkillBackups(
 ) {
   const backups = plan.migrations.filter((migration) => migration.kind === "backup");
   if (!backups.some((backup) => backup.replacement)) return false;
-  const skills = results.flatMap((result) =>
-    result.skills.map(({ name, dir }) => ({ name, dir, result })),
-  );
+  const skills = results.flatMap((result) => result.skills.map((skill) => ({ ...skill, result })));
   const protectedPaths: string[] = [];
   const protectedDirectories = new Set<string>();
   let moved = false;
@@ -836,6 +834,7 @@ export function applySkillBackups(
     const winnerPaths = winner && resolutionPaths(join(winner.dir, "SKILL.md"));
     if (
       winner?.name === replacement.name &&
+      !winner.retainedRemoval &&
       winner.result.id === replacement.source &&
       winner.result.to !== undefined &&
       (replacement.commit === undefined

@@ -92,6 +92,8 @@ export interface SkillEntry {
   path?: string;
   /** A working clone's folder, which links in the skill may lead into when it is copied. */
   root?: string;
+  /** A local copy kept even though it is no longer supplied by the source. */
+  retainedRemoval?: true;
 }
 
 export type SourceStatus =
@@ -2623,7 +2625,12 @@ function applyVendored(
           `${source.id}: ${name} is gone upstream but has local edits, so it stays`,
         );
       else hold(name, undefined, "review", Object.keys(state.skills[name]?.hashes ?? {}));
-      out.skills.push({ name, dir: paths.live, path: state.skills[name]?.path });
+      out.skills.push({
+        name,
+        dir: paths.live,
+        path: state.skills[name]?.path,
+        retainedRemoval: true,
+      });
       continue;
     }
     if (write) {
@@ -2634,7 +2641,12 @@ function applyVendored(
         out.warnings.push(
           `${source.id}: ${name} is gone upstream but has local edits, so it stays`,
         );
-        out.skills.push({ name, dir: paths.live, path: state.skills[name]?.path });
+        out.skills.push({
+          name,
+          dir: paths.live,
+          path: state.skills[name]?.path,
+          retainedRemoval: true,
+        });
         continue;
       }
       for (const dir of Object.values(paths)) rmSync(dir, { recursive: true, force: true });
