@@ -961,71 +961,86 @@ describe("init", () => {
     expect(JSON.parse(read(manifest)).sources[1]).toMatchObject({ git: upstream.url, ref });
   });
 
-  it.skipIf(isWindows).each(["keeps", "moves", "links to personal", "links elsewhere"] as const)(
-    "checks the replacement after the live checkout hook: %s",
-    async (hook) => {
-      const m = machine({ scheduler: "empty" });
-      const upstream = remote(m, "upstream", skills("skills/", "tool"));
-      const ref = upstream.head();
-      upstream.commit({ "skills/tool/SKILL.md": skillMd("tool", "main only") });
-      const personal = remote(m, "personal", {
-        ...skills("skills/", "tool"),
-        "skills-lock.json": JSON.stringify({
-          version: 2,
-          skills: { tool: { source: upstream.url, ref, skillPath: "skills/tool/SKILL.md" } },
-        }),
-      });
-      const work = clone(m, personal, "code/skills");
-      const linkedSkill =
-        hook === "links to personal"
-          ? join(work, "skills/tool/SKILL.md")
-          : m.at("external/SKILL.md");
-      if (hook === "links elsewhere") writeFiles(m.root, { "external/SKILL.md": skillMd("tool") });
-      const manifest = m.manifest({
-        agents: ["claude-code"],
-        sources: [
-          { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
-          {
-            id: "upstream",
-            git: upstream.url,
-            ref,
-            path: m.at("code/upstream"),
-            skills: "skills/*",
-            followLinks: hook.startsWith("links"),
-          },
-        ],
-      });
-      const hooks = m.at("git-hooks");
-      writeFiles(hooks, {
-        "post-checkout": [
-          "#!/bin/sh",
-          'echo checkout >> "$HOME/checkouts"',
-          ...(hook === "moves" ? [`if [ "$2" = "${ref}" ]; then mv skills/tool ./tool; fi`] : []),
-          ...(hook.startsWith("links")
-            ? [
-                `if [ "$2" = "${ref}" ]; then rm skills/tool/SKILL.md; ln -s "${linkedSkill}" skills/tool/SKILL.md; fi`,
-              ]
-            : []),
-          "",
-        ].join("\n"),
-      });
-      chmodSync(join(hooks, "post-checkout"), 0o755);
-      m.git(work, "config", "--global", "core.hooksPath", hooks);
+  it
+    .skipIf(isWindows)
+    .each([
+      "keeps",
+      "moves",
+      "links to personal",
+      "links through personal",
+      "links elsewhere",
+    ] as const)("checks the replacement after the live checkout hook: %s", async (hook) => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const external = m.at("external/SKILL.md");
+    const addBridge = (repo: typeof upstream) => {
+      symlinkSync(external, join(repo.work, "skills/tool/bridge.md"));
+      repo.commit({});
+    };
+    if (hook === "links through personal") addBridge(upstream);
+    const ref = upstream.head();
+    upstream.commit({ "skills/tool/SKILL.md": skillMd("tool", "main only") });
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: { tool: { source: upstream.url, ref, skillPath: "skills/tool/SKILL.md" } },
+      }),
+    });
+    if (hook === "links through personal") addBridge(personal);
+    const work = clone(m, personal, "code/skills");
+    const linkedSkill =
+      hook === "links to personal"
+        ? join(work, "skills/tool/SKILL.md")
+        : hook === "links through personal"
+          ? join(work, "skills/tool/bridge.md")
+          : external;
+    if (hook === "links elsewhere" || hook === "links through personal")
+      writeFiles(m.home, { "external/SKILL.md": skillMd("tool") });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+        {
+          id: "upstream",
+          git: upstream.url,
+          ref,
+          path: m.at("code/upstream"),
+          skills: "skills/*",
+          followLinks: hook.startsWith("links"),
+        },
+      ],
+    });
+    const hooks = m.at("git-hooks");
+    writeFiles(hooks, {
+      "post-checkout": [
+        "#!/bin/sh",
+        'echo checkout >> "$HOME/checkouts"',
+        ...(hook === "moves" ? [`if [ "$2" = "${ref}" ]; then mv skills/tool ./tool; fi`] : []),
+        ...(hook.startsWith("links")
+          ? [
+              `if [ "$2" = "${ref}" ]; then rm skills/tool/SKILL.md; ln -s "${linkedSkill}" skills/tool/SKILL.md; fi`,
+            ]
+          : []),
+        "",
+      ].join("\n"),
+    });
+    chmodSync(join(hooks, "post-checkout"), 0o755);
+    m.git(work, "config", "--global", "core.hooksPath", hooks);
 
-      const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
-      expect(plan.migrations).toContainEqual(
-        expect.objectContaining({ kind: "backup", path: join(work, "skills/tool") }),
-      );
-      expect(existsSync(m.at("checkouts"))).toBe(false);
-      const init = await m.run("init", manifest, "--no-hooks");
-      expect(init.code, init.stdout + init.stderr).toBe(0);
-      expect(read(m.at("checkouts"))).toBe("checkout\ncheckout\n");
-      expect(existsSync(join(work, "skills/tool"))).toBe(
-        hook === "moves" || hook === "links to personal",
-      );
-      expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
-    },
-  );
+    const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+    expect(plan.migrations).toContainEqual(
+      expect.objectContaining({ kind: "backup", path: join(work, "skills/tool") }),
+    );
+    expect(existsSync(m.at("checkouts"))).toBe(false);
+    const init = await m.run("init", manifest, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(read(m.at("checkouts"))).toBe("checkout\ncheckout\n");
+    expect(existsSync(join(work, "skills/tool"))).toBe(
+      hook === "moves" || hook === "links to personal" || hook === "links through personal",
+    );
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
 
   it("links commands from the replacement after backing up a matching copy", async () => {
     const m = machine({ scheduler: "empty" });

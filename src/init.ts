@@ -1,6 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative } from "node:path";
 import { listSkills } from "skills";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { confine, personalSkillsDir, personalSource } from "./edits.ts";
@@ -746,6 +754,42 @@ function backUp(path: string, backupRoot: string): string {
   return `moved ${tildify(path)} to ${tildify(to)}`;
 }
 
+/** Returns the paths used during resolution, not just the final real path. */
+function resolutionPaths(path: string): string[] | undefined {
+  const split = (value: string) =>
+    value.split(process.platform === "win32" ? /[\\/]/ : "/").filter(Boolean);
+  let current = parse(path).root;
+  let pending = split(path.slice(current.length));
+  let links = 0;
+  const paths = [path];
+  try {
+    while (pending.length > 0) {
+      const part = pending.shift()!;
+      const next = join(current, part);
+      paths.push(next);
+      const stat = lstat(next);
+      if (!stat) return undefined;
+      if (!stat.isSymbolicLink()) {
+        current = next;
+        continue;
+      }
+      if (++links > 40) return undefined;
+      const target = readlinkSync(next);
+      const root = parse(target).root;
+      if (root) {
+        if (!isAbsolute(target)) return undefined;
+        current = root;
+      }
+      pending = [...split(target.slice(root.length)), ...pending];
+    }
+    const real = realpathSync.native(path);
+    if (relative(current, real) !== "") return undefined;
+    return [...paths, real];
+  } catch {
+    return undefined;
+  }
+}
+
 /** Check the working tree live sync discovered, not a hook-free preview of its commit. */
 export function applyCloneBackups(
   plan: InitPlan,
@@ -770,9 +814,7 @@ export function applyCloneBackups(
         existsSync(join(skill.dir, "SKILL.md")) &&
         realpathSync(skill.dir) !== real,
     );
-    const winnerPaths = winner
-      ? [winner.dir, join(winner.dir, "SKILL.md")].flatMap((path) => [path, realpathSync(path)])
-      : [];
+    const winnerPaths = winner && resolutionPaths(join(winner.dir, "SKILL.md"));
     if (
       winner?.name === replacement.name &&
       winner.result.id === replacement.source &&
@@ -780,6 +822,7 @@ export function applyCloneBackups(
       winner.result.status !== "error" &&
       winner.result.status !== "offline" &&
       real !== undefined &&
+      winnerPaths !== undefined &&
       ![...protectedPaths, ...winnerPaths].some(
         (path) => inside(backup.path, path) || inside(real, path),
       ) &&

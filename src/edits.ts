@@ -14,7 +14,10 @@ import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
 import {
   changedFiles,
+  changedModes,
   copyDir,
+  copyExecuteBits,
+  executables,
   hashDir,
   inside,
   isErrno,
@@ -340,6 +343,8 @@ interface ForkHead {
   dir: () => Promise<string>;
 }
 
+const FORK_TREE_VERSION = "v2:";
+
 /**
  * Compares each fork's `base` with the skill's folder at the commit upstream has now, and records
  * what it found in `state.forks`. Returns the forks whose upstream moved since the last sync that
@@ -403,16 +408,29 @@ export async function checkForks(
       }
     }
     const known = forks[name];
-    if (known && known.base === fork.base && known.upstream === head.commit) continue;
+    if (
+      known &&
+      known.base === fork.base &&
+      known.upstream === head.commit &&
+      known.tree.startsWith(FORK_TREE_VERSION)
+    )
+      continue;
     let files: string[] = [];
-    let tree = "";
+    let tree = FORK_TREE_VERSION;
+    let legacyTree: string | undefined;
     // Without a base, nothing is known to be in common, so every upstream file counts as changed.
     if (fork.base === undefined || !head.commit.startsWith(fork.base.toLowerCase()))
       try {
         const base = await forkBase(fork, name, head.team);
-        const upstream = hashDir(await head.dir());
-        files = changedFiles(base ? hashDir(base) : {}, upstream);
-        tree = sha256(JSON.stringify(upstream));
+        const dir = await head.dir();
+        const upstream = hashDir(dir);
+        const modes = executables(dir);
+        const modeChanges = changedModes(base ? executables(base) : [], modes);
+        const contentChanges = changedFiles(base ? hashDir(base) : {}, upstream);
+        files = [...new Set([...contentChanges, ...modeChanges])].sort();
+        tree += sha256(JSON.stringify([upstream, modes]));
+        if (base === undefined || modeChanges.length === 0)
+          legacyTree = sha256(JSON.stringify(upstream));
       } catch {
         couldNotTell(name, "could not compare the upstream skill with the recorded base");
         continue;
@@ -424,7 +442,10 @@ export async function checkForks(
       files,
     };
     // Said once for each new upstream version of the skill, not on every sync.
-    if (files.length > 0 && (!known || known.base !== fork.base || known.tree !== tree))
+    if (
+      files.length > 0 &&
+      (!known || known.base !== fork.base || (known.tree !== tree && known.tree !== legacyTree))
+    )
       updates.push({ source: head.source, skill: name, files });
   }
   return { updates, warnings };
@@ -637,6 +658,22 @@ async function mergeTrees(
     ...(base === undefined ? [] : Object.keys(hashDir(base))),
     ...Object.keys(hashDir(upstream)),
   ]);
+  const modeOnly = new Set(
+    base === undefined
+      ? []
+      : changedModes(executables(base), executables(upstream)).filter((file) => {
+          const incoming = readContent(upstream, file);
+          return Buffer.isBuffer(incoming) && sameContent(incoming, readContent(base, file));
+        }),
+  );
+  const mergeMode = (file: string, validateOnly: boolean) => {
+    if (!copyExecuteBits(upstream, live, file, validateOnly))
+      throw new UserError(
+        `cannot merge the executable bit for ${file}: restore the local path to a regular file and retry`,
+      );
+  };
+  for (const file of modeOnly) mergeMode(file, true);
+  if (!dryRun) for (const file of modeOnly) mergeMode(file, false);
   const result: MergeResult = { merged: [], conflicts: [] };
   const markers: Record<string, string> = {};
   /**
@@ -676,11 +713,16 @@ async function mergeTrees(
     markers[file] = relative(live, written).split(sep).join("/");
   };
   for (const file of [...files].sort()) {
+    if (modeOnly.has(file)) {
+      result.merged.push(file);
+      continue;
+    }
     const b = base === undefined ? undefined : readContent(base, file);
-    const l = readContent(live, file);
     const u = readContent(upstream, file);
+    if (sameContent(u, b)) continue;
+    const l = readContent(live, file);
     const target = join(live, file);
-    if (sameContent(u, b) || sameContent(l, u)) continue;
+    if (sameContent(l, u)) continue;
     const plain = (content: Content | undefined) =>
       content === undefined || Buffer.isBuffer(content);
     if (!plain(b) || !plain(l) || !plain(u)) {
