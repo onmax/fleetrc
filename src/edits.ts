@@ -570,13 +570,11 @@ const mergeIncoming = (scratch: string) => join(scratch, "incoming");
 const mergeIdentity = (entry: Stats) => `${entry.dev}:${entry.ino}:${entry.birthtimeMs}`;
 
 const mergeInventory = ({ entries, hashes, modes }: ReturnType<typeof mergeSnapshot>) =>
-  [...entries.keys()]
-    .sort()
-    .map((path) => {
-      const entry = [path, entries.get(path)!.isDirectory(), hashes[path]] as const;
-      const bits = modes.get(path);
-      return bits === undefined ? entry : ([...entry, bits] as const);
-    });
+  [...entries.keys()].sort().map((path) => {
+    const entry = [path, entries.get(path)!.isDirectory(), hashes[path]] as const;
+    const bits = modes.get(path);
+    return bits === undefined ? entry : ([...entry, bits] as const);
+  });
 const mergeFingerprint = (snapshot: ReturnType<typeof mergeSnapshot>) =>
   sha256(JSON.stringify(mergeInventory(snapshot)));
 

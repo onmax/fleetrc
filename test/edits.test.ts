@@ -283,69 +283,74 @@ describe("edited vendored skills", () => {
     expect(read(topic)).toBe("topic v2\n");
   });
 
-  it.skipIf(isWindows).each([
+  const executableCollisionScenarios = [
     "replace executable folder",
     "preserve local chmod",
     "install executable folder",
     "conflict on upstream chmod",
-  ])("merges collision groups with executable files: %s", async (scenario) => {
-    const m = machine({ scheduler: "empty" });
-    const folderIncoming = scenario === "install executable folder";
-    const modeOnly = scenario === "conflict on upstream chmod";
-    const localChmod = scenario === "preserve local chmod";
-    const upstreamTopic = "skills/tool/topic";
-    const upstreamScript = `${upstreamTopic}/run.sh`;
-    const initial = folderIncoming ? upstreamTopic : upstreamScript;
-    const incoming = folderIncoming || modeOnly ? upstreamScript : upstreamTopic;
-    const vendor = remote(m, "vendor", { ...skills("skills/", "tool"), [initial]: "original\n" });
-    if (!modeOnly) {
-      chmodSync(join(vendor.work, initial), 0o755);
-      vendor.commit({}, "make original executable");
-    }
-    const manifest = m.manifest({
-      agents: ["claude-code"],
-      sources: [{ id: "vendor", git: vendor.url, update: "review" }],
-    });
-    const init = await m.run("init", manifest, "--no-hooks");
-    expect(init.code, init.stdout + init.stderr).toBe(0);
-    const topic = m.at(".claude/skills/tool/topic");
-    const script = join(topic, "run.sh");
-    if (localChmod) chmodSync(script, 0o644);
-    if (modeOnly) {
-      rmSync(topic, { recursive: true });
-      writeFileSync(topic, "local file\n");
-    } else {
-      rmSync(join(vendor.work, upstreamTopic), { recursive: true });
-      vendor.commit({ [incoming]: "incoming\n" });
-    }
-    chmodSync(join(vendor.work, incoming), 0o755);
-    vendor.commit({}, "make incoming executable");
-    await m.run("sync");
+  ];
 
-    const conflicts = localChmod || modeOnly;
-    const dry = await m.run("merge", "tool", "--dry-run");
-    expect(dry.code, dry.stdout + dry.stderr).toBe(0);
-    expect(dry.stdout).toContain(conflicts ? "would conflict: topic" : "would merge: topic");
-    expect(read(folderIncoming || modeOnly ? topic : script)).toBe(
-      modeOnly ? "local file\n" : "original\n",
-    );
-    const merge = await m.run("merge", "tool");
-    expect(merge.code, merge.stdout + merge.stderr).toBe(conflicts ? 1 : 0);
-    if (conflicts) {
-      expect(merge.stdout).toContain("conflicts: topic");
-      expect(read(modeOnly ? topic : script)).toBe(modeOnly ? "local file\n" : "original\n");
-      if (modeOnly) expect(existsSync(`${topic}.upstream-conflict`)).toBe(true);
-      else {
-        expect(statSync(script).mode & 0o111).toBe(0);
-        expect(read(`${topic}.upstream`)).toBe("incoming\n");
-        expect(statSync(`${topic}.upstream`).mode & 0o111).toBe(0o111);
+  it.skipIf(isWindows).each(executableCollisionScenarios)(
+    "merges collision groups with executable files: %s",
+    async (scenario) => {
+      const m = machine({ scheduler: "empty" });
+      const folderIncoming = scenario === "install executable folder";
+      const modeOnly = scenario === "conflict on upstream chmod";
+      const localChmod = scenario === "preserve local chmod";
+      const upstreamTopic = "skills/tool/topic";
+      const upstreamScript = `${upstreamTopic}/run.sh`;
+      const initial = folderIncoming ? upstreamTopic : upstreamScript;
+      const incoming = folderIncoming || modeOnly ? upstreamScript : upstreamTopic;
+      const vendor = remote(m, "vendor", { ...skills("skills/", "tool"), [initial]: "original\n" });
+      if (!modeOnly) {
+        chmodSync(join(vendor.work, initial), 0o755);
+        vendor.commit({}, "make original executable");
       }
-    } else {
-      const installed = folderIncoming ? script : topic;
-      expect(read(installed)).toBe("incoming\n");
-      expect(statSync(installed).mode & 0o111).toBe(0o111);
-    }
-  });
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, update: "review" }],
+      });
+      const init = await m.run("init", manifest, "--no-hooks");
+      expect(init.code, init.stdout + init.stderr).toBe(0);
+      const topic = m.at(".claude/skills/tool/topic");
+      const script = join(topic, "run.sh");
+      if (localChmod) chmodSync(script, 0o644);
+      if (modeOnly) {
+        rmSync(topic, { recursive: true });
+        writeFileSync(topic, "local file\n");
+      } else {
+        rmSync(join(vendor.work, upstreamTopic), { recursive: true });
+        vendor.commit({ [incoming]: "incoming\n" });
+      }
+      chmodSync(join(vendor.work, incoming), 0o755);
+      vendor.commit({}, "make incoming executable");
+      await m.run("sync");
+
+      const conflicts = localChmod || modeOnly;
+      const dry = await m.run("merge", "tool", "--dry-run");
+      expect(dry.code, dry.stdout + dry.stderr).toBe(0);
+      expect(dry.stdout).toContain(conflicts ? "would conflict: topic" : "would merge: topic");
+      expect(read(folderIncoming || modeOnly ? topic : script)).toBe(
+        modeOnly ? "local file\n" : "original\n",
+      );
+      const merge = await m.run("merge", "tool");
+      expect(merge.code, merge.stdout + merge.stderr).toBe(conflicts ? 1 : 0);
+      if (conflicts) {
+        expect(merge.stdout).toContain("conflicts: topic");
+        expect(read(modeOnly ? topic : script)).toBe(modeOnly ? "local file\n" : "original\n");
+        if (modeOnly) expect(existsSync(`${topic}.upstream-conflict`)).toBe(true);
+        else {
+          expect(statSync(script).mode & 0o111).toBe(0);
+          expect(read(`${topic}.upstream`)).toBe("incoming\n");
+          expect(statSync(`${topic}.upstream`).mode & 0o111).toBe(0o111);
+        }
+      } else {
+        const installed = folderIncoming ? script : topic;
+        expect(read(installed)).toBe("incoming\n");
+        expect(statSync(installed).mode & 0o111).toBe(0o111);
+      }
+    },
+  );
 
   it("keeps a save in a folder while an earlier file is being merged", async () => {
     const { m, vendor } = await editedVendoredSkill({ scheduler: "empty" });
