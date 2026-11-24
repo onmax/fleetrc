@@ -1287,8 +1287,8 @@ async function allGone(
         return false;
     }
   }
-  if (![...tree].some(([file, mode]) => mode === "120000" || posix.basename(file) === "SKILL.md"))
-    return true;
+  const hasManifest = [...tree.keys()].some((file) => nameKey(posix.basename(file)) === "skill.md");
+  if (!hasManifest) return true;
   return withGitTree(repo, commit, (root) =>
     manifests.some((manifest) => hasInTreeManifest(root, manifest))
       ? false

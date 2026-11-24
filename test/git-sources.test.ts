@@ -840,6 +840,48 @@ describe("the last skill of a repository", () => {
     expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
   });
 
+  it.skipIf(isWindows).each([false, true])(
+    "LAST1. sync without symlink support (linked skill still upstream: %s)",
+    async (linkedSkill) => {
+      const { m, vendor } = linkedSkill ? await linkedLastSkill() : await lastSkill();
+      symlinkSync("README.md", join(vendor.work, "docs-link"));
+      vendor.commit(linkedSkill ? { "README.md": "changed\n" } : { "skills/tool": null });
+      m.git(vendor.work, "config", "--global", "core.symlinks", "false");
+      const bin = join(m.root, "no-symlinks");
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, "git"),
+        `#!/bin/sh
+for arg do
+  case "$arg" in
+    core.symlinks=true) symlinks=true ;;
+    checkout-index) if [ "$symlinks" = true ]; then
+      echo 'unable to create symlink: Operation not permitted' >&2
+      exit 128
+    fi ;;
+  esac
+done
+PATH="$FLEETRC_REAL_PATH" exec git "$@"
+`,
+        { mode: 0o755 },
+      );
+      m.env.FLEETRC_REAL_PATH = m.env.PATH;
+      m.env.PATH = `${bin}:${m.env.PATH}`;
+      const report = await m.json("sync");
+      if (linkedSkill) {
+        const source = report.sources.find((entry) => entry.id === "vendor");
+        expect(source?.status).toBe("error");
+        expect(source?.error).toContain("unable to create symlink");
+        expect(report.skills.removed).toEqual([]);
+        expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+      } else {
+        expect(report.skills.removed, JSON.stringify(report, null, 2)).toEqual(["tool"]);
+        expect(names(m.at(".claude/skills"))).toEqual([]);
+        expect(state(m).commit).toBe(vendor.head());
+      }
+    },
+  );
+
   it.each([
     ["node_modules/fixture/SKILL.md", skillMd("fixture")],
     ["templates/draft/SKILL.md", "# A template without skill metadata\n"],
