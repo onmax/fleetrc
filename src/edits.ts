@@ -1,9 +1,13 @@
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fchmodSync,
+  fstatSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -26,7 +30,6 @@ import {
   changedModes,
   copyDir,
   copyExecuteBits,
-  executables,
   hashDir,
   inside,
   isErrno,
@@ -514,15 +517,29 @@ function readContent(dir: string, file: string): Content | undefined {
   return stat?.isFile() ? readFileSync(path) : undefined;
 }
 
+function writeMergeFile(path: string, content: Buffer, bits: number, flag: "w" | "wx") {
+  if (bits === 0) {
+    writeFileSync(path, content, { flag });
+    return;
+  }
+  const fd = openSync(path, flag);
+  try {
+    writeFileSync(fd, content);
+    fchmodSync(fd, (fstatSync(fd).mode & 0o666) | bits);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Writes upstream's side of a conflict beside the local file, at `<file>.upstream`, or
  * `<file>.upstream.<n>` when that is taken: created, never overwritten, and never through a link.
  */
-function writeSidecar(target: string, content: Buffer, suffix = ".upstream"): string {
+function writeSidecar(target: string, content: Buffer, suffix = ".upstream", bits = 0): string {
   for (let n = 0; ; n++) {
     const path = n === 0 ? `${target}${suffix}` : `${target}${suffix}.${n}`;
     try {
-      writeFileSync(path, content, { flag: "wx" });
+      writeMergeFile(path, content, bits, "wx");
       return path;
     } catch (error) {
       if (!isErrno(error, "EEXIST")) throw error;
@@ -530,10 +547,21 @@ function writeSidecar(target: string, content: Buffer, suffix = ".upstream"): st
   }
 }
 
+const mergeExecuteBits = (entry: Stats | undefined) =>
+  process.platform !== "win32" && entry?.isFile() ? entry.mode & 0o111 : 0;
+
 function mergeSnapshot(dir: string) {
   const entries = new Map<string, Dirent>();
   const hashes = hashDir(dir, entries);
-  return { entries, hashes };
+  const modes = new Map<string, number>();
+  if (process.platform !== "win32") {
+    for (const [path, entry] of entries) {
+      if (!entry.isFile()) continue;
+      const bits = mergeExecuteBits(lstat(join(dir, path)));
+      if (bits !== 0) modes.set(path, bits);
+    }
+  }
+  return { entries, hashes, modes };
 }
 
 const mergeScratchPrefix = (live: string) => `.fleetrc-merge-${sha256(basename(live))}-`;
@@ -541,10 +569,14 @@ const savedMergeUnit = (scratch: string) => join(scratch, "previous", "unit");
 const mergeIncoming = (scratch: string) => join(scratch, "incoming");
 const mergeIdentity = (entry: Stats) => `${entry.dev}:${entry.ino}:${entry.birthtimeMs}`;
 
-const mergeInventory = ({ entries, hashes }: ReturnType<typeof mergeSnapshot>) =>
+const mergeInventory = ({ entries, hashes, modes }: ReturnType<typeof mergeSnapshot>) =>
   [...entries.keys()]
     .sort()
-    .map((path) => [path, entries.get(path)!.isDirectory(), hashes[path]] as const);
+    .map((path) => {
+      const entry = [path, entries.get(path)!.isDirectory(), hashes[path]] as const;
+      const bits = modes.get(path);
+      return bits === undefined ? entry : ([...entry, bits] as const);
+    });
 const mergeFingerprint = (snapshot: ReturnType<typeof mergeSnapshot>) =>
   sha256(JSON.stringify(mergeInventory(snapshot)));
 
@@ -665,7 +697,7 @@ function retireMergeScratch(scratch: string, original?: ReturnType<typeof mergeS
       if (!entry?.isDirectory()) throw changed();
       if ((entry.mode & 0o700) !== 0o700) chmodSync(folder, entry.mode | 0o700);
     }
-    for (const [path, directory, hash] of remaining.reverse()) {
+    for (const [path, directory, hash, bits = 0] of remaining.reverse()) {
       const target = join(previous, path);
       if (directory) rmdirSync(target);
       else {
@@ -675,7 +707,13 @@ function retireMergeScratch(scratch: string, original?: ReturnType<typeof mergeS
           : entry?.isFile()
             ? sha256(readFileSync(target))
             : undefined;
-        if (entry === undefined || current !== hash || entry.isDirectory()) throw changed();
+        if (
+          entry === undefined ||
+          current !== hash ||
+          entry.isDirectory() ||
+          mergeExecuteBits(entry) !== bits
+        )
+          throw changed();
         unlinkSync(target);
       }
     }
@@ -893,7 +931,8 @@ async function mergeTrees(
     }
   }
   const modeOnly = new Set(
-    changedModes(executables(base), executables(upstream)).filter((file) => {
+    changedModes([...previous.modes.keys()], [...next.modes.keys()]).filter((file) => {
+      if (!files.has(file) || groups.has(file)) return false;
       const incoming = readContent(upstream, file);
       return Buffer.isBuffer(incoming) && sameContent(incoming, readContent(base, file));
     }),
@@ -913,7 +952,7 @@ async function mergeTrees(
    * `<file>.upstream` (a link's as a note of its target), or a note that upstream deleted it. A file
    * in a linked folder gets its note beside that folder, since merge never writes through a link.
    */
-  const conflict = (file: string, upstream: Content | "folder" | undefined) => {
+  const conflict = (file: string, upstream: Content | "folder" | undefined, bits = 0) => {
     result.conflicts.push(file);
     if (dryRun) return;
     const folder = linkedFolder(live, file);
@@ -949,6 +988,8 @@ async function mergeTrees(
                 Buffer.isBuffer(upstream)
                   ? upstream
                   : Buffer.from(`upstream has a link here, to ${upstream.link}\n`),
+                ".upstream",
+                bits,
               );
     markers[file] = relative(live, written).split(sep).join("/");
   };
@@ -957,19 +998,22 @@ async function mergeTrees(
    * holds only plain files, and is a conflict on `root` otherwise.
    */
   const mergeUnit = (root: string, paths: string[]) => {
-    const sameHashes = (left: typeof hl, right: typeof hl) =>
-      paths.every((path) => left[path] === right[path]);
-    if (sameHashes(hu, hb) || sameHashes(hl, hu)) return;
+    const sameFile = (left: typeof local, right: typeof local, path: string) =>
+      left.hashes[path] === right.hashes[path] && left.modes.get(path) === right.modes.get(path);
+    const sameUnit = (left: typeof local, right: typeof local) =>
+      paths.every((path) => sameFile(left, right, path));
+    if (sameUnit(next, previous) || sameUnit(local, next)) return;
     const incoming = paths.filter((path) => hu[path] !== undefined);
     const contents = incoming.map((file) => readContent(upstream, file));
     const upstreamConflict = () =>
       conflict(
         root,
         next.entries.get(root)?.isDirectory() ? "folder" : readContent(upstream, root),
+        next.modes.get(root),
       );
     const localEntries = paths.filter((path) => local.entries.has(path));
     if (
-      !sameHashes(hl, hb) ||
+      !sameUnit(local, previous) ||
       localEntries.some((path) => {
         const entry = local.entries.get(path)!;
         return !entry.isFile() && !entry.isDirectory();
@@ -989,7 +1033,7 @@ async function mergeTrees(
           incoming.forEach((file, index) => {
             const path = join(staged, file.slice(root.length));
             mkdirSync(dirname(path), { recursive: true });
-            writeFileSync(path, contents[index] as Buffer);
+            writeMergeFile(path, contents[index] as Buffer, next.modes.get(file) ?? 0, "w");
           });
         },
         (old) =>
@@ -999,7 +1043,8 @@ async function mergeTrees(
             const entry = old.entries.get(saved);
             return (
               (local.entries.get(path)?.isDirectory() ? entry?.isDirectory() : entry?.isFile()) &&
-              old.hashes[saved] === hl[path]
+              old.hashes[saved] === hl[path] &&
+              old.modes.get(saved) === local.modes.get(path)
             );
           }),
       );
@@ -1008,7 +1053,7 @@ async function mergeTrees(
         return;
       }
     }
-    const changed = paths.filter((file) => hb[file] !== hu[file]);
+    const changed = paths.filter((file) => !sameFile(previous, next, file));
     result.merged.push(...changed.sort());
   };
   for (const file of [...files].sort()) {
