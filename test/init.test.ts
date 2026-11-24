@@ -885,6 +885,57 @@ describe("init", () => {
     },
   );
 
+  it.each([
+    "commit",
+    "hex branch",
+    "wrong tracking branch",
+    "same-tip tracking branch",
+    "right tracking branch",
+    "full ref",
+  ])("only migrates a ref-specific copy to a verified replacement (%s)", async (scenario) => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const base = upstream.head();
+    const branch = scenario === "hex branch" ? "deadbee" : "stable";
+    m.git(upstream.work, "push", "origin", `HEAD:refs/heads/${branch}`);
+    if (scenario !== "same-tip tracking branch")
+      upstream.commit({ "skills/tool/SKILL.md": skillMd("tool", "main only") });
+    const ref =
+      scenario === "commit" ? base : scenario === "full ref" ? `refs/heads/${branch}` : branch;
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: { tool: { source: upstream.url, ref, skillPath: "skills/tool/SKILL.md" } },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const replacement = { id: "upstream", git: upstream.url, ref, path: m.at("code/upstream") };
+    if (scenario.endsWith("tracking branch")) {
+      clone(m, upstream, "code/upstream");
+      if (scenario === "right tracking branch") m.git(replacement.path, "checkout", branch);
+    }
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+        ...(["commit", "hex branch"].includes(scenario) ? [] : [replacement]),
+      ],
+    });
+    const keep = ["wrong tracking branch", "same-tip tracking branch", "full ref"].includes(scenario);
+    const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+    expect(
+      plan.migrations.some(
+        (migration) => migration.kind === "backup" && migration.path === join(work, "skills/tool"),
+      ),
+    ).toBe(!keep);
+    const init = await m.run("init", manifest, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(scenario === "full ref" ? 1 : 0);
+    expect(existsSync(join(work, "skills/tool"))).toBe(keep);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    expect(JSON.parse(read(manifest)).sources[1]).toMatchObject({ git: upstream.url, ref });
+  });
+
   it("can migrate a matching copy after adopting an unrelated copied command edit", async () => {
     const m = machine({ scheduler: "empty" });
     const upstream = remote(m, "upstream", skills("skills/", "tool"));

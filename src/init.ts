@@ -25,8 +25,8 @@ import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
 import { git, GitError } from "./exec.ts";
-import { fetchClone, gitUrl, isCommitRef } from "./gitcache.ts";
-import { cloneAt } from "./sources.ts";
+import { fetchClone, gitUrl } from "./gitcache.ts";
+import { cloneAt, confirmCloneSkills } from "./sources.ts";
 import { sync } from "./sync.ts";
 
 export type Migration =
@@ -276,7 +276,7 @@ async function collectImports(
         imports.notes.push(`${error.message}; the local copy stays in place`);
       }
       if (real && (await sameAsUpstream(localEntry, local, cacheRoot, imports.notes))) {
-        const ref = localEntry.ref && !isCommitRef(localEntry.ref) ? localEntry.ref : undefined;
+        const ref = localEntry.ref || undefined;
         candidates.push({
           entry: localEntry,
           ref,
@@ -379,15 +379,27 @@ export async function planInit(
     let rejected = false;
     const migrations: Migration[] = [];
     const warnings: string[] = [];
+    const cloneSkills = new Map<string, ReadonlySet<string>>();
     for (const { entry, ref, path, within, real, addedSource } of candidates) {
       const winner = winners.get(entry.name);
       const source = winner && augmented.sources.find(({ id }) => id === winner.source);
-      if (
+      const matches =
         source &&
         "git" in source &&
         gitUrl(source.git) === gitUrl(entry.source) &&
-        (!ref || source.ref === ref)
-      ) {
+        (!ref || source.ref === ref);
+      if (matches && source.kind === "clone" && !cloneSkills.has(source.id)) {
+        const probe = mkdtempSync(join(scratch, "replacement-"));
+        try {
+          cloneSkills.set(source.id, await confirmCloneSkills(source, join(probe, "checkout")));
+        } catch (error) {
+          cloneSkills.set(source.id, new Set());
+          warnings.push(
+            `${source.id}: could not verify the working clone: ${(error as Error).message}`,
+          );
+        }
+      }
+      if (matches && (source.kind !== "clone" || cloneSkills.get(source.id)?.has(entry.name))) {
         imports.unedited.push({ name: entry.name, path, from: entry.source });
         migrations.push({
           kind: "backup",

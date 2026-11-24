@@ -701,6 +701,38 @@ export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: str
   }
 }
 
+/** Checks what live sync can actually link before init removes a personal copy. */
+export async function confirmCloneSkills(source: CloneSource, probe: string): Promise<Set<string>> {
+  const existing = existsSync(join(source.path, ".git"));
+  if (!existing || source.ref) await cloneAt(source, probe);
+  if (existing && source.ref) {
+    const checkout = async (dir: string) => {
+      const commit = await gitOut(["rev-parse", "HEAD"], dir);
+      const head = await git(["symbolic-ref", "--quiet", "HEAD"], { cwd: dir, allowFail: true });
+      if (head.code === 1) return [commit];
+      if (head.code !== 0) throw new Error(`cannot read the checked-out branch in ${dir}`);
+      const [remote, ref] = (
+        await gitOut(
+          [
+            "for-each-ref",
+            "--format=%(upstream:remotename)%00%(upstream:remoteref)",
+            head.stdout.trim(),
+          ],
+          dir,
+        )
+      ).split("\0");
+      if (!remote || !ref) throw new Error(`the checked-out branch in ${dir} has no upstream`);
+      return [commit, ref, await gitOut(["remote", "get-url", "--", remote], dir)];
+    };
+    const expected = await checkout(probe);
+    const actual = await checkout(source.path);
+    if (expected.length !== actual.length || expected.some((part, index) => part !== actual[index]))
+      return new Set();
+  }
+  const skills = await discoverInPlace(source, existing ? source.path : probe, []);
+  return new Set(skills.map((skill) => skill.name));
+}
+
 /** The commit a ref names in a clone, fetching it from origin when the clone does not have it. */
 async function findCommit(dir: string, ref: string): Promise<string | undefined> {
   const resolve = async () => {
