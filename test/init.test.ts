@@ -1087,12 +1087,12 @@ describe("init", () => {
         },
       ],
     });
-    const init = await m.run("init", manifest, "--no-hooks");
-    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const { sync } = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
+    const command = m.at(".claude/commands/tool/review.md");
     expect(existsSync(join(work, "skills/tool"))).toBe(false);
-    expect(read(m.at(".claude/commands/tool/review.md"))).toBe(files["skills/tool/review.md"]);
-    expect(linkOf(m.at(".claude/commands/tool/review.md"))).toBe(
-      join(replacement, "skills/tool/review.md"),
+    expect(read(command)).toBe(files["skills/tool/review.md"]);
+    expect(sync.files.links).toContainEqual(
+      expect.objectContaining({ path: command, source: "upstream" }),
     );
   });
 
