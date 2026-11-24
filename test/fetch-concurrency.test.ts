@@ -199,6 +199,38 @@ describe.skipIf(isWindows)("fetching git sources", () => {
     else expect(packs).toHaveLength(7);
   });
 
+  it("keeps the new and previous commits reachable during warm-cache pruning", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    const env = {
+      GIT_CONFIG_COUNT: "5",
+      GIT_CONFIG_KEY_0: "fetch.unpackLimit",
+      GIT_CONFIG_VALUE_0: "1",
+      GIT_CONFIG_KEY_1: "gc.autoPackLimit",
+      GIT_CONFIG_VALUE_1: "1",
+      GIT_CONFIG_KEY_2: "maintenance.strategy",
+      GIT_CONFIG_VALUE_2: "gc",
+      GIT_CONFIG_KEY_3: "gc.pruneExpire",
+      GIT_CONFIG_VALUE_3: "now",
+      GIT_CONFIG_KEY_4: "maintenance.auto",
+      GIT_CONFIG_VALUE_4: "true",
+    };
+    const seeded = await m.runWith({ env }, "sync", "--manifest", manifest);
+    expect(seeded.code, seeded.stdout + seeded.stderr).toBe(0);
+    const previous = vendor.head();
+    const next = vendor.commit(skills("skills/", "next"));
+    const updated = await m.runWith({ env }, "sync", "--manifest", manifest);
+    expect(updated.code, updated.stdout + updated.stderr).toBe(0);
+    const repo = join(m.stateDir, "cache", "git", `${cloneKey(vendor.url)}.git`);
+    expect(m.git(repo, "rev-parse", "refs/fleetrc/fetched")).toBe(next);
+    expect(m.git(repo, "cat-file", "-t", previous)).toBe("commit");
+    expect(names(m.at(".claude/skills"))).toEqual(["next", "tool"]);
+  });
+
   it("recovers a warm cache after cancelling maintenance", async () => {
     const m = machine();
     const first = remote(m, "first", skills("skills/", "first-tool"));
@@ -232,7 +264,11 @@ describe.skipIf(isWindows)("fetching git sources", () => {
     });
     const sync = await m.runWith(
       {
-        env: { PATH: slow.PATH, GIT_EXEC_PATH: slow.GIT_EXEC_PATH, FLEETRC_SYNC_TIMEOUT_MS: "5000" },
+        env: {
+          PATH: slow.PATH,
+          GIT_EXEC_PATH: slow.GIT_EXEC_PATH,
+          FLEETRC_SYNC_TIMEOUT_MS: "5000",
+        },
       },
       "sync",
       "--manifest",

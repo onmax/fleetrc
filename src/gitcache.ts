@@ -339,13 +339,13 @@ async function fetchCommit(
     "--no-tags",
     "--",
     url,
-    ref ?? "HEAD",
+    `+${ref ?? "HEAD"}:refs/fleetrc/incoming`,
   ];
   const fetched = await runGit(args, { cwd: repo, allowFail: true, timeoutMs: 600_000 });
   if (fetched.code === 0) {
     const parsed = await runGit(["rev-parse", "--verify", "FETCH_HEAD^{commit}"], { cwd: repo });
     const commit = parsed.stdout.trim();
-    // A ref of its own, so the next fetch sends only what changed.
+    // Keep the previous commit pinned through the fetch while `incoming` protects the new one.
     await runGit(["update-ref", "refs/fleetrc/fetched", commit], { cwd: repo });
     return commit;
   }
