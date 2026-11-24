@@ -23,7 +23,10 @@ import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
 import {
   changedFiles,
+  changedModes,
   copyDir,
+  copyExecuteBits,
+  executables,
   hashDir,
   inside,
   isErrno,
@@ -889,6 +892,20 @@ async function mergeTrees(
       if (path !== root) files.delete(path);
     }
   }
+  const modeOnly = new Set(
+    changedModes(executables(base), executables(upstream)).filter((file) => {
+      const incoming = readContent(upstream, file);
+      return Buffer.isBuffer(incoming) && sameContent(incoming, readContent(base, file));
+    }),
+  );
+  const mergeMode = (file: string, validateOnly: boolean) => {
+    if (!copyExecuteBits(upstream, live, file, validateOnly))
+      throw new UserError(
+        `cannot merge the executable bit for ${file}: restore the local path to a regular file and retry`,
+      );
+  };
+  for (const file of modeOnly) mergeMode(file, true);
+  if (!dryRun) for (const file of modeOnly) mergeMode(file, false);
   const result: MergeResult = { merged: [], conflicts: [] };
   const markers: Record<string, string> = {};
   /**
@@ -995,16 +1012,21 @@ async function mergeTrees(
     result.merged.push(...changed.sort());
   };
   for (const file of [...files].sort()) {
+    if (modeOnly.has(file)) {
+      result.merged.push(file);
+      continue;
+    }
     const group = groups.get(file);
     if (group !== undefined) {
       mergeUnit(file, group);
       continue;
     }
     const b = readContent(base, file);
-    const l = readContent(live, file);
     const u = readContent(upstream, file);
+    if (sameContent(u, b)) continue;
+    const l = readContent(live, file);
     const target = join(live, file);
-    if (sameContent(u, b) || sameContent(l, u)) continue;
+    if (sameContent(l, u)) continue;
     const plain = (content: Content | undefined) =>
       content === undefined || Buffer.isBuffer(content);
     if (!plain(b) || !plain(l) || !plain(u)) {

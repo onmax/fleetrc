@@ -58,9 +58,7 @@ async function pendingTopicReplacement(upstreamIsFolder = false, root = "topic")
   const topic = m.at(`.claude/skills/tool/${root}`);
   const upstream = `skills/tool/${root}`;
   vendor.commit(
-    upstreamIsFolder
-      ? { [upstream]: "topic v1\n" }
-      : { [`${upstream}/notes.md`]: "notes v1\n" },
+    upstreamIsFolder ? { [upstream]: "topic v1\n" } : { [`${upstream}/notes.md`]: "notes v1\n" },
   );
   await m.run("sync");
   expect((await m.run("merge", "tool")).code).toBe(0);

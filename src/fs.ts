@@ -1,5 +1,6 @@
 import {
   appendFileSync,
+  chmodSync,
   constants,
   copyFileSync,
   existsSync,
@@ -122,6 +123,46 @@ export function listFiles(dir: string): string[] {
   };
   if (existsSync(dir)) walk(dir, "");
   return files;
+}
+
+const runnable = (stat: Stats) => (stat.mode & 0o111) !== 0;
+
+/**
+ * Files under `dir` with an executable bit, as `/`-separated relative paths. Hashes hold content
+ * only, so this is how a change to the bit alone shows. Windows keeps no such bit.
+ */
+export function executables(dir: string): string[] {
+  if (process.platform === "win32") return [];
+  return listFiles(dir)
+    .filter((rel) => {
+      const stat = lstat(join(dir, rel));
+      return stat?.isFile() === true && runnable(stat);
+    })
+    .sort();
+}
+
+/** Files executable in one list and not the other. */
+export function changedModes(before: string[], after: string[]): string[] {
+  const changed = new Set(before);
+  for (const file of after) if (!changed.delete(file)) changed.add(file);
+  return [...changed].sort();
+}
+
+/** Copies only execute bits, returning false if either path isn't a regular file. */
+export function copyExecuteBits(from: string, to: string, file: string, dryRun = false): boolean {
+  const parts = file.split("/");
+  let path = to;
+  for (const part of parts) {
+    if (!lstat(path)?.isDirectory()) return false;
+    path = join(path, part);
+  }
+  const dest = lstat(path);
+  if (!dest?.isFile()) return false;
+  const source = lstat(join(from, file));
+  if (!source?.isFile()) return false;
+  const mode = (dest.mode & 0o7666) | (source.mode & 0o111);
+  if (!dryRun && mode !== (dest.mode & 0o7777)) chmodSync(path, mode);
+  return true;
 }
 
 /** node:crypto, loaded on first use: the session hook and `list --json` never hash. */
@@ -285,6 +326,15 @@ export function resolvedHashes(dir: string, within?: string): Hashes {
   for (const entry of resolvedTree(dir, within, []))
     if (!entry.dir) hashes[entry.rel] = sha256(readFileSync(entry.real));
   return sorted(hashes);
+}
+
+/** `executables` of the copy `copyResolved(dir, within)` makes, without making it. */
+export function resolvedExecutables(dir: string, within?: string): string[] {
+  if (process.platform === "win32" || !existsSync(dir)) return [];
+  return resolvedTree(dir, within, [])
+    .filter((entry) => !entry.dir && runnable(statSync(entry.real)))
+    .map((entry) => entry.rel)
+    .sort();
 }
 
 /** Files whose hash differs between two trees, including added and removed ones. */
