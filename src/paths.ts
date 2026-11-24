@@ -76,6 +76,7 @@ export function stateDir(): string {
 export const paths = {
   config: () => join(configDir(), "config.json"),
   state: () => join(stateDir(), "state.json"),
+  mergeRecovery: () => join(stateDir(), "merge-recovery"),
   lastRun: () => join(stateDir(), "last-run.json"),
   initPending: () => join(stateDir(), "init-pending"),
   fleet: () => join(stateDir(), "fleet.json"),

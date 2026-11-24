@@ -10,6 +10,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  rmdirSync,
   statSync,
   type Dirent,
   type Stats,
@@ -528,11 +529,20 @@ function mergeSnapshot(dir: string) {
 }
 
 const mergeScratchPrefix = (live: string) => `.fleetrc-merge-${sha256(basename(live))}-`;
-const mergeRecoveryPointer = (live: string) =>
-  join(dirname(paths.state()), "merge-recovery", sha256(live));
+const mergeRecoveryPointer = (live: string) => join(paths.mergeRecovery(), sha256(live));
 const savedMergeUnit = (scratch: string) => join(scratch, "previous", "unit");
 const mergeIncoming = (scratch: string) => join(scratch, "incoming");
 const mergeIdentity = (entry: Stats) => `${entry.dev}:${entry.ino}:${entry.birthtimeMs}`;
+
+function mergeFingerprint({ entries, hashes }: ReturnType<typeof mergeSnapshot>) {
+  return sha256(
+    JSON.stringify(
+      [...entries.keys()]
+        .sort()
+        .map((path) => [path, entries.get(path)!.isDirectory(), hashes[path]]),
+    ),
+  );
+}
 
 /** Fill an empty or partially installed unit, accepting only entries made by this transaction. */
 function publishMergeUnit(scratch: string, unit: string, target: string) {
@@ -540,7 +550,7 @@ function publishMergeUnit(scratch: string, unit: string, target: string) {
   mkdirSync(dirs, { recursive: true });
   const put = (from: string, to: string) => {
     const entry = lstat(from)!;
-    const dest = lstat(to);
+    let dest = lstat(to);
     const occupied = () => new Error(`${to} is occupied by another entry`);
     if (!entry.isDirectory()) {
       if (dest === undefined) linkSync(from, to);
@@ -548,10 +558,27 @@ function publishMergeUnit(scratch: string, unit: string, target: string) {
       return;
     }
     const record = join(dirs, sha256(relative(unit, from)));
+    const intent = `${record}.creating`;
+    if (dest?.isDirectory() && !existsSync(record) && existsSync(intent)) {
+      if (readdirSync(to).length > 0) throw occupied();
+      const backup = mkdtempSync(join(dirname(scratch), ".fleetrc-unconfirmed-directory-"));
+      const preserved = join(backup, basename(to));
+      process.stderr.write(`merge: preserving unconfirmed directory ${to} at ${preserved}\n`);
+      renameSync(to, preserved);
+      dest = undefined;
+    }
     if (dest === undefined) {
       if (existsSync(record)) throw occupied();
-      mkdirSync(to, { mode: 0o700 });
-      writeFileSync(record, mergeIdentity(lstat(to)!), { flag: "wx" });
+      writeFileSync(intent, "");
+      try {
+        mkdirSync(to, { mode: 0o700 });
+      } catch (error) {
+        rmSync(intent);
+        throw error;
+      }
+      const temporary = `${record}.tmp`;
+      writeFileSync(temporary, mergeIdentity(lstat(to)!));
+      renameSync(temporary, record);
     } else if (
       !dest.isDirectory() ||
       !existsSync(record) ||
@@ -579,9 +606,13 @@ function cleanMergeScratch(scratch: string) {
 }
 
 function retireMergeScratch(scratch: string) {
-  const done = `${scratch}-done`;
-  renameSync(scratch, done);
-  cleanMergeScratch(done);
+  const done = join(scratch, "retired");
+  writeFileSync(done, "");
+  for (const name of readdirSync(scratch)) {
+    if (name !== "retired") cleanMergeScratch(join(scratch, name));
+  }
+  rmSync(done);
+  rmdirSync(scratch);
 }
 
 /** An approved publication is resumed; an unapproved move is restored, never overwritten. */
@@ -592,16 +623,25 @@ function finishMergeUnit(scratch: string, target: string) {
     if (existsSync(publishing)) {
       const incoming = mergeIncoming(scratch);
       const next = join(incoming, "next");
-      const expected = readFileSync(publishing, "utf8");
+      const expected = JSON.parse(readFileSync(publishing, "utf8")) as {
+        incoming?: string;
+        previous?: string;
+      };
+      const checkPrevious = () => {
+        if (mergeFingerprint(mergeSnapshot(dirname(saved))) !== expected.previous)
+          throw new Error("the saved original no longer matches the publication approval");
+      };
       const check = () => {
-        if (JSON.stringify(mergeSnapshot(incoming).hashes) !== expected)
+        if (mergeFingerprint(mergeSnapshot(incoming)) !== expected.incoming)
           throw new Error("the published files changed");
       };
+      checkPrevious();
       check();
       if (lstat(next) !== undefined) publishMergeUnit(scratch, next, target);
       else if (lstat(target) !== undefined)
         throw new Error(`${target} is occupied by another entry`);
       check();
+      checkPrevious();
     } else if (lstat(saved) !== undefined) {
       publishMergeUnit(scratch, saved, target);
     }
@@ -628,7 +668,9 @@ function recoverMergeUnit(live: string, dryRun: boolean) {
   }
   if (lstat(scratch)?.isDirectory()) {
     const saved = savedMergeUnit(scratch);
-    if (lstat(saved) || existsSync(join(scratch, "publish"))) {
+    if (existsSync(join(scratch, "retired"))) {
+      if (!dryRun) retireMergeScratch(scratch);
+    } else if (lstat(saved) || existsSync(join(scratch, "publish"))) {
       const root = readFileSync(join(scratch, "target"), "utf8");
       const target = join(live, root);
       if (
@@ -645,10 +687,8 @@ function recoverMergeUnit(live: string, dryRun: boolean) {
       }
       finishMergeUnit(scratch, target);
     } else if (!dryRun) retireMergeScratch(scratch);
-  } else if (!dryRun) {
-    cleanMergeScratch(`${scratch}-done`);
   }
-  if (!dryRun) rmSync(pointer);
+  if (!dryRun) rmSync(pointer, { force: true });
 }
 
 function makeMergeScratch(live: string, targetParent: string) {
@@ -696,8 +736,15 @@ function replaceMergeUnit(
         throw error;
       }
     }
-    if (!unchanged(mergeSnapshot(previous)) || lstat(target) !== undefined) return false;
-    writeFileSync(join(scratch, "ready"), JSON.stringify(mergeSnapshot(incoming).hashes));
+    const original = mergeSnapshot(previous);
+    if (!unchanged(original) || lstat(target) !== undefined) return false;
+    writeFileSync(
+      join(scratch, "ready"),
+      JSON.stringify({
+        incoming: mergeFingerprint(mergeSnapshot(incoming)),
+        previous: mergeFingerprint(original),
+      }),
+    );
     renameSync(join(scratch, "ready"), join(scratch, "publish"));
     return true;
   } finally {

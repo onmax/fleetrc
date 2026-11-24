@@ -19,6 +19,7 @@ import {
 } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { paths } from "./paths.ts";
 
 export type Hashes = Record<string, string>;
 
@@ -36,15 +37,39 @@ export const lstat = (path: string): Stats | undefined =>
   lstatSync(path, { throwIfNoEntry: false });
 
 export const isMergeScratch = (name: string) =>
-  /^\.fleetrc-merge-[a-f0-9]{64}-[a-zA-Z0-9]{6}(?:-done)?$/.test(name);
+  /^\.fleetrc-merge-[a-f0-9]{64}-[a-zA-Z0-9]{6}$/.test(name);
+
+function mergeWorkspaces(root: string) {
+  const registry = paths.mergeRecovery();
+  const excluded = new Set<string>();
+  let names: string[];
+  try {
+    names = readdirSync(registry);
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) throw error;
+    names = [];
+  }
+  for (const name of names) {
+    if (!/^[a-f0-9]{64}$/.test(name)) continue;
+    try {
+      const workspace = readFileSync(join(registry, name), "utf8");
+      if (isAbsolute(workspace) && isMergeScratch(basename(workspace))) excluded.add(workspace);
+    } catch (error) {
+      if (!isErrno(error, "ENOENT")) throw error;
+    }
+  }
+  const realRoot = excluded.size && existsSync(root) ? realpathSync(root) : root;
+  return (path: string) => excluded.has(join(realRoot, relative(root, path)));
+}
 
 /** sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target text. */
 export function hashDir(dir: string, entries?: Map<string, Dirent>): Hashes {
   const hashes = dict<string>();
+  const excluded = mergeWorkspaces(dir);
   const walk = (current: string) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
-      if (entry.isDirectory() && isMergeScratch(entry.name)) continue;
       const path = join(current, entry.name);
+      if (entry.isDirectory() && excluded(path)) continue;
       const key = relative(dir, path).split(sep).join("/");
       entries?.set(key, entry);
       if (entry.isDirectory()) walk(path);
@@ -62,10 +87,12 @@ const sorted = (hashes: Hashes): Hashes =>
 /** Every file and link under `dir`, as `/`-separated relative paths. */
 export function listFiles(dir: string): string[] {
   const files: string[] = [];
+  const excluded = mergeWorkspaces(dir);
   const walk = (current: string, prefix: string) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
       if (entry.isDirectory()) {
-        if (!isMergeScratch(entry.name)) walk(join(current, entry.name), `${prefix}${entry.name}/`);
+        const path = join(current, entry.name);
+        if (!excluded(path)) walk(path, `${prefix}${entry.name}/`);
       } else files.push(`${prefix}${entry.name}`);
     }
   };
@@ -143,11 +170,15 @@ interface ResolvedEntry {
 }
 
 /** Every real folder under `root`, links not followed, within the budget. */
-function ownFolders(root: string, budget: ReturnType<typeof skillBudget>): Set<string> {
+function ownFolders(
+  root: string,
+  budget: ReturnType<typeof skillBudget>,
+  excluded: (path: string) => boolean,
+): Set<string> {
   const own = new Set<string>([root]);
   const walk = (dir: string, rel: string) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (!entry.isDirectory() || isMergeScratch(entry.name)) continue;
+      if (!entry.isDirectory() || excluded(join(dir, entry.name))) continue;
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       budget.depth(childRel);
       own.add(join(dir, entry.name));
@@ -172,7 +203,8 @@ function resolvedTree(dir: string, within: string | undefined, dropped: DroppedL
   const entries: ResolvedEntry[] = [];
   const budget = skillBudget();
   const root = realpathSync(dir);
-  const reached = ownFolders(root, skillBudget());
+  const excluded = mergeWorkspaces(root);
+  const reached = ownFolders(root, skillBudget(), excluded);
   const walk = (real: string, rel: string, open: readonly string[]) => {
     for (const name of readdirSync(real)) {
       const path = join(real, name);
@@ -195,7 +227,7 @@ function resolvedTree(dir: string, within: string | undefined, dropped: DroppedL
         }
       }
       if (stat.isDirectory()) {
-        if (isMergeScratch(basename(target))) continue;
+        if (excluded(target)) continue;
         if (open.some((folder) => inside(target, folder))) {
           dropped.push({ path: childRel, reason: "loop" });
           continue;
@@ -255,14 +287,15 @@ if (copiesLog) process.on("exit", () => appendFileSync(copiesLog, `${copiedFiles
  * A file system that can clone a file (Btrfs, XFS, APFS) shares its blocks until either side is
  * written.
  */
-function copyTree(from: string, to: string) {
+function copyTree(from: string, to: string, excluded = mergeWorkspaces(from)) {
   const stat = lstatSync(from);
   if (stat.isSymbolicLink()) symlinkSync(readlinkSync(from), to);
   else if (stat.isDirectory()) {
     mkdirSync(to, { recursive: true });
     for (const entry of readdirSync(from, { withFileTypes: true })) {
-      if (entry.isDirectory() && isMergeScratch(entry.name)) continue;
-      copyTree(join(from, entry.name), join(to, entry.name));
+      const path = join(from, entry.name);
+      if (entry.isDirectory() && excluded(path)) continue;
+      copyTree(path, join(to, entry.name), excluded);
     }
   } else {
     copyFileSync(from, to, constants.COPYFILE_FICLONE);

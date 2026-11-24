@@ -1,6 +1,7 @@
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -10,8 +11,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vite-plus/test";
-import { hashDir, listFiles } from "../src/fs.ts";
+import { describe, expect, it, vi } from "vite-plus/test";
+import { copyDir, hashDir, listFiles } from "../src/fs.ts";
 import {
   clone,
   http,
@@ -426,6 +427,82 @@ describe("edited vendored skills", () => {
     },
   );
 
+  it("does not treat a scratch-shaped local directory as a workspace", async () => {
+    const { m, topic } = await pendingTopicReplacement();
+    const folder = join(topic, `.fleetrc-merge-${"a".repeat(64)}-abcdef`);
+    mkdirSync(folder);
+    const draft = join(folder, "draft.md");
+    writeFileSync(draft, "local draft\n");
+    const copied = join(m.root, "copied-topic");
+    copyDir(topic, copied);
+    expect(read(join(copied, folder.slice(topic.length), "draft.md"))).toBe("local draft\n");
+
+    const merge = await m.run("merge", "tool");
+    expect(merge.stdout, merge.stderr).toContain("conflicts: topic");
+    expect(read(draft)).toBe("local draft\n");
+    expect(read(`${topic}.upstream`)).toBe("topic v2\n");
+  });
+
+  it("keeps a save through an open handle after publication approval", async () => {
+    const { m, topic } = await pendingTopicReplacement();
+    const saved = join(m.root, "saved-path");
+    const interrupted = await mergeWithFilesystemHook(
+      m,
+      `
+      const draft = fs.openSync(${JSON.stringify(join(topic, "notes.md"))}, "a");
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        rename(from, to);
+        if (basename(to) === "unit") fs.writeFileSync(${JSON.stringify(saved)}, to);
+        if (basename(to) === "publish") {
+          fs.writeSync(draft, "saved after approval\\n");
+          process.exit(99);
+        }
+      };
+      `,
+    );
+    expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+    const retry = await m.run("merge", "tool");
+    expect(retry.code, retry.stdout + retry.stderr).toBe(1);
+    expect(retry.stderr).toContain(read(saved));
+    expect(read(join(read(saved), "notes.md"))).toBe("notes v1\nsaved after approval\n");
+  });
+
+  it.each([false, true])(
+    "resumes after creating a directory before recording its identity (publish: %s)",
+    async (publishing) => {
+      const { m, topic } = await pendingTopicReplacement(publishing);
+      const interrupted = await mergeWithFilesystemHook(
+        m,
+        `
+        const rename = fs.renameSync;
+        const mkdir = fs.mkdirSync;
+        fs.renameSync = (from, to) => {
+          if (!${publishing} && basename(to) === "unit") {
+            fs.writeFileSync(from + "/draft.md", "draft");
+          }
+          return rename(from, to);
+        };
+        fs.mkdirSync = (path, ...args) => {
+          const made = mkdir(path, ...args);
+          if (basename(path) === "topic") process.exit(99);
+          return made;
+        };
+        `,
+      );
+      expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+      expect(names(topic)).toEqual([]);
+      const retry = await m.run("merge", "tool");
+      if (publishing) {
+        expect(retry.code, retry.stdout + retry.stderr).toBe(0);
+        expect(read(join(topic, "notes.md"))).toBe("notes v2\n");
+      } else {
+        expect(retry.stdout, retry.stderr).toContain("conflicts: topic");
+        expect(read(join(topic, "draft.md"))).toBe("draft");
+      }
+    },
+  );
+
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
     "resumes restoring a read-only subdirectory without losing a saved draft",
     async () => {
@@ -483,8 +560,13 @@ describe("edited vendored skills", () => {
         expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
         const scratch = readdirSync(live).find((name) => name.startsWith(".fleetrc-merge-"));
         expect(scratch).toBeDefined();
-        expect(Object.keys(hashDir(live))).toEqual(["SKILL.md", "ref.md"]);
-        expect(listFiles(live).sort()).toEqual(["SKILL.md", "ref.md"]);
+        vi.stubEnv("XDG_STATE_HOME", m.env.XDG_STATE_HOME);
+        try {
+          expect(Object.keys(hashDir(live))).toEqual(["SKILL.md", "ref.md"]);
+          expect(listFiles(live).sort()).toEqual(["SKILL.md", "ref.md"]);
+        } finally {
+          vi.unstubAllEnvs();
+        }
         const retry = await m.run("merge", "tool");
         expect(retry.code, retry.stdout + retry.stderr).toBe(0);
         expect(read(topic)).toBe("topic v2\n");
