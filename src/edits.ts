@@ -14,6 +14,7 @@ import {
   statSync,
   type Dirent,
   type Stats,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,7 +30,11 @@ import {
   isMergeScratch,
   isRecord,
   lstat,
+  mergeRecoveryPointer,
+  mergeWorkspaceReceipt,
   moveDir,
+  readMergeRecoveryPointer,
+  registerMergeWorkspace,
   sha256,
 } from "./fs.ts";
 import { itemName, itemPath, parseItemId } from "./files.ts";
@@ -529,20 +534,16 @@ function mergeSnapshot(dir: string) {
 }
 
 const mergeScratchPrefix = (live: string) => `.fleetrc-merge-${sha256(basename(live))}-`;
-const mergeRecoveryPointer = (live: string) => join(paths.mergeRecovery(), sha256(live));
 const savedMergeUnit = (scratch: string) => join(scratch, "previous", "unit");
 const mergeIncoming = (scratch: string) => join(scratch, "incoming");
 const mergeIdentity = (entry: Stats) => `${entry.dev}:${entry.ino}:${entry.birthtimeMs}`;
 
-function mergeFingerprint({ entries, hashes }: ReturnType<typeof mergeSnapshot>) {
-  return sha256(
-    JSON.stringify(
-      [...entries.keys()]
-        .sort()
-        .map((path) => [path, entries.get(path)!.isDirectory(), hashes[path]]),
-    ),
-  );
-}
+const mergeInventory = ({ entries, hashes }: ReturnType<typeof mergeSnapshot>) =>
+  [...entries.keys()]
+    .sort()
+    .map((path) => [path, entries.get(path)!.isDirectory(), hashes[path]] as const);
+const mergeFingerprint = (snapshot: ReturnType<typeof mergeSnapshot>) =>
+  sha256(JSON.stringify(mergeInventory(snapshot)));
 
 /** Fill an empty or partially installed unit, accepting only entries made by this transaction. */
 function publishMergeUnit(scratch: string, unit: string, target: string) {
@@ -563,6 +564,7 @@ function publishMergeUnit(scratch: string, unit: string, target: string) {
       if (readdirSync(to).length > 0) throw occupied();
       const backup = mkdtempSync(join(dirname(scratch), ".fleetrc-unconfirmed-directory-"));
       const preserved = join(backup, basename(to));
+      registerMergeWorkspace(backup);
       process.stderr.write(`merge: preserving unconfirmed directory ${to} at ${preserved}\n`);
       renameSync(to, preserved);
       dest = undefined;
@@ -605,11 +607,56 @@ function cleanMergeScratch(scratch: string) {
   rmSync(scratch, { recursive: true, force: true });
 }
 
-function retireMergeScratch(scratch: string) {
+function retireMergeScratch(scratch: string, original?: ReturnType<typeof mergeSnapshot>) {
   const done = join(scratch, "retired");
-  writeFileSync(done, "");
+  const saved = savedMergeUnit(scratch);
+  const previous = dirname(saved);
+  if (original !== undefined) {
+    writeFileSync(`${done}.tmp`, JSON.stringify(mergeInventory(original)));
+    renameSync(`${done}.tmp`, done);
+  }
+  if (lstat(previous) !== undefined) {
+    const recorded = readFileSync(done, "utf8");
+    const expected = new Map<string, string>(
+      recorded
+        ? (JSON.parse(recorded) as ReturnType<typeof mergeInventory>).map((entry) => [
+            entry[0],
+            JSON.stringify(entry),
+          ])
+        : [],
+    );
+    const changed = () =>
+      new UserError(
+        `merge: cannot retire a changed saved original; previous copy kept at ${saved}. Reconcile the copies, then move the recovery folder ${scratch} aside and retry.`,
+      );
+    const remaining = mergeInventory(mergeSnapshot(previous));
+    if (remaining.some((entry) => expected.get(entry[0]) !== JSON.stringify(entry)))
+      throw changed();
+    for (const [path, directory] of remaining) {
+      if (!directory) continue;
+      const folder = join(previous, path);
+      const entry = lstat(folder);
+      if (!entry?.isDirectory()) throw changed();
+      if ((entry.mode & 0o700) !== 0o700) chmodSync(folder, entry.mode | 0o700);
+    }
+    for (const [path, directory, hash] of remaining.reverse()) {
+      const target = join(previous, path);
+      if (directory) rmdirSync(target);
+      else {
+        const entry = lstat(target);
+        const current = entry?.isSymbolicLink()
+          ? sha256(`link:${readlinkSync(target)}`)
+          : entry?.isFile()
+            ? sha256(readFileSync(target))
+            : undefined;
+        if (entry === undefined || current !== hash || entry.isDirectory()) throw changed();
+        unlinkSync(target);
+      }
+    }
+    rmdirSync(previous);
+  }
   for (const name of readdirSync(scratch)) {
-    if (name !== "retired") cleanMergeScratch(join(scratch, name));
+    if (name !== "retired" && name !== "previous") cleanMergeScratch(join(scratch, name));
   }
   rmSync(done);
   rmdirSync(scratch);
@@ -619,6 +666,7 @@ function retireMergeScratch(scratch: string) {
 function finishMergeUnit(scratch: string, target: string) {
   const saved = savedMergeUnit(scratch);
   const publishing = join(scratch, "publish");
+  let original: ReturnType<typeof mergeSnapshot>;
   try {
     if (existsSync(publishing)) {
       const incoming = mergeIncoming(scratch);
@@ -628,8 +676,10 @@ function finishMergeUnit(scratch: string, target: string) {
         previous?: string;
       };
       const checkPrevious = () => {
-        if (mergeFingerprint(mergeSnapshot(dirname(saved))) !== expected.previous)
+        const snapshot = mergeSnapshot(dirname(saved));
+        if (mergeFingerprint(snapshot) !== expected.previous)
           throw new Error("the saved original no longer matches the publication approval");
+        return snapshot;
       };
       const check = () => {
         if (mergeFingerprint(mergeSnapshot(incoming)) !== expected.incoming)
@@ -641,23 +691,24 @@ function finishMergeUnit(scratch: string, target: string) {
       else if (lstat(target) !== undefined)
         throw new Error(`${target} is occupied by another entry`);
       check();
-      checkPrevious();
-    } else if (lstat(saved) !== undefined) {
-      publishMergeUnit(scratch, saved, target);
+      original = checkPrevious();
+    } else {
+      if (lstat(saved) !== undefined) publishMergeUnit(scratch, saved, target);
+      original = mergeSnapshot(dirname(saved));
     }
   } catch (error) {
     throw new UserError(
       `merge: could not finish replacing ${target} (${(error as Error).message}); ${lstat(saved) ? `previous copy kept at ${saved}. Reconcile the copies, then move the recovery folder ${scratch} aside and retry.` : `move the recovery folder ${scratch} aside and retry.`}`,
     );
   }
-  retireMergeScratch(scratch);
+  retireMergeScratch(scratch, original);
 }
 
 /** Recover before hashing; fallback workspaces beside the target are excluded from skill copies. */
 function recoverMergeUnit(live: string, dryRun: boolean) {
   const pointer = mergeRecoveryPointer(live);
-  if (!existsSync(pointer)) return;
-  const scratch = readFileSync(pointer, "utf8");
+  const scratch = readMergeRecoveryPointer(pointer);
+  if (scratch === undefined) return;
   const scratchParent = dirname(scratch);
   if (
     !isMergeScratch(basename(scratch)) ||
@@ -686,9 +737,12 @@ function recoverMergeUnit(live: string, dryRun: boolean) {
         );
       }
       finishMergeUnit(scratch, target);
-    } else if (!dryRun) retireMergeScratch(scratch);
+    } else if (!dryRun) retireMergeScratch(scratch, mergeSnapshot(dirname(saved)));
   }
-  if (!dryRun) rmSync(pointer, { force: true });
+  if (!dryRun) {
+    rmSync(mergeWorkspaceReceipt(scratch), { force: true });
+    rmSync(pointer, { force: true });
+  }
 }
 
 function makeMergeScratch(live: string, targetParent: string) {
@@ -722,6 +776,7 @@ function replaceMergeUnit(
   const incoming = mergeIncoming(scratch);
   const next = join(incoming, "next");
   try {
+    registerMergeWorkspace(scratch, pointer);
     writeFileSync(`${pointer}.tmp`, scratch);
     renameSync(`${pointer}.tmp`, pointer);
     writeFileSync(join(scratch, "target"), root);
@@ -749,6 +804,7 @@ function replaceMergeUnit(
     return true;
   } finally {
     finishMergeUnit(scratch, target);
+    rmSync(mergeWorkspaceReceipt(scratch), { force: true });
     rmSync(pointer, { force: true });
   }
 }

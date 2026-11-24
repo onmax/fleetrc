@@ -12,7 +12,8 @@ import {
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vite-plus/test";
-import { copyDir, hashDir, listFiles } from "../src/fs.ts";
+import { copyDir, hashDir, listFiles, sha256 } from "../src/fs.ts";
+import { paths } from "../src/paths.ts";
 import {
   clone,
   http,
@@ -449,11 +450,14 @@ describe("edited vendored skills", () => {
     const interrupted = await mergeWithFilesystemHook(
       m,
       `
-      const draft = fs.openSync(${JSON.stringify(join(topic, "notes.md"))}, "a");
+      let draft = process.platform === "win32" ? undefined : fs.openSync(${JSON.stringify(join(topic, "notes.md"))}, "a");
       const rename = fs.renameSync;
       fs.renameSync = (from, to) => {
         rename(from, to);
-        if (basename(to) === "unit") fs.writeFileSync(${JSON.stringify(saved)}, to);
+        if (basename(to) === "unit") {
+          draft ??= fs.openSync(to + "/notes.md", "a");
+          fs.writeFileSync(${JSON.stringify(saved)}, to);
+        }
         if (basename(to) === "publish") {
           fs.writeSync(draft, "saved after approval\\n");
           process.exit(99);
@@ -499,6 +503,123 @@ describe("edited vendored skills", () => {
       } else {
         expect(retry.stdout, retry.stderr).toContain("conflicts: topic");
         expect(read(join(topic, "draft.md"))).toBe("draft");
+      }
+    },
+  );
+
+  it.each(["unchanged", "edited", "partially removed"])(
+    "checks the saved original on retirement retry (%s)",
+    async (state) => {
+      const { m, topic } = await pendingTopicReplacement();
+      const marker = join(m.root, "retirement-path");
+      const partial = state === "partially removed";
+      const edited = state === "edited";
+      const interrupted = await mergeWithFilesystemHook(
+        m,
+        `
+      const write = fs.writeFileSync;
+      const rename = fs.renameSync;
+      const unlink = fs.unlinkSync;
+      const stop = (path) => {
+        if (basename(path) !== "retired") return;
+        write(${JSON.stringify(marker)}, dirname(path));
+        if (!${partial}) process.exit(99);
+      };
+      fs.writeFileSync = (path, ...args) => { write(path, ...args); stop(path); };
+      fs.renameSync = (from, to) => { rename(from, to); stop(to); };
+      fs.unlinkSync = (path) => {
+        unlink(path);
+        if (${partial} && basename(path) === "notes.md" && basename(dirname(path)) === "unit") process.exit(99);
+      };
+    `,
+      );
+      expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+      const saved = join(read(marker), "previous", "unit", "notes.md");
+      if (edited) writeFileSync(saved, "late draft\n");
+      const retry = await m.run("merge", "tool");
+      expect(retry.code, retry.stdout + retry.stderr).toBe(edited ? 1 : 0);
+      if (edited) {
+        expect(retry.stderr).toContain(dirname(saved));
+        expect(read(saved)).toBe("late draft\n");
+      } else expect(existsSync(saved)).toBe(false);
+      expect(read(topic)).toBe("topic v2\n");
+    },
+  );
+
+  it("omits a preserved fallback backup from skill walks after recovery", async () => {
+    const { m, topic } = await pendingTopicReplacement(true);
+    const live = realpathSync(dirname(topic));
+    const interrupted = await mergeWithFilesystemHook(
+      m,
+      `
+      const mkdtemp = fs.mkdtempSync;
+      const mkdir = fs.mkdirSync;
+      fs.mkdtempSync = (prefix, ...args) => {
+        if (dirname(prefix) === ${JSON.stringify(dirname(live))} && basename(prefix).startsWith(".fleetrc-merge-")) {
+          throw Object.assign(new Error("read-only skill parent"), { code: "EACCES" });
+        }
+        return mkdtemp(prefix, ...args);
+      };
+      fs.mkdirSync = (path, ...args) => {
+        const made = mkdir(path, ...args);
+        if (basename(path) === "topic") process.exit(99);
+        return made;
+      };
+    `,
+    );
+    expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+    const moved = join(m.root, "preserved-path");
+    const retry = await mergeWithFilesystemHook(
+      m,
+      `
+      const rename = fs.renameSync;
+      fs.renameSync = (from, to) => {
+        if (basename(from) === "topic" && basename(to) === "topic") {
+          fs.writeFileSync(from + "/draft.md", "late draft\\n");
+          fs.writeFileSync(${JSON.stringify(moved)}, to);
+        }
+        return rename(from, to);
+      };
+    `,
+    );
+    expect(retry.code, retry.stdout + retry.stderr).toBe(0);
+    const preserved = read(moved);
+    expect(read(join(preserved, "draft.md"))).toBe("late draft\n");
+    vi.stubEnv("XDG_STATE_HOME", m.env.XDG_STATE_HOME);
+    try {
+      const expected = ["SKILL.md", "ref.md", "topic/extra.md", "topic/notes.md"];
+      expect(Object.keys(hashDir(live))).toEqual(expected);
+      expect(listFiles(live).sort()).toEqual(expected);
+      const copied = join(m.root, "copied-skill");
+      copyDir(live, copied);
+      expect(listFiles(copied).sort()).toEqual(expected);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(retry.stdout + retry.stderr).toContain(preserved);
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "only blocks trees affected by an unreadable merge pointer",
+    () => {
+      const m = machine();
+      const live = join(realpathSync(m.root), "skill");
+      const scratch = join(live, `.fleetrc-merge-${sha256("skill")}-abcdef`);
+      const unrelated = join(realpathSync(m.root), "unrelated");
+      mkdirSync(scratch, { recursive: true });
+      mkdirSync(unrelated);
+      writeFileSync(join(scratch, "draft.md"), "private draft\n");
+      writeFileSync(join(unrelated, "build.js"), "build\n");
+      vi.stubEnv("XDG_STATE_HOME", m.env.XDG_STATE_HOME);
+      const pointer = join(paths.mergeRecovery(), sha256(live));
+      try {
+        mkdirSync(dirname(pointer), { recursive: true });
+        writeFileSync(pointer, scratch, { mode: 0o000 });
+        expect(Object.keys(hashDir(unrelated))).toEqual(["build.js"]);
+        expect(() => hashDir(live)).toThrow(pointer);
+        expect(() => copyDir(live, join(m.root, "copy"))).toThrow(pointer);
+      } finally {
+        vi.unstubAllEnvs();
       }
     },
   );

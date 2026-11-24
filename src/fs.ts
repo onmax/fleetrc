@@ -39,27 +39,51 @@ export const lstat = (path: string): Stats | undefined =>
 export const isMergeScratch = (name: string) =>
   /^\.fleetrc-merge-[a-f0-9]{64}-[a-zA-Z0-9]{6}$/.test(name);
 
-function mergeWorkspaces(root: string) {
-  const registry = paths.mergeRecovery();
-  const excluded = new Set<string>();
-  let names: string[];
+export const mergeRecoveryPointer = (live: string) => join(paths.mergeRecovery(), sha256(live));
+export const mergeWorkspaceReceipt = (workspace: string) =>
+  join(paths.mergeRecovery(), `workspace-${sha256(workspace)}`);
+
+export function readMergeRecoveryPointer(pointer: string) {
   try {
-    names = readdirSync(registry);
+    return readFileSync(pointer, "utf8");
   } catch (error) {
-    if (!isErrno(error, "ENOENT")) throw error;
-    names = [];
+    if (isErrno(error, "ENOENT")) return undefined;
+    throw new Error(`merge: cannot read recovery record ${pointer}; restore access and retry`, {
+      cause: error,
+    });
   }
-  for (const name of names) {
-    if (!/^[a-f0-9]{64}$/.test(name)) continue;
-    try {
-      const workspace = readFileSync(join(registry, name), "utf8");
-      if (isAbsolute(workspace) && isMergeScratch(basename(workspace))) excluded.add(workspace);
-    } catch (error) {
-      if (!isErrno(error, "ENOENT")) throw error;
+}
+
+export function registerMergeWorkspace(workspace: string, pointer = "preserved") {
+  const receipt = mergeWorkspaceReceipt(workspace);
+  mkdirSync(dirname(receipt), { recursive: true });
+  writeFileSync(receipt, pointer, { flag: "wx" });
+}
+
+function mergeWorkspaces(root: string) {
+  let realRoot: string | undefined;
+  return (path: string) => {
+    const name = basename(path);
+    const scratch = isMergeScratch(name);
+    if (!scratch && !/^\.fleetrc-unconfirmed-directory-[a-zA-Z0-9]{6}$/.test(name)) return false;
+    const canonical = inside(root, path)
+      ? join((realRoot ??= realpathSync(root)), relative(root, path))
+      : path;
+    const receipt = readMergeRecoveryPointer(mergeWorkspaceReceipt(canonical));
+    if (receipt !== undefined) {
+      if (receipt !== "preserved") readMergeRecoveryPointer(receipt);
+      return true;
     }
-  }
-  const realRoot = excluded.size && existsSync(root) ? realpathSync(root) : root;
-  return (path: string) => excluded.has(join(realRoot, relative(root, path)));
+    if (!scratch) return false;
+    for (let ancestor = dirname(canonical); ; ancestor = dirname(ancestor)) {
+      if (
+        name.startsWith(`.fleetrc-merge-${sha256(basename(ancestor))}-`) &&
+        readMergeRecoveryPointer(mergeRecoveryPointer(ancestor)) === canonical
+      )
+        return true;
+      if (ancestor === dirname(ancestor)) return false;
+    }
+  };
 }
 
 /** sha256 of every file under `dir`, keyed by `/`-separated relative path. Links hash their target text. */
