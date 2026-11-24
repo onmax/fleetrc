@@ -1145,6 +1145,56 @@ describe("init", () => {
     expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
   });
 
+  it("migrates a matching copy when the cached default branch advances during init", async () => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const previewTip = upstream.head();
+    const updated = skillMd("tool", "upstream update");
+    const liveTip = upstream.commit({ "skills/tool/SKILL.md": updated });
+    const lagging = m.at("lagging.git");
+    m.git(m.home, "init", "--quiet", "--bare", lagging);
+    m.git(upstream.work, "push", "--quiet", lagging, `${previewTip}:refs/heads/main`);
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 1,
+        skills: { tool: { source: lagging, skillPath: "skills/tool/SKILL.md" } },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+    const liveConfig = m.at("live-cache.gitconfig");
+    m.git(
+      work,
+      "config",
+      "--file",
+      liveConfig,
+      `url.${pathToFileURL(upstream.url).href}.insteadOf`,
+      lagging,
+    );
+    m.git(
+      work,
+      "config",
+      "--global",
+      `includeIf.gitdir/i:${join(m.stateDir, "cache", "git", "*.git").replaceAll("\\", "/")}.path`,
+      liveConfig,
+    );
+
+    const init = await m.run("init", manifest, "--no-hooks", "--json");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const { sync } = JSON.parse(init.stdout) as { sync: Report };
+    expect(sync.sources).toContainEqual(expect.objectContaining({ id: "lagging", to: liveTip }));
+    expect(existsSync(join(work, "skills/tool"))).toBe(false);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(updated);
+
+    m.git(upstream.work, "push", "--quiet", lagging, "HEAD:refs/heads/main");
+    const retry = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+    expect(retry.imports.forks).not.toHaveProperty("tool");
+  });
+
   it("can migrate a matching copy after adopting an unrelated copied command edit", async () => {
     const m = machine({ scheduler: "empty" });
     const upstream = remote(m, "upstream", skills("skills/", "tool"));

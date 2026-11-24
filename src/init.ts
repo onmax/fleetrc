@@ -48,7 +48,7 @@ export type Migration =
       path: string;
       reason: string;
       within?: string;
-      replacement?: { name: string; source: string; commit: string; localTree: string };
+      replacement?: { name: string; source: string; commit?: string; localTree: string };
     }
   /** `within`: the working clone `to` is in, which `to` must not lead out of through a link. */
   | { kind: "adopt"; path: string; to: string; within?: string };
@@ -431,7 +431,12 @@ export async function planInit(
           kind: "backup",
           path,
           within,
-          replacement: { name: entry.name, source: source.id, commit, localTree },
+          replacement: {
+            name: entry.name,
+            source: source.id,
+            commit: source.kind === "git" && !source.ref ? undefined : commit,
+            localTree,
+          },
           reason: `it has no edits, so ${entry.source} links ${entry.name} instead; commit its removal`,
         });
         continue;
@@ -832,7 +837,10 @@ export function applySkillBackups(
     if (
       winner?.name === replacement.name &&
       winner.result.id === replacement.source &&
-      winner.result.to === replacement.commit &&
+      winner.result.to !== undefined &&
+      (replacement.commit === undefined
+        ? winner.result.kind === "git"
+        : winner.result.to === replacement.commit) &&
       winner.result.status !== "error" &&
       winner.result.status !== "offline" &&
       real !== undefined &&
