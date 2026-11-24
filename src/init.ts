@@ -389,9 +389,10 @@ export async function planInit(
         gitUrl(source.git) === gitUrl(entry.source) &&
         (!ref || source.ref === ref);
       if (matches && source.kind === "clone" && !cloneSkills.has(source.id)) {
+        const previewCommit = report.sources.find(({ id }) => id === source.id)?.to;
         const probe = mkdtempSync(join(scratch, "replacement-"));
         try {
-          cloneSkills.set(source.id, await confirmCloneSkills(source, join(probe, "checkout")));
+          cloneSkills.set(source.id, await confirmCloneSkills(source, probe, previewCommit));
         } catch (error) {
           cloneSkills.set(source.id, new Set());
           warnings.push(

@@ -629,6 +629,7 @@ export async function syncClone(
             join(ctx.cacheDir, "git"),
           );
           out.skills = await discoverInPlace(source, upstream.dir, out.warnings);
+          out.to = upstream.commit;
         } catch (error) {
           out.warnings.push(`${source.id}: cannot read ${gitUrl(source.git)}: ${message(error)}`);
         }
@@ -674,10 +675,10 @@ export async function syncClone(
 }
 
 /** Clones a working clone at its `ref`: a branch or tag, or else a commit, checked out detached. */
-export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: string) {
+export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: string, runGit = git) {
   const url = gitUrl(source.git);
   const clone = (ref?: string) =>
-    git(["clone", "--quiet", ...(ref ? ["--branch", ref] : []), "--", url, dir], {
+    runGit(["clone", "--quiet", ...(ref ? ["--branch", ref] : []), "--", url, dir], {
       timeoutMs: 600_000,
       allowFail: true,
     });
@@ -691,9 +692,9 @@ export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: str
   cloned = await clone();
   if (cloned.code !== 0) throw new GitError(["clone", "--", url, dir], cloned);
   try {
-    const commit = await findCommit(dir, ref);
+    const commit = await findCommit(dir, ref, runGit);
     if (!commit) throw new Error(`${url} has no branch, tag or commit ${ref}`);
-    await git(["checkout", "--quiet", "--detach", commit], { cwd: dir });
+    await runGit(["checkout", "--quiet", "--detach", commit], { cwd: dir });
   } catch (error) {
     // Nobody worked in a clone made a moment ago, and left on the default branch it would follow it.
     rmSync(dir, { recursive: true, force: true });
@@ -702,9 +703,22 @@ export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: str
 }
 
 /** Checks what live sync can actually link before init removes a personal copy. */
-export async function confirmCloneSkills(source: CloneSource, probe: string): Promise<Set<string>> {
+export async function confirmCloneSkills(
+  source: CloneSource,
+  scratch: string,
+  previewCommit: string | undefined,
+): Promise<Set<string>> {
+  if (!previewCommit) return new Set();
   const existing = existsSync(join(source.path, ".git"));
-  if (!existing || source.ref) await cloneAt(source, probe);
+  const probe = join(scratch, "checkout");
+  if (!existing || source.ref) {
+    const hooks = join(scratch, "empty-hooks");
+    mkdirSync(hooks);
+    await cloneAt(source, probe, (args, options) =>
+      git(["-c", `core.hooksPath=${hooks}`, ...args], options),
+    );
+    if ((await gitOut(["rev-parse", "HEAD"], probe)) !== previewCommit) return new Set();
+  }
   if (existing && source.ref) {
     const checkout = async (dir: string) => {
       const commit = await gitOut(["rev-parse", "HEAD"], dir);
@@ -734,9 +748,9 @@ export async function confirmCloneSkills(source: CloneSource, probe: string): Pr
 }
 
 /** The commit a ref names in a clone, fetching it from origin when the clone does not have it. */
-async function findCommit(dir: string, ref: string): Promise<string | undefined> {
+async function findCommit(dir: string, ref: string, runGit = git): Promise<string | undefined> {
   const resolve = async () => {
-    const found = await git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+    const found = await runGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
       cwd: dir,
       allowFail: true,
     });
@@ -746,7 +760,7 @@ async function findCommit(dir: string, ref: string): Promise<string | undefined>
   if (known) return known;
   // A commit on no branch is fetched by its full id; a shorter one can only be looked up locally.
   if (ref.length !== 40) return undefined;
-  const fetched = await git(["fetch", "--quiet", "--", "origin", ref], {
+  const fetched = await runGit(["fetch", "--quiet", "--", "origin", ref], {
     cwd: dir,
     allowFail: true,
     timeoutMs: 300_000,

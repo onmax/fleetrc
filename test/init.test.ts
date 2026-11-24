@@ -892,21 +892,37 @@ describe("init", () => {
     "same-tip tracking branch",
     "right tracking branch",
     "full ref",
+    "ambiguous ref",
+    "moving branch with lock commit",
   ])("only migrates a ref-specific copy to a verified replacement (%s)", async (scenario) => {
     const m = machine({ scheduler: "empty" });
     const upstream = remote(m, "upstream", skills("skills/", "tool"));
     const base = upstream.head();
     const branch = scenario === "hex branch" ? "deadbee" : "stable";
-    m.git(upstream.work, "push", "origin", `HEAD:refs/heads/${branch}`);
+    const advancedBranch =
+      scenario === "ambiguous ref" || scenario === "moving branch with lock commit";
+    if (scenario === "ambiguous ref") {
+      m.git(upstream.work, "tag", branch);
+      m.git(upstream.work, "push", "origin", `refs/tags/${branch}`);
+    }
+    if (!advancedBranch) m.git(upstream.work, "push", "origin", `HEAD:refs/heads/${branch}`);
     if (scenario !== "same-tip tracking branch")
       upstream.commit({ "skills/tool/SKILL.md": skillMd("tool", "main only") });
+    if (advancedBranch) m.git(upstream.work, "push", "origin", `HEAD:refs/heads/${branch}`);
     const ref =
       scenario === "commit" ? base : scenario === "full ref" ? `refs/heads/${branch}` : branch;
     const personal = remote(m, "personal", {
       ...skills("skills/", "tool"),
       "skills-lock.json": JSON.stringify({
         version: 2,
-        skills: { tool: { source: upstream.url, ref, skillPath: "skills/tool/SKILL.md" } },
+        skills: {
+          tool: {
+            source: upstream.url,
+            ref,
+            ...(scenario === "moving branch with lock commit" ? { commit: base } : {}),
+            skillPath: "skills/tool/SKILL.md",
+          },
+        },
       }),
     });
     const work = clone(m, personal, "code/skills");
@@ -922,7 +938,12 @@ describe("init", () => {
         ...(["commit", "hex branch"].includes(scenario) ? [] : [replacement]),
       ],
     });
-    const keep = ["wrong tracking branch", "same-tip tracking branch", "full ref"].includes(scenario);
+    const keep = [
+      "wrong tracking branch",
+      "same-tip tracking branch",
+      "full ref",
+      "ambiguous ref",
+    ].includes(scenario);
     const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
     expect(
       plan.migrations.some(
@@ -932,8 +953,46 @@ describe("init", () => {
     const init = await m.run("init", manifest, "--no-hooks");
     expect(init.code, init.stdout + init.stderr).toBe(scenario === "full ref" ? 1 : 0);
     expect(existsSync(join(work, "skills/tool"))).toBe(keep);
-    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(
+      scenario === "moving branch with lock commit" ? skillMd("tool", "main only") : skillMd("tool"),
+    );
     expect(JSON.parse(read(manifest)).sources[1]).toMatchObject({ git: upstream.url, ref });
+  });
+
+  it.skipIf(isWindows)("suppresses checkout hooks only for the replacement probe", async () => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const ref = upstream.head();
+    upstream.commit({ "skills/tool/SKILL.md": skillMd("tool", "main only") });
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 2,
+        skills: { tool: { source: upstream.url, ref, skillPath: "skills/tool/SKILL.md" } },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [
+        { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+        { id: "upstream", git: upstream.url, ref, path: m.at("code/upstream") },
+      ],
+    });
+    const hooks = m.at("git-hooks");
+    writeFiles(hooks, { "post-checkout": '#!/bin/sh\necho checkout >> "$HOME/checkouts"\n' });
+    chmodSync(join(hooks, "post-checkout"), 0o755);
+    m.git(work, "config", "--global", "core.hooksPath", hooks);
+
+    const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+    expect(plan.migrations).toContainEqual(
+      expect.objectContaining({ kind: "backup", path: join(work, "skills/tool") }),
+    );
+    expect(existsSync(m.at("checkouts"))).toBe(false);
+    const init = await m.run("init", manifest, "--no-hooks");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    expect(read(m.at("checkouts"))).toBe("checkout\ncheckout\n");
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
   });
 
   it("can migrate a matching copy after adopting an unrelated copied command edit", async () => {
