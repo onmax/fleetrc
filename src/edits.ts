@@ -562,11 +562,18 @@ function publishMergeUnit(scratch: string, unit: string, target: string) {
     const intent = `${record}.creating`;
     if (dest?.isDirectory() && !existsSync(record) && existsSync(intent)) {
       if (readdirSync(to).length > 0) throw occupied();
-      const backup = mkdtempSync(join(dirname(scratch), ".fleetrc-unconfirmed-directory-"));
+      const backupRoot = paths.backup();
+      mkdirSync(backupRoot, { recursive: true });
+      const backup = mkdtempSync(join(backupRoot, "merge-unconfirmed-"));
       const preserved = join(backup, basename(to));
-      registerMergeWorkspace(backup);
       process.stderr.write(`merge: preserving unconfirmed directory ${to} at ${preserved}\n`);
-      renameSync(to, preserved);
+      try {
+        renameSync(to, preserved);
+      } catch (error) {
+        throw new Error(`cannot move ${to} safely to ${preserved}; left it in place`, {
+          cause: error,
+        });
+      }
       dest = undefined;
     }
     if (dest === undefined) {
@@ -1150,6 +1157,11 @@ export async function forkSkill(
   const store = storePaths(paths.store(source.id), name);
   if (!existsSync(store.live))
     throw new UserError(`${name} has no copy on this machine yet; run \`fleetrc sync\``);
+  const recovery = readMergeRecoveryPointer(mergeRecoveryPointer(realpathSync(store.live)));
+  if (recovery !== undefined)
+    throw new UserError(
+      `${name} has an interrupted merge at ${recovery}; run \`fleetrc merge ${name}\` before forking`,
+    );
   const sourceState = state.sources[source.id]!;
   const installed = sourceState.skills[name];
   if (existsSync(store.upstream)) {

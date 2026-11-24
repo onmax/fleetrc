@@ -546,7 +546,7 @@ describe("edited vendored skills", () => {
     },
   );
 
-  it("omits a preserved fallback backup from skill walks after recovery", async () => {
+  it("keeps a preserved fallback backup out of skill walks and through a fork", async () => {
     const { m, topic } = await pendingTopicReplacement(true);
     const live = realpathSync(dirname(topic));
     const interrupted = await mergeWithFilesystemHook(
@@ -568,6 +568,9 @@ describe("edited vendored skills", () => {
     `,
     );
     expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+    const earlyFork = await m.run("fork", "tool");
+    expect(earlyFork.code, earlyFork.stdout + earlyFork.stderr).toBe(1);
+    expect(earlyFork.stderr).toContain("run `fleetrc merge tool` before forking");
     const moved = join(m.root, "preserved-path");
     const retry = await mergeWithFilesystemHook(
       m,
@@ -585,9 +588,9 @@ describe("edited vendored skills", () => {
     expect(retry.code, retry.stdout + retry.stderr).toBe(0);
     const preserved = read(moved);
     expect(read(join(preserved, "draft.md"))).toBe("late draft\n");
+    const expected = ["SKILL.md", "ref.md", "topic/extra.md", "topic/notes.md"];
     vi.stubEnv("XDG_STATE_HOME", m.env.XDG_STATE_HOME);
     try {
-      const expected = ["SKILL.md", "ref.md", "topic/extra.md", "topic/notes.md"];
       expect(Object.keys(hashDir(live))).toEqual(expected);
       expect(listFiles(live).sort()).toEqual(expected);
       const copied = join(m.root, "copied-skill");
@@ -597,6 +600,11 @@ describe("edited vendored skills", () => {
       vi.unstubAllEnvs();
     }
     expect(retry.stdout + retry.stderr).toContain(preserved);
+    const fork = await m.run("fork", "tool");
+    expect(fork.code, fork.stdout + fork.stderr).toBe(0);
+    expect(existsSync(live)).toBe(false);
+    expect(read(join(preserved, "draft.md"))).toBe("late draft\n");
+    expect(listFiles(m.at("code/skills/skills/tool")).sort()).toEqual(expected);
   });
 
   it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
