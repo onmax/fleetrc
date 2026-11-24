@@ -53,6 +53,7 @@ import {
   readConfig,
   remoteManifest,
   sameManifest,
+  type Source,
   stagePolicyManifest,
   tailnetManifestSpec,
   writeConfig,
@@ -62,7 +63,13 @@ import { paths, tildify } from "./paths.ts";
 import { LOCK_MAX_AGE_MS, LockHeldError, lockText, readLock, takeLock } from "./lock.ts";
 import type { HookRun, Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
-import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sources.ts";
+import {
+  failedResult,
+  prefetchGitSources,
+  type SourceResult,
+  sourceFiles,
+  syncSource,
+} from "./sources.ts";
 import { loadState, sourceState, type State, StateFile } from "./state.ts";
 import { scheduleDrift } from "./timer.ts";
 import { version } from "./version.ts";
@@ -454,7 +461,9 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   const startedAt = new Date().toISOString();
   const dryRun = options.dryRun ?? false;
   const offline = options.offline ?? false;
-  const scratch = dryRun ? mkdtempSync(join(tmpdir(), "fleetrc-dry-")) : undefined;
+  // A dry run fetches into a scratch cache, so the real one never moves past what was synced.
+  // Offline it fetches nothing, so it reads the real cache: a scratch one would be empty.
+  const scratch = dryRun && !offline ? mkdtempSync(join(tmpdir(), "fleetrc-dry-")) : undefined;
   const lock = dryRun ? { release: () => {} } : acquireLock();
   if (!dryRun) sweepJsonTemps();
   const warnings: string[] = lock.note ? [lock.note] : [];
@@ -462,13 +471,23 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   // anyway lets go of the lock and says so, and the next timer run starts over.
   let doing = "loading the manifest";
   const limit = syncTimeoutMs();
-  const watchdog = setTimeout(() => {
-    stopAll();
+  let prefetch: ReturnType<typeof prefetchGitSources> | undefined;
+  let onTimeout: Promise<never> | undefined;
+  const cleanUp = () => {
     lock.release();
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
+  };
+  const stopSync = async () => {
+    await prefetch?.finish();
+    stopAll();
+    cleanUp();
     process.stderr.write(
       `fleetrc: the sync was stopped after ${limit >= 60_000 ? `${Math.round(limit / 60_000)} minutes` : `${limit / 1000} s`} while ${doing}; its lock is released, and the next sync starts over\n`,
     );
     process.exit(1);
+  };
+  const watchdog = setTimeout(() => {
+    onTimeout = stopSync();
   }, limit);
   watchdog.unref();
   try {
@@ -487,6 +506,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       candidate?.loaded ??
       (await loadManifest(policy.spec, {
         offline,
+        readOnly: dryRun && offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
       }));
     // The repository has no manifest at the new default place yet, so the policy's spec loaded the
@@ -530,6 +550,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         .map(([name, record]) => ({ name, dir: record.dir }));
     const backupRoot = join(paths.backup(), startedAt.replace(/[:.]/g, "-"));
     const results: SourceResult[] = [];
+    const cacheDir = scratch ?? paths.cache();
+    const fetchedNow = (source: Source) =>
+      !offline && (options.only === undefined || options.only === source.id);
+    prefetch = prefetchGitSources(loaded.sources.filter(fetchedNow), cacheDir, dryRun);
     for (const source of loaded.sources) {
       await yieldToWatchdog();
       const before = state.sources[source.id];
@@ -545,11 +569,12 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           }
       }
       const ctx = {
-        offline: offline || (options.only !== undefined && options.only !== source.id),
+        offline: !fetchedNow(source),
         offlineRequested: offline,
         dryRun,
         apply: options.apply === source.id,
-        cacheDir: scratch ?? paths.cache(),
+        cacheDir,
+        fetchGit: prefetch.fetch,
         storeDir: paths.store(source.id),
         now: startedAt,
         fileLinks: state.links,
@@ -898,8 +923,9 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     return report;
   } finally {
     clearTimeout(watchdog);
-    lock.release();
-    if (scratch) rmSync(scratch, { recursive: true, force: true });
+    if (onTimeout) await onTimeout;
+    await prefetch?.finish();
+    cleanUp();
   }
 }
 

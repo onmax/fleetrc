@@ -786,6 +786,7 @@ function repoIdentity(spec: string): string | undefined {
 
 interface LocateOptions {
   offline?: boolean;
+  readOnly?: boolean;
   cacheRoot?: string;
   base?: string;
   checkout?: typeof fetchClone;
@@ -964,6 +965,7 @@ async function locate(
   spec: string,
   {
     offline = false,
+    readOnly = false,
     cacheRoot = join(paths.cache(), "manifests"),
     base = process.cwd(),
     checkout = fetchClone,
@@ -993,7 +995,7 @@ async function locate(
     const problem = await check(remote.repo);
     if (problem) throw new ManifestError(problem);
   }
-  const clone = await checkout(url, remote.ref, cacheRoot, { offline, check });
+  const clone = await checkout(url, remote.ref, cacheRoot, { offline, readOnly, check });
   const file = otherDefault(clone.dir, remote.path);
   if (!existsSync(file))
     throw new ManifestError(
@@ -1159,10 +1161,10 @@ export interface UrlRewrite {
  * The `url.<base>.insteadOf` and `pushInsteadOf` rules git reads in `cwd`: from the system,
  * global and repository config, and from the environment (GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS).
  */
-export async function urlRewrites(cwd = tmpdir()): Promise<UrlRewrite[]> {
+export async function urlRewrites(cwd = tmpdir(), signal?: AbortSignal): Promise<UrlRewrite[]> {
   const run = await git(
     ["config", "--includes", "-z", "--get-regexp", "^url\\..*\\.(insteadof|pushinsteadof)$"],
-    { cwd, allowFail: true },
+    { cwd, allowFail: true, signal },
   );
   if (run.code !== 0) return [];
   return run.stdout
@@ -1219,13 +1221,17 @@ const otherMachine = (url: string) => remoteTransport(url) && !isLocalHost(url);
  * another machine. Git is asked in `cwd` which URL it fetches, so every rewrite it would apply
  * counts, wherever it is configured; `pushInsteadOf` rules count too.
  */
-export async function teamGitProblem(spec: string, cwd = tmpdir()): Promise<string | undefined> {
+export async function teamGitProblem(
+  spec: string,
+  cwd = tmpdir(),
+  signal?: AbortSignal,
+): Promise<string | undefined> {
   const url = gitUrl(spec);
   const asked = url.startsWith("-")
     ? undefined
-    : await git(["ls-remote", "--get-url", "--", url], { cwd, allowFail: true });
+    : await git(["ls-remote", "--get-url", "--", url], { cwd, allowFail: true, signal });
   const fetched = asked?.code === 0 ? asked.stdout.trim() : undefined;
-  const pushed = rewriteUrl(url, await urlRewrites(cwd), true);
+  const pushed = rewriteUrl(url, await urlRewrites(cwd, signal), true);
   const to = [fetched, pushed].find((rewritten) => rewritten !== url);
   const rewrite = to ? `, which your git config rewrites to ${to}` : "";
   const urls = [url, fetched, pushed];
@@ -1237,7 +1243,11 @@ export async function teamGitProblem(spec: string, cwd = tmpdir()): Promise<stri
     const targets = new Set([fetched, `${fetched.replace(/\/$/, "")}/`]);
     for (const target of targets) {
       const config = ["config", "--type=bool", "--get-urlmatch", "http.followRedirects", target];
-      const redirects = await git([...NO_GIT_REDIRECTS, ...config], { cwd, allowFail: true });
+      const redirects = await git([...NO_GIT_REDIRECTS, ...config], {
+        cwd,
+        allowFail: true,
+        signal,
+      });
       if (redirects.code !== 0 || redirects.stdout.trim() !== "false")
         return `cannot fetch team repository ${spec}${rewrite} with Git redirects disabled; check URL-specific http.followRedirects settings`;
     }
@@ -1312,11 +1322,12 @@ const ROOT_ONLY_SOURCE_KEYS = {
  */
 export async function loadManifest(
   spec: string,
-  { cacheRoot, offline = false, checkout }: LocateOptions = {},
+  { cacheRoot, offline = false, readOnly = false, checkout }: LocateOptions = {},
 ): Promise<LoadedManifest> {
   const options = {
     cacheRoot,
     offline,
+    readOnly,
     checkout:
       checkout ?? (cacheRoot === undefined ? manifestCheckoutRoute(spec).checkout : undefined),
   };
