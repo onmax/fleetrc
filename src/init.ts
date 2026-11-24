@@ -5,7 +5,7 @@ import { listSkills } from "skills";
 import { agentTargets, aliasOf, codexLegacyDir } from "./agents.ts";
 import { confine, personalSkillsDir, personalSource } from "./edits.ts";
 import { UserError } from "./errors.ts";
-import { dict, hashDir, inside, isRecord, lstat, moveDir, readJsonFile, sameTree } from "./fs.ts";
+import { dict, hashDir, inside, isRecord, lstat, moveDir, readJsonFile, sha256 } from "./fs.ts";
 import { type DesiredLink, linkTarget, readTargetManifest, removeLink } from "./linker.ts";
 import {
   defaultSourceId,
@@ -26,7 +26,7 @@ import type { Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
 import { git, GitError } from "./exec.ts";
 import { fetchClone, gitUrl } from "./gitcache.ts";
-import { cloneAt, confirmCloneSkills } from "./sources.ts";
+import { cloneAt, confirmCloneSkills, type SourceResult } from "./sources.ts";
 import { sync } from "./sync.ts";
 
 export type Migration =
@@ -34,7 +34,13 @@ export type Migration =
   | { kind: "clone"; source: string; git: string; ref?: string; path: string }
   | { kind: "unfold"; dir: string; target: string }
   | { kind: "unlink"; path: string; target: string }
-  | { kind: "backup"; path: string; reason: string; within?: string }
+  | {
+      kind: "backup";
+      path: string;
+      reason: string;
+      within?: string;
+      replacement?: { name: string; source: string; commit: string; localTree: string };
+    }
   /** `within`: the working clone `to` is in, which `to` must not lead out of through a link. */
   | { kind: "adopt"; path: string; to: string; within?: string };
 
@@ -129,16 +135,29 @@ async function hasLocalGitHead(path: string): Promise<boolean> {
   return object.code === 0 && object.stdout.trim() === "commit";
 }
 
-/**
- * Whether the local copy of a lock entry has the same files as its upstream folder, at the
- * lock's commit, its ref, or the default HEAD, in that order. Undefined when that can't be told.
- */
-async function sameAsUpstream(
+function treeSignature(dir: string): string {
+  return sha256(
+    JSON.stringify(
+      Object.entries(hashDir(dir)).map(([file, hash]) => {
+        const stat = lstat(join(dir, file));
+        return [
+          file,
+          hash,
+          stat?.isFile(),
+          stat?.isFile() && process.platform !== "win32" ? stat.mode & 0o111 : 0,
+        ];
+      }),
+    ),
+  );
+}
+
+/** The local tree signature, if it matches the lock commit, ref or default HEAD. */
+async function matchingTree(
   entry: LockEntry,
   local: string,
   cacheRoot: string,
   notes: string[],
-): Promise<boolean | undefined> {
+): Promise<string | undefined> {
   if (entry.sourceType === "local" || entry.sourceType === "well-known") return undefined;
   try {
     if (entry.ref?.startsWith("-")) return undefined;
@@ -149,18 +168,8 @@ async function sameAsUpstream(
     );
     const dir = join(clone.dir, entry.skillPath ? dirname(entry.skillPath) : entry.name);
     confine(clone.dir, dir, "compare it with the local copy");
-    const localFiles = hashDir(local);
-    if (!sameTree(localFiles, hashDir(dir))) return false;
-    return Object.keys(localFiles).every((file) => {
-      const localStat = lstat(join(local, file));
-      const upstreamStat = lstat(join(dir, file));
-      if (!localStat || !upstreamStat || localStat.isFile() !== upstreamStat.isFile()) return false;
-      return (
-        process.platform === "win32" ||
-        !localStat.isFile() ||
-        (localStat.mode & 0o111) === (upstreamStat.mode & 0o111)
-      );
-    });
+    const localTree = treeSignature(local);
+    return localTree === treeSignature(dir) ? localTree : undefined;
   } catch (error) {
     notes.push(
       `could not compare ${entry.name} with ${entry.source} (${(error as Error).message}), so it is recorded as a fork`,
@@ -175,6 +184,7 @@ interface LockCopy {
   path: string;
   within: string;
   real: string;
+  localTree: string;
   addedSource?: Record<string, unknown> & { include: string[] };
 }
 
@@ -275,7 +285,8 @@ async function collectImports(
         if (!(error instanceof UserError)) throw error;
         imports.notes.push(`${error.message}; the local copy stays in place`);
       }
-      if (real && (await sameAsUpstream(localEntry, local, cacheRoot, imports.notes))) {
+      const localTree = real && (await matchingTree(localEntry, local, cacheRoot, imports.notes));
+      if (real && localTree) {
         const ref = localEntry.ref || undefined;
         candidates.push({
           entry: localEntry,
@@ -283,6 +294,7 @@ async function collectImports(
           path: local,
           within,
           real,
+          localTree,
           addedSource: addSource(localEntry, ref),
         });
         continue;
@@ -380,7 +392,7 @@ export async function planInit(
     const migrations: Migration[] = [];
     const warnings: string[] = [];
     const cloneSkills = new Map<string, ReadonlySet<string>>();
-    for (const { entry, ref, path, within, real, addedSource } of candidates) {
+    for (const { entry, ref, path, within, real, localTree, addedSource } of candidates) {
       const winner = winners.get(entry.name);
       const source = winner && augmented.sources.find(({ id }) => id === winner.source);
       const matches =
@@ -401,11 +413,15 @@ export async function planInit(
         }
       }
       if (matches && (source.kind !== "clone" || cloneSkills.get(source.id)?.has(entry.name))) {
+        const commit = report.sources.find(({ id }) => id === source.id)?.to;
         imports.unedited.push({ name: entry.name, path, from: entry.source });
         migrations.push({
           kind: "backup",
           path,
           within,
+          ...(source.kind === "clone" && commit
+            ? { replacement: { name: entry.name, source: source.id, commit, localTree } }
+            : {}),
           reason: `it has no edits, so ${entry.source} links ${entry.name} instead; commit its removal`,
         });
         continue;
@@ -720,7 +736,71 @@ function checkMoves(migrations: readonly Migration[]) {
     throw new UserError(`init changed nothing: ${problems.join("; ")}; run \`fleetrc init\` again`);
 }
 
-/** Carries out a plan: back up, adopt, unfold folder links, write config and imports. Sync runs after. */
+function backUp(path: string, backupRoot: string): string {
+  const fromHome = relative(homedir(), path);
+  const to = join(
+    backupRoot,
+    fromHome.startsWith("..") || isAbsolute(fromHome) ? basename(path) : fromHome,
+  );
+  moveDir(path, to);
+  return `moved ${tildify(path)} to ${tildify(to)}`;
+}
+
+/** Check the working tree live sync discovered, not a hook-free preview of its commit. */
+export function applyCloneBackups(
+  plan: InitPlan,
+  results: readonly SourceResult[],
+  done: string[],
+) {
+  const backups = plan.migrations.filter(
+    (migration) => migration.kind === "backup" && migration.replacement !== undefined,
+  );
+  const omitted = new Set<string>();
+  if (backups.length === 0) return omitted;
+  const skills = results.flatMap((result) =>
+    result.skills.map(({ name, dir }) => ({
+      name,
+      dir,
+      real: existsSync(dir) ? realpathSync(dir) : undefined,
+      result,
+    })),
+  );
+  const backupRoot = join(paths.backup(), new Date().toISOString().replace(/[:.]/g, "-"));
+  for (const backup of backups) {
+    const replacement = backup.replacement;
+    if (!replacement) continue;
+    const real = existsSync(backup.path) ? realpathSync(backup.path) : undefined;
+    const winner = skills.find(
+      (skill) =>
+        skill.real !== undefined &&
+        skill.real !== real &&
+        !omitted.has(skill.dir) &&
+        nameKey(skill.name) === nameKey(replacement.name),
+    );
+    if (
+      winner?.name === replacement.name &&
+      winner.result.id === replacement.source &&
+      winner.result.to === replacement.commit &&
+      winner.result.status !== "error" &&
+      winner.result.status !== "offline" &&
+      real !== undefined &&
+      treeSignature(real) === replacement.localTree
+    ) {
+      checkMoves([backup]);
+      done.push(backUp(backup.path, backupRoot));
+      for (const skill of skills) if (skill.real === real) omitted.add(skill.dir);
+    } else {
+      plan.migrations = plan.migrations.filter((migration) => migration !== backup);
+      plan.imports.unedited = plan.imports.unedited.filter(({ path }) => path !== backup.path);
+      const note = `${replacement.name} stays in place: the working clone did not provide the expected replacement`;
+      plan.warnings.push(note);
+      done.push(note);
+    }
+  }
+  return omitted;
+}
+
+/** Carries out non-deferred moves and writes config and imports. Sync runs after. */
 export function applyPlan(plan: InitPlan): string[] {
   checkMoves(plan.migrations);
   const done: string[] = [];
@@ -738,17 +818,9 @@ export function applyPlan(plan: InitPlan): string[] {
         removeLink(migration.path);
         done.push(`removed ${tildify(migration.path)}`);
         break;
-      case "backup": {
-        // Keep the path from HOME, so ~/.codex/skills/x and ~/.claude/skills/x do not collide.
-        const fromHome = relative(homedir(), migration.path);
-        const to = join(
-          backupRoot,
-          fromHome.startsWith("..") || isAbsolute(fromHome) ? basename(migration.path) : fromHome,
-        );
-        moveDir(migration.path, to);
-        done.push(`moved ${tildify(migration.path)} to ${tildify(to)}`);
+      case "backup":
+        if (!migration.replacement) done.push(backUp(migration.path, backupRoot));
         break;
-      }
       case "adopt":
         moveDir(migration.path, migration.to);
         done.push(

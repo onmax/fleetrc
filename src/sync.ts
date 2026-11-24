@@ -84,6 +84,8 @@ export interface SyncOptions {
     omit: (dir: string) => boolean;
     inspectConfirmed?: (links: readonly DesiredLink[], pendingCopyEdits: boolean) => void;
   };
+  /** Apply init's deferred backups against live discovery before choosing links. */
+  initBackups?: (results: readonly SourceResult[]) => ReadonlySet<string>;
   /** Leave out the note about a timer whose schedule the manifest changed (init installs it next). */
   skipTimerCheck?: boolean;
 }
@@ -613,9 +615,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const byKey = new Map<string, DesiredLink>();
     const shadowed: Report["shadowed"] = [];
     const preview = dryRun ? options.previewSkills : undefined;
+    const moved = dryRun ? undefined : options.initBackups?.(results);
     for (const result of results) {
       for (const skill of result.skills) {
-        if (preview?.omit(skill.dir)) continue;
+        if (preview?.omit(skill.dir) || moved?.has(skill.dir)) continue;
         // ~/.claude/skills/fleetrc is the plugin that carries Claude Code's hooks (entrysync.ts).
         if (nameKey(skill.name) === nameKey(CLAUDE_PLUGIN_NAME)) {
           warnings.push(

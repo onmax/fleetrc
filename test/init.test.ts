@@ -954,46 +954,65 @@ describe("init", () => {
     expect(init.code, init.stdout + init.stderr).toBe(scenario === "full ref" ? 1 : 0);
     expect(existsSync(join(work, "skills/tool"))).toBe(keep);
     expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(
-      scenario === "moving branch with lock commit" ? skillMd("tool", "main only") : skillMd("tool"),
+      scenario === "moving branch with lock commit"
+        ? skillMd("tool", "main only")
+        : skillMd("tool"),
     );
     expect(JSON.parse(read(manifest)).sources[1]).toMatchObject({ git: upstream.url, ref });
   });
 
-  it.skipIf(isWindows)("suppresses checkout hooks only for the replacement probe", async () => {
-    const m = machine({ scheduler: "empty" });
-    const upstream = remote(m, "upstream", skills("skills/", "tool"));
-    const ref = upstream.head();
-    upstream.commit({ "skills/tool/SKILL.md": skillMd("tool", "main only") });
-    const personal = remote(m, "personal", {
-      ...skills("skills/", "tool"),
-      "skills-lock.json": JSON.stringify({
-        version: 2,
-        skills: { tool: { source: upstream.url, ref, skillPath: "skills/tool/SKILL.md" } },
-      }),
-    });
-    const work = clone(m, personal, "code/skills");
-    const manifest = m.manifest({
-      agents: ["claude-code"],
-      sources: [
-        { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
-        { id: "upstream", git: upstream.url, ref, path: m.at("code/upstream") },
-      ],
-    });
-    const hooks = m.at("git-hooks");
-    writeFiles(hooks, { "post-checkout": '#!/bin/sh\necho checkout >> "$HOME/checkouts"\n' });
-    chmodSync(join(hooks, "post-checkout"), 0o755);
-    m.git(work, "config", "--global", "core.hooksPath", hooks);
+  it.skipIf(isWindows).each(["keeps", "moves"] as const)(
+    "checks a live hook that %s the replacement",
+    async (hook) => {
+      const m = machine({ scheduler: "empty" });
+      const upstream = remote(m, "upstream", skills("skills/", "tool"));
+      const ref = upstream.head();
+      upstream.commit({ "skills/tool/SKILL.md": skillMd("tool", "main only") });
+      const personal = remote(m, "personal", {
+        ...skills("skills/", "tool"),
+        "skills-lock.json": JSON.stringify({
+          version: 2,
+          skills: { tool: { source: upstream.url, ref, skillPath: "skills/tool/SKILL.md" } },
+        }),
+      });
+      const work = clone(m, personal, "code/skills");
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [
+          { id: "personal", git: personal.url, path: work, skills: "skills/*", adopt: true },
+          {
+            id: "upstream",
+            git: upstream.url,
+            ref,
+            path: m.at("code/upstream"),
+            skills: "skills/*",
+          },
+        ],
+      });
+      const hooks = m.at("git-hooks");
+      writeFiles(hooks, {
+        "post-checkout": [
+          "#!/bin/sh",
+          'echo checkout >> "$HOME/checkouts"',
+          ...(hook === "moves" ? [`if [ "$2" = "${ref}" ]; then mv skills/tool ./tool; fi`] : []),
+          "",
+        ].join("\n"),
+      });
+      chmodSync(join(hooks, "post-checkout"), 0o755);
+      m.git(work, "config", "--global", "core.hooksPath", hooks);
 
-    const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
-    expect(plan.migrations).toContainEqual(
-      expect.objectContaining({ kind: "backup", path: join(work, "skills/tool") }),
-    );
-    expect(existsSync(m.at("checkouts"))).toBe(false);
-    const init = await m.run("init", manifest, "--no-hooks");
-    expect(init.code, init.stdout + init.stderr).toBe(0);
-    expect(read(m.at("checkouts"))).toBe("checkout\ncheckout\n");
-    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
-  });
+      const plan = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+      expect(plan.migrations).toContainEqual(
+        expect.objectContaining({ kind: "backup", path: join(work, "skills/tool") }),
+      );
+      expect(existsSync(m.at("checkouts"))).toBe(false);
+      const init = await m.run("init", manifest, "--no-hooks");
+      expect(init.code, init.stdout + init.stderr).toBe(0);
+      expect(read(m.at("checkouts"))).toBe("checkout\ncheckout\n");
+      expect(existsSync(join(work, "skills/tool"))).toBe(hook === "moves");
+      expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    },
+  );
 
   it("can migrate a matching copy after adopting an unrelated copied command edit", async () => {
     const m = machine({ scheduler: "empty" });
