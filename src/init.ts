@@ -409,11 +409,11 @@ export async function planInit(
         "git" in source &&
         gitUrl(source.git) === gitUrl(entry.source) &&
         (!ref || source.ref === ref);
-      if (matches && source.kind === "clone" && !cloneSkills.has(source.id)) {
-        const previewCommit = report.sources.find(({ id }) => id === source.id)?.to;
+      const commit = source && report.sources.find(({ id }) => id === source.id)?.to;
+      if (matches && commit && source.kind === "clone" && !cloneSkills.has(source.id)) {
         const probe = mkdtempSync(join(scratch, "replacement-"));
         try {
-          cloneSkills.set(source.id, await confirmCloneSkills(source, probe, previewCommit));
+          cloneSkills.set(source.id, await confirmCloneSkills(source, probe, commit));
         } catch (error) {
           cloneSkills.set(source.id, new Set());
           warnings.push(
@@ -421,16 +421,17 @@ export async function planInit(
           );
         }
       }
-      if (matches && (source.kind !== "clone" || cloneSkills.get(source.id)?.has(entry.name))) {
-        const commit = report.sources.find(({ id }) => id === source.id)?.to;
+      if (
+        matches &&
+        commit &&
+        (source.kind !== "clone" || cloneSkills.get(source.id)?.has(entry.name))
+      ) {
         imports.unedited.push({ name: entry.name, path, from: entry.source });
         migrations.push({
           kind: "backup",
           path,
           within,
-          ...(source.kind === "clone" && commit
-            ? { replacement: { name: entry.name, source: source.id, commit, localTree } }
-            : {}),
+          replacement: { name: entry.name, source: source.id, commit, localTree },
           reason: `it has no edits, so ${entry.source} links ${entry.name} instead; commit its removal`,
         });
         continue;
@@ -800,8 +801,8 @@ function resolutionPaths(path: string): { paths: string[]; directories: Set<stri
   }
 }
 
-/** Check the working tree live sync discovered, not a hook-free preview of its commit. */
-export function applyCloneBackups(
+/** Back up matching copies only when live sync still provides the expected replacement. */
+export function applySkillBackups(
   plan: InitPlan,
   results: readonly SourceResult[],
   done: string[],
@@ -851,7 +852,7 @@ export function applyCloneBackups(
     } else {
       plan.migrations = plan.migrations.filter((migration) => migration !== backup);
       plan.imports.unedited = plan.imports.unedited.filter(({ path }) => path !== backup.path);
-      const note = `${replacement.name} stays in place: the working clone did not provide the expected replacement`;
+      const note = `${replacement.name} stays in place: live sync did not provide the expected replacement`;
       plan.warnings.push(note);
       done.push(note);
     }

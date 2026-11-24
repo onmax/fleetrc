@@ -42,7 +42,7 @@ import {
 } from "./fleet.ts";
 import { isRecord, JsonFileError, readJsonOrNothing, writeJson } from "./fs.ts";
 import { HOOK_AGENTS, type HookAgent, runHook } from "./hook.ts";
-import { applyCloneBackups, applyPlan, cloneBeforeAdopt, formatPlan, planInit } from "./init.ts";
+import { applyPlan, applySkillBackups, cloneBeforeAdopt, formatPlan, planInit } from "./init.ts";
 import { gitUrl } from "./gitcache.ts";
 import { errorText } from "./linker.ts";
 import { skillList } from "./list.ts";
@@ -1054,7 +1054,7 @@ async function init() {
     manifest: plan.manifestSpec,
     skipTimerCheck: withTimer,
     copy,
-    initBackups: (results) => applyCloneBackups(plan, results, applied),
+    initBackups: (results) => applySkillBackups(plan, results, applied),
   });
   say(...applied.slice(beforeSync).map((line) => `  ${line}`));
   if (!json) console.log(reportText(report));

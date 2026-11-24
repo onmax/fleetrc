@@ -1087,13 +1087,62 @@ describe("init", () => {
         },
       ],
     });
-    const { sync } = await m.json<{ sync: Report }>("init", manifest, "--no-hooks");
+    const init = await m.run("init", manifest, "--no-hooks", "--json");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const { sync } = JSON.parse(init.stdout) as { sync: Report };
     const command = m.at(".claude/commands/tool/review.md");
     expect(existsSync(join(work, "skills/tool"))).toBe(false);
     expect(read(command)).toBe(files["skills/tool/review.md"]);
     expect(sync.files.links).toContainEqual(
       expect.objectContaining({ path: command, source: "upstream" }),
     );
+  });
+
+  it("keeps a matching copy when live sync cannot fetch the cached replacement", async () => {
+    const m = machine({ scheduler: "empty" });
+    const upstream = remote(m, "upstream", skills("skills/", "tool"));
+    const personal = remote(m, "personal", {
+      ...skills("skills/", "tool"),
+      "skills-lock.json": JSON.stringify({
+        version: 1,
+        skills: { tool: { source: upstream.url, skillPath: "skills/tool/SKILL.md" } },
+      }),
+    });
+    const work = clone(m, personal, "code/skills");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+    });
+    const unavailable = m.at("unavailable.git");
+    const liveConfig = m.at("live-cache.gitconfig");
+    m.git(
+      work,
+      "config",
+      "--file",
+      liveConfig,
+      `url.${pathToFileURL(unavailable).href}.insteadOf`,
+      upstream.url,
+    );
+    m.git(
+      work,
+      "config",
+      "--global",
+      `includeIf.gitdir/i:${join(m.stateDir, "cache", "git", "*.git").replaceAll("\\", "/")}.path`,
+      liveConfig,
+    );
+
+    const preview = await m.json<LockImportPlan>("init", manifest, "--dry-run");
+    expect(preview.migrations).toContainEqual(
+      expect.objectContaining({ kind: "backup", path: join(work, "skills/tool") }),
+    );
+    const init = await m.run("init", manifest, "--no-hooks", "--json");
+    expect(init.code, init.stdout + init.stderr).toBe(1);
+    const { sync } = JSON.parse(init.stdout) as { sync: Report };
+    expect(sync.sources).toContainEqual(
+      expect.objectContaining({ id: "upstream", status: "error" }),
+    );
+    expect(read(join(work, "skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
   });
 
   it("can migrate a matching copy after adopting an unrelated copied command edit", async () => {
