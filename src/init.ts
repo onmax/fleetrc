@@ -1,5 +1,6 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -754,21 +755,30 @@ function backUp(path: string, backupRoot: string): string {
   return `moved ${tildify(path)} to ${tildify(to)}`;
 }
 
-/** Returns the paths used during resolution, not just the final real path. */
-function resolutionPaths(path: string): string[] | undefined {
+function directoryIdentity(stat: { dev: bigint; ino: bigint }): string | undefined {
+  return stat.ino === 0n ? undefined : `${stat.dev}:${stat.ino}`;
+}
+
+/** Returns the paths and directory identities visited, not just the final real path. */
+function resolutionPaths(path: string): { paths: string[]; directories: Set<string> } | undefined {
   const split = (value: string) =>
     value.split(process.platform === "win32" ? /[\\/]/ : "/").filter(Boolean);
   let current = parse(path).root;
   let pending = split(path.slice(current.length));
   let links = 0;
   const paths = [path];
+  const directories = new Set<string>();
   try {
     while (pending.length > 0) {
       const part = pending.shift()!;
       const next = join(current, part);
       paths.push(next);
-      const stat = lstat(next);
+      const stat = lstatSync(next, { bigint: true, throwIfNoEntry: false });
       if (!stat) return undefined;
+      if (stat.isDirectory()) {
+        const identity = directoryIdentity(stat);
+        if (identity !== undefined) directories.add(identity);
+      }
       if (!stat.isSymbolicLink()) {
         current = next;
         continue;
@@ -784,7 +794,7 @@ function resolutionPaths(path: string): string[] | undefined {
     }
     const real = realpathSync.native(path);
     if (relative(current, real) !== "") return undefined;
-    return [...paths, real];
+    return { paths: [...paths, real], directories };
   } catch {
     return undefined;
   }
@@ -802,12 +812,15 @@ export function applyCloneBackups(
     result.skills.map(({ name, dir }) => ({ name, dir, result })),
   );
   const protectedPaths: string[] = [];
+  const protectedDirectories = new Set<string>();
   let moved = false;
   const backupRoot = join(paths.backup(), new Date().toISOString().replace(/[:.]/g, "-"));
   for (const backup of backups) {
     const replacement = backup.replacement;
     if (!replacement) continue;
     const real = existsSync(backup.path) ? realpathSync(backup.path) : undefined;
+    const stat = real && lstatSync(real, { bigint: true, throwIfNoEntry: false });
+    const identity = stat ? directoryIdentity(stat) : undefined;
     const winner = skills.find(
       (skill) =>
         nameKey(skill.name) === nameKey(replacement.name) &&
@@ -823,14 +836,17 @@ export function applyCloneBackups(
       winner.result.status !== "offline" &&
       real !== undefined &&
       winnerPaths !== undefined &&
-      ![...protectedPaths, ...winnerPaths].some(
+      (identity === undefined ||
+        (!protectedDirectories.has(identity) && !winnerPaths.directories.has(identity))) &&
+      ![...protectedPaths, ...winnerPaths.paths].some(
         (path) => inside(backup.path, path) || inside(real, path),
       ) &&
       treeSignature(real) === replacement.localTree
     ) {
       checkMoves([backup]);
       done.push(backUp(backup.path, backupRoot));
-      protectedPaths.push(...winnerPaths);
+      protectedPaths.push(...winnerPaths.paths);
+      for (const directory of winnerPaths.directories) protectedDirectories.add(directory);
       moved = true;
     } else {
       plan.migrations = plan.migrations.filter((migration) => migration !== backup);

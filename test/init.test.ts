@@ -968,6 +968,7 @@ describe("init", () => {
       "moves",
       "links to personal",
       "links through personal",
+      "links through uppercase TOOL",
       "links elsewhere",
     ] as const)("checks the replacement after the live checkout hook: %s", async (hook) => {
     const m = machine({ scheduler: "empty" });
@@ -977,7 +978,9 @@ describe("init", () => {
       symlinkSync(external, join(repo.work, "skills/tool/bridge.md"));
       repo.commit({});
     };
-    if (hook === "links through personal") addBridge(upstream);
+    const uppercase = hook === "links through uppercase TOOL";
+    const throughBridge = hook === "links through personal" || uppercase;
+    if (throughBridge) addBridge(upstream);
     const ref = upstream.head();
     upstream.commit({ "skills/tool/SKILL.md": skillMd("tool", "main only") });
     const personal = remote(m, "personal", {
@@ -987,15 +990,21 @@ describe("init", () => {
         skills: { tool: { source: upstream.url, ref, skillPath: "skills/tool/SKILL.md" } },
       }),
     });
-    if (hook === "links through personal") addBridge(personal);
+    if (throughBridge) addBridge(personal);
     const work = clone(m, personal, "code/skills");
+    const bridgeDir = join(work, "skills", uppercase ? "TOOL" : "tool");
+    const throughPersonal = throughBridge && existsSync(bridgeDir);
+    if (uppercase && !throughPersonal) {
+      mkdirSync(bridgeDir);
+      symlinkSync(external, join(bridgeDir, "bridge.md"));
+    }
     const linkedSkill =
       hook === "links to personal"
         ? join(work, "skills/tool/SKILL.md")
-        : hook === "links through personal"
-          ? join(work, "skills/tool/bridge.md")
+        : throughBridge
+          ? join(bridgeDir, "bridge.md")
           : external;
-    if (hook === "links elsewhere" || hook === "links through personal")
+    if (hook === "links elsewhere" || throughBridge)
       writeFiles(m.home, { "external/SKILL.md": skillMd("tool") });
     const manifest = m.manifest({
       agents: ["claude-code"],
@@ -1037,7 +1046,7 @@ describe("init", () => {
     expect(init.code, init.stdout + init.stderr).toBe(0);
     expect(read(m.at("checkouts"))).toBe("checkout\ncheckout\n");
     expect(existsSync(join(work, "skills/tool"))).toBe(
-      hook === "moves" || hook === "links to personal" || hook === "links through personal",
+      hook === "moves" || hook === "links to personal" || throughPersonal,
     );
     expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
   });
