@@ -786,6 +786,7 @@ function repoIdentity(spec: string): string | undefined {
 
 interface LocateOptions {
   offline?: boolean;
+  readOnly?: boolean;
   cacheRoot?: string;
   base?: string;
   checkout?: typeof fetchClone;
@@ -964,6 +965,7 @@ async function locate(
   spec: string,
   {
     offline = false,
+    readOnly = false,
     cacheRoot = join(paths.cache(), "manifests"),
     base = process.cwd(),
     checkout = fetchClone,
@@ -993,7 +995,7 @@ async function locate(
     const problem = await check(remote.repo);
     if (problem) throw new ManifestError(problem);
   }
-  const clone = await checkout(url, remote.ref, cacheRoot, { offline, check });
+  const clone = await checkout(url, remote.ref, cacheRoot, { offline, readOnly, check });
   const file = otherDefault(clone.dir, remote.path);
   if (!existsSync(file))
     throw new ManifestError(
@@ -1320,11 +1322,12 @@ const ROOT_ONLY_SOURCE_KEYS = {
  */
 export async function loadManifest(
   spec: string,
-  { cacheRoot, offline = false, checkout }: LocateOptions = {},
+  { cacheRoot, offline = false, readOnly = false, checkout }: LocateOptions = {},
 ): Promise<LoadedManifest> {
   const options = {
     cacheRoot,
     offline,
+    readOnly,
     checkout:
       checkout ?? (cacheRoot === undefined ? manifestCheckoutRoute(spec).checkout : undefined),
   };

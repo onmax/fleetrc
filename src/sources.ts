@@ -20,10 +20,13 @@ import { installSkills, isDiagnostic, resolveSource, type SkillSource } from "sk
 import { git, GitError, gitOut } from "./exec.ts";
 import {
   changedFiles,
+  changedModes,
+  copyExecuteBits,
   copyResolved,
   type Hashes,
   countCopies,
   dict,
+  executables,
   hashDir,
   inside,
   isRecord,
@@ -1865,12 +1868,17 @@ function lookForEdits(
     out.edited.push({ skill: name, files });
   }
   for (const [skill, pending] of Object.entries(state.pending)) {
-    const upstream = storePaths(ctx.storeDir, skill).upstream;
-    const base = state.skills[skill]?.hashes ?? {};
+    const { base, upstream } = storePaths(ctx.storeDir, skill);
     out.pending.push({
       skill,
       reason: pending.reason,
-      files: existsSync(upstream) ? changedFiles(base, hashDir(upstream)) : [],
+      files: existsSync(upstream)
+        ? includeModeChanges(
+            changedFiles(state.skills[skill]?.hashes ?? {}, hashDir(upstream)),
+            base,
+            upstream,
+          )
+        : [],
     });
   }
 }
@@ -2355,6 +2363,9 @@ function reportVendoredUpdate(source: Source, out: SourceResult, skill: Found, f
   out.changed.push(...files.map((file) => `${filesAt(source, skill)}${file}`));
 }
 
+const includeModeChanges = (files: string[], base: string, incoming: string) =>
+  [...new Set([...files, ...changedModes(executables(base), executables(incoming))])].sort();
+
 function applyVendored(
   source: VendoredSource,
   state: SourceState,
@@ -2404,7 +2415,9 @@ function applyVendored(
     const incoming = from ? hashDir(from) : {};
     const hasUpstream = existsSync(paths.upstream);
     const upstreamChanged = from
-      ? !hasUpstream || !sameTree(hashDir(paths.upstream), incoming)
+      ? !hasUpstream ||
+        includeModeChanges(changedFiles(hashDir(paths.upstream), incoming), paths.upstream, from)
+          .length > 0
       : hasUpstream;
     if (write && upstreamChanged) {
       if (from) replaceDir(from, paths.upstream);
@@ -2469,8 +2482,22 @@ function applyVendored(
       out.changed.push(...Object.keys(incoming).map((file) => `${filesAt(source, skill)}${file}`));
       continue;
     }
-    const files = changedFiles(record.hashes, incoming);
-    if (files.length === 0) {
+    const contents = changedFiles(record.hashes, incoming);
+    const files = existsSync(paths.base)
+      ? includeModeChanges(contents, paths.base, from)
+      : contents;
+    if (contents.length === 0) {
+      if (files.length > 0) {
+        if (review) {
+          hold(skill.name, from, "review", files, skill.path);
+          continue;
+        }
+        if (write) {
+          for (const file of files) copyExecuteBits(from, paths.live, file);
+          for (const file of files) copyExecuteBits(from, paths.base, file);
+        }
+        reportVendoredUpdate(source, out, skill, files);
+      }
       if (write) rmSync(paths.upstream, { recursive: true, force: true });
       delete state.pending[skill.name];
       if (write) state.skills[skill.name] = installed(incoming, skill.path);

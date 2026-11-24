@@ -119,14 +119,6 @@ export function hasCachedClone(url: string, ref: string | undefined, root: strin
   return markedCommit(join(root, `${cloneKey(url, ref)}.json`)) !== undefined;
 }
 
-interface FetchOptions {
-  offline?: boolean;
-  cacheUrl?: string;
-  signal?: AbortSignal;
-  /** Why `url` may not be fetched, asked in the cache's own repository right before each fetch. */
-  check?: (url: string, cwd: string) => Promise<string | undefined>;
-}
-
 /**
  * The files of `url` at `ref` (default branch when absent), kept under `root` between runs. The
  * `skills` package clones into a temporary folder on every call; this cache is what lets a timer
@@ -141,7 +133,20 @@ export async function fetchClone(
   url: string,
   ref: string | undefined,
   root: string,
-  { offline = false, check, cacheUrl = url, signal }: FetchOptions = {},
+  {
+    offline = false,
+    readOnly = false,
+    check,
+    cacheUrl = url,
+    signal,
+  }: {
+    offline?: boolean;
+    readOnly?: boolean;
+    cacheUrl?: string;
+    signal?: AbortSignal;
+    /** Why `url` may not be fetched, asked in the cache's own repository right before each fetch. */
+    check?: (url: string, cwd: string) => Promise<string | undefined>;
+  } = {},
 ): Promise<CachedClone> {
   signal?.throwIfAborted();
   const key = cloneKey(cacheUrl, ref);
@@ -150,6 +155,13 @@ export async function fetchClone(
     tree: join(root, key),
     marker: join(root, `${key}.json`),
   };
+  if (readOnly) {
+    const marked = markedCommit(cache.marker);
+    if (!marked) throw new UserError(`${url} has never been fetched and --offline is set`);
+    if (!existsSync(cache.tree))
+      throw new UserError(`${url} has no cached checkout; run sync without --dry-run to repair it`);
+    return { dir: cache.tree, ...marked };
+  }
   const runGit: typeof git = (args, options) => git(args, { ...options, signal });
   await recoverTree(cache, root, key, runGit, signal);
   let written = readMarker(cache.marker, cache.tree);
