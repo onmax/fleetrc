@@ -192,19 +192,6 @@ export async function fetchClone(
         runGit,
         signal !== undefined,
       );
-      if (signal)
-        await runGit(
-          [
-            "-c",
-            "maintenance.autoDetach=false",
-            "-c",
-            "gc.autoDetach=false",
-            "maintenance",
-            "run",
-            "--auto",
-          ],
-          { cwd: cache.repo, allowFail: true },
-        );
     } catch (error) {
       // The network or the remote: a cache with a commit stays for --offline and later runs.
       if (fresh) rmSync(cache.repo, { recursive: true, force: true });
@@ -316,6 +303,8 @@ function removeInterruptedFetchLocks(repo: string) {
     "packed-refs.lock",
     "reftable/tables.list.lock",
     "objects/maintenance.lock",
+    "objects/pack/multi-pack-index.lock",
+    "objects/pack/multi-pack-index.d/multi-pack-index-chain.lock",
     "gc.pid.lock",
     "gc.log.lock",
   ])
@@ -337,11 +326,13 @@ async function fetchCommit(
   runGit: typeof git,
   cancellable: boolean,
 ): Promise<string> {
-  const maintenance = cancellable ? ["--no-auto-gc"] : [];
+  const maintenance = cancellable
+    ? ["-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false"]
+    : [];
   const args = [
     ...config,
-    "fetch",
     ...maintenance,
+    "fetch",
     "--quiet",
     "--depth",
     "1",
@@ -367,8 +358,8 @@ async function fetchCommit(
   await runGit(
     [
       ...config,
-      "fetch",
       ...maintenance,
+      "fetch",
       "--quiet",
       "--no-tags",
       ...(shallow ? ["--unshallow"] : []),

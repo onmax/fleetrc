@@ -21,7 +21,7 @@ function slowFetches(
   root: string,
   env: NodeJS.ProcessEnv,
   ms: number,
-  { before = `sleep ${ms / 1000}`, after = "" } = {},
+  { before = `sleep ${ms / 1000}`, after = "", maintenance = "" } = {},
 ) {
   const bin = join(root, "slow-git");
   const log = join(root, "fetches.log");
@@ -32,6 +32,10 @@ function slowFetches(
     join(bin, "git"),
     `#!/bin/sh
 for arg in "$@"; do
+  if [ "$arg" = maintenance ]; then
+    ${maintenance || ":"}
+    break
+  fi
   if [ "$arg" = fetch ]; then
     echo start >> "${log}"
     ${before}
@@ -47,6 +51,7 @@ exec "${real}" "$@"
   chmodSync(join(bin, "git"), 0o755);
   return {
     PATH: pathWith(bin, env),
+    GIT_EXEC_PATH: bin,
     /** "start" and "end" for each fetch, in the order they happened. */
     fetches: () => readFileSync(log, "utf8").trim().split("\n"),
   };
@@ -164,7 +169,7 @@ describe.skipIf(isWindows)("fetching git sources", () => {
     },
   );
 
-  it("compacts persistent Git caches after successful prefetches", async () => {
+  it.each([true, false])("honors maintenance.auto=%s after successful prefetches", async (auto) => {
     const m = machine();
     const vendor = remote(m, "vendor", skills("skills/", "tool"));
     const manifest = m.manifest({
@@ -172,11 +177,13 @@ describe.skipIf(isWindows)("fetching git sources", () => {
       sources: [{ id: "vendor", git: vendor.url }],
     });
     const config = {
-      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_COUNT: "3",
       GIT_CONFIG_KEY_0: "fetch.unpackLimit",
       GIT_CONFIG_VALUE_0: "1",
       GIT_CONFIG_KEY_1: "gc.autoPackLimit",
       GIT_CONFIG_VALUE_1: "2",
+      GIT_CONFIG_KEY_2: "maintenance.auto",
+      GIT_CONFIG_VALUE_2: String(auto),
     };
     const repo = join(m.stateDir, "cache", "git", `${cloneKey(vendor.url)}.git`);
     for (let version = 0; version < 7; version++) {
@@ -188,7 +195,59 @@ describe.skipIf(isWindows)("fetching git sources", () => {
       name.endsWith(".pack"),
     );
     expect(packs.length).toBeGreaterThan(0);
-    expect(packs.length).toBeLessThan(7);
+    if (auto) expect(packs.length).toBeLessThan(7);
+    else expect(packs).toHaveLength(7);
+  });
+
+  it("recovers a warm cache after cancelling maintenance", async () => {
+    const m = machine();
+    const first = remote(m, "first", skills("skills/", "first-tool"));
+    const warm = remote(m, "warm", skills("skills/", "warm-tool"));
+    const sources = [
+      { id: "first", git: first.url },
+      { id: "warm", git: warm.url },
+    ];
+    const seed = m.manifest({ agents: ["claude-code"], sources: sources.slice(1) });
+    const seeded = await m.run("sync", "--manifest", seed);
+    expect(seeded.code, seeded.stdout + seeded.stderr).toBe(0);
+    const oldCommit = warm.head();
+    const repo = join(m.stateDir, "cache", "git", `${cloneKey(warm.url)}.git`);
+    m.git(repo, "repack", "-ad");
+    warm.commit({ "version.txt": "second" });
+    const state = join(m.stateDir, "state.json");
+    rmSync(state);
+    const manifest = m.manifest({ agents: ["claude-code"], sources });
+    const entered = join(m.root, "repacking");
+    const midxLock = "objects/pack/multi-pack-index.lock";
+    const slow = slowFetches(m.root, m.env, 0, {
+      before: `case "$*" in *first.git*)
+        until [ -f "${entered}" ]; do sleep 0.05; done
+        mkdir "${state}";;
+      esac`,
+      maintenance: `if [ "$PWD" -ef "${repo}" ]; then
+        touch objects/maintenance.lock "${midxLock}"
+        touch "${entered}"
+        exec sleep 30
+      fi`,
+    });
+    const sync = await m.runWith(
+      {
+        env: { PATH: slow.PATH, GIT_EXEC_PATH: slow.GIT_EXEC_PATH, FLEETRC_SYNC_TIMEOUT_MS: "5000" },
+      },
+      "sync",
+      "--manifest",
+      manifest,
+    );
+    expect(existsSync(entered)).toBe(true);
+    expect(sync.code).not.toBe(0);
+    expect(sync.stdout + sync.stderr).toContain("EISDIR");
+    expect(m.git(repo, "cat-file", "-t", oldCommit)).toBe("commit");
+    expect(existsSync(join(repo, "objects/maintenance.lock"))).toBe(false);
+    expect(existsSync(join(repo, midxLock))).toBe(false);
+    m.git(repo, "multi-pack-index", "write");
+    rmSync(state, { recursive: true });
+    const resumed = await m.run("sync", "--manifest", manifest);
+    expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
   });
 
   it("cancels stalled fetches without losing cached history or hiding the checkpoint error", async () => {
