@@ -89,19 +89,21 @@ export function changedModes(before: string[], after: string[]): string[] {
   return [...changed].sort();
 }
 
-/** Copies only execute bits, without following locally replaced links within the destination. */
-export function copyExecuteBits(from: string, to: string, file: string) {
-  const path = join(to, file);
-  for (let parent = dirname(path); ; parent = dirname(parent)) {
-    if (!lstat(parent)?.isDirectory()) return;
-    if (parent === to) break;
+/** Copies only execute bits, returning false if either path isn't a regular file. */
+export function copyExecuteBits(from: string, to: string, file: string, dryRun = false): boolean {
+  const parts = file.split("/");
+  let path = to;
+  for (const part of parts) {
+    if (!lstat(path)?.isDirectory()) return false;
+    path = join(path, part);
   }
   const dest = lstat(path);
+  if (!dest?.isFile()) return false;
   const source = lstat(join(from, file));
-  if (dest?.isFile() && source?.isFile()) {
-    const mode = (dest.mode & 0o7666) | (source.mode & 0o111);
-    if (mode !== (dest.mode & 0o7777)) chmodSync(path, mode);
-  }
+  if (!source?.isFile()) return false;
+  const mode = (dest.mode & 0o7666) | (source.mode & 0o111);
+  if (!dryRun && mode !== (dest.mode & 0o7777)) chmodSync(path, mode);
+  return true;
 }
 
 /** node:crypto, loaded on first use: the session hook and `list --json` never hash. */
