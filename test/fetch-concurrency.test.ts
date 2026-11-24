@@ -11,7 +11,7 @@ import {
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import { cloneKey } from "../src/gitcache.ts";
-import { cli, isWindows, machine, names, pathWith, remote, skills } from "./fixture.ts";
+import { cli, isWindows, machine, names, pathWith, remote, skillMd, skills } from "./fixture.ts";
 
 /**
  * A git first on PATH that logs when each fetch starts and ends, and makes it take `ms` longer, so
@@ -222,7 +222,7 @@ describe.skipIf(isWindows)("fetching git sources", () => {
     const seeded = await m.runWith({ env }, "sync", "--manifest", manifest);
     expect(seeded.code, seeded.stdout + seeded.stderr).toBe(0);
     const previous = vendor.head();
-    const next = vendor.commit(skills("skills/", "next"));
+    const next = vendor.commit({ "skills/next/SKILL.md": skillMd("next") });
     const updated = await m.runWith({ env }, "sync", "--manifest", manifest);
     expect(updated.code, updated.stdout + updated.stderr).toBe(0);
     const repo = join(m.stateDir, "cache", "git", `${cloneKey(vendor.url)}.git`);
