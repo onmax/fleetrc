@@ -81,6 +81,7 @@ describe("a sync stopped before it saved state.json", () => {
       from: vendor.url,
       path: "new/Tool",
       base: revision,
+      upstream: "git",
     });
     expect(read(join(work, "skills", "Tool", "SKILL.md"))).toBe(skillMd("Tool", "moved"));
   });
@@ -240,7 +241,12 @@ describe("a sync stopped before it saved state.json", () => {
             published.replace("first", "local edit").replace("last", "upstream edit"),
           ),
         );
-        expect(savedFork).toEqual({ from: vendor.url, path: "new/tool", base: revision });
+        expect(savedFork).toEqual({
+          from: vendor.url,
+          path: "new/tool",
+          base: revision,
+          upstream: "git",
+        });
         return;
       }
       expect((await m.json("sync")).hooks).toEqual([]);
