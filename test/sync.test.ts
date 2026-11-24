@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -440,6 +441,48 @@ appendFileSync(${JSON.stringify(log)}, process.env.FLEETRC_HOOK + "\\n");`,
     expect(names(m.at(".claude/skills"))).toEqual(["one"]);
     expect(names(m.at(".agents/skills"))).toEqual(["one"]);
     expect(readdirSync(m.at(".claude/skills"))).toContain(".fleetrc-manifest.json");
+  });
+
+  it("previews an offline sync from what earlier syncs fetched, for a remote manifest and its git sources", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", skills("skills/", "tool"));
+    const manifests = remote(m, "manifests", {
+      ".fleetrc/manifest.json": JSON.stringify({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      }),
+    });
+    expect((await m.run("init", manifests.url, "--no-hooks")).code).toBe(0);
+    vendor.commit({ "skills/tool/SKILL.md": skillMd("tool", "v2") });
+    const dry = await m.run("sync", "--offline", "--dry-run");
+    expect(dry.code, dry.stdout + dry.stderr).toBe(0);
+    expect(dry.stderr).not.toMatch(/never been fetched/);
+    // Offline, the preview stays at the commit the last sync fetched.
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
+
+  it("leaves a missing manifest checkout for a real offline sync to repair", async () => {
+    const m = machine();
+    const manifests = remote(m, "manifests", {
+      ".fleetrc/manifest.json": JSON.stringify({ agents: ["claude-code"], sources: [] }),
+    });
+    expect((await m.run("init", manifests.url, "--no-hooks")).code).toBe(0);
+    const cache = join(m.stateDir, "cache", "manifests");
+    const marker = readdirSync(cache).find((name) => name.endsWith(".json"))!;
+    const tree = join(cache, marker.slice(0, -5));
+    renameSync(tree, m.at("saved-manifest-checkout"));
+    const entries = readdirSync(cache);
+    const metadata = read(join(cache, marker));
+
+    const dry = await m.run("sync", "--offline", "--dry-run");
+    expect(readdirSync(cache)).toEqual(entries);
+    expect(read(join(cache, marker))).toBe(metadata);
+    expect(dry.code).toBe(1);
+    expect(dry.stderr).toContain("run sync without --dry-run");
+
+    const sync = await m.run("sync", "--offline");
+    expect(sync.code, sync.stdout + sync.stderr).toBe(0);
+    expect(existsSync(tree)).toBe(true);
   });
 
   it("a sync that finds nothing new upstream copies no file", async () => {
