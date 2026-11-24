@@ -727,20 +727,30 @@ function finishMergeUnit(scratch: string, target: string) {
   retireMergeScratch(scratch, original);
 }
 
+function lstatMergeScratch(scratch: string) {
+  try {
+    return lstat(scratch);
+  } catch (error) {
+    if (isErrno(error, "ENOTDIR")) return undefined;
+    throw error;
+  }
+}
+
 /** Recover before hashing; fallback workspaces beside the target are excluded from skill copies. */
 function recoverMergeUnit(live: string, dryRun: boolean) {
   const pointer = mergeRecoveryPointer(live);
   const scratch = readMergeRecoveryPointer(pointer);
   if (scratch === undefined) return;
   const scratchParent = dirname(scratch);
-  if (
-    !isMergeScratch(basename(scratch)) ||
-    (scratchParent !== dirname(live) &&
-      (!inside(live, scratchParent) || realpathSync(scratchParent) !== scratchParent))
-  ) {
+  const besideLive = scratchParent === dirname(live);
+  if (!isMergeScratch(basename(scratch)) || (!besideLive && !inside(live, scratchParent))) {
     throw new UserError(`merge: invalid recovery pointer at ${pointer}`);
   }
-  if (lstat(scratch)?.isDirectory()) {
+  const entry = lstatMergeScratch(scratch);
+  if (entry && !besideLive && realpathSync(scratchParent) !== scratchParent) {
+    throw new UserError(`merge: invalid recovery pointer at ${pointer}`);
+  }
+  if (entry?.isDirectory()) {
     const saved = savedMergeUnit(scratch);
     if (existsSync(join(scratch, "retired"))) {
       if (!dryRun) retireMergeScratch(scratch);
@@ -1174,7 +1184,7 @@ export async function forkSkill(
   if (!existsSync(store.live))
     throw new UserError(`${name} has no copy on this machine yet; run \`fleetrc sync\``);
   const recovery = readMergeRecoveryPointer(mergeRecoveryPointer(realpathSync(store.live)));
-  if (recovery !== undefined && lstat(recovery) !== undefined)
+  if (recovery !== undefined && lstatMergeScratch(recovery) !== undefined)
     throw new UserError(
       `${name} has an interrupted merge at ${recovery}; run \`fleetrc merge ${name}\` before forking`,
     );

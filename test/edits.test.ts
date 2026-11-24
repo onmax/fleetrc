@@ -53,24 +53,25 @@ async function editedVendoredSkill(options: Parameters<typeof machine>[0] = {}) 
   return { m, work, vendor, manifest, local };
 }
 
-async function pendingTopicReplacement(upstreamIsFolder = false) {
+async function pendingTopicReplacement(upstreamIsFolder = false, root = "topic") {
   const { m, vendor } = await editedVendoredSkill({ scheduler: "empty" });
-  const topic = m.at(".claude/skills/tool/topic");
+  const topic = m.at(`.claude/skills/tool/${root}`);
+  const upstream = `skills/tool/${root}`;
   vendor.commit(
     upstreamIsFolder
-      ? { "skills/tool/topic": "topic v1\n" }
-      : { "skills/tool/topic/notes.md": "notes v1\n" },
+      ? { [upstream]: "topic v1\n" }
+      : { [`${upstream}/notes.md`]: "notes v1\n" },
   );
   await m.run("sync");
   expect((await m.run("merge", "tool")).code).toBe(0);
-  rmSync(join(vendor.work, "skills/tool/topic"), { recursive: true });
+  rmSync(join(vendor.work, upstream), { recursive: true });
   vendor.commit(
     upstreamIsFolder
       ? {
-          "skills/tool/topic/notes.md": "notes v2\n",
-          "skills/tool/topic/extra.md": "extra v2\n",
+          [`${upstream}/notes.md`]: "notes v2\n",
+          [`${upstream}/extra.md`]: "extra v2\n",
         }
-      : { "skills/tool/topic": "topic v2\n" },
+      : { [upstream]: "topic v2\n" },
   );
   await m.run("sync");
   return { m, topic, vendor };
@@ -533,29 +534,51 @@ describe("edited vendored skills", () => {
     },
   );
 
-  it("can fork after scratch cleanup is interrupted and sync clears the pending update", async () => {
-    const { m, topic, vendor } = await pendingTopicReplacement();
-    const interrupted = await mergeWithFilesystemHook(
-      m,
-      `
-      const rmdir = fs.rmdirSync;
-      fs.rmdirSync = (path, ...args) => {
-        rmdir(path, ...args);
-        if (basename(path).startsWith(".fleetrc-merge-")) process.exit(99);
-      };
-      `,
-    );
-    expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
-    expect(read(topic)).toBe("topic v2\n");
-    rmSync(join(vendor.work, "skills/tool/topic"));
-    vendor.commit({ "skills/tool/topic/notes.md": "notes v1\n" });
-    expect((await m.json("sync")).pending).toEqual([]);
-    const merge = await m.run("merge", "tool");
-    expect(merge.stderr).toContain("has no upstream change to merge");
-    const fork = await m.run("fork", "tool");
-    expect(fork.code, fork.stdout + fork.stderr).toBe(0);
-    expect(read(m.at("code/skills/skills/tool/topic"))).toBe("topic v2\n");
-  });
+  it.each(["topic", "group/topic"])(
+    "can fork after scratch cleanup is interrupted and sync clears the pending update (%s)",
+    async (root) => {
+      const nested = root === "group/topic";
+      const { m, topic, vendor } = await pendingTopicReplacement(false, root);
+      const live = realpathSync(m.at(".claude/skills/tool"));
+      const interrupted = await mergeWithFilesystemHook(
+        m,
+        `
+        const mkdtemp = fs.mkdtempSync;
+        fs.mkdtempSync = (prefix, ...args) => {
+          if (${nested} && dirname(prefix) === ${JSON.stringify(dirname(live))} && basename(prefix).startsWith(".fleetrc-merge-")) {
+            throw Object.assign(new Error("read-only skill parent"), { code: "EACCES" });
+          }
+          return mkdtemp(prefix, ...args);
+        };
+        const rmdir = fs.rmdirSync;
+        fs.rmdirSync = (path, ...args) => {
+          rmdir(path, ...args);
+          if (basename(path).startsWith(".fleetrc-merge-") && (!${nested} || dirname(path) === ${JSON.stringify(join(live, "group"))})) process.exit(99);
+        };
+        `,
+      );
+      expect(interrupted.code, interrupted.stdout + interrupted.stderr).toBe(99);
+      expect(read(topic)).toBe("topic v2\n");
+      if (nested) {
+        const group = dirname(topic);
+        rmSync(group, { recursive: true });
+        writeFileSync(group, "local group\n");
+        const preview = await m.run("merge", "tool", "--dry-run");
+        expect(preview.code, preview.stdout + preview.stderr).toBe(0);
+        expect(preview.stdout).toContain("would conflict: group");
+      }
+      rmSync(join(vendor.work, `skills/tool/${root}`));
+      vendor.commit({ [`skills/tool/${root}/notes.md`]: "notes v1\n" });
+      expect((await m.json("sync")).pending).toEqual([]);
+      const merge = await m.run("merge", "tool");
+      expect(merge.stderr).toContain("has no upstream change to merge");
+      const fork = await m.run("fork", "tool");
+      expect(fork.code, fork.stdout + fork.stderr).toBe(0);
+      expect(read(m.at(`code/skills/skills/tool/${nested ? "group" : root}`))).toBe(
+        nested ? "local group\n" : "topic v2\n",
+      );
+    },
+  );
 
   it.each(["unchanged", "edited", "partially removed"])(
     "checks the saved original on retirement retry (%s)",
