@@ -105,6 +105,8 @@ Then run `npx fleetrc init` on a fresh machine or one already following the poli
 
 Run `fleetrc <command> --help` for full options. Most commands accept `--dry-run`, `--json`, `--offline`, `--copy`, `--no-copy` and `--manifest <m>`.
 
+A full online `sync` also checks Git forks whose upstream is no longer a source. For an older fork with an ambiguous upstream URL and no recorded Git commit, set `"upstream": "git"` in its `forks` entry to enable this check. Index and npm forks are not checked.
+
 | Command                                            | What it does                                                                                                                                      |
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sync [source]`                                    | Fetch all sources, or only `source`, and link skills. Plain `fleetrc` runs this.                                                                  |
