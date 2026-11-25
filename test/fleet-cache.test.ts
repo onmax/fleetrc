@@ -8,6 +8,10 @@ import { fleet, notInFleet, resolveFleet, type FleetAction } from "../src/fleet.
 
 vi.mock("../src/exec.ts", () => ({ exec: vi.fn() }));
 
+/** The script a remote command carries in base64. */
+const script = (command = "") =>
+  Buffer.from(/^sh -c 'e=([A-Za-z0-9+/=]*);/.exec(command)?.[1] ?? "", "base64").toString();
+
 it.each([
   {
     name: "offline observations do not set the reference",
@@ -111,7 +115,7 @@ it.each([false, true])("only refreshes on the same retry route (%s)", async (cha
   let online = true;
   let retries = 0;
   vi.mocked(exec).mockImplementation(async (command, args) => {
-    const remote = args.at(-1) ?? "";
+    const remote = script(args.at(-1));
     const init = remote.includes(setup.spec);
     const retry = init && remote.includes(observed);
     const result = { stderr: "", code: 0, timedOut: false, truncated: false };
@@ -341,7 +345,8 @@ it.each(scenarios)(
     vi.mocked(exec).mockImplementation(async (command, args) => {
       const [entry, remoteCommand] = args.slice(args.indexOf("--") + 1);
       const user =
-        entry === `bob@${address}` || (differentCommand && remoteCommand?.includes("last-run.json"))
+        entry === `bob@${address}` ||
+        (differentCommand && script(remoteCommand).includes("last-run.json"))
           ? "bob"
           : "alice";
       const stdout =
