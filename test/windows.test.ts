@@ -550,6 +550,31 @@ describe.skipIf(!isWindows)(
         }
       });
 
+      it("backs up an unedited lock copy with HOME spelled as an 8.3 path", async ({ skip }) => {
+        const m = machine({ home: "fleetrc long home" });
+        const long = realpathSync.native(m.home);
+        const short = await shortPath(long);
+        if (!short || short.toLowerCase() === long.toLowerCase())
+          skip("this volume makes no 8.3 names");
+        const upstream = remote(m, "upstream", skills("skills/", "tool"));
+        const personal = remote(m, "personal", {
+          ...skills("skills/", "tool"),
+          "skills-lock.json": JSON.stringify({
+            version: 1,
+            skills: { tool: { source: upstream.url, skillPath: "skills/tool/SKILL.md" } },
+          }),
+        });
+        const work = clone(m, personal, "code/skills");
+        const manifest = m.manifest({
+          agents: ["claude-code"],
+          sources: [{ id: "personal", git: personal.url, path: work, skills: "skills/*" }],
+        });
+        const init = await m.runWith({ env: homeEnv(m, short) }, "init", manifest, "--no-hooks");
+        expect(init.code, both(init)).toBe(0);
+        expect(existsSync(join(work, "skills", "tool"))).toBe(false);
+        expect(read(join(long, ".claude", "skills", "tool", "SKILL.md"))).toBe(skillMd("tool"));
+      });
+
       const other = process.env.RUNNER_TEMP;
       const drive = (path: string) => path.slice(0, 2).toUpperCase();
       // On GitHub's runners TEMP is on C: and RUNNER_TEMP on D:.
