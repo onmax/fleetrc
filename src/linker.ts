@@ -15,10 +15,12 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  changedModes,
   copyResolved,
   type DroppedLink,
   type Hashes,
   dict,
+  executables,
   hashDir,
   isErrno,
   isRecord,
@@ -27,6 +29,7 @@ import {
   readJson,
   recoverRenames,
   renameFolder,
+  resolvedExecutables,
   resolvedHashes,
   sameTree,
   writeJson,
@@ -339,7 +342,8 @@ export function linkTargetDir(
         !copy ||
         !sameTree(now, fresh) ||
         !samePath(record.target, link.target) ||
-        record.root !== link.root
+        record.root !== link.root ||
+        changedModes(executables(path), resolvedExecutables(link.target, link.root)).length > 0
       )
         write(link.name, link, true);
       return;

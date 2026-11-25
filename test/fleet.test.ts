@@ -20,6 +20,7 @@ import {
   markBehind,
   remoteScript,
   resolveFleet,
+  shCommand,
   unpublished,
 } from "../src/fleet.ts";
 import { hostManifestSpec, loadManifest, sameManifest } from "../src/manifest.ts";
@@ -68,6 +69,19 @@ else {
   chmodSync(ssh, 0o755);
   return { PATH: pathWith(dir, m.env) };
 }
+
+const which = (name: string) =>
+  isWindows
+    ? ""
+    : spawnSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).stdout.trim();
+const fish = which("fish");
+/** The login shells on this machine that sshd could run a fleet command with. */
+const loginShells = isWindows
+  ? [["sh", "sh"] as const]
+  : ["sh", "bash", "zsh", "fish", "tcsh"].flatMap((name) => {
+      const path = which(name);
+      return path ? [[name, path] as const] : [];
+    });
 
 let lastIp = 0;
 /** A tailnet peer as `tailscale status --json` lists it. */
@@ -216,9 +230,9 @@ describe("fleet", () => {
     );
   });
 
-  it.skipIf(isWindows)(
-    "R3-6. fleet upgrade on a host whose launcher's node is gone says so, not that fleetrc is missing",
-    () => {
+  it.skipIf(isWindows).each(loginShells)(
+    "R3-6. fleet upgrade on a host whose launcher's node is gone says so, not that fleetrc is missing (%s login shell)",
+    (_, shell) => {
       const m = machine();
       const state = join(m.root, "state");
       const launcher = join(state, "fleetrc", "bin", "fleetrc");
@@ -234,9 +248,8 @@ describe("fleet", () => {
       chmodSync(launcher, 0o755);
       const bin = join(m.root, "ssh-bin");
       mkdirSync(bin);
-      const sed = spawnSync("sh", ["-c", "command -v sed"], { encoding: "utf8" }).stdout.trim();
-      symlinkSync(sed, join(bin, "sed"));
-      const run = spawnSync("/bin/sh", ["-c", remoteScript("upgrade", "1.2.3")], {
+      for (const tool of ["sed", "sh", "base64"]) symlinkSync(which(tool), join(bin, tool));
+      const run = spawnSync(shell, ["-c", shCommand(remoteScript("upgrade", "1.2.3"))], {
         env: { HOME: m.home, XDG_STATE_HOME: state, PATH: bin },
         encoding: "utf8",
       });
@@ -959,7 +972,9 @@ const [host, command] = args;
 if (host !== "localhost" && !machines[host]) setTimeout(() => {}, 1e9);
 else {
   const env = { ...process.env, ...machines[host] };
-  const run = spawnSync("sh", ["-c", command], { cwd: env.HOME, stdio: "inherit", env });
+  // sshd runs the command with the user's login shell.
+  const shell = process.env.FAKE_LOGIN_SHELL || "sh";
+  const run = spawnSync(shell, ["-c", command], { cwd: env.HOME, stdio: "inherit", env });
   process.exit(run.status ?? 1);
 }`,
   );
@@ -1109,6 +1124,15 @@ describe.skipIf(isWindows)("fleet init", () => {
     expect(again.stdout).toContain("the fleet already has them");
     expect(npxCalls(m)).toHaveLength(1);
     expect(fleetIn()).toEqual(["vps2"]);
+  });
+
+  it.skipIf(!fish)("sets up a host whose login shell is fish", async () => {
+    const { m, spec } = await controller();
+    const env = { ...initShims(m, { vps2: join(m.root, "vps2") }), FAKE_LOGIN_SHELL: fish };
+    const run = await m.runWith({ env }, "fleet", "init", "vps2", "--no-hooks", "--json");
+    expect(run.code, run.stdout + run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject([{ host: "vps2", setup: "set up" }]);
+    expect(npxCalls(m)).toEqual([expect.arrayContaining(["init", spec, "--no-hooks", "--json"])]);
   });
 
   it("refuses a host that has another manifest unless --force, and says which it has", async () => {
@@ -1866,6 +1890,58 @@ if (process.env.FAKE_ANSWER === "mismatch") {
     symlinkSync(process.execPath, join(bin, "node"));
     expect(run(bin)).toBe("fleetrc-fleet: no-npx");
   });
+});
+
+describe.skipIf(isWindows)("the command ssh hands the login shell", () => {
+  const spec = `https://h.example/a'$(touch P)\`touch Q\`"; \\ \\\\ '.git//m.json`;
+  const setup: InitSetup = { spec, flags: [], force: false, same: () => false };
+  const script = (["status", "sync", "upgrade", "init"] as const)
+    .map((action) => remoteScript(action, "1.2.3", { setup }))
+    .join("\n");
+
+  it.each(loginShells)("reaches sh byte for byte from a %s login shell", (_, shell) => {
+    const m = machine();
+    // A script that prints itself, so what sh read is what it prints.
+    const run = spawnSync(shell, ["-c", shCommand(`cat <<'EOF'\n${script}\nEOF`)], {
+      cwd: m.root,
+      encoding: "utf8",
+    });
+    expect(run.stderr).toBe("");
+    expect(run.stdout).toBe(`${script}\n`);
+    for (const file of ["P", "Q"]) expect(existsSync(join(m.root, file))).toBe(false);
+  });
+
+  it.each(["missing", "broken", "fallback"] as const)(
+    "handles a %s base64 decoder without evaluating failed output",
+    (mode) => {
+      const m = machine();
+      const bin = join(m.root, "decode-bin");
+      mkdirSync(bin);
+      const shell = which("sh");
+      symlinkSync(shell, join(bin, "sh"));
+      if (mode !== "missing") {
+        const decoder = join(bin, "base64");
+        const fallback = mode === "fallback" ? 'printf "printf complete"; exit 0' : ":";
+        writeFileSync(
+          decoder,
+          `#!/bin/sh\nif [ "$1" = -D ]; then ${fallback}; fi\nprintf "printf partial"\nexit 1\n`,
+        );
+        chmodSync(decoder, 0o755);
+      }
+      const run = spawnSync(shell, ["-c", shCommand("printf complete")], {
+        env: { PATH: bin },
+        encoding: "utf8",
+      });
+      if (mode === "fallback") {
+        expect(run.status, run.stderr).toBe(0);
+        expect(run.stdout).toBe("complete");
+      } else {
+        expect(run.status).toBe(1);
+        expect(run.stdout).toBe("");
+        expect(run.stderr).toContain("could not decode the remote script with base64");
+      }
+    },
+  );
 });
 
 describe("markBehind", () => {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { listSkills } from "skills";
@@ -24,7 +24,7 @@ import { nameKey } from "./names.ts";
 import { paths, tildify } from "./paths.ts";
 import type { Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
-import { GitError } from "./exec.ts";
+import { git, GitError } from "./exec.ts";
 import { cloneAt } from "./sources.ts";
 import { sync } from "./sync.ts";
 
@@ -78,9 +78,9 @@ interface LockEntry {
   source: string;
   sourceType?: string;
   sourceUrl?: string;
+  ref?: string;
   skillPath?: string;
   commit?: string;
-  ref?: string;
 }
 
 /** Entries of a `skills-lock.json` (versions 1 and 2 share these fields). */
@@ -99,12 +99,31 @@ export function readSkillsLock(file: string): LockEntry[] {
         source: entry.source,
         sourceType: text("sourceType"),
         sourceUrl: text("sourceUrl"),
+        ref: text("ref"),
         skillPath: text("skillPath"),
         commit: text("commit"),
-        ref: text("ref"),
       },
     ];
   });
+}
+
+/** Probes the exact filesystem upstream without Git discovering a parent repository. */
+async function hasLocalGitHead(path: string): Promise<boolean> {
+  if (!isAbsolute(path)) return false;
+  let upstream: string;
+  try {
+    upstream = realpathSync.native(path);
+  } catch {
+    return false;
+  }
+  const dotGit = join(upstream, ".git");
+  const options = { allowFail: true, noFetch: true };
+  const metadata = await git(["rev-parse", "--resolve-git-dir", dotGit], options);
+  const gitDir = `--git-dir=${metadata.code === 0 ? dotGit : upstream}`;
+  const head = await git([gitDir, "show-ref", "--hash", "--verify", "HEAD"], options);
+  if (head.code !== 0) return false;
+  const object = await git([gitDir, "cat-file", "-t", head.stdout.trim()], options);
+  return object.code === 0 && object.stdout.trim() === "commit";
 }
 
 /** Turns `skills` lock entries into manifest sources and forks. */
@@ -128,12 +147,23 @@ async function collectImports(loaded: LoadedManifest): Promise<Imports> {
   for (const entry of lockEntries) {
     const local = personal ? join(personalSkillsDir(personal), entry.name) : undefined;
     if (local && existsSync(join(local, "SKILL.md"))) {
-      if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name)))
+      if (!Object.keys(loaded.root.forks).some((key) => nameKey(key) === nameKey(entry.name))) {
+        if (entry.sourceType === "local" && !(await hasLocalGitHead(entry.source))) continue;
+        const base =
+          entry.commit || (entry.ref && /^[0-9a-f]{40}$/i.test(entry.ref) ? entry.ref : undefined);
+        const upstream =
+          entry.sourceType === "well-known"
+            ? "index"
+            : ["git", "github", "gitlab", "local"].includes(entry.sourceType ?? "")
+              ? "git"
+              : undefined;
         imports.forks[entry.name] = {
           from: entry.source,
           path: entry.skillPath ? dirname(entry.skillPath) : entry.name,
-          base: entry.commit ?? entry.ref ?? "unknown",
+          ...(base === undefined ? {} : { base }),
+          ...(upstream === undefined ? {} : { upstream }),
         };
+      }
       continue;
     }
     if (entry.sourceType === "local") continue;
@@ -367,7 +397,9 @@ export function formatPlan(plan: InitPlan, { errors = true } = {}): string {
   for (const source of plan.imports.sources)
     lines.push(`  add source from skills-lock.json: ${JSON.stringify(source)}`);
   for (const [name, fork] of Object.entries(plan.imports.forks))
-    lines.push(`  record fork ${name}: ${fork.from} ${fork.path} at ${fork.base}`);
+    lines.push(
+      `  record fork ${name}: ${fork.from} ${fork.path}${fork.base === undefined ? "" : ` at ${fork.base}`}`,
+    );
   lines.push(
     `  link ${plan.sync.skills.total} skills into ${plan.sync.targets.length} agent folders: ${plan.sync.targets.map((target) => tildify(target.dir)).join(", ")}`,
   );
