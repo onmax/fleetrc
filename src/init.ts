@@ -799,7 +799,8 @@ function resolutionPaths(path: string): { paths: string[]; directories: Set<stri
       pending = [...split(target.slice(root.length)), ...pending];
     }
     const real = realpathSync.native(path);
-    if (relative(current, real) !== "") return undefined;
+    const walked = process.platform === "win32" ? realpathSync.native(current) : current;
+    if (relative(walked, real) !== "") return undefined;
     return { paths: [...paths, real], directories };
   } catch {
     return undefined;

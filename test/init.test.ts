@@ -30,6 +30,7 @@ import {
 } from "./fixture.ts";
 
 const linkKind = isWindows ? "junction" : "dir";
+const liveCacheConfigKey = "includeIf.gitdir/i:**/.local/state/fleetrc/cache/git/*.git.path";
 
 /** Every path under `dir` with what it is, so a dry run can be shown to change nothing. */
 function snapshot(dir: string): string[] {
@@ -1123,13 +1124,7 @@ describe("init", () => {
       `url.${pathToFileURL(unavailable).href}.insteadOf`,
       upstream.url,
     );
-    m.git(
-      work,
-      "config",
-      "--global",
-      `includeIf.gitdir/i:${join(m.stateDir, "cache", "git", "*.git").replaceAll("\\", "/")}.path`,
-      liveConfig,
-    );
+    m.git(work, "config", "--global", liveCacheConfigKey, liveConfig);
 
     const preview = await m.json<LockImportPlan>("init", manifest, "--dry-run");
     expect(preview.migrations).toContainEqual(
@@ -1191,13 +1186,7 @@ describe("init", () => {
         `url.${pathToFileURL(upstream.url).href}.insteadOf`,
         lagging,
       );
-      m.git(
-        work,
-        "config",
-        "--global",
-        `includeIf.gitdir/i:${join(m.stateDir, "cache", "git", "*.git").replaceAll("\\", "/")}.path`,
-        liveConfig,
-      );
+      m.git(work, "config", "--global", liveCacheConfigKey, liveConfig);
 
       const init = await m.run("init", manifest, "--no-hooks", "--json");
       expect(init.code, init.stdout + init.stderr).toBe(0);
