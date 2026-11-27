@@ -1,16 +1,18 @@
 // Breaks found by running the packed tarball in Linux containers and over real SSH (test/envs/).
 // Each case states what a user should get; they fail until the matching fix lands.
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
-import { isWindows, machine, type Machine, remote, skills } from "./fixture.ts";
+import { isWindows, machine, type Machine, pathWithoutFleetrc, remote, skills } from "./fixture.ts";
 
 const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
 
@@ -228,6 +230,131 @@ describe("linux environments", () => {
     const init = await m.run("init", manifest, "--no-hooks");
     const onPath = existsSync(m.at(".local/bin/fleetrc"));
     expect(onPath || /PATH/.test(init.stdout), init.stdout).toBe(true);
+  });
+
+  // L13: over SSH, sshd's PATH lacks the ~/.local/bin that Ubuntu's ~/.profile adds, so `fleet
+  // upgrade` left a host without the `fleetrc` command its login shells would have found.
+  it.skipIf(isWindows)(
+    "L13. init links ~/.local/bin/fleetrc when only a noisy login shell has it on PATH",
+    async () => {
+      const m = machine();
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      const shell = join(m.root, "login-shell");
+      const transient = m.at("node_modules/.bin");
+      mkdirSync(transient, { recursive: true });
+      writeFileSync(join(transient, "fleetrc"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      writeFileSync(
+        shell,
+        `#!/bin/sh\nprintf 'Welcome\\n'\nexport PATH="$HOME/.local/bin:$HOME/node_modules/.bin:$PATH"\n/bin/sh -c "$3"\nstatus=$?\nprintf 'Goodbye\\n'\nexit "$status"\n`,
+      );
+      chmodSync(shell, 0o755);
+      const init = await m.runWith(
+        { env: { SHELL: shell, PATH: pathWithoutFleetrc(m.env) } },
+        "init",
+        manifest,
+        "--no-hooks",
+      );
+      expect(init.code, init.stderr).toBe(0);
+      expect(readlinkSync(m.at(".local/bin/fleetrc"))).toBe(join(m.stateDir, "bin", "fleetrc"));
+      expect(init.stdout).toContain("through ~/.local/bin/fleetrc");
+    },
+  );
+
+  it.skipIf(isWindows)("L13. init leaves an existing login-only fleetrc first", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    const shell = join(m.root, "login-shell");
+    mkdirSync(m.at("npm/bin"), { recursive: true });
+    writeFileSync(m.at("npm/bin/fleetrc"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(
+      shell,
+      `#!/bin/sh\nexport PATH="$HOME/.local/bin:$HOME/npm/bin:$PATH"\nexec /bin/sh -c "$3"\n`,
+      { mode: 0o755 },
+    );
+    const init = await m.runWith(
+      { env: { SHELL: shell, PATH: pathWithoutFleetrc(m.env) } },
+      "init",
+      manifest,
+      "--no-hooks",
+    );
+    expect(init.code, init.stderr).toBe(0);
+    expect(existsSync(m.at(".local/bin/fleetrc"))).toBe(false);
+    expect(init.stdout).toContain("`fleetrc` runs ~/npm/bin/fleetrc, which is on PATH");
+  });
+
+  it.skipIf(isWindows || spawnSync("fish", ["--version"]).status !== 0)(
+    "L13. init links ~/.local/bin/fleetrc from a Fish login profile that overrides pwd",
+    async () => {
+      const m = machine();
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      mkdirSync(m.at(".config/fish"), { recursive: true });
+      writeFileSync(
+        m.at(".config/fish/config.fish"),
+        'status is-login; or return\ncd "$HOME"\nset -gx PATH .local/bin\nfunction pwd\n    printf "~/wrong\\n"\nend\n',
+      );
+      const init = await m.runWith(
+        { env: { SHELL: "fish", PATH: pathWithoutFleetrc(m.env) } },
+        "init",
+        manifest,
+        "--no-hooks",
+      );
+      expect(init.code, init.stderr).toBe(0);
+      expect(init.stdout).toContain("through ~/.local/bin/fleetrc");
+      expect(readlinkSync(m.at(".local/bin/fleetrc"))).toBe(join(m.stateDir, "bin", "fleetrc"));
+    },
+  );
+
+  it.skipIf(isWindows).each([
+    { executableDir: "bin", links: true },
+    { executableDir: "login/bin", links: false },
+  ])(
+    "L13. init resolves relative login PATH entries with fleetrc in $executableDir",
+    async ({ executableDir, links }) => {
+      const m = machine();
+      const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+      const shell = join(m.root, "login-shell");
+      mkdirSync(m.at("login"), { recursive: true });
+      mkdirSync(m.at(executableDir), { recursive: true });
+      writeFileSync(m.at(`${executableDir}/fleetrc`), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      writeFileSync(
+        shell,
+        '#!/bin/sh\ncd "$HOME/login" || exit 1\nexport PATH="$HOME/.local/bin:bin"\nexec /bin/sh -c "$3"\n',
+        { mode: 0o755 },
+      );
+      const init = await m.runWith(
+        { env: { SHELL: shell, PATH: pathWithoutFleetrc(m.env) } },
+        "init",
+        manifest,
+        "--no-hooks",
+      );
+      expect(init.code, init.stderr).toBe(0);
+      expect(existsSync(m.at(".local/bin/fleetrc"))).toBe(links);
+      expect(init.stdout).toContain(
+        links
+          ? "through ~/.local/bin/fleetrc"
+          : "`fleetrc` runs ~/login/bin/fleetrc, which is on PATH",
+      );
+    },
+  );
+
+  it.skipIf(isWindows)("L13. init times out a login shell that ignores SIGTERM", async () => {
+    const m = machine();
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
+    const shell = join(m.root, "login-shell");
+    writeFileSync(
+      shell,
+      `#!/bin/sh\ntrap '' TERM\n/bin/sleep 7\nprintf 'finished' > "$HOME/probe-finished"\n`,
+      { mode: 0o755 },
+    );
+    const init = await m.runWith(
+      { env: { SHELL: shell, PATH: pathWithoutFleetrc(m.env) } },
+      "init",
+      manifest,
+      "--no-hooks",
+    );
+    expect(init.code, init.stderr).toBe(0);
+    expect(init.stdout).toContain("add ~/.local/state/fleetrc/bin to PATH");
+    expect(existsSync(m.at("probe-finished"))).toBe(false);
   });
 
   // L14: a reachable host with node but without fleetrc falls back to `npx -y fleetrc`; the
