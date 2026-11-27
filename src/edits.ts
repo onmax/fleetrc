@@ -1,11 +1,24 @@
 import {
+  chmodSync,
+  closeSync,
   existsSync,
+  fchmodSync,
+  fstatSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
+  rmdirSync,
+  statSync,
+  type Dirent,
+  type Stats,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,9 +34,14 @@ import {
   hashDir,
   inside,
   isErrno,
+  isMergeScratch,
   isRecord,
   lstat,
+  mergeRecoveryPointer,
+  mergeWorkspaceReceipt,
   moveDir,
+  readMergeRecoveryPointer,
+  registerMergeWorkspace,
   sha256,
 } from "./fs.ts";
 import { itemName, itemPath, parseItemId } from "./files.ts";
@@ -624,15 +642,29 @@ function readContent(dir: string, file: string): Content | undefined {
   return stat?.isFile() ? readFileSync(path) : undefined;
 }
 
+function writeMergeFile(path: string, content: Buffer, bits: number, flag: "w" | "wx") {
+  if (bits === 0) {
+    writeFileSync(path, content, { flag });
+    return;
+  }
+  const fd = openSync(path, flag);
+  try {
+    writeFileSync(fd, content);
+    fchmodSync(fd, (fstatSync(fd).mode & 0o666) | bits);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /**
  * Writes upstream's side of a conflict beside the local file, at `<file>.upstream`, or
  * `<file>.upstream.<n>` when that is taken: created, never overwritten, and never through a link.
  */
-function writeSidecar(target: string, content: Buffer, suffix = ".upstream"): string {
+function writeSidecar(target: string, content: Buffer, suffix = ".upstream", bits = 0): string {
   for (let n = 0; ; n++) {
     const path = n === 0 ? `${target}${suffix}` : `${target}${suffix}.${n}`;
     try {
-      writeFileSync(path, content, { flag: "wx" });
+      writeMergeFile(path, content, bits, "wx");
       return path;
     } catch (error) {
       if (!isErrno(error, "EEXIST")) throw error;
@@ -640,8 +672,344 @@ function writeSidecar(target: string, content: Buffer, suffix = ".upstream"): st
   }
 }
 
+const mergeExecuteBits = (entry: Stats | undefined) =>
+  process.platform !== "win32" && entry?.isFile() ? entry.mode & 0o111 : 0;
+
+function mergeSnapshot(dir: string | undefined) {
+  const entries = new Map<string, Dirent>();
+  const hashes: ReturnType<typeof hashDir> = dir === undefined ? {} : hashDir(dir, entries);
+  const modes = new Map<string, number>();
+  if (dir !== undefined && process.platform !== "win32") {
+    for (const [path, entry] of entries) {
+      if (!entry.isFile()) continue;
+      const bits = mergeExecuteBits(lstat(join(dir, path)));
+      if (bits !== 0) modes.set(path, bits);
+    }
+  }
+  return { entries, hashes, modes };
+}
+
+const mergeScratchPrefix = (live: string) => `.fleetrc-merge-${sha256(basename(live))}-`;
+const savedMergeUnit = (scratch: string) => join(scratch, "previous", "unit");
+const mergeIncoming = (scratch: string) => join(scratch, "incoming");
+const mergeIdentity = (entry: Stats) => `${entry.dev}:${entry.ino}:${entry.birthtimeMs}`;
+
+const mergeInventory = ({ entries, hashes, modes }: ReturnType<typeof mergeSnapshot>) =>
+  [...entries.keys()].sort().map((path) => {
+    const entry = [path, entries.get(path)!.isDirectory(), hashes[path]] as const;
+    const bits = modes.get(path);
+    return bits === undefined ? entry : ([...entry, bits] as const);
+  });
+const mergeFingerprint = (snapshot: ReturnType<typeof mergeSnapshot>) =>
+  sha256(JSON.stringify(mergeInventory(snapshot)));
+
+/** Preserve an ambiguous directory, or remove it only if the filesystem confirms it is empty. */
+function preserveUnconfirmedDirectory(target: string) {
+  const backupRoot = paths.backup();
+  mkdirSync(backupRoot, { recursive: true });
+  const backup = mkdtempSync(join(backupRoot, "merge-unconfirmed-"));
+  const preserved = join(backup, basename(target));
+  try {
+    renameSync(target, preserved);
+  } catch (error) {
+    rmdirSync(backup);
+    if (isErrno(error, "EXDEV")) {
+      try {
+        rmdirSync(target);
+        return;
+      } catch (removeError) {
+        throw new Error(`cannot preserve ${target} across filesystems; left it in place`, {
+          cause: removeError,
+        });
+      }
+    }
+    throw new Error(`cannot move ${target} safely to ${preserved}; left it in place`, {
+      cause: error,
+    });
+  }
+  process.stderr.write(`merge: preserving unconfirmed directory ${target} at ${preserved}\n`);
+}
+
+/** Fill an empty or partially installed unit, accepting only entries made by this transaction. */
+function publishMergeUnit(scratch: string, unit: string, target: string) {
+  const dirs = join(scratch, "dirs");
+  mkdirSync(dirs, { recursive: true });
+  const put = (from: string, to: string) => {
+    const entry = lstat(from)!;
+    let dest = lstat(to);
+    const occupied = () => new Error(`${to} is occupied by another entry`);
+    if (!entry.isDirectory()) {
+      if (dest === undefined) linkSync(from, to);
+      else if (mergeIdentity(dest) !== mergeIdentity(entry)) throw occupied();
+      return;
+    }
+    const record = join(dirs, sha256(relative(unit, from)));
+    const intent = `${record}.creating`;
+    if (dest?.isDirectory() && !existsSync(record) && existsSync(intent)) {
+      if (readdirSync(to).length > 0) throw occupied();
+      preserveUnconfirmedDirectory(to);
+      dest = undefined;
+    }
+    if (dest === undefined) {
+      if (existsSync(record)) throw occupied();
+      writeFileSync(intent, "");
+      try {
+        mkdirSync(to, { mode: 0o700 });
+      } catch (error) {
+        rmSync(intent);
+        throw error;
+      }
+      const temporary = `${record}.tmp`;
+      writeFileSync(temporary, mergeIdentity(lstat(to)!));
+      renameSync(temporary, record);
+    } else if (
+      !dest.isDirectory() ||
+      !existsSync(record) ||
+      readFileSync(record, "utf8") !== mergeIdentity(dest)
+    ) {
+      throw occupied();
+    }
+    const children = new Set(readdirSync(from));
+    if (readdirSync(to).some((name) => !children.has(name))) throw occupied();
+    for (const name of children) put(join(from, name), join(to, name));
+    chmodSync(to, entry.mode & 0o7777);
+  };
+  put(unit, target);
+}
+
+function cleanMergeScratch(scratch: string) {
+  function makeRemovable(dir: string) {
+    const entry = lstat(dir);
+    if (!entry?.isDirectory()) return;
+    if ((entry.mode & 0o700) !== 0o700) chmodSync(dir, entry.mode | 0o700);
+    for (const name of readdirSync(dir)) makeRemovable(join(dir, name));
+  }
+  makeRemovable(scratch);
+  rmSync(scratch, { recursive: true, force: true });
+}
+
+function retireMergeScratch(scratch: string, original?: ReturnType<typeof mergeSnapshot>) {
+  const done = join(scratch, "retired");
+  const saved = savedMergeUnit(scratch);
+  const previous = dirname(saved);
+  if (original !== undefined) {
+    writeFileSync(`${done}.tmp`, JSON.stringify(mergeInventory(original)));
+    renameSync(`${done}.tmp`, done);
+  }
+  if (lstat(previous) !== undefined) {
+    const recorded = readFileSync(done, "utf8");
+    const expected = new Map<string, string>(
+      recorded
+        ? (JSON.parse(recorded) as ReturnType<typeof mergeInventory>).map((entry) => [
+            entry[0],
+            JSON.stringify(entry),
+          ])
+        : [],
+    );
+    const changed = () =>
+      new UserError(
+        `merge: cannot retire a changed saved original; previous copy kept at ${saved}. Reconcile the copies, then move the recovery folder ${scratch} aside and retry.`,
+      );
+    const remaining = mergeInventory(mergeSnapshot(previous));
+    if (remaining.some((entry) => expected.get(entry[0]) !== JSON.stringify(entry)))
+      throw changed();
+    for (const [path, directory] of remaining) {
+      if (!directory) continue;
+      const folder = join(previous, path);
+      const entry = lstat(folder);
+      if (!entry?.isDirectory()) throw changed();
+      if ((entry.mode & 0o700) !== 0o700) chmodSync(folder, entry.mode | 0o700);
+    }
+    for (const [path, directory, hash, bits = 0] of remaining.reverse()) {
+      const target = join(previous, path);
+      if (directory) rmdirSync(target);
+      else {
+        const entry = lstat(target);
+        const current = entry?.isSymbolicLink()
+          ? sha256(`link:${readlinkSync(target)}`)
+          : entry?.isFile()
+            ? sha256(readFileSync(target))
+            : undefined;
+        if (
+          entry === undefined ||
+          current !== hash ||
+          entry.isDirectory() ||
+          mergeExecuteBits(entry) !== bits
+        )
+          throw changed();
+        unlinkSync(target);
+      }
+    }
+    rmdirSync(previous);
+  }
+  for (const name of readdirSync(scratch)) {
+    if (name !== "retired" && name !== "previous") cleanMergeScratch(join(scratch, name));
+  }
+  rmSync(done);
+  rmdirSync(scratch);
+}
+
+/** An approved publication is resumed; an unapproved move is restored, never overwritten. */
+function finishMergeUnit(scratch: string, target: string) {
+  const saved = savedMergeUnit(scratch);
+  const publishing = join(scratch, "publish");
+  let original: ReturnType<typeof mergeSnapshot>;
+  try {
+    if (existsSync(publishing)) {
+      const incoming = mergeIncoming(scratch);
+      const next = join(incoming, "next");
+      const expected = JSON.parse(readFileSync(publishing, "utf8")) as {
+        incoming?: string;
+        previous?: string;
+      };
+      const checkPrevious = () => {
+        const snapshot = mergeSnapshot(dirname(saved));
+        if (mergeFingerprint(snapshot) !== expected.previous)
+          throw new Error("the saved original no longer matches the publication approval");
+        return snapshot;
+      };
+      const check = () => {
+        if (mergeFingerprint(mergeSnapshot(incoming)) !== expected.incoming)
+          throw new Error("the published files changed");
+      };
+      checkPrevious();
+      check();
+      if (lstat(next) !== undefined) publishMergeUnit(scratch, next, target);
+      else if (lstat(target) !== undefined)
+        throw new Error(`${target} is occupied by another entry`);
+      check();
+      original = checkPrevious();
+    } else {
+      if (lstat(saved) !== undefined) publishMergeUnit(scratch, saved, target);
+      original = mergeSnapshot(dirname(saved));
+    }
+  } catch (error) {
+    throw new UserError(
+      `merge: could not finish replacing ${target} (${(error as Error).message}); ${lstat(saved) ? `previous copy kept at ${saved}. Reconcile the copies, then move the recovery folder ${scratch} aside and retry.` : `move the recovery folder ${scratch} aside and retry.`}`,
+    );
+  }
+  retireMergeScratch(scratch, original);
+}
+
+function lstatMergeScratch(scratch: string) {
+  try {
+    return lstat(scratch);
+  } catch (error) {
+    if (isErrno(error, "ENOTDIR")) return undefined;
+    throw error;
+  }
+}
+
+/** Recover before hashing; fallback workspaces beside the target are excluded from skill copies. */
+function recoverMergeUnit(live: string, dryRun: boolean) {
+  const pointer = mergeRecoveryPointer(live);
+  const scratch = readMergeRecoveryPointer(pointer);
+  if (scratch === undefined) return;
+  const scratchParent = dirname(scratch);
+  const besideLive = scratchParent === dirname(live);
+  if (!isMergeScratch(basename(scratch)) || (!besideLive && !inside(live, scratchParent))) {
+    throw new UserError(`merge: invalid recovery pointer at ${pointer}`);
+  }
+  const entry = lstatMergeScratch(scratch);
+  if (entry && !besideLive && realpathSync(scratchParent) !== scratchParent) {
+    throw new UserError(`merge: invalid recovery pointer at ${pointer}`);
+  }
+  if (entry?.isDirectory()) {
+    const saved = savedMergeUnit(scratch);
+    if (existsSync(join(scratch, "retired"))) {
+      if (!dryRun) retireMergeScratch(scratch);
+    } else if (lstat(saved) || existsSync(join(scratch, "publish"))) {
+      const root = readFileSync(join(scratch, "target"), "utf8");
+      const target = join(live, root);
+      if (
+        dryRun ||
+        target === live ||
+        relative(live, target).split(sep).join("/") !== root ||
+        !inside(live, target) ||
+        (scratchParent !== dirname(live) && scratchParent !== dirname(target)) ||
+        linkedFolder(live, root) !== undefined
+      ) {
+        throw new UserError(
+          `merge: interrupted replacement of ${target}; recovery folder ${scratch}${dryRun ? "; rerun without --dry-run to recover" : ""}`,
+        );
+      }
+      finishMergeUnit(scratch, target);
+    } else if (!dryRun) retireMergeScratch(scratch, mergeSnapshot(dirname(saved)));
+  }
+  if (!dryRun) {
+    rmSync(mergeWorkspaceReceipt(scratch), { force: true });
+    rmSync(pointer, { force: true });
+  }
+}
+
+function makeMergeScratch(live: string, targetParent: string) {
+  const parent = dirname(live);
+  const prefix = mergeScratchPrefix(live);
+  if (statSync(parent).dev === statSync(targetParent).dev) {
+    try {
+      return mkdtempSync(join(parent, prefix));
+    } catch (error) {
+      if (!isErrno(error, "EACCES") && !isErrno(error, "EPERM") && !isErrno(error, "EROFS"))
+        throw error;
+    }
+  }
+  return mkdtempSync(join(targetParent, prefix));
+}
+
+/** Stage the replacement, then check the old unit after moving it aside and before discarding it. */
+function replaceMergeUnit(
+  live: string,
+  root: string,
+  stage: (next: string) => void,
+  unchanged: (old: ReturnType<typeof mergeSnapshot>) => boolean,
+): boolean {
+  const target = join(live, root);
+  mkdirSync(dirname(target), { recursive: true });
+  const pointer = mergeRecoveryPointer(live);
+  mkdirSync(dirname(pointer), { recursive: true });
+  const scratch = makeMergeScratch(live, dirname(target));
+  const previous = join(scratch, "previous");
+  const saved = savedMergeUnit(scratch);
+  const incoming = mergeIncoming(scratch);
+  const next = join(incoming, "next");
+  try {
+    registerMergeWorkspace(scratch, pointer);
+    writeFileSync(`${pointer}.tmp`, scratch);
+    renameSync(`${pointer}.tmp`, pointer);
+    writeFileSync(join(scratch, "target"), root);
+    mkdirSync(incoming);
+    stage(next);
+    mkdirSync(previous);
+    if (lstat(target) !== undefined) {
+      try {
+        renameSync(target, saved);
+      } catch (error) {
+        if (isErrno(error, "ENOENT")) return false;
+        throw error;
+      }
+    }
+    const original = mergeSnapshot(previous);
+    if (!unchanged(original) || lstat(target) !== undefined) return false;
+    writeFileSync(
+      join(scratch, "ready"),
+      JSON.stringify({
+        incoming: mergeFingerprint(mergeSnapshot(incoming)),
+        previous: mergeFingerprint(original),
+      }),
+    );
+    renameSync(join(scratch, "ready"), join(scratch, "publish"));
+    return true;
+  } finally {
+    finishMergeUnit(scratch, target);
+    rmSync(mergeWorkspaceReceipt(scratch), { force: true });
+    rmSync(pointer, { force: true });
+  }
+}
+
 /**
- * Three-way merge of one folder: `base` to `upstream` changes applied onto `live`, file by file.
+ * Three-way merge of one folder: `base` to `upstream` changes applied onto `live`, file by file,
+ * except that a path that is a file on one side and a folder on another merges as one unit with
+ * what is under it.
  * Links are compared by their targets and never followed, read through or written: a file that is
  * a link, or sits in a linked folder, on any side, and changed upstream, is a conflict. Without
  * a base, merge shared text files against empty content, but report empty versus nonempty as a
@@ -653,15 +1021,44 @@ async function mergeTrees(
   upstream: string,
   dryRun: boolean,
 ): Promise<MergeResult> {
-  const files = new Set([
-    ...Object.keys(hashDir(live)),
-    ...(base === undefined ? [] : Object.keys(hashDir(base))),
-    ...Object.keys(hashDir(upstream)),
-  ]);
+  const realLive = existsSync(live) ? realpathSync(live) : live;
+  recoverMergeUnit(realLive, dryRun);
+  const [local, previous, next] = [
+    mergeSnapshot(live),
+    mergeSnapshot(base),
+    mergeSnapshot(upstream),
+  ];
+  const [hl, hb, hu] = [local.hashes, previous.hashes, next.hashes];
+  const files = new Set([...Object.keys(hl), ...Object.keys(hb), ...Object.keys(hu)]);
+  const collisions = new Set(
+    [...files].filter((file) =>
+      [local, previous, next].some(({ entries }) => entries.get(file)?.isDirectory()),
+    ),
+  );
+  const groups = new Map<string, string[]>();
+  if (collisions.size > 0) {
+    const paths = new Set([
+      ...local.entries.keys(),
+      ...previous.entries.keys(),
+      ...next.entries.keys(),
+    ]);
+    for (const path of paths) {
+      let root: string | undefined;
+      for (let ancestor = path; ancestor !== "."; ancestor = posix.dirname(ancestor)) {
+        if (collisions.has(ancestor)) root = ancestor;
+      }
+      if (root === undefined) continue;
+      const group = groups.get(root);
+      if (group === undefined) groups.set(root, [path]);
+      else group.push(path);
+      if (path !== root) files.delete(path);
+    }
+  }
   const modeOnly = new Set(
     base === undefined
       ? []
-      : changedModes(executables(base), executables(upstream)).filter((file) => {
+      : changedModes([...previous.modes.keys()], [...next.modes.keys()]).filter((file) => {
+          if (!files.has(file) || groups.has(file)) return false;
           const incoming = readContent(upstream, file);
           return Buffer.isBuffer(incoming) && sameContent(incoming, readContent(base, file));
         }),
@@ -681,7 +1078,7 @@ async function mergeTrees(
    * `<file>.upstream` (a link's as a note of its target), or a note that upstream deleted it. A file
    * in a linked folder gets its note beside that folder, since merge never writes through a link.
    */
-  const conflict = (file: string, upstream: Content | undefined) => {
+  const conflict = (file: string, upstream: Content | "folder" | undefined, bits = 0) => {
     result.conflicts.push(file);
     if (dryRun) return;
     const folder = linkedFolder(live, file);
@@ -704,17 +1101,95 @@ async function mergeTrees(
               ),
               ".upstream-deleted",
             )
-          : writeSidecar(
-              at,
-              Buffer.isBuffer(upstream)
-                ? upstream
-                : Buffer.from(`upstream has a link here, to ${upstream.link}\n`),
-            );
+          : upstream === "folder"
+            ? writeSidecar(
+                at,
+                Buffer.from(
+                  `upstream turned ${file} into a folder, and you changed it. Bring in upstream's ${file}/ by hand, then delete this file and run \`fleetrc merge\` again.\n`,
+                ),
+                ".upstream-conflict",
+              )
+            : writeSidecar(
+                at,
+                Buffer.isBuffer(upstream)
+                  ? upstream
+                  : Buffer.from(`upstream has a link here, to ${upstream.link}\n`),
+                ".upstream",
+                bits,
+              );
     markers[file] = relative(live, written).split(sep).join("/");
+  };
+  /**
+   * Replaces the unit at `root` with upstream's when the local copy has no edits in it and upstream's
+   * holds only plain files, and is a conflict on `root` otherwise.
+   */
+  const mergeUnit = (root: string, paths: string[]) => {
+    const sameFile = (left: typeof local, right: typeof local, path: string) =>
+      left.hashes[path] === right.hashes[path] && left.modes.get(path) === right.modes.get(path);
+    const sameUnit = (left: typeof local, right: typeof local) =>
+      paths.every((path) => sameFile(left, right, path));
+    if (sameUnit(next, previous) || sameUnit(local, next)) return;
+    const incoming = paths.filter((path) => hu[path] !== undefined);
+    const contents = incoming.map((file) => readContent(upstream, file));
+    const upstreamConflict = () =>
+      conflict(
+        root,
+        next.entries.get(root)?.isDirectory() ? "folder" : readContent(upstream, root),
+        next.modes.get(root),
+      );
+    const localEntries = paths.filter((path) => local.entries.has(path));
+    if (
+      !sameUnit(local, previous) ||
+      localEntries.some((path) => {
+        const entry = local.entries.get(path)!;
+        return !entry.isFile() && !entry.isDirectory();
+      }) ||
+      linkedFolder(live, root) !== undefined ||
+      !contents.every((content) => Buffer.isBuffer(content))
+    ) {
+      upstreamConflict();
+      return;
+    }
+    if (!dryRun) {
+      const replaced = replaceMergeUnit(
+        realLive,
+        root,
+        (staged) => {
+          if (next.entries.get(root)?.isDirectory()) mkdirSync(staged);
+          incoming.forEach((file, index) => {
+            const path = join(staged, file.slice(root.length));
+            mkdirSync(dirname(path), { recursive: true });
+            writeMergeFile(path, contents[index] as Buffer, next.modes.get(file) ?? 0, "w");
+          });
+        },
+        (old) =>
+          old.entries.size === localEntries.length &&
+          localEntries.every((path) => {
+            const saved = `unit${path.slice(root.length)}`;
+            const entry = old.entries.get(saved);
+            return (
+              (local.entries.get(path)?.isDirectory() ? entry?.isDirectory() : entry?.isFile()) &&
+              old.hashes[saved] === hl[path] &&
+              old.modes.get(saved) === local.modes.get(path)
+            );
+          }),
+      );
+      if (!replaced) {
+        upstreamConflict();
+        return;
+      }
+    }
+    const changed = paths.filter((file) => !sameFile(previous, next, file));
+    result.merged.push(...changed.sort());
   };
   for (const file of [...files].sort()) {
     if (modeOnly.has(file)) {
       result.merged.push(file);
+      continue;
+    }
+    const group = groups.get(file);
+    if (group !== undefined) {
+      mergeUnit(file, group);
       continue;
     }
     const b = base === undefined ? undefined : readContent(base, file);
@@ -901,6 +1376,11 @@ export async function forkSkill(
   const store = storePaths(paths.store(source.id), name);
   if (!existsSync(store.live))
     throw new UserError(`${name} has no copy on this machine yet; run \`fleetrc sync\``);
+  const recovery = readMergeRecoveryPointer(mergeRecoveryPointer(realpathSync(store.live)));
+  if (recovery !== undefined && lstatMergeScratch(recovery) !== undefined)
+    throw new UserError(
+      `${name} has an interrupted merge at ${recovery}; run \`fleetrc merge ${name}\` before forking`,
+    );
   const sourceState = state.sources[source.id]!;
   const installed = sourceState.skills[name];
   if (existsSync(store.upstream)) {
