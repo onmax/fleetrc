@@ -3,12 +3,14 @@
 // On macOS (APFS folds case and Unicode normalization) these reproduce what happens there for real;
 // on Linux and Windows they check that every machine of a fleet ends up with the same skills.
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
+import { sha256 } from "../src/fs.ts";
 import { collisions, refusals } from "../src/gitcache.ts";
 import {
   clone,
+  isWindows,
   type Machine,
   machine,
   names,
@@ -726,5 +728,255 @@ describe("a sync of one source", () => {
       expect((await m.run("status")).stdout).toContain("held personal: 1 local commit not on");
     }
     expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool", "v2"));
+  });
+});
+
+describe("the last skill of a repository", () => {
+  const lastSkill = async (
+    options: { skills?: string; update?: "review" } = {},
+    files: Record<string, string> = {},
+  ) => {
+    const m = machine();
+    const vendor = remote(m, "vendor", {
+      ...skills("skills/", "tool"),
+      "README.md": "readme\n",
+      ...files,
+    });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url, ...options }],
+    });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+    return { m, vendor };
+  };
+  const state = (m: Machine) =>
+    (
+      JSON.parse(read(join(m.stateDir, "state.json"))) as {
+        sources: Record<
+          string,
+          { commit?: string; gitDiscovery?: string; skills: Record<string, unknown> }
+        >;
+      }
+    ).sources.vendor!;
+
+  function forgetDiscovery(m: Machine) {
+    const path = join(m.stateDir, "state.json");
+    const legacy = JSON.parse(read(path)) as { sources: { vendor: ReturnType<typeof state> } };
+    delete legacy.sources.vendor.gitDiscovery;
+    writeFileSync(path, JSON.stringify(legacy));
+  }
+
+  it.each([undefined, "skills/*"])("LAST1. reconciles last deletion with glob %s", async (glob) => {
+    const { m, vendor } = await lastSkill(glob ? { skills: glob } : {});
+    const head = vendor.commit({ "skills/tool": null });
+    const report = await m.json("sync");
+    const source = report.sources.find((entry) => entry.id === "vendor");
+    expect(source?.status, JSON.stringify(report, null, 2)).not.toBe("error");
+    expect(report.skills.removed).toEqual(["tool"]);
+    expect(names(m.at(".claude/skills"))).toEqual([]);
+    expect(state(m).commit).toBe(head);
+    expect(state(m).skills).toEqual({});
+
+    const again = await m.json("sync");
+    expect(again.warnings).toEqual([]);
+    expect(again.sources.find((entry) => entry.id === "vendor")?.status).not.toBe("error");
+  });
+
+  it("LAST1. removed upstream while edited here, it stays with its edit", async () => {
+    const { m, vendor } = await lastSkill();
+    const edited = skillMd("tool", "mine");
+    writeFileSync(m.at(".claude/skills/tool/SKILL.md"), edited);
+    const head = vendor.commit({ "skills/tool": null });
+    const report = await m.json("sync");
+    expect(report.warnings).toContain(
+      "vendor: tool is gone upstream but has local edits, so it stays",
+    );
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(edited);
+    expect(state(m).commit).toBe(head);
+  });
+
+  it("LAST1. proves deletion for an existing install without a discovery fingerprint", async () => {
+    const { m, vendor } = await lastSkill({ skills: "skills/*" });
+    forgetDiscovery(m);
+    vendor.commit({ "skills/tool": null });
+    expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
+  });
+
+  async function linkedLastSkill() {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "shared/tool/SKILL.md": skillMd("tool") });
+    mkdirSync(join(vendor.work, "skills"));
+    symlinkSync("../shared/tool", join(vendor.work, "skills/tool"));
+    m.git(vendor.work, "add", "-A");
+    m.git(vendor.work, "commit", "--quiet", "-m", "linked collection");
+    m.git(vendor.work, "push", "--quiet", "origin", "main");
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url, skills: "skills/*" }],
+    });
+    expect((await m.run("init", manifest, "--no-hooks")).code).toBe(0);
+    expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+    return { m, vendor };
+  }
+
+  it.skipIf(isWindows)("LAST1. proves deletion of a legacy linked folder", async () => {
+    const { m, vendor } = await linkedLastSkill();
+    forgetDiscovery(m);
+    vendor.commit({ "skills/tool": null });
+    expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
+  });
+
+  it.skipIf(isWindows)("LAST1. a plain-file checkout of a link is not a deletion", async () => {
+    const { m, vendor } = await linkedLastSkill();
+    m.git(vendor.work, "config", "--global", "core.symlinks", "false");
+    vendor.commit({ "README.md": "changed\n" });
+    const report = await m.json("sync");
+    expect(report.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+    expect(report.skills.removed).toEqual([]);
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+
+    vendor.commit({ "shared/tool": null });
+    expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
+  });
+
+  it.skipIf(isWindows).each([false, true])(
+    "LAST1. sync without symlink support (linked skill still upstream: %s)",
+    async (linkedSkill) => {
+      const { m, vendor } = linkedSkill ? await linkedLastSkill() : await lastSkill();
+      symlinkSync("README.md", join(vendor.work, "docs-link"));
+      vendor.commit(linkedSkill ? { "README.md": "changed\n" } : { "skills/tool": null });
+      m.git(vendor.work, "config", "--global", "core.symlinks", "false");
+      const bin = join(m.root, "no-symlinks");
+      mkdirSync(bin);
+      writeFileSync(
+        join(bin, "git"),
+        `#!/bin/sh
+for arg do
+  case "$arg" in
+    core.symlinks=true) symlinks=true ;;
+    checkout-index) if [ "$symlinks" = true ]; then
+      echo 'unable to create symlink: Operation not permitted' >&2
+      exit 128
+    fi ;;
+  esac
+done
+PATH="$FLEETRC_REAL_PATH" exec git "$@"
+`,
+        { mode: 0o755 },
+      );
+      m.env.FLEETRC_REAL_PATH = m.env.PATH;
+      m.env.PATH = `${bin}:${m.env.PATH}`;
+      const report = await m.json("sync");
+      if (linkedSkill) {
+        const source = report.sources.find((entry) => entry.id === "vendor");
+        expect(source?.status).toBe("error");
+        expect(source?.error).toContain("unable to create symlink");
+        expect(report.skills.removed).toEqual([]);
+        expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+      } else {
+        expect(report.skills.removed, JSON.stringify(report, null, 2)).toEqual(["tool"]);
+        expect(names(m.at(".claude/skills"))).toEqual([]);
+        expect(state(m).commit).toBe(vendor.head());
+      }
+    },
+  );
+
+  it.each([
+    ["node_modules/fixture/SKILL.md", skillMd("fixture")],
+    ["templates/draft/SKILL.md", "# A template without skill metadata\n"],
+  ])("LAST1. an undiscoverable %s does not veto deletion", async (path, content) => {
+    const { m, vendor } = await lastSkill({}, { [path]: content });
+    const head = vendor.commit({ "skills/tool": null });
+    expect((await m.json("sync")).skills.removed).toEqual(["tool"]);
+    expect(state(m).commit).toBe(head);
+    const trace = join(m.root, "git-trace");
+    m.env.GIT_TRACE = trace;
+    expect((await m.json("sync")).warnings).toEqual([]);
+    expect(read(trace)).toContain("fetch");
+    expect(read(trace)).not.toContain("checkout-index");
+  });
+
+  it("LAST1. a new source whose repository has no skills says so", async () => {
+    const m = machine();
+    const vendor = remote(m, "vendor", { "README.md": "readme\n" });
+    const manifest = m.manifest({
+      agents: ["claude-code"],
+      sources: [{ id: "vendor", git: vendor.url }],
+    });
+    const report = await m.json<{ sync: { sources: { id: string; status: string }[] } }>(
+      "init",
+      manifest,
+      "--no-hooks",
+    );
+    expect(report.sync.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+  });
+
+  it.each([false, true])(
+    "LAST1. wrong glob keeps the last good copy (base exists: %s)",
+    async (baseExists) => {
+      const { m, vendor } = await lastSkill();
+      vendor.commit({
+        "skills/tool": null,
+        ...(baseExists ? { "wrong/README.md": "readme\n" } : {}),
+      });
+      m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url, skills: "wrong/*" }],
+      });
+      const report = await m.json("sync");
+      expect(report.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+      expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    },
+  );
+
+  it("LAST1. a missing cached file does not count as a deletion", async () => {
+    const { m, vendor } = await lastSkill();
+    const key = sha256(`${vendor.url}#`).slice(0, 16);
+    rmSync(join(m.stateDir, "cache", "git", key, "skills", "tool", "SKILL.md"));
+    const report = await m.json("sync");
+    expect(report.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
+
+  it("LAST1. a missing cached replacement does not count as empty discovery", async () => {
+    const { m, vendor } = await lastSkill({ update: "review" });
+    vendor.commit({ "skills/tool": null, "skills/next/SKILL.md": skillMd("next") });
+    expect((await m.json("sync")).sources.find((entry) => entry.id === "vendor")?.status).toBe(
+      "review",
+    );
+    const key = sha256(`${vendor.url}#`).slice(0, 16);
+    rmSync(join(m.stateDir, "cache", "git", key, "skills", "next", "SKILL.md"));
+    const report = await m.json("update", "vendor");
+    expect(report.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+  });
+
+  it("LAST1. changing the remote does not count as a deletion", async () => {
+    const { m, vendor } = await lastSkill();
+    const other = remote(m, "other", { "README.md": "readme\n" });
+    m.manifest({ agents: ["claude-code"], sources: [{ id: "vendor", git: other.url }] });
+    const report = await m.json("sync");
+    expect(report.sources.find((entry) => entry.id === "vendor")?.status).toBe("error");
+    expect(read(m.at(".claude/skills/tool/SKILL.md"))).toBe(skillMd("tool"));
+    expect(state(m).commit).toBe(vendor.head());
+  });
+
+  it("LAST1. review still applies to additions after an approved last deletion", async () => {
+    const { m, vendor } = await lastSkill({ update: "review" });
+    vendor.commit({ "skills/tool": null });
+    expect((await m.json("sync")).sources.find((entry) => entry.id === "vendor")?.status).toBe(
+      "review",
+    );
+    expect(names(m.at(".claude/skills"))).toEqual(["tool"]);
+    expect((await m.json("update", "vendor")).skills.removed).toEqual(["tool"]);
+    expect(names(m.at(".claude/skills"))).toEqual([]);
+    vendor.commit({ "skills/next/SKILL.md": skillMd("next") });
+    expect((await m.json("sync")).sources.find((entry) => entry.id === "vendor")?.status).toBe(
+      "review",
+    );
+    expect(names(m.at(".claude/skills"))).toEqual([]);
+    expect((await m.json("update", "vendor")).skills.added).toEqual(["next"]);
+    expect(names(m.at(".claude/skills"))).toEqual(["next"]);
   });
 });

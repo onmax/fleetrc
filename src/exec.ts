@@ -226,6 +226,7 @@ export async function git(
     timeoutMs?: number;
     allowFail?: boolean;
     input?: string;
+    indexFile?: string;
     noFetch?: boolean;
     signal?: AbortSignal;
   } = {},
@@ -243,6 +244,7 @@ export async function git(
     env.GIT_NO_LAZY_FETCH = "1";
     env.GIT_ALLOW_PROTOCOL = "";
   }
+  if (options.indexFile !== undefined) env.GIT_INDEX_FILE = options.indexFile;
   // Git for Windows writes no path past 260 characters without core.longpaths, and fleetrc's
   // cache sits deep under HOME. Other systems ignore it.
   // A remote that stops sending: under 1 KB/s for a minute ends the transfer, over http(s). Other

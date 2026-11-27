@@ -28,6 +28,10 @@ export interface SourceState {
   kind: Source["kind"];
   /** Commit of the last fetch (git) or of the working clone's HEAD. */
   commit?: string;
+  /** Fingerprint of the Git repository, ref and glob at the last successful discovery. */
+  gitDiscovery?: string;
+  /** The last Git commit and discovery fingerprint were verified to yield no skills. */
+  gitEmpty?: true;
   /** npm package version. */
   version?: string;
   /** Effective registry hash and package name for the recorded npm version. */
@@ -300,7 +304,8 @@ function sourceRecord(record: unknown): SourceState | undefined {
   if (!isRecord(record) || !KINDS.includes(String(record.kind))) return undefined;
   return {
     kind: record.kind as Source["kind"],
-    ...strings(record, "commit", "version", "npmPackageKey", "fetchedAt"),
+    ...strings(record, "commit", "gitDiscovery", "version", "npmPackageKey", "fetchedAt"),
+    ...(record.gitEmpty === true ? { gitEmpty: true } : {}),
     skills: records(record.skills, installedCopy),
     pending: records(record.pending, pendingUpdate),
     ...(isRecord(record.files)

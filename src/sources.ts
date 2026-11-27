@@ -66,6 +66,7 @@ import {
   isCommitRef,
   type Refusal,
   refusals,
+  withGitTree,
 } from "./gitcache.ts";
 import { globBase, globFilter } from "./glob.ts";
 import { isFileKind, ITEM_KINDS, type ItemKind } from "./kinds.ts";
@@ -1233,6 +1234,123 @@ const filesOnly = (source: VendoredSource, state: SourceState) =>
       (kind) => !!kind && Object.keys(kind.items).length + Object.keys(kind.pending).length > 0,
     ));
 
+const gitDiscovery = (source: GitSource) =>
+  sha256(JSON.stringify([gitUrl(source.git), source.ref, source.skills]));
+
+async function gitTreePaths(repo: string, commit: string) {
+  const tree = await git(
+    [`--git-dir=${repo}`, "ls-tree", "-r", "-t", "-z", "--full-tree", commit],
+    { allowFail: true },
+  );
+  if (tree.code !== 0 || tree.truncated) return undefined;
+  return new Map(
+    tree.stdout
+      .split("\0")
+      .filter(Boolean)
+      .map((entry) => [entry.slice(entry.indexOf("\t") + 1), entry.slice(0, entry.indexOf(" "))]),
+  );
+}
+
+function ancestorHasMode(tree: ReadonlyMap<string, string>, file: string, mode: string) {
+  for (let folder = posix.dirname(file); folder !== "."; folder = posix.dirname(folder)) {
+    if (tree.get(folder) === mode) return true;
+    if (folder === "/") break;
+  }
+  return false;
+}
+
+function hasInTreeManifest(root: string, file: string) {
+  try {
+    const real = realpathSync(join(root, file));
+    return inside(realpathSync(root), real) && statSync(real).isFile();
+  } catch (error) {
+    if (isRecord(error) && (error.code === "ENOENT" || error.code === "ENOTDIR")) return false;
+    throw error;
+  }
+}
+
+async function noCommittedSkills(
+  source: GitSource,
+  root: string,
+  matches: (path: string) => boolean,
+) {
+  const handle = await discover(root, source.skills).catch((error: unknown) => {
+    if (isDiagnostic(error, "SKILLS_NO_VALID_SKILLS")) return noSkills(root);
+    if (isDiagnostic(error, "SKILLS_LOCAL_PATH_NOT_FOUND")) return undefined;
+    throw error;
+  });
+  if (!handle) return true;
+  try {
+    const found = handle.skills.map((skill) => ({
+      name: skill.name,
+      path: withBase(source.skills, skill.path),
+    }));
+    return (
+      !found.some(({ path }) => path === undefined || matches(path)) &&
+      linkedFolders(source, root, found, []).length === 0
+    );
+  } finally {
+    await handle.dispose();
+  }
+}
+
+/** Proves empty discovery is an upstream change, not a broken cache or a different source. */
+async function allGone(
+  source: GitSource,
+  state: SourceState,
+  { commit, repo }: CachedClone,
+  missingBase: boolean,
+) {
+  if (state.commit === undefined || repo === undefined) return false;
+  const installed = Object.values(state.skills);
+  if (
+    state.gitDiscovery === undefined
+      ? installed.length === 0
+      : state.gitDiscovery !== gitDiscovery(source)
+  )
+    return false;
+  if (
+    state.gitEmpty &&
+    commit === state.commit &&
+    installed.length === 0 &&
+    Object.keys(state.pending).length === 0
+  )
+    return true;
+  const matches = source.skills
+    ? globFilter(source.skills, `${source.id}: skills glob`)
+    : () => true;
+  const tree = await gitTreePaths(repo, commit);
+  if (!tree || (missingBase && (!source.skills || tree.has(globBase(source.skills))))) return false;
+  const prior = new Map<string, Awaited<ReturnType<typeof gitTreePaths>>>();
+  const manifests: string[] = [];
+  for (const record of installed) {
+    if (record.path === undefined || !matches(record.path)) return false;
+    const manifest = posix.join(record.path, "SKILL.md");
+    if (tree.has(manifest) || ancestorHasMode(tree, manifest, "160000")) return false;
+    manifests.push(manifest);
+    if (state.gitDiscovery === undefined) {
+      const at = record.commit === undefined ? state.commit : record.commit;
+      if (at === null) return false;
+      if (!prior.has(at)) prior.set(at, await gitTreePaths(repo, at));
+      const earlier = prior.get(at);
+      if (!earlier) return false;
+      if (
+        !earlier.has(manifest) &&
+        (!ancestorHasMode(earlier, manifest, "120000") ||
+          !(await withGitTree(repo, at, (root) => hasInTreeManifest(root, manifest))))
+      )
+        return false;
+    }
+  }
+  const hasManifest = [...tree.keys()].some((file) => nameKey(posix.basename(file)) === "skill.md");
+  if (!hasManifest) return true;
+  return withGitTree(repo, commit, (root) =>
+    manifests.some((manifest) => hasInTreeManifest(root, manifest))
+      ? false
+      : noCommittedSkills(source, root, matches),
+  );
+}
+
 /** A source with no skills to discover, for one that gives only files. */
 const noSkills = (dir: string): SkillSource => ({
   source: { input: dir, type: "local", url: dir },
@@ -1358,18 +1476,25 @@ async function openVendored(
             `${source.id}: left out ${path}: macOS and Windows keep it in the same folder as ${kept}`,
           );
       windowsNames(source, clone.refused, warnings);
-      return {
-        handle: await discover(clone.dir, source.skills).catch((error: unknown): SkillSource => {
-          // Only the linked-folder pass, or the files of a source of files, can rescue this
-          // specific empty discovery result.
-          if (
-            !isDiagnostic(error, "SKILLS_NO_VALID_SKILLS") ||
-            (!filesOnly(source, state) &&
-              (!source.skills || linkedFolders(source, clone.dir, [], []).length === 0))
-          )
-            throw error;
+      let gitEmpty = false;
+      const handle = await discover(clone.dir, source.skills).catch(async (error: unknown) => {
+        const empty = isDiagnostic(error, "SKILLS_NO_VALID_SKILLS");
+        const missingBase = isDiagnostic(error, "SKILLS_LOCAL_PATH_NOT_FOUND");
+        if (
+          empty &&
+          (filesOnly(source, state) ||
+            (source.skills && linkedFolders(source, clone.dir, [], []).length > 0))
+        )
           return noSkills(clone.dir);
-        }),
+        if ((empty || missingBase) && (await allGone(source, state, clone, missingBase))) {
+          gitEmpty = true;
+          return noSkills(clone.dir);
+        }
+        throw error;
+      });
+      return {
+        handle,
+        gitEmpty,
         version: clone.commit,
         glob: source.skills,
         root: clone.dir,
@@ -2045,7 +2170,7 @@ async function fetchVendored(
     out.warnings.push(
       `${source.id}: state.json had no install record of ${rebuilt.join(", ")}, so fleetrc rebuilt it from the copy it kept in the store`,
     );
-  const firstRun = Object.keys(state.skills).length === 0;
+  const firstRun = state.commit === undefined && Object.keys(state.skills).length === 0;
   // Local edits are checked on every run, online or not.
   lookForEdits(source, state, ctx, out);
   if (ctx.offline) {
@@ -2077,6 +2202,12 @@ async function fetchVendored(
     return out;
   }
   let staging: string | undefined;
+  const rememberGitDiscovery = () => {
+    if (source.kind !== "git") return;
+    state.gitDiscovery = gitDiscovery(source);
+    if ("gitEmpty" in opened && opened.gitEmpty) state.gitEmpty = true;
+    else delete state.gitEmpty;
+  };
   try {
     const escaping = opened.root
       ? escapingSkills(
@@ -2119,6 +2250,7 @@ async function fetchVendored(
       }));
       if (opened.root) vendoredFiles(source, state, ctx, out, opened.root, opened.version);
       state.fetchedAt = ctx.now;
+      rememberGitDiscovery();
       out.to = opened.version;
       return out;
     }
@@ -2252,6 +2384,7 @@ async function fetchVendored(
       state.version = opened.version;
       state.npmPackageKey = opened.npmPackageKey;
     } else state.commit = opened.version;
+    rememberGitDiscovery();
     out.to = opened.version;
   } catch (error) {
     out.status = "error";

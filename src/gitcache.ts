@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
 import { join } from "node:path";
 import { UserError } from "./errors.ts";
 import { git, GitError } from "./exec.ts";
@@ -183,7 +191,7 @@ export async function fetchClone(
   }
   // A commit never changes: once written out, a ref that names one needs no fetch.
   if (written && ref && isCommitRef(ref) && written.commit.startsWith(ref.toLowerCase()))
-    return { dir: cache.tree, ...written };
+    return { dir: cache.tree, ...written, repo: cache.repo };
   for (let attempt = 0; ; attempt++) {
     const fresh = !(existsSync(cache.repo) && (await usable(cache.repo, runGit)));
     let commit: string;
@@ -410,7 +418,55 @@ async function writeTree(
   runGit: typeof git,
   signal?: AbortSignal,
 ): Promise<Pick<CachedClone, "collisions" | "refused" | "submodules">> {
-  const listed = await runGit(["ls-tree", "-r", "-z", "--full-tree", commit], { cwd: cache.repo });
+  const temp = `${cache.tree}.${process.pid}.tmp`;
+  const old = `${cache.tree}.${process.pid}.old`;
+  rmSync(temp, { recursive: true, force: true });
+  mkdirSync(temp, { recursive: true });
+  try {
+    const paths = await checkoutTree(cache.repo, commit, temp, runGit);
+    const metadata = { commit, ...paths, skipsRefused: SKIPS_REFUSED };
+    writeJson(`${cache.tree}.${process.pid}.pending`, metadata);
+    // Moved aside, not deleted, so a kill here leaves a whole tree for `recoverTree`.
+    const replaced = existsSync(cache.tree);
+    if (replaced) renameSync(cache.tree, old);
+    renameSync(temp, cache.tree);
+    writeJson(cache.marker, metadata);
+    rmSync(`${cache.tree}.${process.pid}.pending`, { force: true });
+    if (replaced) rmSync(old, { recursive: true, force: true });
+    return paths;
+  } finally {
+    if (signal?.aborted) rmSync(join(cache.repo, "index.lock"), { force: true });
+    // Keep an unpublished temp beside its journal so recovery can distinguish rollback.
+    if (!existsSync(`${cache.tree}.${process.pid}.pending`))
+      rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+/** Reads an independent checkout without publishing it or changing the cached index. */
+export async function withGitTree<T>(
+  repo: string,
+  commit: string,
+  read: (dir: string) => Promise<T> | T,
+): Promise<T> {
+  const temp = mkdtempSync(`${repo}.inspect-`);
+  try {
+    const tree = join(temp, "tree");
+    mkdirSync(tree);
+    await checkoutTree(repo, commit, tree, git, join(temp, "index"));
+    return await read(tree);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+async function checkoutTree(
+  repo: string,
+  commit: string,
+  dir: string,
+  runGit: typeof git,
+  indexFile?: string,
+) {
+  const listed = await runGit(["ls-tree", "-r", "-z", "--full-tree", commit], { cwd: repo });
   const entries = listed.stdout
     .trim()
     .split("\0")
@@ -427,42 +483,23 @@ async function writeTree(
   const left = collisions(writable.map((entry) => entry.path));
   const kept = writable.filter((entry) => !within(left)(entry.path));
   const submodules = entries.filter((entry) => entry.mode === "160000").map((entry) => entry.path);
-  const temp = `${cache.tree}.${process.pid}.tmp`;
-  const old = `${cache.tree}.${process.pid}.old`;
-  rmSync(temp, { recursive: true, force: true });
-  mkdirSync(temp, { recursive: true });
-  try {
-    // Names go to and from git byte for byte, compared with their case.
-    const at = [
-      "-c",
-      "core.precomposeunicode=false",
-      "-c",
-      "core.ignorecase=false",
-      `--work-tree=${temp}`,
-    ];
-    // The index gets only the paths written out: git refuses a whole tree on Windows when one of
-    // its paths is one Windows can't write.
-    await runGit([...at, "read-tree", "--empty"], { cwd: cache.repo });
-    await runGit([...at, "update-index", "-z", "--index-info"], {
-      cwd: cache.repo,
-      input: kept.map((entry) => `${entry.line}\0`).join(""),
-    });
-    await runGit([...at, "checkout-index", "--all", "--force"], { cwd: cache.repo });
-    const metadata = { commit, collisions: left, refused, submodules, skipsRefused: SKIPS_REFUSED };
-    writeJson(`${cache.tree}.${process.pid}.pending`, metadata);
-    // Moved aside, not deleted, so a kill here leaves a whole tree for `recoverTree`.
-    const replaced = existsSync(cache.tree);
-    if (replaced) renameSync(cache.tree, old);
-    renameSync(temp, cache.tree);
-    writeJson(cache.marker, metadata);
-    rmSync(`${cache.tree}.${process.pid}.pending`, { force: true });
-    if (replaced) rmSync(old, { recursive: true, force: true });
-  } finally {
-    if (signal?.aborted) rmSync(join(cache.repo, "index.lock"), { force: true });
-    // Keep an unpublished temp beside its journal so recovery can distinguish rollback.
-    if (!existsSync(`${cache.tree}.${process.pid}.pending`))
-      rmSync(temp, { recursive: true, force: true });
-  }
+  // Names go to and from git byte for byte, compared with their case.
+  const at = [
+    "-c",
+    "core.precomposeunicode=false",
+    "-c",
+    "core.ignorecase=false",
+    ...(indexFile === undefined ? [] : ["-c", "core.symlinks=true"]),
+    `--work-tree=${dir}`,
+  ];
+  // The index gets only the paths written out: git refuses paths Windows can't write.
+  const options = { cwd: repo, indexFile };
+  await runGit([...at, "read-tree", "--empty"], options);
+  await runGit([...at, "update-index", "-z", "--index-info"], {
+    ...options,
+    input: kept.map((entry) => `${entry.line}\0`).join(""),
+  });
+  await runGit([...at, "checkout-index", "--all", "--force"], options);
   return { collisions: left, refused, submodules };
 }
 
