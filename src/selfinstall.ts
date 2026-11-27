@@ -473,29 +473,67 @@ const isExecutable = (file: string) => {
 };
 
 /**
+ * PATH as the user's login shell sets it, resolved from its working directory after startup.
+ * A command run over SSH gets sshd's PATH, without the folders the shell's startup files add,
+ * such as the `~/.local/bin` that Ubuntu's ~/.profile adds.
+ */
+export function loginShellPath(shell = process.env.SHELL): string[] {
+  if (!shell || process.platform === "win32") return [];
+  const physicalPwd = basename(shell) === "fish" ? "builtin pwd -P" : "command -p pwd -P";
+  const probe = `printf "\\000fleetrc-path\\000%s\\000" "$PATH" && ${physicalPwd} && printf "\\000"`;
+  const run = spawnSync(shell, ["-l", "-c", probe], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 5_000,
+    killSignal: "SIGKILL",
+  });
+  if (run.status !== 0) return [];
+  const record = run.stdout.split("\0fleetrc-path\0")[1]?.split("\0", 3);
+  if (record?.length !== 3) return [];
+  const [path, pwd] = record;
+  if (!path || !pwd?.endsWith("\n")) return [];
+  const cwd = pwd.slice(0, -1);
+  if (!isAbsolute(cwd)) return [];
+  return path.split(delimiter).map((dir) => (isAbsolute(dir) ? dir : resolve(cwd, dir)));
+}
+
+/**
  * Makes `fleetrc` a command in new shells, and says how. A `fleetrc` already on PATH, such
- * as a global npm install, is left alone. Otherwise, when `~/.local/bin` is on PATH (Linux, and
- * macOS when the user put it there), `~/.local/bin/fleetrc` links to the launcher; failing
- * that, the message says which folder to add to PATH. npx and `pnpm dlx` put their own temporary
- * `node_modules/.bin` on PATH, which a new shell does not have, so those folders do not count.
+ * as a global npm install, is left alone. Otherwise, when `~/.local/bin` is on PATH, here or in
+ * the login shell (Linux, and macOS when the user put it there), `~/.local/bin/fleetrc` links
+ * to the launcher; failing that, the message says which folder to add to PATH. npx and
+ * `pnpm dlx` put their own temporary `node_modules/.bin` on PATH, which a new shell does not
+ * have, so those folders do not count.
  */
 export function commandOnPath(launcher = launcherPath()): string {
   const bin = dirname(launcher);
-  const dirs = (process.env.PATH ?? "")
-    .split(delimiter)
-    .filter((dir) => dir && !resolve(dir).endsWith(`${sep}node_modules${sep}.bin`));
+  const persistent = (dir: string) => dir && !resolve(dir).endsWith(`${sep}node_modules${sep}.bin`);
   const names = process.platform === "win32" ? ["fleetrc.cmd", "fleetrc.exe"] : ["fleetrc"];
-  const found = dirs
-    .flatMap((dir) => names.map((name) => join(dir, name)))
-    .find((file) => lstat(file) && isExecutable(file));
+  const findCommand = (dirs: string[]) =>
+    dirs
+      .flatMap((dir) => names.map((name) => join(dir, name)))
+      .find((file) => {
+        try {
+          return statSync(file).isFile() && isExecutable(file);
+        } catch {
+          return false;
+        }
+      });
+  const local = process.platform === "win32" ? undefined : join(homedir(), ".local", "bin");
+  const inLocal = (dir: string) => resolve(dir) === local;
+  let dirs = (process.env.PATH ?? "").split(delimiter).filter(persistent);
+  let found = findCommand(dirs);
+  if (!found && local && !dirs.some(inLocal)) {
+    dirs = loginShellPath().filter(persistent);
+    found = findCommand(dirs);
+  }
   if (found)
     return realpathSync(found) === realpathSync(launcher)
       ? `\`fleetrc\` runs ${tildify(launcher)}${found === launcher ? "" : `, through ${tildify(found)}`}`
       : `\`fleetrc\` runs ${tildify(found)}, which is on PATH; the timer runs ${tildify(launcher)}`;
-  if (process.platform !== "win32") {
-    const local = join(homedir(), ".local", "bin");
+  if (local) {
     const link = join(local, "fleetrc");
-    if (dirs.some((dir) => resolve(dir) === local)) {
+    if (dirs.some(inLocal)) {
       const existing = lstat(link);
       if (!existing) {
         mkdirSync(local, { recursive: true });

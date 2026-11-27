@@ -19,7 +19,7 @@ import { remoteScript } from "../src/fleet.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { launchers, pathAdvice, stableNode } from "../src/selfinstall.ts";
 import { foreignTimer } from "../src/timer.ts";
-import { cli, isWindows, machine, pathWith, version } from "./fixture.ts";
+import { cli, isWindows, machine, pathWith, pathWithoutFleetrc, version } from "./fixture.ts";
 
 const executable = (file: string, text: string) => {
   mkdirSync(join(file, ".."), { recursive: true });
@@ -128,7 +128,14 @@ describe("mac environments", () => {
     async () => {
       const m = machine();
       const manifest = m.manifest({ agents: ["claude-code"], sources: [] });
-      const init = await m.runWith({ env: { SHELL: "/bin/zsh" } }, "init", manifest, "--no-hooks");
+      const shell = join(m.root, "zsh");
+      executable(shell, '#!/bin/sh\nexec /bin/sh -c "$3"\n');
+      const init = await m.runWith(
+        { env: { SHELL: shell, PATH: pathWithoutFleetrc(m.env) } },
+        "init",
+        manifest,
+        "--no-hooks",
+      );
       expect(init.code, init.stderr).toBe(0);
       expect(init.stdout).toContain(
         process.platform === "darwin" ? "in ~/.zprofile:" : "in ~/.zshrc:",
