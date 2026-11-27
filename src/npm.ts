@@ -38,6 +38,7 @@ const PACKAGE_NAME = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/i
 
 /** One path segment that looks like a version: semver and the looser versions old registries hold. */
 const VERSION = /^[0-9A-Za-z](?:[0-9A-Za-z.+_-]{0,126}[0-9A-Za-z])?$/;
+const EXACT_VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]*)?$/;
 
 /** Largest tarball fleetrc downloads, and the most it unpacks to. */
 const TARBALL_LIMIT = 100 * 1024 * 1024;
@@ -246,7 +247,7 @@ export function guardedFetch(
 }
 
 /**
- * Downloads an npm package into `cacheRoot/<name>@<version>` and returns that folder.
+ * Downloads an npm package into `cacheRoot/<registry hash>/<name>@<version>` and returns that folder.
  * `skills` has no npm source type; it discovers skills in the unpacked folder like any local path.
  */
 export async function fetchNpm(
@@ -265,10 +266,34 @@ export async function fetchNpm(
   const { name, want } = parseNpmSpec(spec);
   if (!PACKAGE_NAME.test(name)) throw new Error(`npm "${name}" is not a package name`);
   const base = registryUrl(registry);
-  const response = await fetch(`${base}/${name.replace("/", "%2f")}`, {
-    headers: { accept: "application/json", ...headers(sendToken) },
-    signal: AbortSignal.timeout(30_000),
-  });
+  const registryKey = createHash("sha256").update(base).digest("hex");
+  const registryCache = join(cacheRoot, registryKey);
+  const packageKey = `${registryKey}/${name}`;
+  const folder = (version: string) => {
+    const dir = join(registryCache, `${name.replace("/", "+")}@${version}`);
+    const inside = relative(registryCache, dir);
+    if (!inside || inside.startsWith("..") || /[/\\]/.test(inside))
+      throw new Error(`npm ${name}@${version}: the cache folder would be outside the cache`);
+    return dir;
+  };
+  // A published version never changes, so one already downloaded from this registry needs no request.
+  if (EXACT_VERSION.test(want) && VERSION.test(want)) {
+    const dir = folder(want);
+    if (existsSync(dir)) return { dir, version: want, packageKey };
+  }
+  const signal = AbortSignal.timeout(30_000);
+  const requestPackument = (accept: string) =>
+    fetch(`${base}/${name.replace("/", "%2f")}`, {
+      headers: { accept, ...headers(sendToken) },
+      signal,
+    });
+  let response = await requestPackument(
+    "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8",
+  );
+  if (response.status === 406 || response.status === 404) {
+    await response.body?.cancel();
+    response = await requestPackument("application/json");
+  }
   if (!response.ok) throw new Error(`npm ${name}: registry answered ${response.status}`);
   const packument: unknown = await response.json();
   if (!isRecord(packument) || !isRecord(packument.versions))
@@ -280,11 +305,8 @@ export async function fetchNpm(
   if (!isRecord(manifest) || !isRecord(manifest.dist) || typeof manifest.dist.tarball !== "string")
     throw new Error(`npm ${name}: no version or tag "${want}"`);
   if (!VERSION.test(version)) throw new Error(`npm ${name}: the registry gave an invalid version`);
-  const dir = join(cacheRoot, `${name.replace("/", "+")}@${version}`);
-  const inside = relative(cacheRoot, dir);
-  if (!inside || inside.startsWith("..") || /[/\\]/.test(inside))
-    throw new Error(`npm ${name}@${version}: the cache folder would be outside the cache`);
-  if (existsSync(dir)) return { dir, version };
+  const dir = folder(version);
+  if (existsSync(dir)) return { dir, version, packageKey };
   const url = manifest.dist.tarball;
   // The token is for the registry; a packument can point the tarball at any host.
   const tarballOrigin = urlOrigin(url);
@@ -308,5 +330,5 @@ export async function fetchNpm(
   mkdirSync(temp, { recursive: true });
   extractStripped(files, temp);
   renameSync(temp, dir);
-  return { dir, version };
+  return { dir, version, packageKey };
 }
