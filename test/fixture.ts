@@ -721,6 +721,13 @@ export function names(dir: string): string[] {
 export const pathWith = (dir: string, env: NodeJS.ProcessEnv) =>
   [dir, env.PATH ?? env.Path ?? ""].join(delimiter);
 
+/** The test's PATH without folders that have a `fleetrc`, as on a machine that has it installed. */
+export const pathWithoutFleetrc = (env: NodeJS.ProcessEnv) =>
+  (env.PATH ?? env.Path ?? "")
+    .split(delimiter)
+    .filter((dir) => !existsSync(join(dir, "fleetrc")))
+    .join(delimiter);
+
 /**
  * A systemd that answers as one with fleetrc's units loaded once their files exist, and linger
  * on. Its folder comes first on PATH and is inside the test's machine folder, so the scheduler
