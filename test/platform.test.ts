@@ -1,4 +1,4 @@
-import { appendFileSync, lstatSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, lstatSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vite-plus/test";
 import {
@@ -13,6 +13,7 @@ import {
   remote,
   skillMd,
   skills,
+  writeFiles,
 } from "./fixture.ts";
 
 describe("links on each OS", () => {
@@ -181,4 +182,48 @@ describe("links on each OS", () => {
     expect(again.warnings).toEqual([]);
     expect(again.targets.flatMap((target) => [...target.created, ...target.removed])).toEqual([]);
   });
+
+  it.skipIf(isWindows)("--copy publishes a local skill with a 255-byte name", async () => {
+    const m = machine();
+    const local = join(m.root, "local-skills");
+    const name = "a".repeat(255);
+    const files = { "SKILL.md": skillMd(name), "notes.md": "notes\n" };
+    writeFiles(join(local, name), files);
+    const manifest = m.manifest({ agents: ["claude-code"], sources: [{ id: "loc", local }] });
+    const init = await m.run("init", manifest, "--no-hooks", "--copy");
+    expect(init.code, init.stdout + init.stderr).toBe(0);
+    const target = m.at(".claude/skills", name);
+    expect(isLink(target)).toBe(false);
+    for (const [file, content] of Object.entries(files))
+      expect(read(join(target, file))).toBe(content);
+  });
+
+  it.skipIf(isWindows || process.getuid?.() === 0)(
+    "a copy that failed halfway is not read as deleting the files it missed",
+    async () => {
+      const m = machine();
+      const vendor = remote(m, "vendor", {
+        ...skills("skills/", "tool"),
+        "skills/tool/notes.md": "notes\n",
+      });
+      const manifest = m.manifest({
+        agents: ["claude-code"],
+        sources: [{ id: "vendor", git: vendor.url }],
+      });
+      expect((await m.run("init", manifest, "--no-hooks", "--copy")).code).toBe(0);
+      const notes = join(m.stateDir, "store/vendor/live/tool/notes.md");
+      rmSync(m.at(".claude/skills/tool"), { recursive: true });
+      chmodSync(notes, 0);
+      try {
+        expect((await m.run("sync", "--copy")).code).toBe(1);
+      } finally {
+        chmodSync(notes, 0o644);
+      }
+      const report = await m.json("sync", "--copy");
+      expect(report.ok, JSON.stringify(report.errors)).toBe(true);
+      expect(report.edited).toEqual([]);
+      expect(read(notes)).toBe("notes\n");
+      expect(read(m.at(".claude/skills/tool/notes.md"))).toBe("notes\n");
+    },
+  );
 });

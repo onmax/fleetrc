@@ -92,6 +92,8 @@ export interface SkillEntry {
   path?: string;
   /** A working clone's folder, which links in the skill may lead into when it is copied. */
   root?: string;
+  /** A local copy kept even though it is no longer supplied by the source. */
+  retainedRemoval?: true;
 }
 
 export type SourceStatus =
@@ -631,21 +633,26 @@ export async function syncClone(
     }
     if (ctx.dryRun) {
       out.status = "installed";
-      out.warnings.push(`${source.id}: ${dir} is not cloned yet; sync clones it`);
-      if (existsSync(dir)) out.skills = await discoverInPlace(source, dir, out.warnings);
-      else
+      if (lstatSync(dir, { throwIfNoEntry: false })) {
+        out.previewLimitation = `${source.id}: ${dir} exists and is not a git repository`;
+        out.skills = await discoverInPlace(source, dir, out.warnings);
+      } else {
+        out.warnings.push(`${source.id}: ${dir} is not cloned yet; sync clones it`);
         // What the clone will hold, read from the repository through the (dry run's) git cache,
         // so a plan counts the skills the clone brings.
         try {
           const upstream = await (ctx.fetchGit?.(source) ?? fetchGitSource(source, ctx.cacheDir));
           out.skills = await discoverInPlace(source, upstream.dir, out.warnings);
+          out.to = upstream.commit;
         } catch (error) {
           out.warnings.push(`${source.id}: cannot read ${gitUrl(source.git)}: ${message(error)}`);
         }
+      }
       return out;
     }
     try {
-      if (existsSync(dir)) throw new Error(`${dir} exists and is not a git repository`);
+      if (lstatSync(dir, { throwIfNoEntry: false }))
+        throw new Error(`${dir} exists and is not a git repository`);
       await cloneAt(source, dir);
       await nameClashes(source, dir, out.warnings, true);
       out.status = "installed";
@@ -682,10 +689,10 @@ export async function syncClone(
 }
 
 /** Clones a working clone at its `ref`: a branch or tag, or else a commit, checked out detached. */
-export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: string) {
+export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: string, runGit = git) {
   const url = gitUrl(source.git);
   const clone = (ref?: string) =>
-    git(["clone", "--quiet", ...(ref ? ["--branch", ref] : []), "--", url, dir], {
+    runGit(["clone", "--quiet", ...(ref ? ["--branch", ref] : []), "--", url, dir], {
       timeoutMs: 600_000,
       allowFail: true,
     });
@@ -699,9 +706,9 @@ export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: str
   cloned = await clone();
   if (cloned.code !== 0) throw new GitError(["clone", "--", url, dir], cloned);
   try {
-    const commit = await findCommit(dir, ref);
+    const commit = await findCommit(dir, ref, runGit);
     if (!commit) throw new Error(`${url} has no branch, tag or commit ${ref}`);
-    await git(["checkout", "--quiet", "--detach", commit], { cwd: dir });
+    await runGit(["checkout", "--quiet", "--detach", commit], { cwd: dir });
   } catch (error) {
     // Nobody worked in a clone made a moment ago, and left on the default branch it would follow it.
     rmSync(dir, { recursive: true, force: true });
@@ -709,10 +716,55 @@ export async function cloneAt(source: Pick<CloneSource, "git" | "ref">, dir: str
   }
 }
 
+/** Checks what live sync can actually link before init removes a personal copy. */
+export async function confirmCloneSkills(
+  source: CloneSource,
+  scratch: string,
+  previewCommit: string | undefined,
+): Promise<Set<string>> {
+  if (!previewCommit) return new Set();
+  const existing = existsSync(join(source.path, ".git"));
+  const probe = join(scratch, "checkout");
+  if (!existing || source.ref) {
+    const hooks = join(scratch, "empty-hooks");
+    mkdirSync(hooks);
+    await cloneAt(source, probe, (args, options) =>
+      git(["-c", `core.hooksPath=${hooks}`, ...args], options),
+    );
+    if ((await gitOut(["rev-parse", "HEAD"], probe)) !== previewCommit) return new Set();
+  }
+  if (existing && source.ref) {
+    const checkout = async (dir: string) => {
+      const commit = await gitOut(["rev-parse", "HEAD"], dir);
+      const head = await git(["symbolic-ref", "--quiet", "HEAD"], { cwd: dir, allowFail: true });
+      if (head.code === 1) return [commit];
+      if (head.code !== 0) throw new Error(`cannot read the checked-out branch in ${dir}`);
+      const [remote, ref] = (
+        await gitOut(
+          [
+            "for-each-ref",
+            "--format=%(upstream:remotename)%00%(upstream:remoteref)",
+            head.stdout.trim(),
+          ],
+          dir,
+        )
+      ).split("\0");
+      if (!remote || !ref) throw new Error(`the checked-out branch in ${dir} has no upstream`);
+      return [commit, ref, await gitOut(["remote", "get-url", "--", remote], dir)];
+    };
+    const expected = await checkout(probe);
+    const actual = await checkout(source.path);
+    if (expected.length !== actual.length || expected.some((part, index) => part !== actual[index]))
+      return new Set();
+  }
+  const skills = await discoverInPlace(source, existing ? source.path : probe, []);
+  return new Set(skills.map((skill) => skill.name));
+}
+
 /** The commit a ref names in a clone, fetching it from origin when the clone does not have it. */
-async function findCommit(dir: string, ref: string): Promise<string | undefined> {
+async function findCommit(dir: string, ref: string, runGit = git): Promise<string | undefined> {
   const resolve = async () => {
-    const found = await git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+    const found = await runGit(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
       cwd: dir,
       allowFail: true,
     });
@@ -722,7 +774,7 @@ async function findCommit(dir: string, ref: string): Promise<string | undefined>
   if (known) return known;
   // A commit on no branch is fetched by its full id; a shorter one can only be looked up locally.
   if (ref.length !== 40) return undefined;
-  const fetched = await git(["fetch", "--quiet", "--", "origin", ref], {
+  const fetched = await runGit(["fetch", "--quiet", "--", "origin", ref], {
     cwd: dir,
     allowFail: true,
     timeoutMs: 300_000,
@@ -2578,7 +2630,12 @@ function applyVendored(
           `${source.id}: ${name} is gone upstream but has local edits, so it stays`,
         );
       else hold(name, undefined, "review", Object.keys(state.skills[name]?.hashes ?? {}));
-      out.skills.push({ name, dir: paths.live, path: state.skills[name]?.path });
+      out.skills.push({
+        name,
+        dir: paths.live,
+        path: state.skills[name]?.path,
+        retainedRemoval: true,
+      });
       continue;
     }
     if (write) {
@@ -2589,7 +2646,12 @@ function applyVendored(
         out.warnings.push(
           `${source.id}: ${name} is gone upstream but has local edits, so it stays`,
         );
-        out.skills.push({ name, dir: paths.live, path: state.skills[name]?.path });
+        out.skills.push({
+          name,
+          dir: paths.live,
+          path: state.skills[name]?.path,
+          retainedRemoval: true,
+        });
         continue;
       }
       for (const dir of Object.values(paths)) rmSync(dir, { recursive: true, force: true });
