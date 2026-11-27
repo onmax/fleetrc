@@ -59,7 +59,7 @@
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["from", "path", "base"],
+        "required": ["from", "path"],
         "properties": {
           "from": {
             "type": "string",
@@ -71,10 +71,14 @@
             "minLength": 1,
             "description": "Skill folder inside that repository."
           },
+          "upstream": {
+            "enum": ["git", "index"],
+            "description": "Upstream type. Use git to let full online sync check a standalone repository whose origin is otherwise ambiguous. Index forks are not checked."
+          },
           "base": {
             "type": "string",
             "minLength": 1,
-            "description": "Upstream commit the fork was last merged with."
+            "description": "Upstream commit the fork was last merged with. Without it, `merge` has no common ancestor, so each difference from upstream is a conflict to settle once; the merge then records the base."
           }
         }
       }

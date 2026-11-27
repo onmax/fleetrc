@@ -42,7 +42,7 @@ import {
 } from "./fleet.ts";
 import { isRecord, JsonFileError, readJsonOrNothing, writeJson } from "./fs.ts";
 import { HOOK_AGENTS, type HookAgent, runHook } from "./hook.ts";
-import { applyPlan, cloneBeforeAdopt, formatPlan, planInit } from "./init.ts";
+import { applyPlan, applySkillBackups, cloneBeforeAdopt, formatPlan, planInit } from "./init.ts";
 import { gitUrl } from "./gitcache.ts";
 import { errorText } from "./linker.ts";
 import { skillList } from "./list.ts";
@@ -81,7 +81,7 @@ import {
 import { staleSessions } from "./sessions.ts";
 import { loadState } from "./state.ts";
 import { LockHeldError } from "./lock.ts";
-import { manifestSpec, sync, withSyncLock } from "./sync.ts";
+import { manifestSpec, sync, type SyncOptions, withSyncLock } from "./sync.ts";
 import {
   foreignTimer,
   foreignTimerResource,
@@ -396,6 +396,7 @@ async function syncReport({
   apply?: string;
   skipTimerCheck?: boolean;
   manifest?: string;
+  initBackups?: SyncOptions["initBackups"];
 } = {}): Promise<Report> {
   const report = await sync({
     manifest: values.manifest,
@@ -649,7 +650,10 @@ async function status() {
   if (!report) say("no sync has run on this machine yet");
   else
     say(`last run: ${report.finishedAt}${report.ok ? "" : " (with errors)"}`, formatReport(report));
-  for (const line of [...forkLines(state), ...conflictLines(state)]) say(line);
+  const loaded = config?.manifest
+    ? await loadManifest(config.manifest, { offline: true }).catch(() => undefined)
+    : undefined;
+  for (const line of [...forkLines(state, loaded), ...conflictLines(state)]) say(line);
   say(`syncs start from: ${describeTrigger(hooks, withTimer)}`);
   if (timerState !== undefined)
     say(
@@ -1045,7 +1049,14 @@ async function init() {
     applied.push("the manifest is the one the tailnet policy names; each sync asks again");
   say(...applied.map((line) => `  ${line}`));
   // init installs the timer from the manifest next, so the sync need not say it differs.
-  const report = await syncReport({ manifest: plan.manifestSpec, skipTimerCheck: withTimer, copy });
+  const beforeSync = applied.length;
+  const report = await syncReport({
+    manifest: plan.manifestSpec,
+    skipTimerCheck: withTimer,
+    copy,
+    initBackups: (results) => applySkillBackups(plan, results, applied),
+  });
+  say(...applied.slice(beforeSync).map((line) => `  ${line}`));
   if (!json) console.log(reportText(report));
   // The copy that new shells, the hooks, the timer and `fleet` run.
   const installed = selfInstall();

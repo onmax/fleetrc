@@ -66,8 +66,8 @@ export interface FileLink {
 
 /** What the last sync found upstream of a fork (the manifest's `forks`). */
 export interface ForkState {
-  /** The fork's `base` when it was checked. */
-  base: string;
+  /** The fork's `base` when it was checked; none when the manifest gives none. */
+  base?: string;
   /** The upstream commit checked. */
   upstream: string;
   /** A hash of the skill's folder at `upstream`, so a new version is told apart from the last one. */
@@ -335,12 +335,12 @@ function pendingUpdate(record: unknown): PendingUpdate | undefined {
 }
 
 function forkRecord(record: unknown): ForkState | undefined {
-  if (!isRecord(record) || !text(record.base) || !text(record.upstream)) return undefined;
+  if (!isRecord(record) || !text(record.upstream)) return undefined;
   const files = Array.isArray(record.files)
     ? record.files.filter((file): file is string => typeof file === "string")
     : [];
   return {
-    base: record.base as string,
+    ...strings(record, "base"),
     upstream: record.upstream as string,
     tree: text(record.tree) ?? "",
     files,

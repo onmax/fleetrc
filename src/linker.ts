@@ -3,9 +3,11 @@ import {
   constants,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmdirSync,
   rmSync,
   symlinkSync,
@@ -13,10 +15,12 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  changedModes,
   copyResolved,
   type DroppedLink,
   type Hashes,
   dict,
+  executables,
   hashDir,
   isErrno,
   isRecord,
@@ -25,6 +29,7 @@ import {
   readJson,
   recoverRenames,
   renameFolder,
+  resolvedExecutables,
   resolvedHashes,
   sameTree,
   writeJson,
@@ -179,7 +184,17 @@ export function makeLink(
       if (process.platform !== "win32") throw error;
     }
   }
-  return { kind: "copy", dropped: copyResolved(link.target, path, link.root) };
+  // Made beside `path` and renamed into place whole: a copy cut short would read as the user
+  // deleting the files it missed, and the next sync would delete them from the skill.
+  const staging = mkdtempSync(join(dirname(path), ".fleetrc-copy-"));
+  try {
+    const temp = join(staging, "skill");
+    const dropped = copyResolved(link.target, temp, link.root);
+    renameSync(temp, path);
+    return { kind: "copy", dropped };
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
 }
 
 const DROPPED = {
@@ -327,7 +342,8 @@ export function linkTargetDir(
         !copy ||
         !sameTree(now, fresh) ||
         !samePath(record.target, link.target) ||
-        record.root !== link.root
+        record.root !== link.root ||
+        changedModes(executables(path), resolvedExecutables(link.target, link.root)).length > 0
       )
         write(link.name, link, true);
       return;

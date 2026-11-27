@@ -356,7 +356,15 @@ const sshRemoteCommand = (
   version: string,
   dryRun: boolean,
   setup?: InitSetup,
-) => `sh -c ${quote(remoteScript(action, version, { dryRun, setup }))}`;
+) => shCommand(remoteScript(action, version, { dryRun, setup }));
+
+/**
+ * The command that runs `script` with sh on a host. sshd hands it to the user's login shell, which
+ * may be fish, where `\\` in single quotes is an escape, or tcsh, which refuses a newline in them,
+ * so the script goes as base64. Older macOS decodes with -D.
+ */
+export const shCommand = (script: string) =>
+  `sh -c 'e=${Buffer.from(script).toString("base64")}; if decoded=$(printf %s "$e" | base64 -d 2>/dev/null) || decoded=$(printf %s "$e" | base64 -D); then eval "$decoded"; else echo "fleetrc: could not decode the remote script with base64" >&2; exit 1; fi'`;
 
 async function runOnHost(
   host: string,

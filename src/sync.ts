@@ -53,6 +53,7 @@ import {
   readConfig,
   remoteManifest,
   sameManifest,
+  type Source,
   stagePolicyManifest,
   tailnetManifestSpec,
   writeConfig,
@@ -62,7 +63,13 @@ import { paths, tildify } from "./paths.ts";
 import { LOCK_MAX_AGE_MS, LockHeldError, lockText, readLock, takeLock } from "./lock.ts";
 import type { HookRun, Report } from "./report.ts";
 import { CLAUDE_PLUGIN_NAME } from "./hookdefs.ts";
-import { failedResult, type SourceResult, sourceFiles, syncSource } from "./sources.ts";
+import {
+  failedResult,
+  prefetchGitSources,
+  type SourceResult,
+  sourceFiles,
+  syncSource,
+} from "./sources.ts";
 import { loadState, sourceState, type State, StateFile } from "./state.ts";
 import { scheduleDrift } from "./timer.ts";
 import { version } from "./version.ts";
@@ -80,6 +87,12 @@ export interface SyncOptions {
   manifest?: string;
   /** An already loaded manifest (init plans with one that is not on disk yet). */
   loaded?: LoadedManifest;
+  previewSkills?: {
+    omit: (dir: string) => boolean;
+    inspectConfirmed?: (links: readonly DesiredLink[], pendingCopyEdits: boolean) => void;
+  };
+  /** Apply init's deferred backups against live discovery; returns whether any directory moved. */
+  initBackups?: (results: readonly SourceResult[]) => boolean;
   /** Leave out the note about a timer whose schedule the manifest changed (init installs it next). */
   skipTimerCheck?: boolean;
 }
@@ -454,7 +467,9 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   const startedAt = new Date().toISOString();
   const dryRun = options.dryRun ?? false;
   const offline = options.offline ?? false;
-  const scratch = dryRun ? mkdtempSync(join(tmpdir(), "fleetrc-dry-")) : undefined;
+  // A dry run fetches into a scratch cache, so the real one never moves past what was synced.
+  // Offline it fetches nothing, so it reads the real cache: a scratch one would be empty.
+  const scratch = dryRun && !offline ? mkdtempSync(join(tmpdir(), "fleetrc-dry-")) : undefined;
   const lock = dryRun ? { release: () => {} } : acquireLock();
   if (!dryRun) sweepJsonTemps();
   const warnings: string[] = lock.note ? [lock.note] : [];
@@ -462,13 +477,23 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
   // anyway lets go of the lock and says so, and the next timer run starts over.
   let doing = "loading the manifest";
   const limit = syncTimeoutMs();
-  const watchdog = setTimeout(() => {
-    stopAll();
+  let prefetch: ReturnType<typeof prefetchGitSources> | undefined;
+  let onTimeout: Promise<never> | undefined;
+  const cleanUp = () => {
     lock.release();
+    if (scratch) rmSync(scratch, { recursive: true, force: true });
+  };
+  const stopSync = async () => {
+    await prefetch?.finish();
+    stopAll();
+    cleanUp();
     process.stderr.write(
       `fleetrc: the sync was stopped after ${limit >= 60_000 ? `${Math.round(limit / 60_000)} minutes` : `${limit / 1000} s`} while ${doing}; its lock is released, and the next sync starts over\n`,
     );
     process.exit(1);
+  };
+  const watchdog = setTimeout(() => {
+    onTimeout = stopSync();
   }, limit);
   watchdog.unref();
   try {
@@ -487,6 +512,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
       candidate?.loaded ??
       (await loadManifest(policy.spec, {
         offline,
+        readOnly: dryRun && offline,
         ...(scratch ? { cacheRoot: join(scratch, "manifests") } : {}),
       }));
     // The repository has no manifest at the new default place yet, so the policy's spec loaded the
@@ -523,6 +549,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const adoptedFileEdits = adoptFileCopyEdits(state, dryRun);
     warnings.push(...adoptedSkillEdits, ...adoptedFileEdits);
     if (dryRun) previewLimitations.push(...adoptedFileEdits);
+    const pendingCopyEdits = previewLimitations.length > 0;
     // Skills linked last time, by source: what a source that fails, or can't be read, keeps.
     const lastLinked = (id: string) =>
       Object.entries(state.skills)
@@ -530,6 +557,10 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         .map(([name, record]) => ({ name, dir: record.dir }));
     const backupRoot = join(paths.backup(), startedAt.replace(/[:.]/g, "-"));
     const results: SourceResult[] = [];
+    const cacheDir = scratch ?? paths.cache();
+    const fetchedNow = (source: Source) =>
+      !offline && (options.only === undefined || options.only === source.id);
+    prefetch = prefetchGitSources(loaded.sources.filter(fetchedNow), cacheDir, dryRun);
     for (const source of loaded.sources) {
       await yieldToWatchdog();
       const before = state.sources[source.id];
@@ -545,11 +576,12 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           }
       }
       const ctx = {
-        offline: offline || (options.only !== undefined && options.only !== source.id),
+        offline: !fetchedNow(source),
         offlineRequested: offline,
         dryRun,
         apply: options.apply === source.id,
-        cacheDir: scratch ?? paths.cache(),
+        cacheDir,
+        fetchGit: prefetch.fetch,
         storeDir: paths.store(source.id),
         now: startedAt,
         fileLinks: state.links,
@@ -606,9 +638,19 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     // Unicode normalization count as one, since macOS and Windows keep them in one folder.
     const winners = new Map<string, DesiredLink>();
     const byKey = new Map<string, DesiredLink>();
+    const retainedRemovals = new Set<DesiredLink>();
     const shadowed: Report["shadowed"] = [];
+    const preview = dryRun ? options.previewSkills : undefined;
+    const moved = !dryRun && options.initBackups?.(results);
+    if (moved) {
+      for (const result of results) {
+        result.skills = result.skills.filter(({ dir }) => existsSync(join(dir, "SKILL.md")));
+        result.files = result.files.filter(({ file }) => existsSync(file));
+      }
+    }
     for (const result of results) {
       for (const skill of result.skills) {
+        if (preview?.omit(skill.dir)) continue;
         // ~/.claude/skills/fleetrc is the plugin that carries Claude Code's hooks (entrysync.ts).
         if (nameKey(skill.name) === nameKey(CLAUDE_PLUGIN_NAME)) {
           warnings.push(
@@ -630,10 +672,15 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
         };
         winners.set(skill.name, link);
         byKey.set(nameKey(skill.name), link);
+        if (skill.retainedRemoval) retainedRemovals.add(link);
       }
     }
     for (const link of carried)
-      if (!byKey.has(nameKey(link.name))) {
+      if (
+        !preview?.omit(link.target) &&
+        (!moved || existsSync(join(link.target, "SKILL.md"))) &&
+        !byKey.has(nameKey(link.name))
+      ) {
         winners.set(link.name, link);
         byKey.set(nameKey(link.name), link);
       }
@@ -645,6 +692,22 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
           : "none of the manifest's agents has a global skills folder, so no skills were linked",
       );
     const desired = [...winners.values()];
+    if (preview?.inspectConfirmed && pendingCopyEdits) {
+      preview.inspectConfirmed([], true);
+    } else if (preview?.inspectConfirmed) {
+      const confirmed = new Set(
+        results
+          .filter(
+            ({ status, previewLimitation }) =>
+              status !== "error" && status !== "offline" && !previewLimitation,
+          )
+          .map(({ id }) => id),
+      );
+      preview.inspectConfirmed(
+        desired.filter((link) => confirmed.has(link.source) && !retainedRemovals.has(link)),
+        false,
+      );
+    }
     doing = "linking skills into agent folders";
     // One folder that can't be written must not stop the others.
     const linkInto = (dir: string, links: DesiredLink[]): TargetReport => {
@@ -726,7 +789,7 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     const forks =
       dryRun || offline
         ? { updates: [], warnings: [] }
-        : await checkForks(loaded, results, state, paths.cache());
+        : await checkForks(loaded, results, state, paths.cache(), options.only === undefined);
     const forked = new Set(Object.keys(loaded.root.forks).map(nameKey));
     const sourceWon = (result: SourceResult, skill: string) =>
       winners.get(skill)?.source === result.id;
@@ -898,8 +961,9 @@ export async function sync(options: SyncOptions = {}): Promise<Report> {
     return report;
   } finally {
     clearTimeout(watchdog);
-    lock.release();
-    if (scratch) rmSync(scratch, { recursive: true, force: true });
+    if (onTimeout) await onTimeout;
+    await prefetch?.finish();
+    cleanUp();
   }
 }
 
