@@ -30,6 +30,8 @@ export interface SourceState {
   commit?: string;
   /** npm package version. */
   version?: string;
+  /** Effective registry hash and package name for the recorded npm version. */
+  npmPackageKey?: string;
   fetchedAt?: string;
   skills: Record<string, InstalledCopy>;
   pending: Record<string, PendingUpdate>;
@@ -298,7 +300,7 @@ function sourceRecord(record: unknown): SourceState | undefined {
   if (!isRecord(record) || !KINDS.includes(String(record.kind))) return undefined;
   return {
     kind: record.kind as Source["kind"],
-    ...strings(record, "commit", "version", "fetchedAt"),
+    ...strings(record, "commit", "version", "npmPackageKey", "fetchedAt"),
     skills: records(record.skills, installedCopy),
     pending: records(record.pending, pendingUpdate),
     ...(isRecord(record.files)
